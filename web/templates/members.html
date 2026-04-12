@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block title %}Members - Vibe Gatekeeper{% endblock %}
+
+{% block content %}
+<h2 class="mb-4">Community Members</h2>
+
+<form method="get" action="/members" class="mb-4">
+    <div class="input-group" style="max-width: 400px;">
+        <input type="text" class="form-control" name="name"
+               placeholder="Search by name or username..."
+               value="{{ search_name }}">
+        <button class="btn btn-outline-primary" type="submit">Search</button>
+        {% if search_name %}
+        <a href="/members" class="btn btn-outline-secondary">Clear</a>
+        {% endif %}
+    </div>
+</form>
+
+<div class="table-responsive">
+    <table class="table table-hover align-middle">
+        <thead class="table-light">
+            <tr>
+                <th>Name</th>
+                <th>Username</th>
+                <th>Intro Status</th>
+                <th>Vouched By</th>
+                <th>Joined Date</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for m in members %}
+            <tr>
+                <td>{{ m.name }}</td>
+                <td>
+                    {% if m.username %}
+                    <a href="https://t.me/{{ m.username }}" target="_blank" rel="noopener">
+                        @{{ m.username }}
+                    </a>
+                    {% else %}
+                    <span class="text-muted">-</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if m.has_intro %}
+                    <span class="badge bg-success">есть</span>
+                    {% else %}
+                    <span class="badge bg-danger">нет</span>
+                    {% endif %}
+                </td>
+                <td>{{ m.vouched_by or "-" }}</td>
+                <td>
+                    {% if m.joined_at %}
+                    {{ m.joined_at.strftime("%Y-%m-%d") }}
+                    {% else %}
+                    <span class="text-muted">-</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="5" class="text-center text-muted py-4">
+                    {% if search_name %}
+                    No members found matching "{{ search_name }}".
+                    {% else %}
+                    No members yet.
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<p class="text-muted">Total: {{ members | length }} member{{ "s" if members | length != 1 else "" }}</p>
+{% endblock %}

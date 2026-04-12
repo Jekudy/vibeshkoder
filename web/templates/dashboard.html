@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Vibe Gatekeeper{% endblock %}
+
+{% block content %}
+<h2 class="mb-4">Application Funnel</h2>
+
+<div class="row g-3 mb-4">
+    <div class="col-md-4 col-lg">
+        <div class="card text-center h-100">
+            <div class="card-body">
+                <h5 class="card-title text-muted">Started</h5>
+                <p class="display-5 fw-bold">{{ stats.total_started }}</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4 col-lg">
+        <div class="card text-center h-100">
+            <div class="card-body">
+                <h5 class="card-title text-muted">Filled</h5>
+                <p class="display-5 fw-bold">{{ stats.filled }}</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4 col-lg">
+        <div class="card text-center h-100">
+            <div class="card-body">
+                <h5 class="card-title text-muted">Waiting</h5>
+                <p class="display-5 fw-bold text-warning">{{ stats.waiting }}</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4 col-lg">
+        <div class="card text-center h-100">
+            <div class="card-body">
+                <h5 class="card-title text-muted">Added</h5>
+                <p class="display-5 fw-bold text-success">{{ stats.added }}</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4 col-lg">
+        <div class="card text-center h-100">
+            <div class="card-body">
+                <h5 class="card-title text-muted">Rejected</h5>
+                <p class="display-5 fw-bold text-danger">{{ stats.rejected }}</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if stats.total_started > 0 %}
+<div class="card">
+    <div class="card-body">
+        <h5 class="card-title mb-3">Funnel Visualization</h5>
+
+        {% set total = stats.total_started %}
+
+        <div class="mb-3">
+            <div class="d-flex justify-content-between mb-1">
+                <span>Started</span>
+                <span>{{ stats.total_started }}</span>
+            </div>
+            <div class="progress" style="height: 24px;">
+                <div class="progress-bar bg-secondary" style="width: 100%;">100%</div>
+            </div>
+        </div>
+
+        <div class="mb-3">
+            <div class="d-flex justify-content-between mb-1">
+                <span>Filled</span>
+                <span>{{ stats.filled }}</span>
+            </div>
+            <div class="progress" style="height: 24px;">
+                <div class="progress-bar bg-info"
+                     style="width: {{ (stats.filled / total * 100) | round(1) }}%;">
+                    {{ (stats.filled / total * 100) | round(1) }}%
+                </div>
+            </div>
+        </div>
+
+        <div class="mb-3">
+            <div class="d-flex justify-content-between mb-1">
+                <span>Waiting</span>
+                <span>{{ stats.waiting }}</span>
+            </div>
+            <div class="progress" style="height: 24px;">
+                <div class="progress-bar bg-warning"
+                     style="width: {{ (stats.waiting / total * 100) | round(1) }}%;">
+                    {{ (stats.waiting / total * 100) | round(1) }}%
+                </div>
+            </div>
+        </div>
+
+        <div class="mb-3">
+            <div class="d-flex justify-content-between mb-1">
+                <span>Added</span>
+                <span>{{ stats.added }}</span>
+            </div>
+            <div class="progress" style="height: 24px;">
+                <div class="progress-bar bg-success"
+                     style="width: {{ (stats.added / total * 100) | round(1) }}%;">
+                    {{ (stats.added / total * 100) | round(1) }}%
+                </div>
+            </div>
+        </div>
+
+        <div class="mb-3">
+            <div class="d-flex justify-content-between mb-1">
+                <span>Rejected</span>
+                <span>{{ stats.rejected }}</span>
+            </div>
+            <div class="progress" style="height: 24px;">
+                <div class="progress-bar bg-danger"
+                     style="width: {{ (stats.rejected / total * 100) | round(1) }}%;">
+                    {{ (stats.rejected / total * 100) | round(1) }}%
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

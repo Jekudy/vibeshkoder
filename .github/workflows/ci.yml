@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: 123456:test-token
+      COMMUNITY_CHAT_ID: -1001234567890
+      ADMIN_IDS: '[149820031]'
+      DATABASE_URL: postgresql+asyncpg://vibe:changeme@db:5432/vibe_gatekeeper
+      REDIS_URL: redis://redis:6379/0
+      GOOGLE_SHEETS_CREDS_FILE: ""
+      GOOGLE_SHEET_ID: ""
+      WEB_BASE_URL: http://localhost:8080
+      WEB_BOT_USERNAME: vibeshkoder_dev_bot
+      DB_PASSWORD: changeme
+      WEB_PASSWORD: test-pass
+      DEV_MODE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run lint
+        run: ruff check .

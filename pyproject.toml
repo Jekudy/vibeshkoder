@@ -1,0 +1,48 @@
+[project]
+name = "vibe-gatekeeper"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.25",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "pydantic-settings>=2.0",
+    "gspread-asyncio>=2.0",
+    "gspread>=6.0",
+    "google-auth>=2.0",
+    "fastapi>=0.115",
+    "jinja2>=3.1",
+    "uvicorn>=0.34",
+    "apscheduler>=3.10,<4",
+    "redis>=5.0",
+    "python-dotenv>=1.0",
+    "itsdangerous>=2.0",
+    "httpx>=0.28",
+    "python-multipart>=0.0.9",
+    "aiosqlite>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.11",
+]
+ops = [
+    "telethon>=1.39",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["bot*", "web*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
