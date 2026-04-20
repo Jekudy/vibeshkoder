@@ -120,3 +120,25 @@ After those values are set, redeploy web and bot from Coolify and run the smoke 
 ## Current Bootstrap Limitation
 
 The old production runtime at `/home/claw/vibe-gatekeeper` remains the live user path until the new staging path is verified and a controlled bot cutover window is prepared.
+
+## Coolify deploys
+
+Canonical reference: `~/Vibe/knowledge/nocoders/docs/architecture/coolify-deploy-playbook.md` plus `/coolify-deploy` skill.
+
+- **Start app:** Coolify UI → project → app → Start. CLI: `coolify start <app-uuid>` (if `coolify` CLI available on host) or `docker start <container-uuid>` as fallback.
+- **Stop app:** Coolify UI → Stop, or `coolify stop <app-uuid>`.
+- **Pull logs (last 500 lines, follow):** `coolify logs <app-uuid> --tail 500 --follow`; fallback `docker logs <container-uuid> --tail 500`.
+- **Where secrets live:** Coolify env panel per app. On disk: `/data/coolify/...` (ACL 600 root:root). Never commit to git.
+- **Rollback to previous digest:** Coolify UI → app → Deployments → select previous deployment → Redeploy. CLI path: update image reference in app config to the prior `@sha256:` digest, redeploy.
+
+## Known Issues & Quirks
+
+_Filled incrementally as Coolify migration reveals issues. Each entry format:_
+
+```
+### <YYYY-MM-DD> — <short issue>
+Symptom:
+Root cause:
+Fix:
+```
+
