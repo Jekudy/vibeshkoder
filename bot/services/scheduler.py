@@ -152,7 +152,7 @@ async def _check_intro_refresh(session: AsyncSession, bot: Bot) -> None:
         should_send = False
 
         if tracking.phase == "daily":
-            if tracking.reminders_sent < 5:
+            if tracking.reminders_sent < settings.INTRO_NUDGE_PHASE_1_MAX:
                 if tracking.last_reminder_at is None or (now - tracking.last_reminder_at).days >= 1:
                     should_send = True
             else:
@@ -161,7 +161,9 @@ async def _check_intro_refresh(session: AsyncSession, bot: Bot) -> None:
                 await session.flush()
 
         if tracking.phase == "every_2_days":
-            if tracking.reminders_sent < 8:  # 5 daily + 3 every_2_days
+            if (
+                tracking.reminders_sent < settings.INTRO_NUDGE_PHASE_2_MAX
+            ):  # phase1 daily + phase2 every_2_days
                 if tracking.last_reminder_at is None or (now - tracking.last_reminder_at).days >= 2:
                     should_send = True
             else:
