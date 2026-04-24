@@ -77,9 +77,8 @@ Sprint-2 env vars (all optional, commented out in `.env.example`):
 ## Known drift (keep in mind when reading docs)
 
 - **`SPEC.md §7` has an implementation-differs note** (added sprint-2) — the section still describes a Telegram Login Widget + HMAC-SHA256, but now carries an italic note that the actual implementation is a password form + `itsdangerous.URLSafeTimedSerializer` cookie (`web/auth.py`, `web/routes/auth.py`). No Widget code exists.
-- **`SPEC.md §1` structure diagram is now accurate** (fixed sprint-2) — `bot/handlers/chat_events.py` and `bot/db/repos/intro.py` added; test file list updated to reflect all 11 test files.
+- **`SPEC.md §1` structure diagram is now accurate** (fixed sprint-2) — `bot/handlers/chat_events.py` and `bot/db/repos/intro.py` added; test file list updated to reflect all 11 test files (12 files in `tests/` including `conftest.py`).
 - **`README.md:30-36` + preflight mention `uv`** — `uv` binary is on PATH but `uv.lock` is absent and CI uses `pip install -e ".[dev]"` (`.github/workflows/ci.yml:34`). Treat pip as current truth.
-- **Declared-but-unused deps** in `pyproject.toml:11,19,21`: `gspread-asyncio`, `httpx`, `python-dotenv` — zero imports in `bot/` or `web/`.
 - **Top-level `test_*.py` + `phone_login.py` / `scan_work.py` / `transcribe_voice.py`** are Telethon ops scripts, not pytest targets (`pyproject.toml:42-44` pins `testpaths = ["tests"]`). Needs `[ops]` extra.
 
 ## Key rules
