@@ -12,6 +12,18 @@ from web.dependencies import get_session
 router = APIRouter()
 
 
+def _display_name(user: User) -> str:
+    """Return a human-readable display name for a user.
+
+    Priority: "first last" → "first" → "User #<id>".
+    """
+    if user.first_name and user.last_name:
+        return f"{user.first_name} {user.last_name}"
+    if user.first_name:
+        return user.first_name
+    return f"User #{user.id}"
+
+
 @router.get("/members")
 async def members(
     request: Request,
@@ -61,24 +73,17 @@ async def members(
     if voucher_ids:
         vouchers_q = await session.execute(select(User).where(User.id.in_(voucher_ids)))
         for v in vouchers_q.scalars():
-            display = v.first_name
-            if v.last_name:
-                display += f" {v.last_name}"
-            voucher_names[v.id] = display
+            voucher_names[v.id] = _display_name(v)
 
     # Build member list for template
     member_list = []
     for u in users:
-        display_name = u.first_name
-        if u.last_name:
-            display_name += f" {u.last_name}"
-
         voucher_id = vouch_map.get(u.id)
         vouched_by = voucher_names.get(voucher_id, "") if voucher_id else ""
 
         member_list.append(
             {
-                "name": display_name,
+                "name": _display_name(u),
                 "username": u.username or "",
                 "has_intro": u.intro is not None,
                 "vouched_by": vouched_by,
