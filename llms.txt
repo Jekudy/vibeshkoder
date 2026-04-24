@@ -54,7 +54,7 @@ The bot is the primary service (aiogram 3 long polling). The web app is a thin F
 
 ## Testing
 
-- [Tests dir](./tests/): 11 test files, 52 tests total — pytest collects from `tests/` only
+- [Tests dir](./tests/): 12 test files, 52 tests total — pytest collects from `tests/` only
 - [conftest](./tests/conftest.py): fixtures — `app_env` (env monkeypatch), `session_factory_sqlite` (in-memory SQLite async sessionmaker), `aiogram_bot_mock` (AsyncMock Bot), `chat_member_factory`, `message_factory`, `callback_query_factory`
 - [test_chat_events](./tests/test_chat_events.py): 11 tests — join/leave handler logic and DB side-effects
 - [test_intro_refresh](./tests/test_intro_refresh.py): 5 tests — intro refresh scheduler job

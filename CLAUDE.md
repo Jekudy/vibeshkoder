@@ -23,7 +23,7 @@ web/          15 files (10 .py + 4 .html + 1 .css) — FastAPI admin
   routes/         auth, dashboard, members
   templates/      base, login, dashboard, members (Bootstrap 5 CDN, no build step)
 alembic/      3 .py, 205 LOC — migrations; single revision in 001_initial.py
-tests/        11 .py, 52 tests — pytest collects from tests/ only
+tests/        12 .py, 52 tests — pytest collects from tests/ only
 docs/         runbook.md (authoritative ops), ops/, superpowers/plans+specs, superflow/
 ```
 
@@ -111,7 +111,7 @@ Sprint-2 env vars (all optional, commented out in `.env.example`):
 | P0 | `credentials.json` still on legacy path past 7-day retention window | `docs/runbook.md:104` |
 | P1 | Weak config defaults (`changeme`, `admin`) in `bot/config.py:10-19` | `bot/config.py` |
 | P1 | Migration in bot CMD → boot-loop on bad revision | `Dockerfile.bot:14` |
-| P1 | ~20% test coverage (46 tests, core flows covered; db repos + sheets edge cases remain) | `tests/` |
+| P1 | ~20% test coverage (52 tests, core flows covered; db repos + sheets edge cases remain) | `tests/` |
 | P1 | Session cookie missing `Secure` flag, prod served over HTTP | `web/routes/auth.py:37-43` |
 
 <!-- updated-by-superflow:2026-04-25 sprint-2 -->
