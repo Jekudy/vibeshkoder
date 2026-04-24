@@ -146,3 +146,19 @@ class VouchLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=func.now(), server_default=func.now()
     )
+
+
+class MemberTagCooldown(Base):
+    __tablename__ = "member_tag_cooldowns"
+    __table_args__ = (
+        Index("ix_member_tag_cooldowns_chat_user", "chat_id", "user_id", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    last_tag: Mapped[str | None] = mapped_column(String(16))
+    changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=func.now(), server_default=func.now()
+    )

@@ -8,7 +8,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from bot.config import settings
-from bot.handlers import admin, chat_events, chat_messages, forward_lookup, questionnaire, start, vouch
+from bot.handlers import admin, alias, chat_events, chat_messages, forward_lookup, questionnaire, start, vouch
 from bot.middlewares.db_session import DbSessionMiddleware
 from bot.services.scheduler import start_scheduler, stop_scheduler
 
@@ -59,6 +59,7 @@ async def main() -> None:
         questionnaire.router,
         vouch.router,
         admin.router,
+        alias.router,
         chat_events.router,
         forward_lookup.router,
         chat_messages.router,  # lowest priority — catches all group messages
