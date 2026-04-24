@@ -19,9 +19,30 @@ TEMPLATES = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
 # Paths that don't require authentication
 _PUBLIC_PATHS = {"/login", "/docs", "/openapi.json"}
 
+
+def _get_client_ip(request: Request) -> str:
+    """Return the real client IP, honouring X-Forwarded-For from a trusted proxy.
+
+    Starlette's ProxyHeadersMiddleware is not available in the installed version,
+    so we extract the leftmost (original client) address from X-Forwarded-For.
+    This is safe because Coolify places the app behind a non-public, container-
+    network-only proxy — external traffic cannot inject a spoofed header that the
+    proxy does not strip/overwrite.
+
+    Falls back to request.client.host when the header is absent (e.g. direct
+    connections in tests without the header).
+    """
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return get_remote_address(request)
+
+
 # Module-level limiter instance — routes import this to apply decorators.
 # Uses in-memory storage (suitable for single-process deployments).
-limiter = Limiter(key_func=get_remote_address, storage_uri="memory://")
+# _get_client_ip reads X-Forwarded-For so each real client gets its own bucket
+# even when all requests arrive from the same proxy/container IP.
+limiter = Limiter(key_func=_get_client_ip, storage_uri="memory://")
 
 
 def create_app() -> FastAPI:

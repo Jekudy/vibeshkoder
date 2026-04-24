@@ -43,3 +43,46 @@ def test_sixth_attempt_hits_rate_limit(client):
 
     resp = _post_login(client, password="wrong")
     assert resp.status_code == 429
+
+
+def test_rate_limit_keys_per_forwarded_client_ip(app_env):
+    """Two different X-Forwarded-For IPs must have independent rate-limit buckets.
+
+    IP A exhausts its quota (5 wrong passwords → 429 on attempt 6).
+    IP B makes its first attempt → must get 200 (login page re-rendered),
+    NOT 429. Failure here means all users share one bucket and a single
+    attacker can lock everyone out.
+    """
+    # Fresh module import gives us a clean Limiter with empty counters.
+    for name in list(sys.modules):
+        if name == "web" or name.startswith("web."):
+            sys.modules.pop(name, None)
+
+    web_app = importlib.import_module("web.app")
+    app = web_app.create_app()
+
+    ip_a_headers = {"X-Forwarded-For": "10.0.0.1"}
+    ip_b_headers = {"X-Forwarded-For": "10.0.0.2"}
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        # IP A exhausts its quota.
+        for _ in range(5):
+            c.post(
+                "/login", data={"password": "wrong"}, headers=ip_a_headers, follow_redirects=False
+            )
+
+        # IP A's 6th attempt must be rate-limited.
+        resp_a = c.post(
+            "/login", data={"password": "wrong"}, headers=ip_a_headers, follow_redirects=False
+        )
+        assert resp_a.status_code == 429, "IP A should be rate-limited after 5 wrong passwords"
+
+        # IP B has never posted — its first attempt must NOT be blocked.
+        resp_b = c.post(
+            "/login", data={"password": "wrong"}, headers=ip_b_headers, follow_redirects=False
+        )
+        assert resp_b.status_code == 200, (
+            f"IP B got {resp_b.status_code} instead of 200 — "
+            "rate-limit buckets are not isolated per forwarded IP; "
+            "a single attacker can lock out all users"
+        )

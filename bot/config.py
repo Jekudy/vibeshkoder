@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     INTRO_NUDGE_PHASE_1_MAX: int = 5
     INTRO_NUDGE_PHASE_2_MAX: int = 8
     LOGIN_RATE_LIMIT_PER_15M: int = 5
+    # Coolify places the app behind a non-public container-network proxy,
+    # so "*" is safe here. Set to a specific IP for hardened environments.
+    TRUSTED_PROXY_HOSTS: str = "*"
     WEB_PASSWORD: str
     DEV_MODE: bool = False  # Use SQLite + MemoryStorage for local testing
 
