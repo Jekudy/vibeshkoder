@@ -10,7 +10,7 @@ from web.config import settings
 _SECRET_KEY = hashlib.sha256(settings.BOT_TOKEN.encode()).hexdigest()
 _serializer = URLSafeTimedSerializer(_SECRET_KEY)
 
-_COOKIE_MAX_AGE = 7 * 24 * 60 * 60  # 7 days
+COOKIE_MAX_AGE = 7 * 24 * 60 * 60  # 7 days
 
 
 def verify_password(password: str) -> bool:
@@ -27,7 +27,7 @@ def create_session_cookie() -> str:
 def get_user_from_cookie(cookie: str) -> dict | None:
     """Deserialize and verify session cookie. Returns payload dict or None."""
     try:
-        data = _serializer.loads(cookie, max_age=_COOKIE_MAX_AGE)
+        data = _serializer.loads(cookie, max_age=COOKIE_MAX_AGE)
         if data.get("authenticated"):
             return data
         return None

@@ -13,6 +13,7 @@ from bot.db.repos.intro import IntroRepo
 from bot.db.repos.questionnaire import QuestionnaireRepo
 from bot.db.repos.user import UserRepo
 from bot.handlers.questionnaire import build_intro_preview
+from bot.utils.telegram import mention_for
 
 logger = logging.getLogger(__name__)
 
@@ -109,14 +110,19 @@ async def _handle_join(
 
         # Post message in chat only on first kick
         if first_kick:
-            mention = f"@{tg_user.username}" if tg_user.username else tg_user.first_name
+            mention = mention_for(tg_user)
+            bot_ref = (
+                f"@{settings.WEB_BOT_USERNAME}"
+                if settings.WEB_BOT_USERNAME
+                else "the bot"
+            )
             try:
                 await event.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"Мимо меня хотел(-а) пройти {mention}. "
                         f"Если хотите помочь человеку попасть сюда, "
-                        f"скиньте ему мой юзернейм @vibeshkoder_bot"
+                        f"скиньте ему мой юзернейм {bot_ref}"
                     ),
                 )
             except Exception:
@@ -152,7 +158,7 @@ async def _handle_join(
             if active_app.vouched_by:
                 voucher = await UserRepo.get(session, active_app.vouched_by)
                 if voucher:
-                    vouched_by_name = f"@{voucher.username}" if voucher.username else voucher.first_name
+                    vouched_by_name = mention_for(voucher)
 
             await IntroRepo.upsert(
                 session,

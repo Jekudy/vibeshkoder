@@ -119,8 +119,6 @@ def _sync_row_to_sheet(
 
     if row_num is not None:
         # Update existing row
-        cell_range = f"A{row_num}:{gspread.utils.rowcol_to_a1(row_num, len(HEADERS)).split('!')[0]}"
-        # Use row_num to build proper range
         end_col = chr(ord("A") + len(HEADERS) - 1)  # 'K' for 11 columns
         cell_range = f"A{row_num}:{end_col}{row_num}"
         worksheet.update([row_data], cell_range)
@@ -396,11 +394,6 @@ async def _update_status_column() -> None:
     # Look up membership status and intro existence for all users
     telegram_ids = [tid for _, tid in updates]
     async with async_session() as session:
-        result = await session.execute(
-            select(User).where(User.id.in_(telegram_ids))
-        )
-        _ = {u.id: u for u in result.scalars().all()}
-
         intro_result = await session.execute(
             select(Intro.user_id).where(Intro.user_id.in_(telegram_ids))
         )

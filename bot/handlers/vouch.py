@@ -15,6 +15,7 @@ from bot.db.repos.user import UserRepo
 from bot.db.repos.vouch import VouchRepo
 from bot.keyboards.inline import ReadyCallback, VouchCallback, ready_keyboard
 from bot.services.invite import try_send_invite
+from bot.utils.telegram import mention_for
 from bot.texts import (
     ALREADY_PROCESSED,
     CANT_VOUCH_SELF,
@@ -97,7 +98,7 @@ async def handle_vouch(
             )
 
     # Notify applicant and send invite
-    voucher_name = f"@{voucher.username}" if voucher.username else voucher.first_name
+    voucher_name = mention_for(voucher)
     try:
         await callback.bot.send_message(
             chat_id=app.user_id,

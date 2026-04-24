@@ -38,3 +38,6 @@ jobs:
 
       - name: Run lint
         run: ruff check .
+
+      - name: Check formatting
+        run: ruff format --check .
