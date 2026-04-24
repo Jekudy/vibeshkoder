@@ -23,7 +23,7 @@ web/          15 files (10 .py + 4 .html + 1 .css) — FastAPI admin
   routes/         auth, dashboard, members
   templates/      base, login, dashboard, members (Bootstrap 5 CDN, no build step)
 alembic/      3 .py, 205 LOC — migrations; single revision in 001_initial.py
-tests/        12 .py, 52 tests — pytest collects from tests/ only
+tests/        12 .py, 54 tests — pytest collects from tests/ only
 docs/         runbook.md (authoritative ops), ops/, superpowers/plans+specs, superflow/
 ```
 
@@ -39,7 +39,7 @@ python -m bot                      # Telegram bot (long polling)
 python -m web                      # FastAPI on 0.0.0.0:8080 via uvicorn
 
 # Tests + lint + format (exactly what CI runs — see .github/workflows/ci.yml)
-pytest -q                          # collects 52 tests from tests/ only
+pytest -q                          # collects 54 tests from tests/ only
 ruff check .                       # lint
 ruff format --check .              # format (enforced in CI since sprint-1)
 
@@ -53,11 +53,11 @@ docker compose up                  # bot + web + postgres:16-alpine + redis:7-al
 
 Prereqs: `DATABASE_URL`, `BOT_TOKEN`, `WEB_PASSWORD` and ~9 other env vars. See `.env.example` for the full 12-key list. In `DEV_MODE=true` the bot uses SQLite (`vibe_gatekeeper.db`) and `MemoryStorage` for FSM, so Redis and Postgres are not required locally.
 
-Sprint-2 env vars (all optional, commented out in `.env.example`):
+Sprint-2/3 env vars (all optional, commented out in `.env.example`):
 - `INTRO_NUDGE_PHASE_1_MAX=5` — max intros before phase-1 nudge
 - `INTRO_NUDGE_PHASE_2_MAX=8` — max intros before phase-2 nudge
 - `LOGIN_RATE_LIMIT_PER_15M=5` — max /login attempts per 15 min per IP
-- `TRUSTED_PROXY_HOSTS=*` — currently inert (see `bot/config.py` comment); placeholder for future proxy trust enforcement
+- `TRUSTED_PROXY_HOSTS` — comma-separated IPs/CIDRs or `"*"` for all; default `""` (never trust XFF). Set only when app runs behind a known proxy (e.g. Coolify's internal Docker network). Prod is currently direct-exposed — leave empty.
 
 ## Environments
 
@@ -111,7 +111,7 @@ Sprint-2 env vars (all optional, commented out in `.env.example`):
 | P0 | `credentials.json` still on legacy path past 7-day retention window | `docs/runbook.md:104` |
 | P1 | Weak config defaults (`changeme`, `admin`) in `bot/config.py:10-19` | `bot/config.py` |
 | P1 | Migration in bot CMD → boot-loop on bad revision | `Dockerfile.bot:14` |
-| P1 | ~20% test coverage (52 tests, core flows covered; db repos + sheets edge cases remain) | `tests/` |
+| P1 | ~44% test coverage (54 tests; handler-dispatch layer largely uncovered; db repos + sheets edge cases remain) | `tests/` |
 | P1 | Session cookie missing `Secure` flag, prod served over HTTP | `web/routes/auth.py:37-43` |
 
 <!-- updated-by-superflow:2026-04-25 sprint-2 -->

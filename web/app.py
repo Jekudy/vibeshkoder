@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -8,7 +9,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 from web.auth import get_user_from_cookie
 
@@ -20,28 +20,63 @@ TEMPLATES = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
 _PUBLIC_PATHS = {"/login", "/docs", "/openapi.json"}
 
 
-def _get_client_ip(request: Request) -> str:
-    """Return the real client IP, honouring X-Forwarded-For from a trusted proxy.
+def _is_trusted_proxy(client_ip: str, trusted_spec: str) -> bool:
+    """Return True if client_ip matches the trusted proxy specification.
 
-    Starlette's ProxyHeadersMiddleware is not available in the installed version,
-    so we extract the leftmost (original client) address from X-Forwarded-For.
-    This is safe because Coolify places the app behind a non-public, container-
-    network-only proxy — external traffic cannot inject a spoofed header that the
-    proxy does not strip/overwrite.
-
-    Falls back to request.client.host when the header is absent (e.g. direct
-    connections in tests without the header).
+    trusted_spec is a comma-separated list of IPs or CIDRs, or the wildcard "*".
+    "*" means trust all — ONLY safe when the app is known to be behind a proxy
+    network (e.g. Coolify's internal Docker network) and is never reachable directly.
     """
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return get_remote_address(request)
+    if trusted_spec == "*":
+        return True
+    try:
+        client = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    for entry in trusted_spec.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                if client in ipaddress.ip_network(entry, strict=False):
+                    return True
+            else:
+                if client == ipaddress.ip_address(entry):
+                    return True
+        except ValueError:
+            continue
+    return False
+
+
+def _get_client_ip(request: Request) -> str:
+    """Extract client IP for rate-limiting.
+
+    Trust model: X-Forwarded-For is only honoured when request.client.host
+    matches an entry in settings.TRUSTED_PROXY_HOSTS. Prod (vibe-gatekeeper)
+    is currently direct-exposed with no proxy, so the default is to ignore XFF
+    entirely and use the real TCP peer address.
+
+    This prevents an attacker from spoofing X-Forwarded-For to rotate rate-limit
+    buckets and bypass the /login brute-force protection.
+    """
+    from bot.config import settings
+
+    client_host = request.client.host if request.client else ""
+    trusted = (settings.TRUSTED_PROXY_HOSTS or "").strip()
+
+    if trusted and client_host and _is_trusted_proxy(client_host, trusted):
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        first_hop = forwarded.split(",")[0].strip() if forwarded else ""
+        if first_hop:
+            return first_hop
+
+    return client_host or "unknown"
 
 
 # Module-level limiter instance — routes import this to apply decorators.
 # Uses in-memory storage (suitable for single-process deployments).
-# _get_client_ip reads X-Forwarded-For so each real client gets its own bucket
-# even when all requests arrive from the same proxy/container IP.
+# _get_client_ip honours X-Forwarded-For only from trusted proxies (TRUSTED_PROXY_HOSTS).
 limiter = Limiter(key_func=_get_client_ip, storage_uri="memory://")
 
 

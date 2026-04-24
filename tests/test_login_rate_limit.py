@@ -45,14 +45,18 @@ def test_sixth_attempt_hits_rate_limit(client):
     assert resp.status_code == 429
 
 
-def test_rate_limit_keys_per_forwarded_client_ip(app_env):
-    """Two different X-Forwarded-For IPs must have independent rate-limit buckets.
+def test_rate_limit_keys_per_forwarded_client_ip(app_env, monkeypatch):
+    """Two different X-Forwarded-For IPs must have independent rate-limit buckets
+    when TRUSTED_PROXY_HOSTS is set (i.e. the app is behind a known proxy).
 
     IP A exhausts its quota (5 wrong passwords → 429 on attempt 6).
     IP B makes its first attempt → must get 200 (login page re-rendered),
     NOT 429. Failure here means all users share one bucket and a single
     attacker can lock everyone out.
     """
+    # Enable proxy trust so XFF is honoured — simulates a real proxy deployment.
+    monkeypatch.setenv("TRUSTED_PROXY_HOSTS", "*")
+
     # Fresh module import gives us a clean Limiter with empty counters.
     for name in list(sys.modules):
         if name == "web" or name.startswith("web."):
@@ -85,4 +89,89 @@ def test_rate_limit_keys_per_forwarded_client_ip(app_env):
             f"IP B got {resp_b.status_code} instead of 200 — "
             "rate-limit buckets are not isolated per forwarded IP; "
             "a single attacker can lock out all users"
+        )
+
+
+def test_xff_ignored_from_untrusted_client(app_env):
+    """With TRUSTED_PROXY_HOSTS="" (default), rotating X-Forwarded-For does NOT
+    produce independent rate-limit buckets — all requests key off the TCP peer
+    address, so an attacker cannot bypass the limit by spoofing XFF.
+    """
+    # Ensure default (empty = no proxy trust).
+    # app_env fixture does not set TRUSTED_PROXY_HOSTS, which defaults to "".
+
+    # Fresh module import gives a clean Limiter.
+    for name in list(sys.modules):
+        if name == "web" or name.startswith("web."):
+            sys.modules.pop(name, None)
+
+    web_app = importlib.import_module("web.app")
+    app = web_app.create_app()
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        # First 5 attempts with different fake XFF values — should all be 200.
+        for i in range(5):
+            resp = c.post(
+                "/login",
+                data={"password": "wrong"},
+                headers={"X-Forwarded-For": f"1.2.3.{i}"},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 200
+
+        # 6th attempt with yet another fake XFF — should be 429 because the
+        # real TCP peer (testclient) has exhausted its quota regardless of XFF.
+        resp = c.post(
+            "/login",
+            data={"password": "wrong"},
+            headers={"X-Forwarded-For": "9.9.9.9"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 429, (
+            "Untrusted client spoofing XFF should still be rate-limited by TCP peer IP"
+        )
+
+
+def test_xff_honored_when_proxy_trusted(app_env, monkeypatch):
+    """With TRUSTED_PROXY_HOSTS="*", XFF is trusted and different forwarded IPs
+    get independent rate-limit buckets (correct proxy-behind-proxy behaviour).
+    """
+    monkeypatch.setenv("TRUSTED_PROXY_HOSTS", "*")
+
+    # Fresh module import gives a clean Limiter.
+    for name in list(sys.modules):
+        if name == "web" or name.startswith("web."):
+            sys.modules.pop(name, None)
+
+    web_app = importlib.import_module("web.app")
+    app = web_app.create_app()
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        # Exhaust quota for 10.0.0.100 via XFF.
+        for _ in range(5):
+            c.post(
+                "/login",
+                data={"password": "wrong"},
+                headers={"X-Forwarded-For": "10.0.0.100"},
+                follow_redirects=False,
+            )
+
+        # 6th attempt for 10.0.0.100 should be 429.
+        resp_limited = c.post(
+            "/login",
+            data={"password": "wrong"},
+            headers={"X-Forwarded-For": "10.0.0.100"},
+            follow_redirects=False,
+        )
+        assert resp_limited.status_code == 429, "Exhausted XFF bucket should be rate-limited"
+
+        # First attempt for a different XFF IP should be 200 (fresh bucket).
+        resp_fresh = c.post(
+            "/login",
+            data={"password": "wrong"},
+            headers={"X-Forwarded-For": "10.0.0.200"},
+            follow_redirects=False,
+        )
+        assert resp_fresh.status_code == 200, (
+            "Different XFF IP should have its own fresh bucket when proxy is trusted"
         )
