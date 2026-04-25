@@ -19,6 +19,13 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 - Staging and production must use separate bot tokens and isolated data stores.
 - Secrets never belong in git.
 
+## Issue Tracker
+
+- This repo uses Notion via `nt` plugin (`/nt:issue`, `/nt:work`, `/nt:status`, ...)
+- Other projects use Linear via `ln` plugin
+- Do not mix: `nt` commands in non-shkoderbot repos will fail by design
+- To override in one-off scenarios: `export NT_TEAM=SHK`
+
 ## Current Migration Rule
 
 - The legacy production runtime at `/home/claw/vibe-gatekeeper` remains the live path until the new GitHub/GHCR/Coolify path is verified.

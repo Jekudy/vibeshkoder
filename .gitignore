@@ -3,6 +3,9 @@
 .env.staging
 .env.local
 .worktrees/
+.claude/agent-memory/
+.claude/worktrees/
+memory/
 __pycache__/
 *.pyc
 .pytest_cache/
