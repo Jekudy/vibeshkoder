@@ -2,6 +2,8 @@
 .env.production
 .env.staging
 .env.local
+.env.dev
+.superflow-state.json
 .worktrees/
 .claude/agent-memory/
 .claude/worktrees/

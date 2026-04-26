@@ -1,6 +1,24 @@
-# Shkoderbot Memory Editor — Design Spec
+# [SUPERSEDED] Shkoderbot Memory Editor — Design Spec v0.5
 
-## Status
+> **STATUS: SUPERSEDED on 2026-04-26.**
+>
+> This v0.5 design spec (LiteLLM/Instructor/sqladmin/pgvector/RRF, single-instance asyncio.Semaphore,
+> direct extraction → findings, no governance phases) is **archived**.
+>
+> Canonical memory architecture is now: **`docs/memory-system/HANDOFF.md`** (governance-first phased
+> roadmap with telegram_updates + message_versions + offrecord_marks + forget_events).
+>
+> Why superseded: the new architecture prioritizes governance (#nomem/#offrecord/forget tombstones),
+> source-of-truth versioning, and phase gates BEFORE any LLM extraction. v0.5 jumped to extraction
+> without the safety primitives. Lessons from v0.5 (LLM provider abstraction, asyncio.Semaphore for
+> single-instance, sqladmin for admin UI, hybrid retrieval with RRF) are noted but not load-bearing
+> until governance phases are complete.
+>
+> Do not implement from this document. Do not cite it as the spec.
+
+---
+
+## Original Status (preserved for history)
 
 - **Version:** draft v0.5 (add §9 Public Wiki + §10 Member UX + §11 Content Safety + §12 Ops Pragmatics)
 - **Date:** 2026-04-22
