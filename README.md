@@ -18,14 +18,28 @@ Copy `.env.example` to `.env` and fill the required values.
 
 Recommended local settings:
 
-- `DEV_MODE=true`
+- `DEV_MODE=true` — enables permissive checks (e.g. ephemeral web password)
 - a separate development bot token
 - local-only `WEB_PASSWORD`
+- a `DATABASE_URL` pointing at a local postgres (see step 1.5)
 
-With `DEV_MODE=true`, the app uses:
+`DEV_MODE=true` makes the web app generate ephemeral credentials and uses in-memory FSM
+storage instead of Redis. **It does NOT change the database driver** — postgres is required
+in all environments (T0-02; see `bot/db/engine.py`). Sqlite is no longer supported as a
+runtime DB.
 
-- SQLite (`vibe_gatekeeper.db`)
-- in-memory FSM storage instead of Redis
+### 1.5. Start a local postgres
+
+If you are working on the memory system cycle, use the dev postgres in the memory worktree:
+
+```bash
+cd .worktrees/memory
+cp .env.dev.example .env.dev
+docker compose -f docker-compose.dev.yml --env-file .env.dev up -d postgres-dev
+alembic upgrade head
+```
+
+For other workflows, any reachable postgres 16 instance works — set `DATABASE_URL` to its URL.
 
 ### 2. Install dependencies
 
@@ -38,7 +52,7 @@ pip install -e ".[dev]"
 ### 3. Run local checks
 
 ```bash
-pytest -q
+pytest -q              # DB-backed tests skip cleanly if postgres is unreachable
 ruff check .
 ```
 
