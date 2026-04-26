@@ -88,7 +88,10 @@ class FeatureFlagRepo:
                     "config_json": config_json,
                     "updated_by": updated_by,
                     # Manual updated_at on conflict; ORM-level onupdate does not fire here.
-                    "updated_at": func.now(),
+                    # ``clock_timestamp()`` (statement time), not ``now()`` (transaction
+                    # start), so updates within a single transaction (e.g. tests, batched
+                    # toggles, or migrations) get distinguishable audit timestamps.
+                    "updated_at": func.clock_timestamp(),
                 },
             )
             .returning(FeatureFlag)
