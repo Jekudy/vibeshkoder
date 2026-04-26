@@ -21,3 +21,4 @@ dist/
 build/
 *.egg-info/
 docs/ops/private/
+.handoffs/
