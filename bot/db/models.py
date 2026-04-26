@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -245,3 +246,64 @@ class IngestionRun(Base):
     stats_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     config_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class TelegramUpdate(Base):
+    """Raw source-of-truth archive of one Telegram update (T1-03).
+
+    Filled by the live ingestion service (T1-04) and by the Telegram Desktop importer
+    (T2-01 dry-run / T2-03 apply). Live updates carry a non-null ``update_id`` (Telegram
+    guarantees uniqueness per bot), and the partial unique index
+    ``ix_telegram_updates_update_id`` prevents duplicates on polling retries. Synthetic
+    import updates leave ``update_id`` NULL; the importer enforces its own idempotency
+    via ``raw_hash`` + ``ingestion_run_id``.
+
+    No content is logged here; ``raw_json`` is the unmodified Telegram payload until the
+    governance detector (T1-12) marks it offrecord, at which point ``is_redacted`` and
+    ``redaction_reason`` are set and the redacted columns are nulled in the same
+    transaction (per AUTHORIZED_SCOPE.md §`#offrecord` ordering rule).
+    """
+
+    __tablename__ = "telegram_updates"
+    __table_args__ = (
+        Index(
+            "ix_telegram_updates_update_id",
+            "update_id",
+            unique=True,
+            postgresql_where=text("update_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_telegram_updates_update_type_received_at",
+            "update_type",
+            "received_at",
+        ),
+        Index(
+            "ix_telegram_updates_chat_id_message_id",
+            "chat_id",
+            "message_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    update_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    update_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    raw_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=func.now(),
+        server_default=func.now(),
+        nullable=False,
+    )
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("ingestion_runs.id"), nullable=True
+    )
+    is_redacted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    redaction_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=func.now(), server_default=func.now()
+    )
