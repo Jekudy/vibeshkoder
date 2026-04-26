@@ -7,7 +7,7 @@ transaction as the raw insert). This ticket only provides the SQL primitives.
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,7 +52,15 @@ class TelegramUpdateRepo:
                     is_redacted=is_redacted,
                     redaction_reason=redaction_reason,
                 )
-                .on_conflict_do_nothing(index_elements=["update_id"])
+                # Target the PARTIAL unique index `ix_telegram_updates_update_id` —
+                # postgres ON CONFLICT requires the conflict target to match the index
+                # exactly, including its WHERE predicate. Without ``index_where`` the
+                # planner can refuse the upsert with "no unique or exclusion constraint
+                # matching the ON CONFLICT specification".
+                .on_conflict_do_nothing(
+                    index_elements=["update_id"],
+                    index_where=text("update_id IS NOT NULL"),
+                )
                 .returning(TelegramUpdate)
             )
             result = await session.execute(stmt)

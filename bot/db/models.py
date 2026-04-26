@@ -298,7 +298,9 @@ class TelegramUpdate(Base):
     chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     ingestion_run_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("ingestion_runs.id"), nullable=True
+        Integer,
+        ForeignKey("ingestion_runs.id", name="fk_telegram_updates_ingestion_run_id"),
+        nullable=True,
     )
     is_redacted: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
