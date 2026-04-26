@@ -19,6 +19,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Canonical list of Telegram update types this bot subscribes to.
+#
+# Rule (per docs/memory-system/HANDOFF.md §8 'allowed_updates rollout'): do NOT add an
+# update type here unless a handler AND its persistence layer exist. Adding an update type
+# without a handler means silent data loss — Telegram delivers updates we cannot process.
+#
+# Currently authorized:
+#   - message              (chat_messages handler + others)
+#   - callback_query       (vouch / questionnaire callbacks)
+#   - chat_member          (chat_events handler — join / leave events)
+#   - my_chat_member       (chat_events handler — bot-as-member status changes)
+#
+# Phase 1 will add 'edited_message' once T1-06 message_versions and the T1-14 edit handler
+# both exist. Phase 5 will add 'message_reaction' / 'message_reaction_count' once the
+# reactions table and handler exist. Until then, leave them out.
+_ALLOWED_UPDATES = [
+    "message",
+    "callback_query",
+    "chat_member",
+    "my_chat_member",
+]
+
+
 async def _init_db() -> None:
     """Ensure tables exist when running in dev mode without alembic.
 
@@ -72,9 +95,29 @@ async def main() -> None:
 
     # Startup / shutdown hooks
     async def on_startup() -> None:
+        from bot.services.health import report, startup_log_lines
+
         start_scheduler(bot)
         bot_info = await bot.me()
-        logger.info("Bot started: @%s", bot_info.username)
+        logger.info("Bot started: @%s id=%s", bot_info.username, bot_info.id)
+        # Log non-secret startup banner lines (T0-05).
+        for line in startup_log_lines():
+            logger.info("startup: %s", line)
+        h = await report()
+        logger.info(
+            "startup health: db.ok=%s settings_sanity.ok=%s",
+            h.db.ok,
+            h.settings_sanity.ok,
+        )
+        if not h.ok:
+            logger.warning(
+                "startup health degraded: db.reason=%r settings.reason=%r",
+                h.db.reason,
+                h.settings_sanity.reason,
+            )
+        # Log allowed_updates so we can verify the rollout invariant
+        # (no update type without a handler — see HANDOFF.md §8).
+        logger.info("startup: allowed_updates=%s", _ALLOWED_UPDATES)
 
     async def on_shutdown() -> None:
         stop_scheduler()
@@ -85,16 +128,8 @@ async def main() -> None:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # Start polling — allowed_updates includes chat_member for join/leave
-    await dp.start_polling(
-        bot,
-        allowed_updates=[
-            "message",
-            "callback_query",
-            "chat_member",
-            "my_chat_member",
-        ],
-    )
+    # Start polling — see _ALLOWED_UPDATES below for the canonical list.
+    await dp.start_polling(bot, allowed_updates=_ALLOWED_UPDATES)
 
 
 if __name__ == "__main__":

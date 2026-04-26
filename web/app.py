@@ -14,7 +14,7 @@ _WEB_DIR = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
 
 # Paths that don't require authentication
-_PUBLIC_PATHS = {"/login", "/docs", "/openapi.json"}
+_PUBLIC_PATHS = {"/login", "/docs", "/openapi.json", "/healthz"}
 
 
 def create_app() -> FastAPI:
@@ -44,8 +44,10 @@ def create_app() -> FastAPI:
     # Import and include route modules
     from web.routes.auth import router as auth_router
     from web.routes.dashboard import router as dashboard_router
+    from web.routes.health import router as health_router
     from web.routes.members import router as members_router
 
+    app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(dashboard_router)
     app.include_router(members_router)
