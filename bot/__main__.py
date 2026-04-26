@@ -20,7 +20,12 @@ logger = logging.getLogger(__name__)
 
 
 async def _init_db() -> None:
-    """Create tables in dev mode (SQLite)."""
+    """Ensure tables exist when running in dev mode without alembic.
+
+    Production uses ``alembic upgrade head`` against postgres. Dev mode against an empty
+    postgres can rely on this helper to bootstrap the schema directly from SQLAlchemy
+    metadata, mirroring what ``alembic upgrade head`` would have produced.
+    """
     from bot.db.engine import engine
     from bot.db.models import Base
 
@@ -30,7 +35,8 @@ async def _init_db() -> None:
 
 
 async def main() -> None:
-    # Storage: Redis in prod, Memory in dev
+    # Storage: Redis in prod, in-memory FSM in dev. The DB driver is postgres in both modes
+    # (T0-02; see bot/db/engine.py).
     if settings.DEV_MODE:
         from aiogram.fsm.storage.memory import MemoryStorage
 

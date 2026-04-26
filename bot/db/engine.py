@@ -23,11 +23,11 @@ def _validate_postgres_url(url: str) -> str:
             "'postgresql+asyncpg://user:pass@host:port/dbname'. See "
             "docs/memory-system/DEV_SETUP.md for the dev setup."
         )
-    if url.startswith("sqlite") or "+aiosqlite" in url:
+    if not (url.startswith("postgresql://") or url.startswith("postgresql+")):
         raise RuntimeError(
-            "DATABASE_URL points at sqlite, which is no longer supported. The codebase "
-            "relies on postgres-specific SQL (see ticket T0-02). Use the dev postgres "
-            "from docker-compose.dev.yml — see docs/memory-system/DEV_SETUP.md."
+            f"DATABASE_URL must point at postgres (got scheme: {url.split('://', 1)[0]!r}). "
+            "The codebase relies on postgres-specific SQL (see ticket T0-02). Use the dev "
+            "postgres from docker-compose.dev.yml — see docs/memory-system/DEV_SETUP.md."
         )
     return url
 
