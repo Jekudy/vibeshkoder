@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -283,6 +284,7 @@ async def handle_confirm(
                 application_id,
                 "pending",
                 questionnaire_message_id=msg.message_id,
+                submitted_at=datetime.now(timezone.utc),
             )
             await state.clear()
             await callback.message.edit_text(QUESTIONNAIRE_POSTED)

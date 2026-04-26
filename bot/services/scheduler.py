@@ -59,7 +59,7 @@ async def check_vouch_deadlines(bot: Bot) -> None:
                 logger.warning("Failed to DM user %s about rejection", app.user_id)
 
         # 48h nudge (only apps not yet nudged and not yet rejected above)
-        apps_to_nudge = await ApplicationRepo.get_pending_older_than(
+        apps_to_nudge = await ApplicationRepo.get_pending_created_older_than(
             session, settings.NUDGE_TIMEOUT_HOURS
         )
         for app in apps_to_nudge:

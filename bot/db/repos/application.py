@@ -71,6 +71,19 @@ class ApplicationRepo:
         result = await session.execute(
             select(Application).where(
                 Application.status == "pending",
+                func.coalesce(Application.submitted_at, Application.created_at) < cutoff,
+            )
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_pending_created_older_than(
+        session: AsyncSession, hours: int
+    ) -> list[Application]:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        result = await session.execute(
+            select(Application).where(
+                Application.status == "pending",
                 Application.created_at < cutoff,
             )
         )
