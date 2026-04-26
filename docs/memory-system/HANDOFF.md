@@ -625,7 +625,7 @@ phase 12 butler
 | T1-01 | `feature_flags` table / repo                   | p0  | s     | T0       | default memory flags off                                                |
 | T1-02 | `ingestion_runs`                               | p0  | s     | T1-01    | run row tracks live / import                                            |
 | T1-03 | `telegram_updates`                             | p0  | m     | T1-02    | unique `update_id`; idempotent insert                                   |
-| T1-04 | Raw update persistence service                 | p0  | m     | T1-03    | message update writes raw row before normalization                      |
+| T1-04 | Raw update persistence service                 | p0  | m     | T1-03    | message update writes raw row before normalization; **MUST include stub `governance.detect_policy()` returning `('normal', None)` called in same DB transaction as raw insert** (cross-ref AUTHORIZED_SCOPE `#offrecord` ordering rule); raw archive flag defaults OFF |
 | T1-05 | Extend `chat_messages` fields                  | p0  | l     | T1-04    | old rows survive; new fields nullable                                   |
 | T1-06 | `message_versions`                             | p0  | l     | T1-05    | new message has v1                                                      |
 | T1-07 | Backfill v1 `message_versions`                 | p0  | m     | T1-06    | all existing messages get v1                                            |
@@ -633,7 +633,7 @@ phase 12 butler
 | T1-09 | Persist `reply_to_message_id`                  | p0  | s     | T1-05    | reply id stored                                                         |
 | T1-10 | Persist `message_thread_id`                    | p0  | s     | T1-05    | thread id stored if present                                             |
 | T1-11 | Persist caption / `message_kind`               | p0  | m     | T1-05    | caption not lost; media classified                                      |
-| T1-12 | Minimal `#nomem` / `#offrecord` detector       | p0  | m     | T1-05    | policy persists                                                         |
+| T1-12 | Minimal `#nomem` / `#offrecord` detector       | p0  | m     | T1-05    | `#nomem` and `#offrecord` detected in BOTH text AND caption fields; `chat_messages.memory_policy` persists; `offrecord_marks` row created (with T1-13); `#offrecord` raw_json text/caption fields redacted in same transaction as raw insert (cross-ref AUTHORIZED_SCOPE §`#offrecord` ordering rule) |
 | T1-13 | `offrecord_marks` minimal table                | p0  | m     | T1-12    | mark exists for policy token                                            |
 | T1-14 | `edited_message` handler (after versions)      | p1  | m     | T1-06    | edit creates v2                                                         |
 
@@ -672,23 +672,47 @@ projection, T11-01 eval tables / runner.
 - Tombstones are durable.
 - Derived layers are rebuildable.
 
-### Authorized migrations (this cycle)
+### Authorized migrations (this cycle — strict)
 
-| # | Migration name                          | Notes                                                          |
-|---|-----------------------------------------|----------------------------------------------------------------|
-| 1 | `add_feature_flags`                     | Unique `(flag_key, scope_type, scope_id)`. Memory flags off.   |
-| 2 | `add_ingestion_runs`                    | `run_type` check: live / import / dry_run / cancelled.         |
-| 3 | `add_telegram_updates`                  | Unique `update_id` (partial where not null). Raw archive.      |
-| 4 | `extend_chat_messages`                  | All new columns nullable / default. Backfill memory_policy='normal'. |
-| 5 | `add_message_versions`                  | Unique `(chat_message_id, version_seq)`. v1 backfill.          |
-| 6 | `add_chat_threads`                      | Optional this cycle; useful for explicit topics.               |
-| 7 | `add_message_entities` (if scope allows)| Derived; can defer if T1-11 enough.                            |
-| 8 | `add_message_links`                     | Deterministic parse from text / caption only. No external fetch. |
-| 9 | `add_attachments`                       | Metadata only. No downloads.                                   |
-|11 | `add_offrecord_marks`                   | Deterministic detector writes here.                            |
+Only migrations that have a corresponding ticket in `AUTHORIZED_SCOPE.md` are authorized in
+this cycle. Implementing additional migrations without a ticket is out-of-scope creep.
 
-> Tables 10 (user consent fields), 12 (`forget_events`), 13 (`admin_actions`), 14 (FTS + qa
-> traces), 15+ (reactions, ledger, extraction, events, cards, etc.) — later phases.
+| # | Migration name                          | Ticket  | Notes                                                          |
+|---|-----------------------------------------|---------|----------------------------------------------------------------|
+| 1 | `add_feature_flags`                     | T1-01   | Unique `(flag_key, scope_type, scope_id)`. Memory flags off.   |
+| 2 | `add_ingestion_runs`                    | T1-02   | `run_type` check: live / import / dry_run / cancelled.         |
+| 3 | `add_telegram_updates`                  | T1-03   | Unique `update_id` (partial where not null). Raw archive.      |
+| 4 | `extend_chat_messages`                  | T1-05   | All new columns nullable / default. Backfill memory_policy='normal'. |
+| 5 | `add_message_versions`                  | T1-06 + T1-07 | Unique `(chat_message_id, version_seq)`. v1 backfill.    |
+| 6 | `add_offrecord_marks`                   | T1-13   | Deterministic detector writes here.                            |
+| 7 | (stretch) `add_forget_events`           | T3-01   | Tombstone skeleton. Stretch.                                   |
+
+### NOT authorized this cycle (later phases — DO NOT IMPLEMENT)
+
+| Migration name                          | Phase   | Why not now                                                    |
+|-----------------------------------------|---------|----------------------------------------------------------------|
+| `add_chat_threads`                      | 1+      | No ticket in this cycle. Adding a `message_thread_id` int on `chat_messages` is enough for T1-10. |
+| `add_message_entities`                  | 1+      | Derived metadata. Defer until search / qa needs it.            |
+| `add_message_links`                     | 1+ / 4  | Defer until search / qa needs link normalization.              |
+| `add_attachments`                       | 1+ / 5  | Defer until reactions / extraction needs media metadata.       |
+| `add_user_consent_anonymization_fields` | 3       | Phase 3 governance.                                            |
+| `add_admin_actions`                     | 3       | Phase 3 governance audit.                                      |
+| `add_search_indexes_and_qa_traces`      | 4       | Phase 4 q&a.                                                   |
+| `add_reactions`                         | 5       | Phase 5; requires reactions handler first.                     |
+| `add_llm_usage_ledger`                  | 5       | Phase 5; requires `llm_gateway`.                               |
+| `add_extraction_runs` and downstream    | 5+      | Phase 5+ extraction.                                           |
+| `add_memory_events`                     | 5       | Phase 5.                                                       |
+| `add_observations`                      | 5       | Phase 5.                                                       |
+| `add_reflection_runs`                   | 5       | Phase 5.                                                       |
+| `add_memory_candidates`                 | 5       | Phase 5.                                                       |
+| `add_memory_items`                      | 6       | Phase 6 catalog.                                               |
+| `add_knowledge_cards`                   | 6       | Phase 6 catalog.                                               |
+| `add_card_sources`                      | 6       | Phase 6.                                                       |
+| `add_card_relations`                    | 6       | Phase 6.                                                       |
+| `add_summaries` / `add_summary_sources` | 7       | Phase 7.                                                       |
+| `add_digests` / `add_digest_sections`   | 8       | Phase 8.                                                       |
+| `add_graph_sync_runs`                   | 10      | Phase 10.                                                      |
+| `add_eval_tables`                       | 11      | Phase 11.                                                      |
 
 Full column-by-column spec lives further down in the architect's original handoff (see archived
 copy if needed). For each migration in this cycle, the implementation ticket holds the column
@@ -746,16 +770,24 @@ Never silently — adding an update type without a handler = invisible data loss
 
 ### Feature flag gating (Phase 1+)
 
-- `memory.ingestion.raw_updates.enabled`
-- `memory.qa.enabled`
-- `memory.import.apply.enabled`
-- `memory.extraction.enabled`
-- `memory.cards.enabled`
-- `memory.digest.enabled`
-- `memory.wiki.enabled`
-- `memory.graph.enabled`
+> **Naming convention:** feature flag keys use **dot notation** (`memory.ingestion.raw_updates.enabled`).
+> Database column names use **underscore** (`memory_policy`, `is_redacted`). These are
+> deliberately different — a flag-key lookup is `feature_flags.get('memory.ingestion.raw_updates.enabled')`,
+> a column read is `chat_messages.memory_policy`. Do not confuse them.
 
-Default: all risky flags off except raw archive after deployment.
+Flag keys (canonical defaults: ALL OFF until their phase gate):
+
+- `memory.ingestion.raw_updates.enabled` — raw `telegram_updates` write enabled (T1-03 / T1-04). MUST stay OFF until T1-12 + T1-13 land per the `#offrecord` ordering rule.
+- `memory.qa.enabled` — q&a handler enabled (Phase 4)
+- `memory.import.apply.enabled` — Telegram Desktop import apply (Phase 2b)
+- `memory.extraction.enabled` — LLM extraction runs (Phase 5)
+- `memory.cards.enabled` — knowledge cards lifecycle (Phase 6)
+- `memory.digest.enabled` — daily / weekly digests (Phase 7-8)
+- `memory.wiki.enabled` — internal / member wiki (Phase 9)
+- `memory.graph.enabled` — graph projection sync (Phase 10)
+
+Default: all flags OFF in this cycle. Operators may toggle `memory.ingestion.raw_updates.enabled`
+ON ONLY after T1-12 / T1-13 land AND the `#offrecord` ordering rule is verifiable.
 
 ### Startup checks (Phase 0)
 
@@ -776,11 +808,19 @@ Default: all risky flags off except raw archive after deployment.
 
 ### Live message update flow
 
-1. Persist raw `telegram_updates` (idempotent on `update_id`).
+> **Critical ordering rule:** steps 1 and 3 happen in the SAME DB transaction. The raw insert
+> calls `governance.detect_policy()` (stub or real) BEFORE commit. If `detect_policy` returns
+> `'offrecord'`, the raw_json text/caption/entities are redacted (nulled or sentinel-replaced)
+> in the same transaction. Hash / ids / timestamps / policy marker are kept. See
+> AUTHORIZED_SCOPE.md §`#offrecord` ordering rule.
+
+1. Persist raw `telegram_updates` row in transaction T (idempotent on `update_id`); do NOT
+   commit yet.
 2. Normalize user / chat (upsert users; create chat row if phase includes chats; do not infer
-   consent).
-3. Detect `#nomem` / `#offrecord` deterministically; write `memory_policy`; write
-   `offrecord_marks` when table exists.
+   consent). Same transaction T.
+3. Detect `#nomem` / `#offrecord` deterministically (T1-12 detector or T1-04 stub); write
+   `memory_policy`; write `offrecord_marks` when table exists. If `'offrecord'`: redact
+   raw_json content fields in transaction T BEFORE commit.
 4. Upsert `chat_messages` keyed by `(chat_id, message_id)` with new normalized fields.
 5. Create `message_versions` v1 if new message; if duplicate same hash → no new version.
 6. Persist `reply_to_message_id` (nullable; unresolved OK).

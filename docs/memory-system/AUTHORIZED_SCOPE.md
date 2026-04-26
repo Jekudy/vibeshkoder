@@ -95,6 +95,40 @@ Committed storage for `#offrecord` keeps only minimal metadata:
 **No** search, q&a, extraction, summary, catalog, vector, graph, or wiki may use `#offrecord`
 content. Forbidden content never reaches `llm_gateway`.
 
+### `#offrecord` ordering rule (T1-04 ↔ T1-12 cross-cutting requirement)
+
+The ticket order in this cycle puts T1-04 (raw update persistence) BEFORE T1-12 (deterministic
+policy detector). Without an explicit rule, a compliant T1-04 implementation would commit
+content-bearing `raw_json` for several days before T1-12 lands the detector. That is a silent
+violation of the `#offrecord` rule.
+
+**Cross-cutting requirement (binding for both tickets):**
+
+1. **T1-04 must not merge until either (a) the detector stub is in place, or (b) the raw
+   archive feature flag `memory.ingestion.raw_updates.enabled` defaults to `false` AND there
+   is no production environment in which it is set to `true` until T1-12 lands.**
+
+2. T1-04's PR MUST include `bot/services/governance.py::detect_policy(text, caption) ->
+   ('normal'|'nomem'|'offrecord', mark_payload_or_None)` as a stub returning `('normal', None)`
+   for any input. The stub MUST be called inside the same DB transaction as the
+   `telegram_updates` insert. This guarantees that when T1-12 replaces the stub with the real
+   detector, the redaction path is already wired and atomic.
+
+3. T1-04's PR MUST persist content-bearing `raw_json` ONLY in the same DB transaction that
+   runs `detect_policy()`. If a future implementation moves the raw write to its own
+   transaction, the move requires explicit team-lead approval and a follow-up safety review.
+
+4. T1-12's PR replaces the stub with the real detector AND adds `offrecord_marks` insertion
+   (T1-13 is in the same PR or merged immediately after). Between T1-12 merge and T1-13 merge,
+   the detector still works — `offrecord_marks` adds the audit row, not the redaction itself.
+
+5. The redaction itself happens inside the same transaction: when `detect_policy()` returns
+   `'offrecord'`, the raw_json `text` / `caption` / `entities` fields are nulled or replaced
+   with a sentinel before commit. The hash, ids, timestamps, and policy marker are kept.
+
+If you are picking up T1-04 in isolation: implement the stub. Do not skip it. Do not merge a
+T1-04 that writes raw_json without going through the (stub) detector path.
+
 ---
 
 ## Telegram import rule (relevant if T2-01 is picked up)

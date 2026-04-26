@@ -23,10 +23,10 @@
 
 | Ticket | Title                                                       | Status         | Notes |
 |--------|-------------------------------------------------------------|----------------|-------|
-| T0-01  | Fix forward_lookup membership/admin check                   | verified       | Merged in PR#11 / commit `7f95b53` (security audit C3). Verified 2026-04-26: PASS by architect's hard criteria (auth guard before DB lookup; silent denial; no info leakage; admin allowed; member allowed; tests cover (a)(b)(c)(d)). Three minor follow-up gaps captured as T0-01-r1/r2/r3 below. |
-| T0-01-r1 | Test: admin authorized via `settings.ADMIN_IDS` (env-only) | not started    | nice-to-have. Patch ADMIN_IDS=[user_id] with is_admin=False in DB; verify lookup proceeds. |
-| T0-01-r2 | Test: unknown user (UserRepo.get returns None) silent return | not started   | nice-to-have. Cover the ghost-user code path. |
-| T0-01-r3 | Distinguish denial log lines: "user not in DB" vs "not a member" | not started | quality. Audit log clarity. |
+| T0-01  | Fix forward_lookup membership/admin check                   | verified       | Merged in PR#11 / commit `7f95b53` (security audit C3). Verified 2026-04-26 by independent code-reviewer subagent (output preserved in PR #16 description and commit message). Acceptance verbatim: "non-member denied; member allowed; admin allowed; no intro in denial response; auth guard runs BEFORE any DB lookup of message author or intro." Tests cover (a) non-member denied, (b) member allowed, (c) admin allowed via DB flag, (d) no intro leaked in denial. Independent reviewer also confirmed no bypass code path (`F.forward_origin` registered only in `forward_lookup.py`). |
+| T0-01-r1 | Test: admin authorized via `settings.ADMIN_IDS` (env-only) | not started    | nice-to-have. Does NOT block T0-06 regression suite. Standalone GitHub issue #18. |
+| T0-01-r2 | Test: unknown user (UserRepo.get returns None) silent return | not started   | nice-to-have. Does NOT block T0-06. GitHub issue #19. |
+| T0-01-r3 | Distinguish denial log lines: "user not in DB" vs "not a member" | not started | quality. Does NOT block T0-06. GitHub issue #20. |
 | T0-02  | Fix/contain sqlite vs postgres upsert in UserRepo           | not started    | First implementation ticket of this cycle. |
 | T0-03  | Make MessageRepo.save idempotent                            | not started    |
 | T0-04  | Implementation status doc                                   | done           | This file + ROADMAP.md + AUTHORIZED_SCOPE.md + HANDOFF.md. |
@@ -62,7 +62,7 @@
 
 | Ticket | Title                                                       | Status         | Notes |
 |--------|-------------------------------------------------------------|----------------|-------|
-| T3-01  | forget_events tombstone skeleton                            | not started    | Stretch. Required before T2-02 import apply. |
+| T3-01  | forget_events tombstone skeleton                            | not started    | Stretch. Required before T2-03 import apply (which is itself out of scope this cycle). |
 
 ## Phases 2b, 4–12
 

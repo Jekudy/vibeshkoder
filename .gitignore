@@ -3,6 +3,7 @@
 .env.staging
 .env.local
 .env.dev
+.env.dev.real
 .superflow-state.json
 .worktrees/
 .claude/agent-memory/
