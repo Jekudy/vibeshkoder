@@ -13,6 +13,7 @@ from sqlalchemy import select
 from bot.config import settings
 from bot.db.engine import async_session
 from bot.db.models import Intro, QuestionnaireAnswer, User
+from bot.html_escape import html_escape
 
 logger = logging.getLogger(__name__)
 
@@ -283,13 +284,13 @@ async def sync_all_from_sheet() -> None:
             from bot.texts import INTRO_TEMPLATE
 
             intro.intro_text = INTRO_TEMPLATE.format(
-                name=row[2].strip() or "—",
-                location=row[3].strip() or "—",
-                source=row[4].strip() or "—",
-                experience=row[5].strip() or "—",
-                projects=row[6].strip() or "—",
-                hardest=row[7].strip() or "—",
-                goals=row[8].strip() or "—",
+                name=html_escape(row[2].strip()) or "—",
+                location=html_escape(row[3].strip()) or "—",
+                source=html_escape(row[4].strip()) or "—",
+                experience=html_escape(row[5].strip()) or "—",
+                projects=html_escape(row[6].strip()) or "—",
+                hardest=html_escape(row[7].strip()) or "—",
+                goals=html_escape(row[8].strip()) or "—",
             )
 
             # Update vouched_by if changed

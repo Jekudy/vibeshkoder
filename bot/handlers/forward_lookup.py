@@ -77,7 +77,7 @@ async def handle_forwarded_message(
             FORWARD_INTRO_RESULT.format(
                 name=html_escape(name),
                 username=html_escape(username),
-                intro_text=html_escape(intro.intro_text),
+                intro_text=intro.intro_text,
             )
         )
     else:
