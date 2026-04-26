@@ -21,5 +21,6 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 
 ## Current Migration Rule
 
-- The legacy production runtime at `/home/claw/vibe-gatekeeper` remains the live path until the new GitHub/GHCR/Coolify path is verified.
-- Do not cut over the production bot token during bootstrap work.
+- Coolify is the production runtime for bot and web deploys.
+- Legacy `/home/claw/vibe-gatekeeper` is retained only as rollback fallback until
+  `scripts/cleanup-legacy.sh` passes its A3, soak window, and disk preflights.
