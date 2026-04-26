@@ -1,0 +1,10 @@
+title = "Vibe Gatekeeper gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Postmortems may quote already-rotated incident artifacts for audit context."
+paths = [
+  '''^docs/session-postmortems/.*''',
+]
