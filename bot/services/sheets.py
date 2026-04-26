@@ -135,9 +135,14 @@ def _sync_row_to_sheet(
 
 
 def _row_content_hash(row: list[str]) -> str:
-    """Compute a hash of the answer columns (indices 2-8) for change detection."""
+    """Compute a hash of the answer columns (indices 2-8) for change detection.
+
+    Non-cryptographic — only used to compare sheet row content against local DB
+    state. SHA-256 chosen over MD5 to satisfy the security gate; collision
+    strength is not actually relevant here.
+    """
     parts = "|".join(row[2:9] if len(row) > 8 else [])
-    return hashlib.md5(parts.encode("utf-8")).hexdigest()
+    return hashlib.sha256(parts.encode("utf-8")).hexdigest()
 
 
 # ── Async public API ─────────────────────────────────────────────────
@@ -251,7 +256,7 @@ async def sync_all_from_sheet() -> None:
             local_row_values = [""] * 7
             for q_idx in range(7):
                 local_row_values[q_idx] = local_answers.get(q_idx, "")
-            local_hash = hashlib.md5("|".join(local_row_values).encode("utf-8")).hexdigest()
+            local_hash = hashlib.sha256("|".join(local_row_values).encode("utf-8")).hexdigest()
 
             if sheet_hash == local_hash:
                 # No changes — just update row number
