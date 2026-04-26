@@ -33,6 +33,16 @@ def test_settings_accept_explicit_values(app_env) -> None:
 
 
 def test_config_no_password_prod_raises(app_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WEB_PASSWORD")
+    monkeypatch.setenv("DEV_MODE", "false")
+
+    with pytest.raises(ValidationError, match="WEB_PASSWORD is required when DEV_MODE=false"):
+        import_module("bot.config")
+
+
+def test_settings_no_password_prod_raises_direct_call(
+    app_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = import_module("bot.config")
     Settings = config.Settings
     monkeypatch.delenv("WEB_PASSWORD")

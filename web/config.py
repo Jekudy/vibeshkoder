@@ -1,3 +1,3 @@
-from bot.config import Settings
+from bot.config import settings
 
-settings = Settings()
+__all__ = ["settings"]
