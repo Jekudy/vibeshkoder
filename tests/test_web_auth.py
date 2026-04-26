@@ -14,6 +14,18 @@ def test_password_and_session_cookie_roundtrip(app_env) -> None:
     assert payload == {"authenticated": True}
 
 
+def test_verify_password_constant_time_correct(app_env) -> None:
+    auth = import_module("web.auth")
+
+    assert auth.verify_password("test-pass") is True
+
+
+def test_verify_password_constant_time_incorrect(app_env) -> None:
+    auth = import_module("web.auth")
+
+    assert auth.verify_password("wrong-pass") is False
+
+
 def test_invalid_cookie_returns_none(app_env) -> None:
     auth = import_module("web.auth")
 

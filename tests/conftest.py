@@ -26,6 +26,7 @@ def app_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("WEB_BOT_USERNAME", "vibeshkoder_dev_bot")
     monkeypatch.setenv("DB_PASSWORD", "changeme")
     monkeypatch.setenv("WEB_PASSWORD", "test-pass")
+    monkeypatch.setenv("WEB_SESSION_SECRET", "test-session-secret")
     monkeypatch.setenv("DEV_MODE", "true")
     _clear_modules()
     yield

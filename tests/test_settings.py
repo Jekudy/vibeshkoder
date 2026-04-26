@@ -23,6 +23,7 @@ def test_settings_accept_explicit_values(app_env) -> None:
         WEB_BOT_USERNAME="vibeshkoder_dev_bot",
         DB_PASSWORD="changeme",
         WEB_PASSWORD="test-pass",
+        WEB_SESSION_SECRET="test-session-secret",
         DEV_MODE=True,
     )
 
@@ -30,6 +31,7 @@ def test_settings_accept_explicit_values(app_env) -> None:
     assert settings.ADMIN_IDS == [149820031]
     assert settings.DEV_MODE is True
     assert settings.WEB_PASSWORD == "test-pass"
+    assert settings.WEB_SESSION_SECRET == "test-session-secret"
 
 
 def test_config_no_password_prod_raises(app_env, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,6 +68,36 @@ def test_config_no_password_dev_warns(
     assert settings.WEB_PASSWORD
     assert settings.WEB_PASSWORD != "admin"
     assert "WEB_PASSWORD is not set" in caplog.text
+
+
+def test_config_no_session_secret_prod_raises(
+    app_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = import_module("bot.config")
+    Settings = config.Settings
+    monkeypatch.delenv("WEB_SESSION_SECRET")
+    monkeypatch.setenv("DEV_MODE", "false")
+
+    with pytest.raises(
+        ValidationError, match="WEB_SESSION_SECRET is required when DEV_MODE=false"
+    ):
+        Settings()
+
+
+def test_config_no_session_secret_dev_warns(
+    app_env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = import_module("bot.config")
+    Settings = config.Settings
+    monkeypatch.delenv("WEB_SESSION_SECRET")
+    monkeypatch.setenv("DEV_MODE", "true")
+
+    with caplog.at_level(logging.WARNING):
+        settings = Settings()
+
+    assert settings.WEB_SESSION_SECRET
+    assert len(settings.WEB_SESSION_SECRET) >= 32
+    assert "WEB_SESSION_SECRET is not set" in caplog.text
 
 
 def test_config_explicit_password_used(app_env, monkeypatch: pytest.MonkeyPatch) -> None:

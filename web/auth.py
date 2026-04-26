@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-import hashlib
+import hmac
 
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from web.config import settings
 
-_SECRET_KEY = hashlib.sha256(settings.BOT_TOKEN.encode()).hexdigest()
+_SECRET_KEY = settings.WEB_SESSION_SECRET
 _serializer = URLSafeTimedSerializer(_SECRET_KEY)
 
 _COOKIE_MAX_AGE = 7 * 24 * 60 * 60  # 7 days
 
 
-def verify_password(password: str) -> bool:
+def verify_password(password: str | None) -> bool:
     """Check password against the configured WEB_PASSWORD."""
-    return password == settings.WEB_PASSWORD
+    if not password or settings.WEB_PASSWORD is None:
+        return False
+
+    return hmac.compare_digest(password.encode(), settings.WEB_PASSWORD.encode())
 
 
 def create_session_cookie() -> str:

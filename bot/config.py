@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     NUDGE_TIMEOUT_HOURS: int = 48
     INTRO_REFRESH_DAYS: int = 90
     WEB_PASSWORD: str | None = None
+    WEB_SESSION_SECRET: str | None = None
     DEV_MODE: bool = False  # Use SQLite + MemoryStorage for local testing
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
@@ -36,6 +37,18 @@ class Settings(BaseSettings):
             return self
 
         raise ValueError("WEB_PASSWORD is required when DEV_MODE=false")
+
+    @model_validator(mode="after")
+    def validate_web_session_secret(self) -> Settings:
+        if self.WEB_SESSION_SECRET is not None:
+            return self
+
+        if self.DEV_MODE:
+            logging.warning("WEB_SESSION_SECRET is not set; generated an ephemeral dev session secret")
+            self.WEB_SESSION_SECRET = secrets.token_urlsafe(32)
+            return self
+
+        raise ValueError("WEB_SESSION_SECRET is required when DEV_MODE=false")
 
 
 settings = Settings()  # type: ignore[call-arg]
