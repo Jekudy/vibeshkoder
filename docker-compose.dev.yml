@@ -1,0 +1,33 @@
+# Dev compose — isolated postgres for memory pipeline testing.
+# Port 5433 deliberately avoids clash with prod/staging (5432).
+# Volume name suffixed -dev to avoid clash with existing volumes.
+#
+# Usage:
+#   cp .env.dev.example .env.dev
+#   # fill secrets in .env.dev
+#   docker compose -f docker-compose.dev.yml --env-file .env.dev up -d postgres-dev
+#   alembic upgrade head
+#   python -m bot
+#
+# Bot itself is run on the host so we can hot-iterate code; only the DB lives in compose.
+
+services:
+  postgres-dev:
+    image: postgres:16
+    container_name: shkoder-postgres-dev
+    environment:
+      POSTGRES_USER: shkoder_dev
+      POSTGRES_PASSWORD: shkoder_dev
+      POSTGRES_DB: shkoder_dev
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - shkoder-postgres-dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "shkoder_dev", "-d", "shkoder_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  shkoder-postgres-dev:
