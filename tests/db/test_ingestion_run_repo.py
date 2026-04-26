@@ -104,6 +104,17 @@ async def test_get_active_live_returns_none_when_no_run(db_session) -> None:
     assert await IngestionRunRepo.get_active_live(db_session) is None
 
 
+async def test_get_active_live_returns_none_when_only_run_is_completed(db_session) -> None:
+    """The previous bot process exited cleanly and closed its live run. The next startup
+    must see no active live and create a new one."""
+    from bot.db.repos.ingestion_run import IngestionRunRepo
+
+    run = await IngestionRunRepo.create(db_session, run_type="live")
+    await IngestionRunRepo.update_status(db_session, run, status="completed")
+
+    assert await IngestionRunRepo.get_active_live(db_session) is None
+
+
 async def test_get_active_live_returns_most_recent_running_live_run(db_session) -> None:
     from bot.db.repos.ingestion_run import IngestionRunRepo
 
@@ -124,6 +135,42 @@ async def test_get_active_live_ignores_non_live_runs(db_session) -> None:
     await IngestionRunRepo.create(db_session, run_type="dry_run")
 
     assert await IngestionRunRepo.get_active_live(db_session) is None
+
+
+# ─── secret rejection (Codex MEDIUM enforcement) ──────────────────────────────────────────
+
+async def test_create_rejects_secret_shaped_config_keys(db_session) -> None:
+    """The table is dumped in admin views; refuse payloads with token / secret / password
+    / api_key shaped top-level keys before they reach the DB."""
+    from bot.db.repos.ingestion_run import IngestionRunRepo
+
+    for offending in (
+        {"bot_token": "x"},
+        {"DB_PASSWORD": "x"},
+        {"api_key": "x"},
+        {"sentry_secret": "x"},
+        {"refresh_token": "x"},
+    ):
+        with pytest.raises(ValueError, match="must not contain secret-shaped keys"):
+            await IngestionRunRepo.create(
+                db_session, run_type="live", config_json=offending
+            )
+
+    # Sanity: harmless keys are accepted.
+    run = await IngestionRunRepo.create(
+        db_session, run_type="live", config_json={"rolloutPct": 10}
+    )
+    assert run.config_json == {"rolloutPct": 10}
+
+
+async def test_update_status_rejects_secret_shaped_stats_keys(db_session) -> None:
+    from bot.db.repos.ingestion_run import IngestionRunRepo
+
+    run = await IngestionRunRepo.create(db_session, run_type="live")
+    with pytest.raises(ValueError, match="must not contain secret-shaped keys"):
+        await IngestionRunRepo.update_status(
+            db_session, run, status="completed", stats_json={"auth_token": "x"}
+        )
 
 
 # ─── metadata smoke ────────────────────────────────────────────────────────────────────────
