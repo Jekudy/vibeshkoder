@@ -22,6 +22,7 @@ from bot.texts import (
     REFRESH_NO_INTRO,
     REFRESH_START,
     RESUME_QUESTIONNAIRE,
+    VOUCHED_PENDING,
     WELCOME_EXISTING_MEMBER,
     WELCOME_NEW,
     QUESTIONS,
@@ -90,6 +91,10 @@ async def cmd_start(
                 await message.answer(
                     RESUME_QUESTIONNAIRE.format(question=QUESTIONS[0])
                 )
+            return
+
+        if active_app.status == "vouched":
+            await message.answer(VOUCHED_PENDING)
             return
 
     # Check if member without intro → existing member flow
