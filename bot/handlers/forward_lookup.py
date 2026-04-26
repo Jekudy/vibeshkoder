@@ -11,6 +11,7 @@ from bot.db.repos.intro import IntroRepo
 from bot.db.repos.message import MessageRepo
 from bot.db.repos.user import UserRepo
 from bot.filters.chat_type import PrivateChatFilter
+from bot.html_escape import html_escape
 from bot.texts import (
     FORWARD_INTRO_RESULT,
     FORWARD_NO_INTRO,
@@ -74,10 +75,15 @@ async def handle_forwarded_message(
     if intro is not None:
         await message.answer(
             FORWARD_INTRO_RESULT.format(
-                name=name, username=username, intro_text=intro.intro_text
+                name=html_escape(name),
+                username=html_escape(username),
+                intro_text=html_escape(intro.intro_text),
             )
         )
     else:
         await message.answer(
-            FORWARD_NO_INTRO.format(name=name, username=username)
+            FORWARD_NO_INTRO.format(
+                name=html_escape(name),
+                username=html_escape(username),
+            )
         )

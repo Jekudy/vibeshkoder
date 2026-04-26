@@ -13,6 +13,7 @@ from bot.db.repos.intro import IntroRepo
 from bot.db.repos.questionnaire import QuestionnaireRepo
 from bot.db.repos.user import UserRepo
 from bot.handlers.questionnaire import build_intro_preview
+from bot.html_escape import html_escape
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ async def _handle_join(
         # Post message in chat only on first kick
         if first_kick:
             mention = f"@{tg_user.username}" if tg_user.username else tg_user.first_name
+            mention = html_escape(mention)
             try:
                 await event.bot.send_message(
                     chat_id=chat_id,
@@ -153,6 +155,7 @@ async def _handle_join(
                 voucher = await UserRepo.get(session, active_app.vouched_by)
                 if voucher:
                     vouched_by_name = f"@{voucher.username}" if voucher.username else voucher.first_name
+            vouched_by_display = html_escape(vouched_by_name)
 
             await IntroRepo.upsert(
                 session,
@@ -162,10 +165,10 @@ async def _handle_join(
             )
 
             # Post intro in community chat
-            header = f"🎉 Новый участник: {tg_user.first_name}"
+            header = f"🎉 Новый участник: {html_escape(tg_user.first_name)}"
             if tg_user.username:
-                header += f" (@{tg_user.username})"
-            header += f"\nПоручился: {vouched_by_name}\n\n"
+                header += f" (@{html_escape(tg_user.username)})"
+            header += f"\nПоручился: {vouched_by_display}\n\n"
 
             try:
                 await event.bot.send_message(
