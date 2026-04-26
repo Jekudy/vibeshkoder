@@ -13,6 +13,7 @@ from bot.db.models import Application
 from bot.db.repos.application import ApplicationRepo
 from bot.db.repos.user import UserRepo
 from bot.db.repos.vouch import VouchRepo
+from bot.html_escape import html_escape
 from bot.keyboards.inline import ReadyCallback, VouchCallback, ready_keyboard
 from bot.services.invite import try_send_invite
 from bot.texts import (
@@ -101,7 +102,7 @@ async def handle_vouch(
     try:
         await callback.bot.send_message(
             chat_id=app.user_id,
-            text=VOUCHED_NOTIFICATION.format(name=voucher_name),
+            text=VOUCHED_NOTIFICATION.format(name=html_escape(voucher_name)),
         )
     except Exception:
         logger.warning("Failed to notify user %s about vouch", app.user_id)

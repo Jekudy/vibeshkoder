@@ -15,6 +15,7 @@ from bot.db.repos.intro import IntroRepo
 from bot.db.repos.questionnaire import QuestionnaireRepo
 from bot.db.repos.user import UserRepo
 from bot.filters.chat_type import PrivateChatFilter
+from bot.html_escape import html_escape
 from bot.keyboards.inline import (
     ConfirmCallback,
     confirm_keyboard,
@@ -39,13 +40,13 @@ def build_intro_preview(answers: list[QuestionnaireAnswer]) -> str:
     """Build formatted intro text from questionnaire answers."""
     answers_by_idx = {a.question_index: a.answer_text for a in answers}
     return INTRO_TEMPLATE.format(
-        name=answers_by_idx.get(0, "—"),
-        location=answers_by_idx.get(1, "—"),
-        source=answers_by_idx.get(2, "—"),
-        experience=answers_by_idx.get(3, "—"),
-        projects=answers_by_idx.get(4, "—"),
-        hardest=answers_by_idx.get(5, "—"),
-        goals=answers_by_idx.get(6, "—"),
+        name=html_escape(answers_by_idx.get(0, "—")),
+        location=html_escape(answers_by_idx.get(1, "—")),
+        source=html_escape(answers_by_idx.get(2, "—")),
+        experience=html_escape(answers_by_idx.get(3, "—")),
+        projects=html_escape(answers_by_idx.get(4, "—")),
+        hardest=html_escape(answers_by_idx.get(5, "—")),
+        goals=html_escape(answers_by_idx.get(6, "—")),
     )
 
 
@@ -247,9 +248,9 @@ async def handle_confirm(
             await state.clear()
 
             # Post intro in community chat (without vouch button)
-            header = f"📋 Интро: {user_display}"
+            header = f"📋 Интро: {html_escape(user_display)}"
             if username:
-                header += f" (@{username})"
+                header += f" (@{html_escape(username)})"
             header += "\n\n"
             try:
                 await callback.bot.send_message(
@@ -269,9 +270,9 @@ async def handle_confirm(
                 )
         else:
             # New applicant: post to community chat
-            header = f"📋 Новая анкета от {user_display}"
+            header = f"📋 Новая анкета от {html_escape(user_display)}"
             if username:
-                header += f" (@{username})"
+                header += f" (@{html_escape(username)})"
             header += "\n\n"
 
             msg = await callback.bot.send_message(

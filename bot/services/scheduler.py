@@ -13,6 +13,7 @@ from bot.db.models import IntroRefreshTracking
 from bot.db.repos.application import ApplicationRepo
 from bot.db.repos.intro import IntroRepo
 from bot.db.repos.user import UserRepo
+from bot.html_escape import html_escape
 from bot.texts import (
     ADMIN_NUDGE_MSG,
     NUDGE_MSG,
@@ -23,6 +24,14 @@ from bot.texts import (
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="UTC")
+
+
+def format_admin_nudge(name: str, username: str, app_id: int) -> str:
+    return ADMIN_NUDGE_MSG.format(
+        name=html_escape(name),
+        username=html_escape(username),
+        app_id=app_id,
+    )
 
 
 async def check_vouch_deadlines(bot: Bot) -> None:
@@ -87,9 +96,7 @@ async def check_vouch_deadlines(bot: Bot) -> None:
                     try:
                         await bot.send_message(
                             chat_id=admin_id,
-                            text=ADMIN_NUDGE_MSG.format(
-                                name=name, username=username, app_id=app.id
-                            ),
+                            text=format_admin_nudge(name, username, app.id),
                         )
                     except Exception:
                         logger.warning("Failed to notify admin %s", admin_id)
