@@ -18,11 +18,16 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+import logging
+
 from sqlalchemy import text
 from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 from bot.config import settings
 from bot.db.engine import async_session
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -56,13 +61,21 @@ def _safe_db_url() -> str:
 
 
 async def check_db() -> CheckResult:
-    """Ping the configured DB. Returns ok=True if a trivial SELECT 1 succeeds."""
+    """Ping the configured DB. Returns ok=True if a trivial SELECT 1 succeeds.
+
+    Catches only SQLAlchemy / driver errors so genuine programming bugs propagate to the
+    caller's error handler. The ``reason`` field returns ONLY the exception class name —
+    full ``str(exc)`` from asyncpg / psycopg often embeds host / DB name / connection
+    details that we do not want to expose in a public ``/healthz`` response. The full
+    exception is still logged at WARNING for operator diagnostics.
+    """
     try:
         async with async_session() as session:
             await session.execute(text("SELECT 1"))
         return CheckResult(ok=True)
-    except Exception as exc:  # pragma: no cover — failure paths exercised in tests via mock
-        return CheckResult(ok=False, reason=f"{type(exc).__name__}: {exc}")
+    except SQLAlchemyError as exc:  # pragma: no cover — exercised via mock in tests
+        logger.warning("check_db failed: %s: %s", type(exc).__name__, exc)
+        return CheckResult(ok=False, reason=type(exc).__name__)
 
 
 def check_settings_sanity() -> CheckResult:

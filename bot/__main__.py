@@ -34,12 +34,12 @@ logger = logging.getLogger(__name__)
 # Phase 1 will add 'edited_message' once T1-06 message_versions and the T1-14 edit handler
 # both exist. Phase 5 will add 'message_reaction' / 'message_reaction_count' once the
 # reactions table and handler exist. Until then, leave them out.
-_ALLOWED_UPDATES = [
+_ALLOWED_UPDATES: tuple[str, ...] = (
     "message",
     "callback_query",
     "chat_member",
     "my_chat_member",
-]
+)
 
 
 async def _init_db() -> None:
@@ -128,8 +128,9 @@ async def main() -> None:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # Start polling — see _ALLOWED_UPDATES below for the canonical list.
-    await dp.start_polling(bot, allowed_updates=_ALLOWED_UPDATES)
+    # Start polling — see _ALLOWED_UPDATES above for the canonical list.
+    # aiogram expects a list, so materialize the immutable tuple here.
+    await dp.start_polling(bot, allowed_updates=list(_ALLOWED_UPDATES))
 
 
 if __name__ == "__main__":
