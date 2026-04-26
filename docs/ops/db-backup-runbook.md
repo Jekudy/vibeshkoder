@@ -124,10 +124,11 @@ This drops and re-creates objects. Stop the bot first to avoid open connections.
 
 ```bash
 ssh foodzy-vps
-TOKEN=<COOLIFY_API_TOKEN>
-API=http://100.101.196.21:8100/api/v1
-BOT_UUID=maiwn569gziz935wv0w7kcch
-WEB_UUID=cexv50jspo5gl3kq6ojypw43
+# Set these env vars from your operator notes / ~/.env.tokens:
+TOKEN="${COOLIFY_API_TOKEN:?set Coolify API token}"
+API="${COOLIFY_API_URL:-http://100.101.196.21:8100/api/v1}"
+BOT_UUID="${SHKODER_BOT_APP_UUID:?set bot app UUID — see Coolify UI}"
+WEB_UUID="${SHKODER_WEB_APP_UUID:?set web app UUID — see Coolify UI}"
 
 # 1) Stop bot + web (release DB connections):
 curl -sS -X POST -H "Authorization: Bearer $TOKEN" "$API/applications/$BOT_UUID/stop"
@@ -161,8 +162,7 @@ Expected baseline row counts (from 2026-04-20 cutover): `users=275`,
 
 ### Smoke restore into a throwaway DB (recommended monthly)
 
-Validates the dump is restorable without touching prod. Per playbook
-`p3.5#restore-drill`:
+Validates the dump is restorable without touching prod:
 
 ```bash
 ssh foodzy-vps
@@ -186,8 +186,8 @@ sudo docker rm -f pg-restore-test
    PG data volume. A full disk failure or VPS loss would wipe both. Off-host
    storage (S3 / B2) is the next iteration — see "Future work".
 2. **No encryption.** Dumps are written in plaintext custom format. They
-   contain user data and should be encrypted (per playbook `p3.5#encrypt`)
-   before any off-host upload. For local-only storage on a single-tenant VPS,
+   contain user data and should be encrypted (e.g. `age` or `gpg`) before
+   any off-host upload. For local-only storage on a single-tenant VPS,
    the file mode `0600` + `0700` directory mode + root-only access is the
    current control.
 3. **Ad-hoc pause is not built in.** If the DB is undergoing a long migration
