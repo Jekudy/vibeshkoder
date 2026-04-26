@@ -54,10 +54,14 @@ class MessageRepo:
         result = await session.execute(stmt)
         inserted = result.scalar_one_or_none()
         if inserted is not None:
+            # Mirror UserRepo.upsert / set_member: flush after a write so the row is
+            # visible inside the caller's transaction without committing.
             await session.flush()
             return inserted
 
-        # Conflict path: the row already exists. Fetch and return it.
+        # Conflict path: the row already exists. The follow-up SELECT triggers SQLAlchemy's
+        # autoflush, so no explicit flush is required here (and there is nothing to flush —
+        # the conflict path made no mutation).
         existing = await session.execute(
             select(ChatMessage).where(
                 ChatMessage.chat_id == chat_id,
