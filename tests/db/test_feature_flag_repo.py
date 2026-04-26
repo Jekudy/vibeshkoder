@@ -110,16 +110,47 @@ async def test_per_scope_flags_coexist_with_global(db_session) -> None:
     ) is True
 
 
-async def test_memory_flags_have_no_seed_rows(db_session) -> None:
-    """T1-01 invariant: the migration MUST NOT pre-enable any memory.* flag.
-    A regression that adds an INSERT into the migration would tripwire here."""
+async def test_memory_flags_have_no_enabled_seed_rows(db_session) -> None:
+    """T1-01 invariant: the migration MUST NOT seed any ENABLED memory.* flag.
+
+    Stricter than the bare "no seed rows" check — what we actually care about is that no
+    migration silently turns on a memory feature. A future ticket may legitimately seed a
+    documentation row with ``enabled=False`` (e.g., to expose a flag in an admin UI before
+    operators toggle it); that is fine. What is NEVER fine is a seed with ``enabled=True``.
+    """
     from bot.db.models import FeatureFlag
 
     rows = await db_session.execute(
-        select(FeatureFlag).where(FeatureFlag.flag_key.like("memory.%"))
+        select(FeatureFlag).where(
+            FeatureFlag.flag_key.like("memory.%"),
+            FeatureFlag.enabled.is_(True),
+        )
     )
     seeded = rows.scalars().all()
-    assert seeded == [], f"unexpected seeded memory.* flag rows: {[r.flag_key for r in seeded]}"
+    assert seeded == [], (
+        "memory.* flag was seeded with enabled=True by a migration: "
+        f"{[r.flag_key for r in seeded]}"
+    )
+
+
+async def test_set_enabled_updates_updated_at(db_session) -> None:
+    """Audit trail invariant: ``updated_at`` must change on conflict-update path.
+
+    The model declares ``onupdate=func.now()`` for ORM-managed updates, but
+    ``pg_insert(...).on_conflict_do_update(...)`` is a Core statement and does NOT trigger
+    the ORM hook. Repo sets ``updated_at`` explicitly in the conflict ``set_`` map.
+    """
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+
+    key = _unique_flag_key()
+
+    inserted = await FeatureFlagRepo.set_enabled(db_session, flag_key=key, enabled=False)
+    original_updated_at = inserted.updated_at
+
+    updated = await FeatureFlagRepo.set_enabled(db_session, flag_key=key, enabled=True)
+    await db_session.refresh(updated)
+
+    assert updated.updated_at > original_updated_at
 
 
 def test_engine_module_imports_feature_flag_model(app_env) -> None:

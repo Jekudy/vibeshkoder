@@ -155,6 +155,12 @@ class FeatureFlag(Base):
     Logical key: ``(flag_key, scope_type, scope_id)``. Global flags use ``scope_type=None``
     and ``scope_id=None``. Per-chat / per-user flags pin a non-null scope.
 
+    The DB-level unique index ``uq_feature_flags_key_scope`` uses ``NULLS NOT DISTINCT``
+    so global-scope rows are actually unique per flag_key (postgres 15+ feature; postgres
+    16 is the runtime). The model's ``__table_args__`` declares the unique index with the
+    same flag so ``Base.metadata.create_all`` (used by ``bot/__main__.py::_init_db`` in
+    dev) produces the same shape as the alembic migration.
+
     All ``memory.*`` flag keys default to OFF — the migration does not seed any rows, and
     ``FeatureFlagRepo.get`` returns ``False`` for missing flags. Operators enable flags
     explicitly via SQL until an admin UI lands in a later phase.
@@ -163,9 +169,14 @@ class FeatureFlag(Base):
     __tablename__ = "feature_flags"
     __table_args__ = (
         Index("ix_feature_flags_enabled", "enabled"),
-        # Unique on the logical key. Postgres treats NULLs as distinct, so global rows
-        # (both scope columns NULL) coexist with per-scope rows.
-        # Constraint name matches the migration.
+        Index(
+            "uq_feature_flags_key_scope",
+            "flag_key",
+            "scope_type",
+            "scope_id",
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
