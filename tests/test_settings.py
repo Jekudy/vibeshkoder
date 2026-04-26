@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import logging
+
+import pytest
+from pydantic import ValidationError
+
 from tests.conftest import import_module
 
 
@@ -25,3 +30,40 @@ def test_settings_accept_explicit_values(app_env) -> None:
     assert settings.ADMIN_IDS == [149820031]
     assert settings.DEV_MODE is True
     assert settings.WEB_PASSWORD == "test-pass"
+
+
+def test_config_no_password_prod_raises(app_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = import_module("bot.config")
+    Settings = config.Settings
+    monkeypatch.delenv("WEB_PASSWORD")
+    monkeypatch.setenv("DEV_MODE", "false")
+
+    with pytest.raises(ValidationError, match="WEB_PASSWORD is required when DEV_MODE=false"):
+        Settings()
+
+
+def test_config_no_password_dev_warns(
+    app_env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = import_module("bot.config")
+    Settings = config.Settings
+    monkeypatch.delenv("WEB_PASSWORD")
+    monkeypatch.setenv("DEV_MODE", "true")
+
+    with caplog.at_level(logging.WARNING):
+        settings = Settings()
+
+    assert settings.WEB_PASSWORD
+    assert settings.WEB_PASSWORD != "admin"
+    assert "WEB_PASSWORD is not set" in caplog.text
+
+
+def test_config_explicit_password_used(app_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = import_module("bot.config")
+    Settings = config.Settings
+    monkeypatch.setenv("WEB_PASSWORD", "explicit-pass")
+    monkeypatch.setenv("DEV_MODE", "false")
+
+    settings = Settings()
+
+    assert settings.WEB_PASSWORD == "explicit-pass"
