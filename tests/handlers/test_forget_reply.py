@@ -1,9 +1,10 @@
 """T3-02 acceptance tests for the forget_reply handler.
 
 Test isolation strategy:
-- All 5 tests are offline (mock-based, no DB). Fast, hermetic.
-- Use SimpleNamespace for aiogram Message and mock repos directly,
-  mirroring the pattern in test_edited_message.py.
+- Tests 1–5: mock-based (no DB required). Fast and hermetic.
+- Tests 6–7: mock-based branch coverage (Fix 3).
+- DB-backed tests (8–10): use the ``db_session`` fixture with real postgres.
+  Skip cleanly if postgres is unreachable.
 
 Coverage:
 - test_forget_own_message_creates_event: author /forget → event created
@@ -11,6 +12,11 @@ Coverage:
 - test_forget_other_member_denied_silently_no_event: other member → silent denial
 - test_forget_unknown_user_denied_silently_no_event: unknown user → silent denial
 - test_forget_idempotent_re_issue_returns_same_event: re-issue returns same event, no duplicate
+- test_forget_no_reply_returns_usage_hint: no reply_to_message → usage hint, no event
+- test_forget_replied_to_unknown_message_silent: replied-to msg not in DB → silent, no event
+- test_forget_db_own_message_creates_real_event_row: DB-backed, author creates event
+- test_forget_db_admin_creates_real_event_row: DB-backed, admin creates event
+- test_forget_db_idempotent_no_duplicate_row: DB-backed, second /forget returns same row
 """
 
 from __future__ import annotations
@@ -326,3 +332,238 @@ def test_forget_idempotent_re_issue_returns_same_event(app_env, monkeypatch) -> 
     # Both replies reference the same event id
     for call in message.answer.call_args_list:
         assert "77" in call[0][0]
+
+
+# ─── Test 6: no reply_to_message → usage hint ─────────────────────────────────
+
+
+def test_forget_no_reply_returns_usage_hint(app_env, monkeypatch) -> None:
+    """/forget sent WITHOUT a reply_to_message → usage hint reply, no event created."""
+    handler = import_module("bot.handlers.forget_reply")
+
+    # Message with NO reply_to_message
+    message = _make_command_message(
+        chat_id=COMMUNITY_CHAT_ID,
+        user_id=_random_user_id(),
+        reply_to_message_id=None,  # explicit: no reply
+    )
+    mock_create_event = AsyncMock()
+    session = AsyncMock()
+
+    monkeypatch.setattr(handler.ForgetEventRepo, "create", mock_create_event)
+
+    asyncio.run(handler.handle_forget(message, session))
+
+    # Must respond with a usage hint
+    message.answer.assert_awaited_once()
+    reply_text = message.answer.call_args[0][0]
+    assert "as a reply" in reply_text.lower(), (
+        f"Expected usage hint containing 'as a reply', got: {reply_text!r}"
+    )
+    # Must NOT create a forget event
+    mock_create_event.assert_not_awaited()
+
+
+# ─── Test 7: replied-to message not in DB → silent return ─────────────────────
+
+
+def test_forget_replied_to_unknown_message_silent(app_env, monkeypatch, caplog) -> None:
+    """/forget on a message not in chat_messages → no event, no reply, warn log emitted."""
+    import logging
+
+    handler = import_module("bot.handlers.forget_reply")
+
+    user_id = _random_user_id()
+    replied_msg_id = _random_message_id()
+
+    message = _make_command_message(
+        chat_id=COMMUNITY_CHAT_ID,
+        user_id=user_id,
+        reply_to_message_id=replied_msg_id,
+    )
+
+    # Known requester (registered user, is author if message existed)
+    requester_user = _make_user_row(tg_id=user_id, is_admin=False, is_member=True)
+    # _find_chat_message returns None → message not found in DB
+    mock_find_chat_msg = AsyncMock(return_value=None)
+    mock_create_event = AsyncMock()
+    session = AsyncMock()
+
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=requester_user))
+    monkeypatch.setattr(handler, "_find_chat_message", mock_find_chat_msg)
+    monkeypatch.setattr(handler.ForgetEventRepo, "create", mock_create_event)
+
+    with caplog.at_level(logging.WARNING, logger="bot.handlers.forget_reply"):
+        asyncio.run(handler.handle_forget(message, session))
+
+    # Silent: no reply to the user
+    message.answer.assert_not_awaited()
+    # No event created
+    mock_create_event.assert_not_awaited()
+    # Warning must be logged
+    assert any("chat_messages" in r.message or "no chat_messages" in r.message or "skipping" in r.message
+               for r in caplog.records), (
+        f"Expected a warning log mentioning missing chat_messages row, got: {[r.message for r in caplog.records]}"
+    )
+
+
+# ─── DB-backed tests ──────────────────────────────────────────────────────────
+
+import itertools
+import random as _random
+
+_user_counter_fr = itertools.count(start=9_200_000_000)
+
+
+def _next_user_id_fr() -> int:
+    return next(_user_counter_fr)
+
+
+async def _make_db_user_fr(db_session, *, is_admin: bool = False) -> int:
+    """Insert a user row and return its telegram_id (== users.id)."""
+    from bot.db.repos.user import UserRepo
+
+    uid = _next_user_id_fr()
+    user = await UserRepo.upsert(
+        db_session,
+        telegram_id=uid,
+        username=f"u{uid}",
+        first_name="Test",
+        last_name=None,
+    )
+    if is_admin:
+        from sqlalchemy import update as sa_update
+        from bot.db.models import User
+        await db_session.execute(
+            sa_update(User).where(User.id == uid).values(is_admin=True)
+        )
+        await db_session.flush()
+    return uid
+
+
+async def _make_db_chat_message(db_session, *, user_id: int, chat_id: int) -> "ChatMessage":
+    """Insert a minimal chat_messages row and return the ORM object."""
+    from datetime import datetime, timezone
+    from bot.db.models import ChatMessage
+
+    msg = ChatMessage(
+        message_id=_random.randint(10_000_000, 99_999_999),
+        chat_id=chat_id,
+        user_id=user_id,
+        text="hello world",
+        date=datetime.now(timezone.utc),
+    )
+    db_session.add(msg)
+    await db_session.flush()
+    return msg
+
+
+async def test_forget_db_own_message_creates_real_event_row(db_session) -> None:
+    """DB-backed: author calls /forget → forget_events row has correct fields."""
+    from sqlalchemy import func, select
+    from bot.db.models import ForgetEvent
+    from bot.config import settings
+
+    handler = import_module("bot.handlers.forget_reply")
+
+    chat_id = settings.COMMUNITY_CHAT_ID
+    user_tg_id = await _make_db_user_fr(db_session)
+    chat_msg = await _make_db_chat_message(db_session, user_id=user_tg_id, chat_id=chat_id)
+
+    # Build a minimal message simulating /forget as reply to chat_msg
+    message = _make_command_message(
+        chat_id=chat_id,
+        user_id=user_tg_id,
+        reply_to_message_id=chat_msg.message_id,
+    )
+
+    await handler.handle_forget(message, db_session)
+
+    tombstone_key = f"message:{chat_id}:{chat_msg.message_id}"
+    count = await db_session.scalar(
+        select(func.count(ForgetEvent.id)).where(
+            ForgetEvent.tombstone_key == tombstone_key
+        )
+    )
+    assert count == 1, f"Expected 1 forget_events row, got {count}"
+
+    ev = await db_session.scalar(
+        select(ForgetEvent).where(ForgetEvent.tombstone_key == tombstone_key)
+    )
+    assert ev.authorized_by == "self"
+    assert ev.target_type == "message"
+    assert ev.target_id == str(chat_msg.id)
+
+
+async def test_forget_db_admin_creates_real_event_row(db_session) -> None:
+    """DB-backed: admin /forget on another user's message → event has authorized_by='admin'."""
+    from sqlalchemy import func, select
+    from bot.db.models import ForgetEvent
+    from bot.config import settings
+
+    handler = import_module("bot.handlers.forget_reply")
+
+    chat_id = settings.COMMUNITY_CHAT_ID
+    author_tg_id = await _make_db_user_fr(db_session)
+    admin_tg_id = await _make_db_user_fr(db_session, is_admin=True)
+    chat_msg = await _make_db_chat_message(db_session, user_id=author_tg_id, chat_id=chat_id)
+
+    # Admin issues /forget on author's message
+    message = _make_command_message(
+        chat_id=chat_id,
+        user_id=admin_tg_id,
+        reply_to_message_id=chat_msg.message_id,
+    )
+
+    await handler.handle_forget(message, db_session)
+
+    tombstone_key = f"message:{chat_id}:{chat_msg.message_id}"
+    count = await db_session.scalar(
+        select(func.count(ForgetEvent.id)).where(
+            ForgetEvent.tombstone_key == tombstone_key
+        )
+    )
+    assert count == 1, f"Expected 1 forget_events row, got {count}"
+
+    ev = await db_session.scalar(
+        select(ForgetEvent).where(ForgetEvent.tombstone_key == tombstone_key)
+    )
+    assert ev.authorized_by == "admin"
+    assert ev.actor_user_id == admin_tg_id
+    assert ev.target_id == str(chat_msg.id)
+
+
+async def test_forget_db_idempotent_no_duplicate_row(db_session) -> None:
+    """DB-backed: two /forget calls → COUNT(forget_events WHERE tombstone_key=...) == 1."""
+    from sqlalchemy import func, select
+    from bot.db.models import ForgetEvent
+    from bot.config import settings
+
+    handler = import_module("bot.handlers.forget_reply")
+
+    chat_id = settings.COMMUNITY_CHAT_ID
+    user_tg_id = await _make_db_user_fr(db_session)
+    chat_msg = await _make_db_chat_message(db_session, user_id=user_tg_id, chat_id=chat_id)
+
+    message = _make_command_message(
+        chat_id=chat_id,
+        user_id=user_tg_id,
+        reply_to_message_id=chat_msg.message_id,
+    )
+
+    await handler.handle_forget(message, db_session)
+    await handler.handle_forget(message, db_session)
+
+    tombstone_key = f"message:{chat_id}:{chat_msg.message_id}"
+    count = await db_session.scalar(
+        select(func.count(ForgetEvent.id)).where(
+            ForgetEvent.tombstone_key == tombstone_key
+        )
+    )
+    assert count == 1, f"Expected 1 forget_events row after two calls, got {count}"
+
+    # Both calls return the same event id (idempotency)
+    ev = await db_session.scalar(
+        select(ForgetEvent).where(ForgetEvent.tombstone_key == tombstone_key)
+    )
+    assert ev is not None

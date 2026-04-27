@@ -42,12 +42,23 @@ async def _find_chat_message(
     chat_id: int,
     message_id: int,
 ) -> ChatMessage | None:
-    """Return the ``chat_messages`` row for ``(chat_id, message_id)``, or None."""
+    """Return the ``chat_messages`` row for ``(chat_id, message_id)``, or None.
+
+    Uses ``SELECT ... FOR UPDATE`` to acquire a row-level lock for the duration of the
+    transaction. This closes the authz→tombstone TOCTOU window: without the lock, two
+    concurrent /forget handlers could both read the authz check, then one writes the
+    tombstone *after* the other has completed — the lock ensures the authz read and the
+    ForgetEventRepo.create write are serialized within the same transaction.
+    (Note: the earlier "race-safe via ON CONFLICT" rationale addressed the duplicate-key
+    insert race inside the repo, NOT the authz read race at the handler level.)
+    """
     result = await session.execute(
-        select(ChatMessage).where(
+        select(ChatMessage)
+        .where(
             ChatMessage.chat_id == chat_id,
             ChatMessage.message_id == message_id,
         )
+        .with_for_update()
     )
     return result.scalar_one_or_none()
 
