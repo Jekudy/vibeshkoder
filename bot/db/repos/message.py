@@ -33,6 +33,8 @@ class MessageRepo:
         caption: str | None = None,
         message_kind: str | None = None,
         raw_update_id: int | None = None,
+        memory_policy: str | None = None,
+        is_redacted: bool | None = None,
     ) -> ChatMessage:
         """Idempotent save: returns the existing row on duplicate ``(chat_id, message_id)``.
 
@@ -66,6 +68,10 @@ class MessageRepo:
             values["message_kind"] = message_kind
         if raw_update_id is not None:
             values["raw_update_id"] = raw_update_id
+        if memory_policy is not None:
+            values["memory_policy"] = memory_policy
+        if is_redacted is not None:
+            values["is_redacted"] = is_redacted
 
         stmt = (
             pg_insert(ChatMessage)

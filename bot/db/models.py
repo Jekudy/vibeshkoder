@@ -266,6 +266,82 @@ class MessageVersion(Base):
     )
 
 
+class OffrecordMark(Base):
+    """Audit row for a ``#nomem`` / ``#offrecord`` detection (T1-13).
+
+    Created by the chat_messages handler (and future import / admin paths) whenever
+    ``governance.detect_policy`` returns a non-normal policy. The row records WHO
+    triggered the mark, WHAT mark, WHERE in the data model, HOW it was detected and
+    WHEN. Status lifecycle: active → expired | revoked. Phase 3 admin actions add
+    revoke flows.
+
+    Cascades:
+    - chat_message_id → chat_messages.id ON DELETE CASCADE: forget cascade wipes the
+      message and its mark together
+    - set_by_user_id → users.id ON DELETE SET NULL: keep the audit row even if the
+      user record is later anonymized (forget_me)
+    """
+
+    __tablename__ = "offrecord_marks"
+    __table_args__ = (
+        CheckConstraint(
+            "mark_type IN ('nomem','offrecord')",
+            name="ck_offrecord_marks_mark_type",
+        ),
+        CheckConstraint(
+            "scope_type IN ('message','thread','chat')",
+            name="ck_offrecord_marks_scope_type",
+        ),
+        CheckConstraint(
+            "status IN ('active','expired','revoked')",
+            name="ck_offrecord_marks_status",
+        ),
+        Index(
+            "ix_offrecord_marks_mark_type_status", "mark_type", "status"
+        ),
+        Index(
+            "ix_offrecord_marks_chat_message_id", "chat_message_id"
+        ),
+        Index("ix_offrecord_marks_scope", "scope_type", "scope_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mark_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    chat_message_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey(
+            "chat_messages.id",
+            name="fk_offrecord_marks_chat_message_id",
+            ondelete="CASCADE",
+        ),
+        nullable=True,
+    )
+    thread_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    set_by_user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "users.id",
+            name="fk_offrecord_marks_set_by_user_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    detected_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="active", server_default="active"
+    )
+
+
 class IntroRefreshTracking(Base):
     __tablename__ = "intro_refresh_tracking"
 

@@ -45,10 +45,11 @@ def test_save_chat_message_does_not_auto_mark_member(app_env, monkeypatch) -> No
         last_name="Example",
     )
     user_set_member.assert_not_called()
-    # T1-09/10/11 added normalized kwargs to MessageRepo.save. The handler now
-    # extracts reply / thread / caption / message_kind via
-    # bot/services/normalization.py and passes them through. SimpleNamespace
-    # without those attributes makes them resolve to None / 'text'.
+    # T1-09/10/11 added normalized kwargs to MessageRepo.save. T1-12 added
+    # memory_policy + is_redacted (the handler now calls detect_policy on every
+    # message; for plain text 'hello from chat' the policy is 'normal',
+    # is_redacted=False). SimpleNamespace without media/reply attrs resolves
+    # extras to None / 'text'.
     message_save.assert_awaited_once_with(
         session,
         message_id=101,
@@ -61,4 +62,6 @@ def test_save_chat_message_does_not_auto_mark_member(app_env, monkeypatch) -> No
         message_thread_id=None,
         caption=None,
         message_kind="text",
+        memory_policy="normal",
+        is_redacted=False,
     )
