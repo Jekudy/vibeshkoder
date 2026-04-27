@@ -206,3 +206,130 @@ def test_redact_does_not_mutate_input(app_env) -> None:
     original_text = raw["message"]["text"]
     _ = redact_raw_for_offrecord(raw)
     assert raw["message"]["text"] == original_text
+
+
+# ─── redact: channel_post / edited_channel_post (Codex MEDIUM) ─────────────────────────────
+
+def test_redact_handles_channel_post(app_env) -> None:
+    from bot.services.governance import redact_raw_for_offrecord
+
+    raw = {
+        "update_id": 10,
+        "channel_post": {
+            "message_id": 50,
+            "text": "channel secret",
+            "caption": "channel cap",
+            "entities": [{"type": "bold"}],
+            "chat": {"id": -100, "type": "channel"},
+        },
+    }
+    redacted = redact_raw_for_offrecord(raw)
+    msg = redacted["channel_post"]
+    assert "text" not in msg
+    assert "caption" not in msg
+    assert "entities" not in msg
+    assert msg["message_id"] == 50
+    assert msg["chat"] == {"id": -100, "type": "channel"}
+
+
+def test_redact_handles_edited_channel_post(app_env) -> None:
+    from bot.services.governance import redact_raw_for_offrecord
+
+    raw = {
+        "update_id": 11,
+        "edited_channel_post": {
+            "message_id": 51,
+            "text": "channel edit secret",
+            "caption_entities": [{"type": "italic"}],
+        },
+    }
+    redacted = redact_raw_for_offrecord(raw)
+    msg = redacted["edited_channel_post"]
+    assert "text" not in msg
+    assert "caption_entities" not in msg
+    assert msg["message_id"] == 51
+
+
+# ─── redact: nested message-shaped fields (Codex HIGH — reply_to_message leak) ─────────────
+
+def test_redact_scrubs_reply_to_message_content(app_env) -> None:
+    """Codex HIGH: shallow-copy redactor leaked parent content via reply_to_message.
+    Telegram echoes parent text/caption inline; we must scrub the same content fields
+    from reply_to_message too."""
+    from bot.services.governance import redact_raw_for_offrecord
+
+    raw = {
+        "update_id": 20,
+        "message": {
+            "message_id": 100,
+            "text": "child #offrecord",
+            "reply_to_message": {
+                "message_id": 99,
+                "text": "parent secret content",
+                "caption": "parent cap",
+                "entities": [{"type": "bold"}],
+                "from": {"id": 7},
+            },
+        },
+    }
+    redacted = redact_raw_for_offrecord(raw)
+    parent = redacted["message"]["reply_to_message"]
+    assert "text" not in parent, "parent text leaked through reply_to_message"
+    assert "caption" not in parent
+    assert "entities" not in parent
+    # Non-content fields survive on the nested message:
+    assert parent["message_id"] == 99
+    assert parent["from"] == {"id": 7}
+
+
+def test_redact_scrubs_nested_reply_chain(app_env) -> None:
+    """Reply-of-reply: scrubbing must recurse so nested reply_to_message.reply_to_message
+    is also content-stripped."""
+    from bot.services.governance import redact_raw_for_offrecord
+
+    raw = {
+        "message": {
+            "message_id": 3,
+            "text": "leaf",
+            "reply_to_message": {
+                "message_id": 2,
+                "text": "middle secret",
+                "reply_to_message": {
+                    "message_id": 1,
+                    "text": "root secret",
+                    "caption": "root cap",
+                },
+            },
+        },
+    }
+    redacted = redact_raw_for_offrecord(raw)
+    middle = redacted["message"]["reply_to_message"]
+    root = middle["reply_to_message"]
+    assert "text" not in middle
+    assert "text" not in root
+    assert "caption" not in root
+    assert root["message_id"] == 1
+
+
+def test_redact_scrubs_pinned_and_external_reply(app_env) -> None:
+    """pinned_message / external_reply also echo content snapshots → must be scrubbed."""
+    from bot.services.governance import redact_raw_for_offrecord
+
+    raw = {
+        "message": {
+            "message_id": 4,
+            "text": "child",
+            "pinned_message": {
+                "message_id": 1,
+                "text": "pinned secret",
+            },
+            "external_reply": {
+                "message_id": 99,
+                "caption": "external cap secret",
+            },
+        },
+    }
+    redacted = redact_raw_for_offrecord(raw)
+    assert "text" not in redacted["message"]["pinned_message"]
+    assert "caption" not in redacted["message"]["external_reply"]
+    assert redacted["message"]["pinned_message"]["message_id"] == 1
