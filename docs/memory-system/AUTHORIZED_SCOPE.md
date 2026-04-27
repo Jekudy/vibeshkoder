@@ -129,6 +129,40 @@ violation of the `#offrecord` rule.
 If you are picking up T1-04 in isolation: implement the stub. Do not skip it. Do not merge a
 T1-04 that writes raw_json without going through the (stub) detector path.
 
+### Known gap: `chat_messages.raw_json` and the `caption` column (T1-12 closes)
+
+The `#offrecord` ordering rule above governs the `telegram_updates` path. The
+`chat_messages` path (gatekeeper-era handler at `bot/handlers/chat_messages.py`) writes its
+own `raw_json` directly via `MessageRepo.save` and does NOT route through
+`bot.services.governance.detect_policy()`. Same for the `caption` column added in T1-05
+and populated by T1-09/10/11 normalization — it stores the caption verbatim with no
+redaction.
+
+**This gap is known and intentional in Phase 1.** T1-12 (the deterministic detector) MUST
+close BOTH paths in one go:
+
+1. The text path through `bot/services/ingestion.py` → `telegram_updates` (already wired
+   to call the stub detector; T1-12 swaps the stub).
+2. The text + caption path through `bot/handlers/chat_messages.py` →
+   `chat_messages.raw_json` + `chat_messages.caption`. T1-12 must extend the chat_messages
+   handler to call `detect_policy()` BEFORE the `MessageRepo.save` call and either redact
+   or skip persistence accordingly.
+
+Mitigation until T1-12 lands:
+- The `chat_messages` handler in T1-09/10/11 deliberately does NOT extend `raw_json` to
+  caption-only media messages. Captions are stored only in the `caption` column, and
+  `raw_json` is still populated only when text is present (matching the gatekeeper-era
+  behaviour).
+- The `caption` column is the new exposure introduced by T1-05/T1-11. Operators running
+  the bot in `#offrecord`-active chats accept that captions land in the DB unfiltered
+  until T1-12.
+- Search / q&a / extraction / catalog / wiki / graph / LLM features all remain disabled by
+  feature flag, so the unfiltered caption never reaches downstream consumers in this
+  cycle.
+
+T1-12's PR description MUST mention this gap and confirm both paths are now governance-
+filtered before merging.
+
 ---
 
 ## Telegram import rule (relevant if T2-01 is picked up)

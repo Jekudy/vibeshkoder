@@ -47,16 +47,19 @@ async def save_chat_message(
     # MessageRepo.save is idempotent on (chat_id, message_id) per T0-03 — duplicates
     # return the existing row instead of raising. No need for a try/except + rollback
     # that would also discard the UserRepo.upsert and set_member work above.
-    # T1-11 caption is now first-class — persist raw_json whenever there is content
-    # (text OR caption), not only when text is set.
     #
-    # TODO(T1-12): raw_json here includes caption verbatim. The #offrecord ordering
-    # rule from AUTHORIZED_SCOPE.md is currently enforced ONLY in the
-    # telegram_updates path via bot/services/ingestion.py — chat_messages.raw_json
-    # bypasses governance.detect_policy() entirely until T1-12 lands the real
-    # detector. This is the same gap that exists for the text path; T1-12 must close
-    # both. Until then, operators flipping memory.ingestion.raw_updates.enabled will
-    # also expose chat_messages.raw_json for any caption-bearing media messages.
+    # raw_json continues to be persisted ONLY when text is present (preserving the
+    # gatekeeper-era behaviour). Caption-only media messages get their content captured
+    # via the dedicated `caption` column (T1-05/T1-11) — that column is the
+    # authoritative store for caption content going forward. raw_json is intentionally
+    # NOT extended to caption-only paths in this PR because:
+    #   - chat_messages.raw_json sits OUTSIDE the #offrecord ordering rule (which
+    #     governs telegram_updates via bot/services/ingestion.py + governance stub)
+    #   - T1-12 (deterministic detector) is the right place to wire detect_policy
+    #     into the chat_messages path; widening raw_json here would extend the
+    #     governance gap to caption-bearing media messages with no compensating
+    #     redaction
+    # See AUTHORIZED_SCOPE.md §`#offrecord` ordering rule for the full constraint.
     await MessageRepo.save(
         session,
         message_id=message.message_id,
@@ -65,7 +68,7 @@ async def save_chat_message(
         text=message.text,
         date=message.date,
         raw_json=message.model_dump(mode="json", exclude_none=True)
-        if (message.text or message.caption)
+        if message.text
         else None,
         **normalized,
     )
