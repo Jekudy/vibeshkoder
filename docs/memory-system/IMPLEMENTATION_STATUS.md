@@ -52,19 +52,41 @@
 | T1-13  | offrecord_marks minimal table                               | merged         | Sprint 15 / PR #63 (combined T1-12+T1-13). Alembic migration `011_add_offrecord_marks` (renumbered from 009 after rebase — main merged 009/010 invite-outbox migrations in parallel) (id, mark_type non-null + check ('nomem','offrecord'), scope_type non-null + check ('message','thread','chat'), scope_id nullable, chat_message_id FK→chat_messages.id ON DELETE CASCADE, thread_id BigInt, set_by_user_id FK→users.id ON DELETE SET NULL, detected_by non-null, detected_at default now NOT NULL, expires_at, status default 'active' + check; 3 indexes). New `OffrecordMark` model + `OffrecordMarkRepo.create_for_message(chat_message_id, mark_type, detected_by, set_by_user_id, thread_id)` — flushes; no commit. Tests: 5 (4 DB-backed + 1 metadata smoke) covering active row creation, thread_id, invalid mark_type rejected, CASCADE on message delete, model registered. |
 | T1-14  | edited_message handler                                      | merged + hotfix | Sprint 16 / PR #75 (merged 2026-04-27). Hotfix PR #TBD addresses Codex Phase 1 final-review CRITICAL: `_apply_offrecord_flip` now also nulls text/caption/normalized_text/entities_json + sets is_redacted=True on every existing message_versions row of the parent (privacy invariant — without this, T1-07 backfilled v1 rows + any prior v(n+1) rows retained raw content after the offrecord flip). Final Phase 1 ticket. New `bot/handlers/edited_message.py` (Router, GroupChatFilter, COMMUNITY_CHAT_ID guard) handles `edited_message` Telegram updates: (a) hash-based idempotency via `compute_content_hash` (chv1) + `MessageVersionRepo.insert_version` keyed on (chat_message_id, content_hash) — unchanged content is no-op; (b) `detect_policy` runs BEFORE any DB content mutation (privacy ordering rule); (c) flip `normal→offrecord` retroactively nulls `chat_messages.text/caption/raw_json` + `is_redacted=True` + `memory_policy='offrecord'` + creates `offrecord_marks` row, all in same tx; (d) flip `offrecord→normal` updates `memory_policy='normal'` but content fields stay NULL (irreversibility doctrine — HANDOFF.md §10); (e) unknown prior message → log warning + return (no placeholder); (f) legacy v1 rows: runtime recompute chv1 from existing row's text/caption/kind before comparison (no migration). Adds `edited_message` to `bot/__main__.py::_ALLOWED_UPDATES` and registers router before `chat_messages` catch-all. **Process**: dual-team independent implementation (two parallel ag-developer agents in isolated worktrees) + Codex cross-team review → caught a privacy bug in Team A on offrecord→normal flip restoring text/caption to parent; final branch combines correct ordering + legacy hash from Team A with correct flip semantics + __main__.py wiring from Team B + a 10th test (`test_edit_offrecord_to_normal_does_not_write_text_caption_to_parent`) that captures the actual UPDATE statement values dict to assert the bug class is locked behind a regression test. 10/10 edited_message tests pass; 131 pass / 66 skip across full suite. Follow-up issues to log on merge: (i) re-confirmed offrecord edit does not create fresh `offrecord_marks` row (Claude MEDIUM-1, audit-trail asymmetry, complementary to #68), (ii) integration-style state-based test pairing the value-capture test with a real db_session assertion (Claude NIT-1, refactor-resilience). |
 
-## Phase 2a — Import dry-run (stretch)
+## Phase 2 — Importer (planned, all tickets logged as GitHub issues)
 
-| Ticket | Title                                                       | Status         | Notes |
-|--------|-------------------------------------------------------------|----------------|-------|
-| T2-01  | Telegram Desktop import dry-run parser                      | not started    | Stretch only. No apply. |
+Backlog logged after Phase 1 close. Ag-sa final audit produced the dependency DAG and
+identified 8 spec-defined tickets (T2-01..T2-03, T3-01..T3-05) plus 8 NEW tickets
+(T2-NEW-A..H) covering documentation, helpers, resume/checkpoint, rate limiting and
+rollback that the original spec left implicit.
 
-## Phase 3 — Governance (stretch skeleton)
+Critical path to "import apply ready": **#89 → T3-01 → T3-05 → T2-03**.
 
-| Ticket | Title                                                       | Status         | Notes |
-|--------|-------------------------------------------------------------|----------------|-------|
-| T3-01  | forget_events tombstone skeleton                            | not started    | Stretch. Required before T2-03 import apply (which is itself out of scope this cycle). |
+| Order | Issue | Ticket | Title                                                | Pri | Size | Deps |
+|-------|-------|--------|------------------------------------------------------|-----|------|------|
+| 1     | #91   | T2-NEW-A | Telegram Desktop export schema + fixtures          | P0  | M    | none |
+| 2     | #92   | T3-01    | forget_events table + repo                         | P0  | M    | T1-13 (done) |
+| 3     | #89   | (helper) | persist_message_with_policy() — Phase 2 prerequisite | P1 | M    | issues #67/#80/#81 |
+| 4     | #93   | T2-NEW-B | Import user mapping policy                         | P0  | M    | T2-NEW-A |
+| 5     | #94   | T2-01    | Import dry-run parser                              | P0  | M    | T1-02 (done), #91, #93 |
+| 6     | #95   | T3-02    | /forget reply command                              | P0  | M    | T3-01 |
+| 7     | #96   | T3-04    | Cascade worker skeleton                            | P0  | L    | T3-01 |
+| 8     | #97   | T3-05    | Reimport tombstone prevention                      | P0  | M    | T3-01, T2-01 |
+| 9     | #98   | T2-NEW-C | Reply resolver service                             | P1  | M    | T2-01 |
+| 10    | #99   | T2-02    | Dry-run duplicate / policy stats                   | P1  | M    | T2-01, T1-12 (done), T2-NEW-C |
+| 11    | #100  | T2-NEW-D | Tombstone collision dry-run report                 | P1  | S    | T2-02, T3-01 |
+| 12    | #101  | T2-NEW-E | Apply checkpoint / resume                          | P0  | M    | T2-01 |
+| 13    | #102  | T2-NEW-F | Apply rate limit + chunking                        | P1  | S    | T2-NEW-E |
+| 14    | #103  | T2-03    | Import apply with synthetic updates                | P1  | XL   | many (see issue) |
+| 15    | #104  | T2-NEW-G | Logical rollback per ingestion_run                 | P1  | M    | T2-03 |
+| 16    | #105  | T3-03    | /forget_me skeleton                                | P1  | L    | T3-01 |
+| 17    | #106  | T2-NEW-H | Edit history policy doc                            | P2  | S    | T2-NEW-A |
 
-## Phases 2b, 4–12
+Three parallel tracks possible from day 1 (no shared deps):
+- Track A: #89 helper (unblocks downstream)
+- Track B: #91 schema doc → #93 user mapping → #94 parser
+- Track C: #92 forget_events → #95/#96/#97/#105 (all parallel after #92)
+
+## Phases 4–12
 
 Not started. Not authorized. See `AUTHORIZED_SCOPE.md` for gating rules.
 

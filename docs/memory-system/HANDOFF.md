@@ -997,6 +997,19 @@ Tombstone keys (multiple matching where possible):
 FTS / search materialized rows if present. Later: vectors, events, observations, candidates,
 cards, summaries, digests, graph, wiki rendered pages, eval cases.
 
+### Phase 2 risk map (added after Phase 1 final ag-sa audit)
+
+These risks are unique to the importer + tombstone phase and should drive the test design
+and review checklist for the corresponding tickets. Numbering matches the ag-sa audit.
+
+| Risk | Severity | Mitigation | Tracking |
+|------|----------|-----------|---------|
+| R1: Resurrection via re-import — operator forgets a message, later re-runs an old export, T3-05 misses → forgotten content returns. | HIGH | Tombstones immortal (no TTL); T3-05 always-on (no feature flag); test re-import after delayed forget. | T3-05 (issue #97) |
+| R2: User identity collision — ghost users (deleted Telegram accounts) merged with live users by display_name match → cross-user privacy leak. | HIGH | Ghost users tagged `is_imported_only=true`, NEVER merged with live users; explicit policy in T2-NEW-B. | T2-NEW-B (issue #93) |
+| R3: Lock contention live ↔ import — bulk INSERTs in import block live ingestion. | MEDIUM | Chunking + sleep between chunks (T2-NEW-F); optional advisory lock per ingestion_run_id. | T2-NEW-F (issue #102) |
+| R4: Silent governance bypass in importer — implementer skips `detect_policy` on "old" historical data → `#offrecord` from history lands in raw without redaction. | HIGH | Cross-cutting binding rule: import apply MUST call `persist_message_with_policy()` (issue #89). Direct INSERT into `chat_messages` forbidden — enforced by reviewer checklist. | T2-03 (issue #103) + #89 |
+| R5: Reply chain partial truth — incomplete export → `reply_to_message_id` points at missing parent, Phase 4 q&a evidence shows `reply to [missing]`. | MEDIUM | Reply resolver returns NULL on unresolved (T2-NEW-C); downstream filters; report % broken in dry-run (T2-02). | T2-NEW-C (issue #98), T2-02 (#99) |
+
 ---
 
 ## §11. Test strategy and quality gates
