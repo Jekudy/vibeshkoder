@@ -66,6 +66,12 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
    Read BEFORE implementing #103 import apply. Defines: `message_versions.imported_final=TRUE`
    marker, version_seq overlap semantics (live wins; import skips when live row exists),
    governance unchanged (`detect_policy` still runs). Schema/migration land in #103.
+8. `docs/memory-system/import-user-mapping.md` — Telegram Desktop import user-mapping policy.
+   Read BEFORE touching any code under `bot/services/import_*` that reads `from_id` / writes
+   `users` rows. Defines: known-user resolution, ghost-user creation with `is_imported_only=true`
+   flag, anonymous channel singleton, privacy R2 (imports cannot promote themselves to live;
+   only the gatekeeper live-registration path flips ghost→live by clearing `is_imported_only`),
+   display_name first-write-wins, attribution semantics under live/import overlap.
 
 Issue tracker for memory cycle: **GitHub Issues** (label `phase:0`, `phase:1`, etc.). The
 `nt` (Notion) plugin remains the tracker for non-memory work in this repo if any.
