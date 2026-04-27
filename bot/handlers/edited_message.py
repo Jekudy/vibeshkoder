@@ -94,12 +94,22 @@ async def _find_chat_message(
     chat_id: int,
     message_id: int,
 ) -> ChatMessage | None:
-    """Return the ``chat_messages`` row for ``(chat_id, message_id)``, or None."""
+    """Return the ``chat_messages`` row for ``(chat_id, message_id)``, or None.
+
+    Uses ``SELECT ... FOR UPDATE`` to acquire a row-level lock for the duration of the
+    transaction. This prevents a TOCTOU race where two concurrent edit handlers (asyncio
+    tasks within the same single-instance bot, or two delivery attempts) could both read
+    ``memory_policy='normal'`` and one of them then writes ``text/caption`` *after* the
+    other has flipped to ``offrecord``. Without the lock, the privacy invariant relies on
+    a single-transaction guarantee that does not hold across two transactions.
+    """
     result = await session.execute(
-        select(ChatMessage).where(
+        select(ChatMessage)
+        .where(
             ChatMessage.chat_id == chat_id,
             ChatMessage.message_id == message_id,
         )
+        .with_for_update()
     )
     return result.scalar_one_or_none()
 
@@ -259,23 +269,39 @@ async def handle_edited_message(
         entities=None,  # existing row doesn't store normalized entities in chat_messages
     )
 
-    # For the comparison against existing version: look up by the new_hash first.
-    # If found → same content hash already stored → no new version.
-    # If not found → check if the content is really different by comparing against
-    # the chv1 recomputed from existing row (covers legacy hash case).
-    existing_version = await MessageVersionRepo.get_by_hash(session, existing.id, new_hash)
+    # PRIVACY (Codex review HIGH): for offrecord versions we MUST NOT store the chv1 of
+    # the un-redacted edit content as ``content_hash`` in ``message_versions``. Doing so
+    # would let anyone with read access to the audit table verify "was content X said?"
+    # by computing chv1(X) and grep'ing the column. Phase 1 invariant requires that
+    # offrecord content fingerprints are NOT durably stored.
+    #
+    # Fix: when ``new_policy == "offrecord"``, both the lookup hash and the stored
+    # ``content_hash`` are computed from the redacted state (None text, None caption,
+    # message_kind, None entities) instead of the raw edit content. This means:
+    # - Re-confirmation edits of an already-offrecord row produce the same redacted-state
+    #   hash → ``get_by_hash`` returns existing version → no duplicate row inserted.
+    # - normal→offrecord flip: existing row's text was nulled in ``_apply_offrecord_flip``
+    #   above, so ``existing_chv1`` (computed from the now-null parent row) ALSO equals
+    #   the redacted-state hash → idempotency holds and no duplicate version row is
+    #   created. Note this means we do NOT insert a fresh v(n+1) on the flip itself —
+    #   the parent row's policy/is_redacted/memory_policy fields carry the state change.
+    #   ``offrecord_marks`` is the audit timeline for this transition.
+    is_redacted_version = new_policy == "offrecord"
+    if is_redacted_version:
+        hash_to_check = compute_content_hash(
+            text=None, caption=None, message_kind=message_kind, entities=None
+        )
+    else:
+        hash_to_check = new_hash
+
+    existing_version = await MessageVersionRepo.get_by_hash(session, existing.id, hash_to_check)
     if existing_version is not None:
-        # Hash already in DB — no-op (unchanged content or duplicate edit).
         return
 
-    # If new_hash == existing_chv1 of the current row's content, content is unchanged
-    # even though the stored hash in message_versions may be a legacy pre-chv1 hash.
-    if new_hash == existing_chv1:
+    if hash_to_check == existing_chv1:
         return
 
     # Content changed — insert new version v(n+1).
-    # For offrecord flips: version is_redacted=True, content fields null in version too.
-    is_redacted_version = new_policy == "offrecord"
     version_text = None if is_redacted_version else text
     version_caption = None if is_redacted_version else caption
 
@@ -283,15 +309,10 @@ async def handle_edited_message(
     if not is_redacted_version:
         entities_json = _build_entities_json(message)
 
-    # Note (Claude review MEDIUM-2): for redacted versions we still pass ``new_hash`` —
-    # the chv1 of the *un-redacted* edit content — even though the stored ``text``/
-    # ``caption`` columns are NULL. This is intentional: the hash anchors a stable
-    # citation key per content state. Two redacted version rows can share NULL columns
-    # but differ in ``content_hash``; that is a feature, not an inconsistency.
     new_version = await MessageVersionRepo.insert_version(
         session,
         chat_message_id=existing.id,
-        content_hash=new_hash,
+        content_hash=hash_to_check,
         text=version_text,
         caption=version_caption,
         normalized_text=version_text,

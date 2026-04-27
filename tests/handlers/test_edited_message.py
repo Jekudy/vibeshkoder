@@ -283,14 +283,17 @@ def test_edit_normal_to_offrecord_flip_zero_out(app_env, monkeypatch) -> None:
 
     asyncio.run(handler.handle_edited_message(message, session))
 
-    # _apply_offrecord_flip must have been called (BLOCKER #1)
+    # _apply_offrecord_flip must have been called (BLOCKER #1) — this is the audit
+    # trail: parent row content nulled + offrecord_marks row created.
     mock_apply_flip.assert_awaited_once()
-    # The new version must be marked as redacted
-    mock_insert_version.assert_awaited_once()
-    insert_kwargs = mock_insert_version.call_args.kwargs
-    assert insert_kwargs["is_redacted"] is True
-    assert insert_kwargs["text"] is None
-    assert insert_kwargs["caption"] is None
+
+    # Codex HIGH (privacy): on normal→offrecord flip the version row is NOT inserted —
+    # both the parent row's now-null content and the redacted-state lookup hash collapse
+    # to the same redacted-state chv1, so insert_version's idempotency path returns early.
+    # The state change is captured by the parent row update + offrecord_marks audit row.
+    # Storing a fresh version row here would either fingerprint the raw content (privacy
+    # leak Codex flagged) or be a redundant no-op row (no information gain).
+    mock_insert_version.assert_not_awaited()
 
 
 # ─── Test 4: offrecord → normal flip: no content restoration ─────────────────
