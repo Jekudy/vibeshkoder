@@ -42,12 +42,20 @@ async def check_vouch_deadlines(bot: Bot) -> None:
             session, settings.VOUCH_TIMEOUT_HOURS
         )
         for app in apps_to_reject:
-            await ApplicationRepo.update_status(
+            rejected = await ApplicationRepo.update_status_if(
                 session,
                 app.id,
-                "rejected",
+                expected_from="pending",
+                new_status="rejected",
                 rejected_at=datetime.now(timezone.utc),
             )
+            if not rejected:
+                logger.info(
+                    "Skipping auto-reject for app %s — status changed since SELECT",
+                    app.id,
+                )
+                continue
+
             # Delete questionnaire message from chat
             if app.questionnaire_message_id:
                 try:
