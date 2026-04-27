@@ -53,11 +53,11 @@ def upgrade() -> None:
         return
 
     bind = op.get_bind()
-    op.execute(DUPLICATE_PENDING_COUNT_SQL)
     duplicate_count = bind.execute(
         sa.text(DUPLICATE_PENDING_COUNT_SQL)
     ).scalar_one()
-    logger.warning(
+    log_fn = logger.warning if duplicate_count > 0 else logger.info
+    log_fn(
         "invite_outbox pending duplicate rows to delete before unique index: %s",
         duplicate_count,
     )
