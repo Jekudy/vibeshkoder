@@ -27,6 +27,8 @@ Single-admin invite-only Telegram + web bot. **Real attack history** в прое
 | A8 | DB content (applications, vouch_log, intros, chat_messages) | High | Все assets выше в одном месте + audit trail |
 | A9 | GHCR PAT | Medium | Pull токен — read access к private images. Не write. |
 | A10 | Founder's Mac | Critical (meta-asset) | На нём всё перечисленное выше — single point of compromise |
+| A11 | Tailscale account / coordination plane | Critical | Единственный ingress path к VPS после Round 2. Suspension / control plane outage = total ops loss; no break-glass (MID-28) |
+| A12 | CI / GitHub repo / release.yml | High | Compromise = malicious image published to GHCR + auto-deployed via Coolify. Trust boundary 7 below |
 
 ---
 
@@ -38,10 +40,13 @@ Single-admin invite-only Telegram + web bot. **Real attack history** в прое
 | T2 | Malicious applicant | Submit questionnaire, send chat msgs, social engineering members | Get access to community without vouch | Medium |
 | T3 | Compromised member | Has valid invite, can forward, can vouch | Внести non-vetted user; PII leak | Low-medium |
 | T4 | Lost / stolen laptop | Physical access to founder's Mac (encrypted at rest) | Random theft → opportunistic credential abuse | Low (physical) |
-| T5 | Targeted compromise of founder's Mac | Phishing, malware, supply chain | Targeted takeover (community is small but has reputation value) | Low-medium |
+| T5 | Targeted compromise of founder's Mac | Phishing, malware | Targeted takeover (community is small but has reputation value) | Low-medium |
 | **T6** | **Operator-induced leak** (founder OR AI agent committing/saving secret in plaintext) | Internal mistake | Inadvertent disclosure | **High (3 incidents in 4 days history)** |
 | **T7** | **Operator process failure** (false DONE, silent regression, unverified fix) | Internal mistake | Bug ships to prod, undetected | **High (23 errors in session 75567d36)** |
 | T8 | Memory team agent collision | Parallel cycle on same files | Silent regression of security fix | Medium (3 known collision points) |
+| T9 | Supply-chain attacker | Malicious PyPI package, GHCR registry compromise, dependency typosquat | Persistence on VPS via build-time injection | Low (no observed) — partial mitigation via H7 trivy + lock file |
+| T10 | Insider / ex-member sabotage | Has community access, can leak intros publicly, can spam | Personal grudge after vouch fight, breakup-style fallout | Low (gипотеза, не наблюдалось) — not yet ranked, monitor if community grows |
+| T11 | Tailscale control plane outage / account suspension | External provider failure | n/a (not an attacker, ops resilience) | Low — but blast radius high (no break-glass, see MID-28) |
 
 ---
 
@@ -68,8 +73,20 @@ Single-admin invite-only Telegram + web bot. **Real attack history** в прое
     effects]    ←── Trust boundary 5: outbox pattern, idempotent send
 
 [Operator (founder)] ──→ Trust boundary 6: secret storage, identity split,
-                          audit trail на secret writes
+                          audit trail на secret writes.
+                          Explicit sinks где исторически утекали секреты:
+                            - .handoffs/*.md (gitignored, syncs via iCloud)
+                            - memory/*.md (gitignored, feeds into AI context)
+                            - worklog entries (any file under memory/)
+                            - git stage / commit messages (gitleaks pre-commit
+                              требуется ДО staging, не только pre-push)
+                            - agent stdout / stderr in tasks/*.output
                           ↑↑↑ THIS IS WHERE WE ACTUALLY GET BREACHED
+
+[CI / GitHub Actions /
+ release.yml / GHCR] ──→ Trust boundary 7: signed commits required for main,
+                          immutable tag pin (sha) для prod, GHCR PAT scope
+                          minimal (read:packages only for pull). См. CRIT-06.
 ```
 
 **Inverted insight:** наша current defense покрывает T1-T5 хорошо (firewall, escape, hmac, etc.). T6-T7 — где история показывает реальные инциденты — практически без protection.
@@ -93,7 +110,7 @@ Single-admin invite-only Telegram + web bot. **Real attack history** в прое
 | **AC11** | **Plaintext secret в worklog/handoff (`memory/`, `.handoffs/`)** | **T6** | **redaction post-hoc + .gitignore** | **OPEN** — нет pre-commit/pre-write gate. История: 2 раза за 2 дня |
 | **AC12** | **False DONE / unverified fix через dual-review ritual** | **T7** | None systematic | **OPEN** — постмортем 75567d36 не починен |
 | AC13 | Stolen laptop = total takeover | T4, T5 | FileVault | **PARTIAL** — нет identity split (CRIT-06) |
-| AC14 | Tailscale account suspended | external | None | **OPEN** — нет break-glass (MID-28) |
+| AC14 | Tailscale account suspended / control plane outage | T11 | None | **OPEN** — нет break-glass (MID-28). Asset A11 |
 | AC15 | Trust boundary 5 bypass (Telegram side effect leaks DB rollback state) | T7 | None | **OPEN** (CRIT-02) |
 | AC16 | Memory team T0/T1 silent regression of W1/H2/N2 | T8 | None | **OPEN** (HIGH-16) |
 | AC17 | Lock file CVE freeze без regen process | T7 (forgetting) | None | **OPEN** (HIGH-14) |
@@ -118,10 +135,12 @@ Single-admin invite-only Telegram + web bot. **Real attack history** в прое
 
 ### Re-ranked что окажется LESS urgent после threat model
 
-- HIGH-15 (CI gates response runbook) — gates ловят T1, не доминирующие T6/T7. Defer.
-- HIGH-14 (dependabot) — supply chain угроза real, но T7 (operator forget) гораздо чаще. Сначала feedback loop (HIGH-12), потом dependabot.
-- MID-26 (Dockerfile hash pinning) — T1 mitigation, defer.
-- MID-31 (semgrep custom rules) — T1, defer.
+Defer обоснование везде: **no observed incident в этом проекте** + **lower immediate risk** чем AC11/AC12 (доминирующие). НЕ "T1-only" — T6/T7 имеют higher observed rate, поэтому идут первыми.
+
+- HIGH-15 (CI gates response runbook) — оборона процесса для T1/T9; реактивная процедура, без неё gates через 2 недели окажутся silenced. Defer пока T6/T7 не закрыты.
+- HIGH-14 (dependabot) — closure для T9 (supply chain). Real but без observed incident. Сначала feedback loop (HIGH-12), потом dependabot.
+- MID-26 (Dockerfile hash pinning) — T9 mitigation, defer (no observed).
+- MID-31 (semgrep custom rules) — T1/T2 hardening, defer (default rules дают baseline).
 
 ---
 
