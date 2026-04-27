@@ -64,6 +64,24 @@ class ApplicationRepo:
         await session.flush()
 
     @staticmethod
+    async def update_status_if(
+        session: AsyncSession,
+        app_id: int,
+        expected_from: str,
+        new_status: str,
+        **extra_fields,
+    ) -> bool:
+        """CAS update — returns True if matched and updated, False if no match."""
+        values: dict = {"status": new_status, **extra_fields}
+        result = await session.execute(
+            update(Application)
+            .where(Application.id == app_id, Application.status == expected_from)
+            .values(**values)
+        )
+        await session.flush()
+        return result.rowcount > 0
+
+    @staticmethod
     async def get_pending_older_than(
         session: AsyncSession, hours: int
     ) -> list[Application]:
