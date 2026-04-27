@@ -161,8 +161,12 @@ class ForgetEventRepo:
             return row
 
         # Either the id doesn't exist or the current status disallows the transition.
-        # Re-fetch to produce a precise error message.
-        actual = await session.get(ForgetEvent, forget_event_id)
+        # Re-fetch with populate_existing=True so identity-map cache (expire_on_commit=False
+        # in bot/db/engine.py) does not shadow the actual current DB status in the error
+        # message. Without this flag a stale cached row would mislead the caller.
+        actual = await session.get(
+            ForgetEvent, forget_event_id, populate_existing=True
+        )
         if actual is None:
             raise ValueError(f"ForgetEvent(id={forget_event_id}) not found")
         allowed_next = _ALLOWED_TRANSITIONS.get(actual.status, frozenset())
