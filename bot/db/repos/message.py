@@ -28,6 +28,11 @@ class MessageRepo:
         text: str | None,
         date: datetime,
         raw_json: dict | None = None,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+        caption: str | None = None,
+        message_kind: str | None = None,
+        raw_update_id: int | None = None,
     ) -> ChatMessage:
         """Idempotent save: returns the existing row on duplicate ``(chat_id, message_id)``.
 
@@ -37,17 +42,34 @@ class MessageRepo:
 
         Idempotency key: the unique index ``ix_chat_messages_chat_msg`` on
         ``(chat_id, message_id)`` (see ``bot/db/models.py`` ``ChatMessage.__table_args__``).
+
+        T1-09/10/11 normalized fields are accepted as optional kwargs. If omitted, they
+        default to None (rows from the gatekeeper-era code path keep their original
+        nullable shape; new code passes the full set extracted via
+        ``bot/services/normalization.py::extract_normalized_fields``).
         """
+        values: dict = {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "text": text,
+            "date": date,
+            "raw_json": raw_json,
+        }
+        if reply_to_message_id is not None:
+            values["reply_to_message_id"] = reply_to_message_id
+        if message_thread_id is not None:
+            values["message_thread_id"] = message_thread_id
+        if caption is not None:
+            values["caption"] = caption
+        if message_kind is not None:
+            values["message_kind"] = message_kind
+        if raw_update_id is not None:
+            values["raw_update_id"] = raw_update_id
+
         stmt = (
             pg_insert(ChatMessage)
-            .values(
-                message_id=message_id,
-                chat_id=chat_id,
-                user_id=user_id,
-                text=text,
-                date=date,
-                raw_json=raw_json,
-            )
+            .values(**values)
             .on_conflict_do_nothing(index_elements=["chat_id", "message_id"])
             .returning(ChatMessage)
         )

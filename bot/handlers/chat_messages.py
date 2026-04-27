@@ -10,6 +10,7 @@ from bot.config import settings
 from bot.db.repos.message import MessageRepo
 from bot.db.repos.user import UserRepo
 from bot.filters.chat_type import GroupChatFilter
+from bot.services.normalization import extract_normalized_fields
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +38,17 @@ async def save_chat_message(
         last_name=message.from_user.last_name,
     )
 
+    # T1-09/10/11: extract normalized fields (reply / thread / caption / kind) so
+    # captions and media-only messages are first-class content in the archive. Falls
+    # back to None for fields the message doesn't carry, preserving the legacy shape
+    # for plain-text messages.
+    normalized = extract_normalized_fields(message)
+
     # MessageRepo.save is idempotent on (chat_id, message_id) per T0-03 — duplicates
     # return the existing row instead of raising. No need for a try/except + rollback
     # that would also discard the UserRepo.upsert and set_member work above.
+    # T1-11 caption is now first-class — persist raw_json whenever there is content
+    # (text OR caption), not only when text is set.
     await MessageRepo.save(
         session,
         message_id=message.message_id,
@@ -48,6 +57,7 @@ async def save_chat_message(
         text=message.text,
         date=message.date,
         raw_json=message.model_dump(mode="json", exclude_none=True)
-        if message.text
+        if (message.text or message.caption)
         else None,
+        **normalized,
     )
