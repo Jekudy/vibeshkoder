@@ -58,8 +58,15 @@ import hashlib
 import json
 from typing import Any
 
-# Bump when the recipe changes (e.g. add new field, change default, change normalization).
-# Old hashes persist forever; new hashes use the new tag.
+# Bump ONLY when the recipe produces different output for the same logical content
+# (new field added, default changed, normalization changed). Pure code refactors that
+# preserve output (variable rename, comment tweaks, equivalent serialization) MUST NOT
+# bump the tag — bumping invalidates existing hashes and forces all live-ingested
+# versions to re-hash on next edit.
+#
+# Old hashes persist in the DB forever; new hashes use the new tag. Repo idempotency
+# keys on (chat_message_id, content_hash) so divergence creates new version rows
+# rather than colliding.
 HASH_FORMAT_VERSION = "chv1"
 
 
