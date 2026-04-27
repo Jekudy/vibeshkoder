@@ -57,7 +57,7 @@ async def backfill_v1_message_versions(
                 text=msg.text,
                 caption=msg.caption,
                 message_kind=msg.message_kind,
-                entities_json=None,
+                entities=None,
             )
             version = MessageVersion(
                 chat_message_id=msg.id,

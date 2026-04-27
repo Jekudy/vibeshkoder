@@ -89,7 +89,7 @@ def upgrade() -> None:
                 text=row.text,
                 caption=row.caption,
                 message_kind=row.message_kind,
-                entities_json=None,
+                entities=None,
             )
             inserted = bind.execute(
                 _INSERT_VERSION,

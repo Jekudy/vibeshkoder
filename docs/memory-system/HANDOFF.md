@@ -866,11 +866,33 @@ ON ONLY after T1-12 / T1-13 land AND the `#offrecord` ordering rule is verifiabl
 
 ### `content_hash` strategy
 
-Hash normalized tuple:
+T1-08 (commit f017be4) ratified the recipe with a format version tag and entity
+normalization. The canonical `chv1` payload is:
+
 ```
-text || caption || entities_json_normalized || message_kind
+[HASH_FORMAT_VERSION, text, caption, message_kind, normalized_entities]
 ```
-Do not hash volatile `raw_json` fields.
+
+Where:
+- `HASH_FORMAT_VERSION` = `"chv1"` (bumped on any recipe change that produces
+  different output for the same logical content)
+- `text` and `caption` default to `""` if `None`
+- `message_kind` defaults to `"text"` if `None`
+- `normalized_entities` is the entity list sorted by `(offset, length, type)`;
+  empty list and `None` are treated identically as `[]`
+
+Serialized via `json.dumps(..., sort_keys=True, separators=(",":"), ensure_ascii=False)`,
+SHA-256 hex.
+
+Do not hash volatile `raw_json` fields. The `compute_content_hash()` signature
+accepts ONLY the four canonical inputs; passing `date`, `message_id`, `raw_json`,
+`from_user`, etc. raises `TypeError`.
+
+T1-07 backfilled v1 rows persist with the legacy first-cut hashes (no version tag,
+no entity normalization). chv1 hashes apply to live-ingested versions only
+(T1-14+). Repo idempotency `(chat_message_id, content_hash)` is unaffected by the
+divergence — different recipes for the same logical content correctly produce
+distinct version rows.
 
 ### `raw_json` redaction strategy
 
