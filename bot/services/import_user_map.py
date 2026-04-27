@@ -21,11 +21,17 @@ Three mapping cases:
      ``docs/memory-system/import-user-mapping.md`` §3 for the cross-phase note.
 
 Privacy invariant (ag-sa risk R2):
-  Ghost users (``is_imported_only=True``) are NEVER merged with live users
-  (``is_imported_only=False``). If a row already exists with the requested ``tg_id``,
-  this service returns its ``id`` WITHOUT modifying ``is_imported_only``.  A live user
-  (``is_imported_only=False``) is returned as-is — it is NOT flipped to imported_only.
-  A ghost user is also returned as-is — it is NOT flipped back to live.
+  Ghost users (``is_imported_only=True``) are NEVER promoted to live status by the import
+  service. If a row already exists with the requested ``tg_id``, this service returns its
+  ``id`` WITHOUT modifying ``is_imported_only``. A live user (``is_imported_only=False``)
+  is returned as-is — it is NOT flipped to imported_only. A ghost user is also returned
+  as-is by the import path — it is NOT flipped back to live by imports.
+
+  Ghost-to-live transition: only ``UserRepo.upsert`` (the gatekeeper live-registration
+  path, called from ``bot/handlers/start.py``) can flip ``is_imported_only`` from True to
+  False. When a previously-imported ghost DMs the bot, ``UserRepo.upsert`` clears the flag
+  and overwrites name fields — the row becomes fully live. Historical imported messages
+  remain attributed to the same ``users.id`` (identity continuity).
 
 Display-name policy:
   Ghost user ``first_name`` (the display_name) is set on creation and NEVER overwritten
@@ -147,7 +153,12 @@ def _parse_export_id(export_id: str) -> tuple[str, int]:
     for prefix in ("user", "channel"):
         if export_id.startswith(prefix):
             tail = export_id[len(prefix):]
-            if not tail.lstrip("-").isdigit():
+            if tail.startswith("-"):
+                raise ValueError(
+                    f"negative export ids not allowed: {export_id!r} "
+                    f"(tail={tail!r})"
+                )
+            if not tail.isdigit():
                 raise ValueError(
                     f"non-numeric tail in export_id: {export_id!r} "
                     f"(tail={tail!r})"
