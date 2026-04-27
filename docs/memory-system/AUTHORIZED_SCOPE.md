@@ -129,30 +129,36 @@ violation of the `#offrecord` rule.
 If you are picking up T1-04 in isolation: implement the stub. Do not skip it. Do not merge a
 T1-04 that writes raw_json without going through the (stub) detector path.
 
-### Known gap: `chat_messages.raw_json` and the `caption` column (T1-12 closes)
+### Known gap: `chat_messages.raw_json` and the `caption` column (CLOSED in PR #63)
 
 **STATUS: CLOSED in PR #63 (T1-12 + T1-13 combined sprint).** Both paths now route through
-`detect_policy` before persistence, and offrecord content is nulled in the same transaction.
-The historical context below is preserved for future readers.
+`detect_policy` before persistence; offrecord content is nulled in the same transaction;
+`offrecord_marks` audit row is created in the same tx via `OffrecordMarkRepo.create_for_message`.
+The historical context below is preserved as a record of why the rule exists — DO NOT
+re-introduce a path that bypasses `detect_policy`.
 
-The `#offrecord` ordering rule above governs the `telegram_updates` path. The
-`chat_messages` path (gatekeeper-era handler at `bot/handlers/chat_messages.py`) writes its
-own `raw_json` directly via `MessageRepo.save` and does NOT route through
-`bot.services.governance.detect_policy()`. Same for the `caption` column added in T1-05
-and populated by T1-09/10/11 normalization — it stores the caption verbatim with no
+---
+
+**Historical context (pre-PR #63 state):**
+
+The `#offrecord` ordering rule above governed only the `telegram_updates` path. The
+`chat_messages` path (gatekeeper-era handler at `bot/handlers/chat_messages.py`) used to
+write its own `raw_json` directly via `MessageRepo.save` and did NOT route through
+`bot.services.governance.detect_policy()`. Same applied to the `caption` column added in
+T1-05 and populated by T1-09/10/11 normalization — it stored the caption verbatim with no
 redaction.
 
-**This gap is known and intentional in Phase 1.** T1-12 (the deterministic detector) MUST
+That gap was known and intentional in Phase 1, deferred until T1-12. T1-12 was required to
 close BOTH paths in one go:
 
 1. The text path through `bot/services/ingestion.py` → `telegram_updates` (already wired
-   to call the stub detector; T1-12 swaps the stub).
+   to call the stub detector; T1-12 swapped the stub for the real detector).
 2. The text + caption path through `bot/handlers/chat_messages.py` →
-   `chat_messages.raw_json` + `chat_messages.caption`. T1-12 must extend the chat_messages
+   `chat_messages.raw_json` + `chat_messages.caption`. T1-12 extended the chat_messages
    handler to call `detect_policy()` BEFORE the `MessageRepo.save` call and either redact
-   or skip persistence accordingly.
+   (for offrecord) or annotate (for nomem) accordingly.
 
-Mitigation until T1-12 lands:
+Mitigation that was in place until T1-12 landed:
 - The `chat_messages` handler in T1-09/10/11 deliberately does NOT extend `raw_json` to
   caption-only media messages. Captions are stored only in the `caption` column, and
   `raw_json` is still populated only when text is present (matching the gatekeeper-era
