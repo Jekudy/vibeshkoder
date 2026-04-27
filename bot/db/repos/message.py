@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -101,15 +101,35 @@ class MessageRepo:
         if wants_policy_update:
             # Build the SET clause with only the fields that were explicitly passed.
             # Immutable fields (ids, text, date, raw_json) are never updated on conflict.
+            #
+            # STICKY POLICY (Codex CRITICAL / Sprint #80 fixup):
+            # memory_policy and is_redacted are monotonically ratcheted toward more-restrictive
+            # values. A stale duplicate original delivery (e.g. Telegram polling glitch re-delivers
+            # a message after its #offrecord edit) must NOT downgrade an existing 'offrecord' row
+            # back to 'normal'. The CASE expressions below enforce this invariant atomically in SQL:
+            #
+            #   memory_policy: if the stored value is already 'offrecord', keep 'offrecord';
+            #                  otherwise adopt the incoming EXCLUDED.memory_policy.
+            #
+            #   is_redacted:   once True, stays True — OR semantics: existing OR incoming.
+            #                  A caller passing is_redacted=False cannot unflag a redacted row.
+            #
+            # Build the INSERT statement first so .excluded references are on the same object.
+            insrt = pg_insert(ChatMessage).values(**values)
             set_clause: dict = {}
             if memory_policy is not None:
-                set_clause["memory_policy"] = pg_insert(ChatMessage).excluded.memory_policy
+                set_clause["memory_policy"] = case(
+                    (ChatMessage.memory_policy == "offrecord", "offrecord"),
+                    else_=insrt.excluded.memory_policy,
+                )
             if is_redacted is not None:
-                set_clause["is_redacted"] = pg_insert(ChatMessage).excluded.is_redacted
+                set_clause["is_redacted"] = case(
+                    (ChatMessage.is_redacted.is_(True), True),
+                    else_=insrt.excluded.is_redacted,
+                )
 
             stmt = (
-                pg_insert(ChatMessage)
-                .values(**values)
+                insrt
                 .on_conflict_do_update(
                     index_elements=["chat_id", "message_id"],
                     set_=set_clause,
@@ -139,12 +159,13 @@ class MessageRepo:
         # Conflict path: the row already exists. The follow-up SELECT triggers SQLAlchemy's
         # autoflush, so no explicit flush is required here (and there is nothing to flush —
         # the conflict path made no mutation).
-        # #80: use SELECT ... FOR NO KEY UPDATE (key_share=False, update=True) to acquire
-        # a row-level lock for the duration of the transaction. This prevents a TOCTOU
-        # race where a concurrent transaction (e.g. an offrecord flip in edited_message.py)
-        # writes memory_policy AFTER this transaction has read 'normal' but before it has
-        # committed. FOR NO KEY UPDATE is lighter than full FOR UPDATE — it allows
-        # concurrent FK inserts from message_versions which share the same parent row.
+        # #80: use SELECT ... FOR UPDATE to acquire a row-level lock for the duration of
+        # the transaction. This prevents a TOCTOU race where a concurrent transaction
+        # (e.g. an offrecord flip in edited_message.py) writes memory_policy AFTER this
+        # transaction has read 'normal' but before it has committed.
+        # Note: with_for_update(key_share=False) in SQLAlchemy emits plain FOR UPDATE
+        # (not FOR NO KEY UPDATE). The key_share flag controls the shared variant only;
+        # the exclusive variant is always full FOR UPDATE regardless of key_share.
         existing = await session.execute(
             select(ChatMessage)
             .where(

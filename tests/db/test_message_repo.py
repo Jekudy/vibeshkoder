@@ -446,3 +446,153 @@ async def test_save_duplicate_with_only_policy_normal_does_not_unflip_redacted(
     assert second.memory_policy == "normal"
     # is_redacted must remain True — the caller did not declare it, so it must not flip back.
     assert second.is_redacted is True
+
+
+# ─── Codex CRITICAL: sticky policy regression tests (Sprint #80 fixup) ────────
+
+
+async def test_save_duplicate_with_normal_policy_does_not_downgrade_offrecord(
+    db_session,
+) -> None:
+    """Privacy invariant: once a row is 'offrecord' + is_redacted=True, a stale duplicate
+    original delivery (memory_policy='normal', is_redacted=False) MUST NOT downgrade either
+    field.
+
+    Reproduces the exact Codex CRITICAL race:
+    1. Row flipped to offrecord via edited_message handler.
+    2. Telegram polling glitch re-delivers original M with normal policy.
+    3. MessageRepo.save must NOT overwrite offrecord state with normal.
+    """
+    from bot.db.repos.message import MessageRepo
+
+    user_id = _random_user_id()
+    chat_id = _random_chat_id()
+    message_id = _random_message_id()
+    when = datetime.now(timezone.utc)
+
+    await _create_user(db_session, user_id)
+
+    # Step 1: insert as offrecord (simulates edited_message flip already happened).
+    await MessageRepo.save(
+        db_session,
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text=None,  # already redacted
+        date=when,
+        memory_policy="offrecord",
+        is_redacted=True,
+    )
+
+    # Step 2: stale duplicate original delivery with normal policy and is_redacted=False.
+    result = await MessageRepo.save(
+        db_session,
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text="original text before offrecord",
+        date=when,
+        memory_policy="normal",
+        is_redacted=False,
+    )
+
+    # Both fields must stay at their more-restrictive values.
+    assert result.memory_policy == "offrecord", (
+        f"PRIVACY VIOLATION: memory_policy downgraded from 'offrecord' to "
+        f"'{result.memory_policy}' by stale duplicate delivery"
+    )
+    assert result.is_redacted is True, (
+        "PRIVACY VIOLATION: is_redacted flipped back to False by stale duplicate delivery"
+    )
+
+
+async def test_save_duplicate_with_only_normal_policy_does_not_downgrade_offrecord(
+    db_session,
+) -> None:
+    """Variant: only memory_policy='normal' passed (no is_redacted kwarg).
+
+    Same stale-duplicate race but caller omits is_redacted entirely. The sticky CASE
+    expression for memory_policy must still keep 'offrecord'.
+    """
+    from bot.db.repos.message import MessageRepo
+
+    user_id = _random_user_id()
+    chat_id = _random_chat_id()
+    message_id = _random_message_id()
+    when = datetime.now(timezone.utc)
+
+    await _create_user(db_session, user_id)
+
+    # Insert as offrecord.
+    await MessageRepo.save(
+        db_session,
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text=None,
+        date=when,
+        memory_policy="offrecord",
+        is_redacted=True,
+    )
+
+    # Stale duplicate with only memory_policy='normal' — no is_redacted kwarg.
+    result = await MessageRepo.save(
+        db_session,
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text="stale text",
+        date=when,
+        memory_policy="normal",
+    )
+
+    assert result.memory_policy == "offrecord", (
+        f"PRIVACY VIOLATION: memory_policy='normal' stale duplicate downgraded offrecord row. "
+        f"Got memory_policy='{result.memory_policy}'"
+    )
+
+
+async def test_save_duplicate_only_is_redacted_false_does_not_unflag_redacted(
+    db_session,
+) -> None:
+    """Variant: only is_redacted=False passed (no memory_policy kwarg).
+
+    A caller passing only is_redacted=False must not be able to unflag a row that has
+    is_redacted=True. The sticky OR-semantics for is_redacted must prevent this.
+    """
+    from bot.db.repos.message import MessageRepo
+
+    user_id = _random_user_id()
+    chat_id = _random_chat_id()
+    message_id = _random_message_id()
+    when = datetime.now(timezone.utc)
+
+    await _create_user(db_session, user_id)
+
+    # Insert as is_redacted=True (any policy).
+    await MessageRepo.save(
+        db_session,
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text=None,
+        date=when,
+        memory_policy="offrecord",
+        is_redacted=True,
+    )
+
+    # Duplicate with only is_redacted=False — no memory_policy kwarg.
+    result = await MessageRepo.save(
+        db_session,
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text="stale text",
+        date=when,
+        is_redacted=False,
+    )
+
+    assert result.is_redacted is True, (
+        f"PRIVACY VIOLATION: is_redacted=False stale duplicate unset the redaction flag. "
+        f"Got is_redacted={result.is_redacted!r}"
+    )
