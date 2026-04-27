@@ -127,19 +127,33 @@ def test_edited_fixture_contains_edited_field():
 
 
 def test_edited_fixture_contains_policy_markers():
-    """At least one message in edited_messages.json must contain #nomem or #offrecord
-    (case-insensitive) in its text or caption field, triggering detect_policy."""
+    """edited_messages.json must contain BOTH #nomem AND #offrecord (case-insensitive)
+    across its messages — the fixture is explicitly designed to exercise both policies."""
     result = json.loads(EDITED_MESSAGES.read_text(encoding="utf-8"))
-    markers = ("#nomem", "#offrecord")
-    found = False
-    for msg in result["messages"]:
+
+    def _extract_text(msg: dict[str, Any]) -> str:
+        """Extract all visible text from a message for policy scanning."""
         text_val = msg.get("text", "") or ""
+        if isinstance(text_val, list):
+            # mixed-array form: extract string segments and entity text
+            parts = []
+            for item in text_val:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    parts.append(item.get("text", ""))
+            text_val = " ".join(parts)
         caption_val = msg.get("caption", "") or ""
-        combined = (text_val + " " + caption_val).lower()
-        if any(m in combined for m in markers):
-            found = True
-            break
-    assert found, "No #nomem or #offrecord marker found in edited_messages.json"
+        return (text_val + " " + caption_val).lower()
+
+    all_text = " ".join(_extract_text(m) for m in result["messages"])
+
+    assert "#nomem" in all_text, (
+        "edited_messages.json must contain at least one message with #nomem marker"
+    )
+    assert "#offrecord" in all_text, (
+        "edited_messages.json must contain at least one message with #offrecord marker"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,11 +161,32 @@ def test_edited_fixture_contains_policy_markers():
 # ---------------------------------------------------------------------------
 
 def test_replies_fixture_has_reply_chain():
-    """replies_with_media.json must have at least 2 messages with reply_to_message_id."""
+    """replies_with_media.json must contain a documented A→B→C reply chain:
+    an id_a, id_b, id_c where id_b.reply_to == id_a.id AND id_c.reply_to == id_b.id."""
     result = json.loads(REPLIES_WITH_MEDIA.read_text(encoding="utf-8"))
-    replies = [m for m in result["messages"] if m.get("reply_to_message_id") is not None]
-    assert len(replies) >= 2, (
-        f"Expected >=2 messages with reply_to_message_id, got {len(replies)}"
+    msgs_by_id = {m["id"]: m for m in result["messages"]}
+
+    chain_found = None
+    for msg_c in result["messages"]:
+        id_b = msg_c.get("reply_to_message_id")
+        if id_b is None:
+            continue
+        msg_b = msgs_by_id.get(id_b)
+        if msg_b is None:
+            continue
+        id_a = msg_b.get("reply_to_message_id")
+        if id_a is None:
+            continue
+        msg_a = msgs_by_id.get(id_a)
+        if msg_a is None:
+            continue
+        chain_found = (msg_a["id"], msg_b["id"], msg_c["id"])
+        break
+
+    assert chain_found is not None, (
+        "No A→B→C reply chain found in replies_with_media.json. "
+        "Expected: msg_b.reply_to == msg_a.id AND msg_c.reply_to == msg_b.id. "
+        f"Messages present: {[m['id'] for m in result['messages']]}"
     )
 
 
@@ -188,8 +223,14 @@ def test_replies_fixture_has_dangling_reply():
 # ---------------------------------------------------------------------------
 
 def test_message_kinds_match_taxonomy():
-    """For each fixture, every message's inferred kind must be in the documented
-    VALID_MESSAGE_KINDS set. Uses inline _infer_kind helper only."""
+    """Across all fixtures:
+    1. No hand-crafted message may be classified as 'unknown' — all are known-shape.
+    2. The fixture set collectively covers at least: text, photo, voice, forward, service,
+       video (meaningful subset — not required to cover all 16 kinds).
+    """
+    REQUIRED_KINDS = {"text", "photo", "voice", "forward", "service", "video"}
+
+    observed_kinds: set[str] = set()
     for path in ALL_FIXTURES:
         result = json.loads(path.read_text(encoding="utf-8"))
         for i, msg in enumerate(result["messages"]):
@@ -198,3 +239,60 @@ def test_message_kinds_match_taxonomy():
                 f"{path.name}[{i}] (id={msg.get('id')}): "
                 f"inferred kind '{kind}' not in documented taxonomy"
             )
+            assert kind != "unknown", (
+                f"{path.name}[{i}] (id={msg.get('id')}): "
+                f"hand-crafted fixture message classified as 'unknown' — "
+                f"all fixture messages must have an identifiable kind"
+            )
+            observed_kinds.add(kind)
+
+    missing = REQUIRED_KINDS - observed_kinds
+    assert not missing, (
+        f"Fixture set does not cover required message kinds: {missing}. "
+        f"Observed kinds: {observed_kinds}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# NIT-3: date_unixtime presence
+# ---------------------------------------------------------------------------
+
+def test_each_message_has_date_unixtime():
+    """Every NON-service message in every fixture must have a 'date_unixtime' field
+    (string representation of a unix timestamp). Service messages may omit it."""
+    for path in ALL_FIXTURES:
+        result = json.loads(path.read_text(encoding="utf-8"))
+        for i, msg in enumerate(result["messages"]):
+            if msg.get("type") == "service":
+                continue  # service messages may omit date_unixtime
+            assert "date_unixtime" in msg, (
+                f"{path.name}[{i}] (id={msg.get('id')}): "
+                f"non-service message missing 'date_unixtime' field"
+            )
+            assert isinstance(msg["date_unixtime"], str), (
+                f"{path.name}[{i}] (id={msg.get('id')}): "
+                f"'date_unixtime' must be a string, got {type(msg['date_unixtime']).__name__}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# HIGH-3: small_chat fixture text mixed-array form coverage
+# ---------------------------------------------------------------------------
+
+def test_small_chat_has_mixed_array_text():
+    """small_chat.json message id=1005 must use the mixed-array form for 'text'
+    (list containing both plain strings and entity dicts) to demonstrate that shape."""
+    result = json.loads(SMALL_CHAT.read_text(encoding="utf-8"))
+    msg_1005 = next((m for m in result["messages"] if m["id"] == 1005), None)
+    assert msg_1005 is not None, "Message id=1005 not found in small_chat.json"
+
+    text_val = msg_1005.get("text")
+    assert isinstance(text_val, list), (
+        f"Message id=1005 'text' must be a list (mixed-array form), got {type(text_val).__name__}"
+    )
+    has_plain_str = any(isinstance(item, str) for item in text_val)
+    has_entity_dict = any(isinstance(item, dict) for item in text_val)
+    assert has_plain_str and has_entity_dict, (
+        "Message id=1005 'text' array must contain both plain strings and entity dicts "
+        f"(interleaved mixed form). Got: {text_val}"
+    )

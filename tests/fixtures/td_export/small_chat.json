@@ -65,9 +65,12 @@
       "from": "User Two",
       "from_id": "user1000002",
       "forwarded_from": "Tech News Daily",
-      "text": "Interesting article about community building:",
+      "text": [
+        "Interesting article about community building: ",
+        {"type": "text_link", "text": "read more", "href": "https://example.com/article"}
+      ],
       "text_entities": [
-        {"type": "plain", "text": "Interesting article about community building:"},
+        {"type": "plain", "text": "Interesting article about community building: "},
         {"type": "text_link", "text": "read more", "href": "https://example.com/article"}
       ]
     },

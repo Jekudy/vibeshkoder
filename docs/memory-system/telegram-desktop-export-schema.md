@@ -60,23 +60,26 @@ A single chat export produces one `result.json` file:
 | `id` | integer | Chat ID (negative for groups/channels) |
 | `messages` | array | Ordered list of all message objects in the export window |
 
-### Companion `media/` subdirectory
+### Media attachment subdirectories
 
-Telegram Desktop places all binary attachments in a `media/` subdirectory alongside
-`result.json`. Media fields in messages contain **relative paths** such as:
+Telegram Desktop places binary attachments in type-specific subdirectories alongside
+`result.json`: `photos/`, `video_files/`, `voice_messages/`, `files/`, `stickers/`,
+`video_messages/`. Media fields in messages contain **relative paths** such as:
 
 - `"photos/photo_1@15-01-2024_10-05-00.jpg"`
 - `"video_files/video_1@05-03-2024_14-20-00.mp4"`
 - `"voice_messages/audio_1@15-01-2024_10-12-00.ogg"`
 
-The path is relative to the directory containing `result.json`.
+All paths are relative to the directory containing `result.json` (e.g.
+`"photos/photo_1@..."`). Real exports use these type-specific subdirs — there is no
+single `media/` parent directory.
 
 ### Export types and scope
 
 | Export type | Supported? | Notes |
 |-------------|-----------|-------|
 | Single chat JSON | **Yes — primary** | One `result.json` per chat |
-| Full account archive | Partial — parser reads per-chat | Full account export is a folder of per-chat JSON files; we consume each chat's `result.json` individually |
+| Full account archive | Partial — one chat at a time | Single root `result.json` with `chats: [...]` at top level, each chat containing its own `messages: [...]`. We support consumption of one chat at a time — caller must extract the relevant chat from the root structure before passing to the parser. Direct full-archive parsing is NOT supported by #94. |
 | Channel as single chat | Yes | Channel posts treated as a single-chat export; anonymous posts have `from_id` starting with `channel` (see §6) |
 
 ---
@@ -103,7 +106,7 @@ Every element of the top-level `messages` array is a **message object**. There a
 |-------|------|-------|
 | `from` | string | Display name of sender at export time |
 | `from_id` | string | Prefixed ID — `"user<N>"` for regular users, `"channel<N>"` for anonymous channel posts; absent on some service messages |
-| `text` | string or array | Message text. Plain string for simple text; array of entity objects for formatted text. May be empty string `""` for media-only messages |
+| `text` | string or array | Message text. Plain string for simple messages; **mixed array** of plain strings and entity objects for formatted text. May be empty string `""` for media-only messages. See §2 "Mixed-array text form" below. |
 | `text_entities` | array | Entity annotation array (see below). May be empty `[]` |
 | `reply_to_message_id` | integer | ID of the message being replied to; absent if not a reply |
 | `forwarded_from` | string | Original sender display name for forwarded messages; absent if not forwarded |
@@ -123,8 +126,33 @@ Each element is an object with `type` and `text` fields:
 ```
 
 Common entity types: `plain`, `bold`, `italic`, `code`, `pre`, `strikethrough`,
-`underline`, `spoiler`, `hashtag`, `mention`, `url`, `text_link`, `email`,
+`underline`, `spoiler`, `hashtag`, `mention`, `link`, `text_link`, `email`,
 `phone`, `cashtag`, `bot_command`.
+
+### Mixed-array `text` form
+
+When a message contains inline formatting or links, the `text` field is a **mixed array**
+containing both plain strings and entity objects interleaved — not a flat array of entity
+objects only. Example:
+
+```json
+"text": ["See ", {"type": "bold", "text": "important"}, " update."]
+```
+
+The fixture `tests/fixtures/td_export/small_chat.json` message id=1005 demonstrates this shape:
+
+```json
+"text": [
+  "Interesting article about community building: ",
+  {"type": "text_link", "text": "read more", "href": "https://example.com/article"}
+]
+```
+
+Relationship with `text_entities`: when both fields are present, `text_entities` is the
+**canonical normalized representation** and `text` (array form) recapitulates the same
+segments positionally. When `text` is an array, a parser SHOULD prefer `text_entities`
+for entity-aware processing (they must be consistent — inconsistency indicates a malformed
+export). See §3 for the full entity-type list.
 
 ### Service message fields (`type: "service"`)
 
@@ -150,7 +178,11 @@ The inline helper `_infer_kind` in `tests/fixtures/test_td_export_fixtures.py` i
 this mapping for fixture validation without importing from `bot/`.
 
 **Priority order matters** — a message with both `forwarded_from` and `photo` is classified
-as `forward`, matching how `normalization.py` gives `forward_origin` top priority.
+as `forward`. TD export uses `forwarded_from` (a string display-name field) as the forward
+discriminator; it pre-empts media kind classification, mirroring `_KIND_PROBES` priority
+where `forward` outranks media. TD service messages are identified by `type: "service"` (not
+by aiogram attributes like `new_chat_members`); they pre-empt all content classification
+because they have no content fields to misclassify.
 
 | TD export field shape | `message_kind` | Notes |
 |-----------------------|---------------|-------|
@@ -214,13 +246,23 @@ row per detected change: version_seq=1 for original, version_seq=2 for first edi
 
 ### Implication for import
 
-When importing a TD export, an edited message becomes a **single `message_versions` row with
-`version_seq=1`** (no v0 original). The parser (#94) must record `edit_date` from
-`edited_unixtime` in this row. There is no v0 to create.
+When importing a TD export, an edited message is represented as a **single `message_versions`
+row with `version_seq=1`** — there is no v0 original because TD export only stores the
+latest state.
 
-The detailed edit history reconciliation policy (partial imports, merge with live versions)
-is specified in **#106 (T2-NEW-H)**. This document only establishes the structural constraint:
-TD export is a snapshot of the latest state, not a history.
+**Import apply path (#103, Stream Delta):** The apply path creates this `message_versions`
+row. If `edited_unixtime` is present, it populates `edit_date` in that row. Direct content
+writes are owned by `persist_message_with_policy()` (#89), not the parser.
+
+**Import dry-run parser (#94):** The dry-run parser does NOT write `message_versions` rows
+or any other content rows. It is read-only by design (AUTHORIZED_SCOPE.md "Telegram import
+rule"). The parser MAY surface "would-be edited message" counts to the stats output
+(#99, T2-02) — but only as a statistic, never as a DB write.
+
+The detailed edit history reconciliation policy (partial imports, merging imported edits
+with live versions, version numbering across both paths) is specified in **#106 (T2-NEW-H)**.
+This document only establishes the structural constraint: TD export is a snapshot of the
+latest state, not a full history.
 
 ---
 
@@ -369,7 +411,8 @@ is forbidden — enforced by reviewer checklist (see Phase 2 risk map in HANDOFF
 
 `tests/fixtures/td_export/edited_messages.json` includes:
 - Message id=2003: `#nomem` hashtag in text — triggers `detect_policy` returning `'nomem'`
-- Message id=2004: `#offrecord` hashtag in caption — must be redacted on apply in the same
+- Message id=2004: `#offrecord` hashtag in the photo's `text` field, which TD export uses
+  for media captions (see §3 message_kind mapping) — must be redacted on apply in the same
   transaction; only minimal metadata (ids, timestamps, hash, policy marker) survives
 
 ---
