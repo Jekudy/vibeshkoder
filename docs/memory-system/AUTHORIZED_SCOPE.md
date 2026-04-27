@@ -131,6 +131,10 @@ T1-04 that writes raw_json without going through the (stub) detector path.
 
 ### Known gap: `chat_messages.raw_json` and the `caption` column (T1-12 closes)
 
+**STATUS: CLOSED in PR #63 (T1-12 + T1-13 combined sprint).** Both paths now route through
+`detect_policy` before persistence, and offrecord content is nulled in the same transaction.
+The historical context below is preserved for future readers.
+
 The `#offrecord` ordering rule above governs the `telegram_updates` path. The
 `chat_messages` path (gatekeeper-era handler at `bot/handlers/chat_messages.py`) writes its
 own `raw_json` directly via `MessageRepo.save` and does NOT route through

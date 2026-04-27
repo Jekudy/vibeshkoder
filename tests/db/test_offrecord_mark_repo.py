@@ -51,15 +51,24 @@ async def _make_chat_message(db_session) -> int:
 
 async def test_create_for_message_inserts_active_row(db_session) -> None:
     from bot.db.repos.offrecord_mark import OffrecordMarkRepo
+    from bot.db.repos.user import UserRepo
 
     msg_id = await _make_chat_message(db_session)
+    setter_id = _next_user()
+    await UserRepo.upsert(
+        db_session,
+        telegram_id=setter_id,
+        username=f"setter_{setter_id}",
+        first_name="Setter",
+        last_name=None,
+    )
 
     mark = await OffrecordMarkRepo.create_for_message(
         db_session,
         chat_message_id=msg_id,
         mark_type="offrecord",
         detected_by="deterministic_token_match_v1",
-        set_by_user_id=42,
+        set_by_user_id=setter_id,
     )
 
     assert mark.id is not None
@@ -67,7 +76,7 @@ async def test_create_for_message_inserts_active_row(db_session) -> None:
     assert mark.scope_type == "message"
     assert mark.scope_id == str(msg_id)
     assert mark.chat_message_id == msg_id
-    assert mark.set_by_user_id == 42
+    assert mark.set_by_user_id == setter_id
     assert mark.detected_by == "deterministic_token_match_v1"
     assert mark.status == "active"
     assert mark.detected_at is not None

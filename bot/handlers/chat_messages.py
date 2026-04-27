@@ -93,11 +93,13 @@ async def save_chat_message(
     # T1-13: persist the audit mark for any non-normal policy. The same transaction
     # carries the message + mark — DbSessionMiddleware commits both atomically.
     if policy != "normal" and mark_payload is not None:
+        # ``detected_by`` is unconditionally populated by detect_policy; the get()
+        # default is defensive only.
         await OffrecordMarkRepo.create_for_message(
             session,
             chat_message_id=saved.id,
             mark_type=policy,
-            detected_by=mark_payload.get("detected_by", "deterministic_token_match"),
+            detected_by=mark_payload["detected_by"],
             set_by_user_id=message.from_user.id,
             thread_id=normalized["message_thread_id"],
         )
