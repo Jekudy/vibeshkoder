@@ -7,6 +7,7 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
+from bot.db.locks import advisory_lock_chat_message
 from bot.db.repos.message import MessageRepo
 from bot.db.repos.offrecord_mark import OffrecordMarkRepo
 from bot.db.repos.user import UserRepo
@@ -30,6 +31,11 @@ async def save_chat_message(
 
     if message.from_user is None:
         return
+
+    # #80: Take advisory lock for this (chat_id, message_id) pair before any read or
+    # write. Serializes concurrent transactions (e.g. duplicate delivery, simultaneous
+    # edit) at the application level. Releases automatically at transaction end.
+    await advisory_lock_chat_message(session, message.chat.id, message.message_id)
 
     # Keep sender profile fresh for message attribution and admin lookups.
     await UserRepo.upsert(

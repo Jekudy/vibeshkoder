@@ -44,6 +44,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
+from bot.db.locks import advisory_lock_chat_message
 from bot.db.models import ChatMessage, MessageVersion
 from bot.db.repos.message_version import MessageVersionRepo
 from bot.db.repos.offrecord_mark import OffrecordMarkRepo
@@ -220,6 +221,14 @@ async def handle_edited_message(
     chat_id = message.chat.id
     message_id = message.message_id
     user_id = getattr(message.from_user, "id", None) if message.from_user else None
+
+    # #80: Take advisory lock for this (chat_id, message_id) pair before any read or
+    # write. Serializes concurrent transactions (e.g. chat_messages handler racing with
+    # edited_message handler for the same row). Releases at transaction end.
+    # Keep T1-14's with_for_update() in _find_chat_message — both layers cooperate:
+    # advisory lock prevents two transactions from even starting simultaneously;
+    # FOR UPDATE adds row-level protection inside one transaction.
+    await advisory_lock_chat_message(session, chat_id, message_id)
 
     # Step 1: find existing chat_messages row.
     existing = await _find_chat_message(session, chat_id, message_id)

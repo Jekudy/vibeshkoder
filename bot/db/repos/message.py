@@ -139,11 +139,19 @@ class MessageRepo:
         # Conflict path: the row already exists. The follow-up SELECT triggers SQLAlchemy's
         # autoflush, so no explicit flush is required here (and there is nothing to flush —
         # the conflict path made no mutation).
+        # #80: use SELECT ... FOR NO KEY UPDATE (key_share=False, update=True) to acquire
+        # a row-level lock for the duration of the transaction. This prevents a TOCTOU
+        # race where a concurrent transaction (e.g. an offrecord flip in edited_message.py)
+        # writes memory_policy AFTER this transaction has read 'normal' but before it has
+        # committed. FOR NO KEY UPDATE is lighter than full FOR UPDATE — it allows
+        # concurrent FK inserts from message_versions which share the same parent row.
         existing = await session.execute(
-            select(ChatMessage).where(
+            select(ChatMessage)
+            .where(
                 ChatMessage.chat_id == chat_id,
                 ChatMessage.message_id == message_id,
             )
+            .with_for_update(key_share=False)
         )
         return existing.scalar_one()
 
