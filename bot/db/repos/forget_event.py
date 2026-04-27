@@ -15,9 +15,8 @@ Any other transition raises ``ValueError`` immediately (before any DB call).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
-from sqlalchemy import select
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import ForgetEvent
@@ -50,24 +49,39 @@ class ForgetEventRepo:
         returns the existing row without raising or creating a duplicate.
 
         Flushes; does not commit. Caller controls the transaction lifecycle.
-        """
-        existing = await ForgetEventRepo.get_by_tombstone_key(session, tombstone_key)
-        if existing is not None:
-            return existing
 
-        row = ForgetEvent(
-            target_type=target_type,
-            target_id=target_id,
-            actor_user_id=actor_user_id,
-            authorized_by=authorized_by,
-            tombstone_key=tombstone_key,
-            reason=reason,
-            policy=policy,
-            status="pending",
+        Implementation: ``INSERT ... ON CONFLICT (tombstone_key) DO NOTHING RETURNING *``.
+        On conflict the RETURNING result is empty; we then SELECT the existing row.
+        Both operations live in the caller's transaction (no commit, no rollback here).
+        This is race-safe: two concurrent callers both pass no application-level check;
+        one wins the insert, the other hits the conflict path and fetches the winner's row.
+        """
+        stmt = (
+            pg_insert(ForgetEvent)
+            .values(
+                target_type=target_type,
+                target_id=target_id,
+                actor_user_id=actor_user_id,
+                authorized_by=authorized_by,
+                tombstone_key=tombstone_key,
+                reason=reason,
+                policy=policy,
+                status="pending",
+            )
+            .on_conflict_do_nothing(index_elements=["tombstone_key"])
+            .returning(ForgetEvent)
         )
-        session.add(row)
-        await session.flush()
-        return row
+        result = await session.execute(stmt)
+        inserted = result.scalars().first()
+        if inserted is not None:
+            await session.flush()
+            return inserted
+
+        # Conflict path: the row already exists.
+        existing = await session.execute(
+            select(ForgetEvent).where(ForgetEvent.tombstone_key == tombstone_key)
+        )
+        return existing.scalars().one()
 
     @staticmethod
     async def get_by_tombstone_key(
@@ -92,7 +106,7 @@ class ForgetEventRepo:
         result = await session.execute(
             select(ForgetEvent)
             .where(ForgetEvent.status == "pending")
-            .order_by(ForgetEvent.created_at.asc())
+            .order_by(ForgetEvent.created_at.asc(), ForgetEvent.id.asc())
             .limit(limit)
         )
         return list(result.scalars().all())
@@ -124,22 +138,36 @@ class ForgetEventRepo:
                 f"Must be one of: {sorted(_ALLOWED_TRANSITIONS)}"
             )
 
-        result = await session.execute(
-            select(ForgetEvent).where(ForgetEvent.id == forget_event_id)
-        )
-        row = result.scalars().one()
+        # Compute which current statuses may transition to the requested status.
+        allowed_old = [
+            old for old, nexts in _ALLOWED_TRANSITIONS.items() if status in nexts
+        ]
 
-        allowed_next = _ALLOWED_TRANSITIONS.get(row.status, frozenset())
-        if status not in allowed_next:
-            raise ValueError(
-                f"Invalid status transition for ForgetEvent(id={forget_event_id}): "
-                f"{row.status!r} → {status!r}. "
-                f"Allowed from {row.status!r}: {sorted(allowed_next) or '[]'}"
-            )
-
-        row.status = status
+        values: dict = {"status": status, "updated_at": func.now()}
         if cascade_status is not None:
-            row.cascade_status = cascade_status
-        row.updated_at = datetime.now(timezone.utc)
-        await session.flush()
-        return row
+            values["cascade_status"] = cascade_status
+
+        stmt = (
+            update(ForgetEvent)
+            .where(ForgetEvent.id == forget_event_id)
+            .where(ForgetEvent.status.in_(allowed_old))
+            .values(**values)
+            .returning(ForgetEvent)
+        )
+        result = await session.execute(stmt)
+        row = result.scalars().first()
+        if row is not None:
+            await session.flush()
+            return row
+
+        # Either the id doesn't exist or the current status disallows the transition.
+        # Re-fetch to produce a precise error message.
+        actual = await session.get(ForgetEvent, forget_event_id)
+        if actual is None:
+            raise ValueError(f"ForgetEvent(id={forget_event_id}) not found")
+        allowed_next = _ALLOWED_TRANSITIONS.get(actual.status, frozenset())
+        raise ValueError(
+            f"Invalid status transition for ForgetEvent(id={forget_event_id}): "
+            f"{actual.status!r} → {status!r}. "
+            f"Allowed from {actual.status!r}: {sorted(allowed_next) or '[]'}"
+        )

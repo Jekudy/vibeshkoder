@@ -18,6 +18,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -418,7 +419,11 @@ class ForgetEvent(Base):
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="pending", server_default="pending"
     )
-    cascade_status: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    cascade_status: Mapped[dict | None] = mapped_column(
+        # JSONB on postgres (enables future GIN indexing); JSON elsewhere for test compat.
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=func.now(),

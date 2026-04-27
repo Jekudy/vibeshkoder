@@ -266,6 +266,10 @@ async def test_invalid_transition_pending_to_completed_raises(db_session) -> Non
 async def test_list_pending_returns_oldest_first_and_respects_limit(db_session) -> None:
     from bot.db.repos.forget_event import ForgetEventRepo
 
+    # Insert 4 rows. By inserting in forward order, IDs are ascending naturally.
+    # We then insert a 5th row with a key that sorts BEFORE the first 4 alphabetically
+    # but gets a HIGHER id — this exercises the id ASC tie-breaker when created_at
+    # timestamps are equal (common in fast sequential inserts within a transaction).
     keys = [f"message:-100:{next(_key_counter)}" for _ in range(4)]
     created_ids = []
     for key in keys:
@@ -289,8 +293,10 @@ async def test_list_pending_returns_oldest_first_and_respects_limit(db_session) 
     assert created_ids[0] not in pending_ids
     # Limit of 2 is respected.
     assert len(pending_ids) == 2
-    # Results should be from the remaining pending ones, oldest first.
+    # Results are ordered by (created_at ASC, id ASC): ids should be ascending.
     assert pending_ids[0] < pending_ids[1]
+    # The two oldest remaining pending rows are created_ids[1] and created_ids[2].
+    assert pending_ids == [created_ids[1], created_ids[2]]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -310,10 +316,11 @@ async def test_cascade_status_json_round_trip(db_session) -> None:
         tombstone_key=f"message:-9:{next(_key_counter)}",
     )
 
+    # Use a realistic per-layer nested dict to validate JSONB nested-dict round-trip.
     cascade_payload = {
-        "chat_messages": "completed",
-        "message_versions": "pending",
-        "offrecord_marks": "pending",
+        "chat_messages": {"status": "completed", "rows_affected": 1, "completed_at": "2026-04-27T12:00:00Z"},
+        "message_versions": {"status": "pending", "rows_affected": 0},
+        "offrecord_marks": {"status": "completed", "rows_affected": 1},
     }
 
     await ForgetEventRepo.mark_status(db_session, ev.id, status="processing")
@@ -372,3 +379,40 @@ def test_forget_event_model_registered_in_metadata(app_env) -> None:
 
     fk_names = {fk.name for fk in table.foreign_keys if fk.name}
     assert "fk_forget_events_actor_user_id" in fk_names
+
+    # Fix 3: cascade_status must render as JSONB on postgres dialect.
+    from sqlalchemy.dialects import postgresql as pg_dialect
+
+    cascade_col = table.c["cascade_status"]
+    compiled_type = cascade_col.type.compile(dialect=pg_dialect.dialect())
+    assert compiled_type == "JSONB", (
+        f"cascade_status should compile to JSONB on postgres, got {compiled_type!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Terminal state lockout
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def test_failed_state_is_terminal(db_session) -> None:
+    """Verify that failed is a terminal state: no transition out of it is allowed."""
+    from bot.db.repos.forget_event import ForgetEventRepo
+
+    ev = await ForgetEventRepo.create(
+        db_session,
+        target_type="message",
+        target_id=None,
+        actor_user_id=None,
+        authorized_by="system",
+        tombstone_key=f"message:-terminal:{next(_key_counter)}",
+    )
+
+    # Transition pending → processing → failed.
+    await ForgetEventRepo.mark_status(db_session, ev.id, status="processing")
+    failed = await ForgetEventRepo.mark_status(db_session, ev.id, status="failed")
+    assert failed.status == "failed"
+
+    # Attempt to re-enter processing from failed must raise ValueError.
+    with pytest.raises(ValueError, match="failed"):
+        await ForgetEventRepo.mark_status(db_session, ev.id, status="processing")

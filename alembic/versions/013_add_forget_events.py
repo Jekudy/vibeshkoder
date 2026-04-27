@@ -17,6 +17,7 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.postgresql import JSONB
 
 revision: str = "013"
 down_revision: Union[str, Sequence[str], None] = "012"
@@ -46,7 +47,8 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("'pending'"),
         ),
-        sa.Column("cascade_status", sa.JSON(), nullable=True),
+        # JSONB (not JSON): enables future GIN indexing on per-layer cascade progress.
+        sa.Column("cascade_status", JSONB(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
