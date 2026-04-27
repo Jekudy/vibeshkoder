@@ -13,6 +13,7 @@ from bot.handlers import (
     chat_events,
     chat_messages,
     edited_message,
+    forget_me,
     forget_reply,
     forward_lookup,
     questionnaire,
@@ -107,9 +108,10 @@ async def main() -> None:
         vouch.router,
         admin.router,
         chat_events.router,
-        forward_lookup.router,
         edited_message.router,  # T1-14: edited_message handler (before chat_messages catch-all)
+        forget_me.router,  # T3-03: /forget_me command (DM or in-chat)
         forget_reply.router,   # T3-02: /forget command handler (before chat_messages catch-all)
+        forward_lookup.router,
         chat_messages.router,  # lowest priority — catches all group messages
     )
 
