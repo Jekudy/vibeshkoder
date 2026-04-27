@@ -56,7 +56,7 @@ class Application(Base):
     questionnaire_message_id: Mapped[int | None] = mapped_column(BigInteger)
     vouched_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"))
     vouched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    invite_user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"))
+    invite_user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"))
     notified_admin_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     nudged_newcomer_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -34,6 +34,7 @@ def upgrade() -> None:
         "users",
         ["invite_user_id"],
         ["id"],
+        ondelete="SET NULL",
     )
     op.execute(
         """
