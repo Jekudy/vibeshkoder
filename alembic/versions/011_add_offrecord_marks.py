@@ -6,9 +6,14 @@ records WHO triggered the mark (set_by_user_id), WHAT (mark_type), WHERE
 (detected_at). Status lifecycle: active → expired | revoked. Phase 3 admin actions
 extend this with revoke flows.
 
-Revision ID: 009
-Revises: 008
+Revision ID: 011
+Revises: 010
 Create Date: 2026-04-27
+
+Renumbered from 009 to 011 after rebase onto main: a parallel security-fix branch
+merged 009_bind_application_invites + 010_add_invite_outbox while Sprint 15 was
+under review. The detector + offrecord_marks work has no dependency on those
+migrations — adjusting only the head pointer keeps things linear.
 """
 
 from __future__ import annotations
@@ -18,8 +23,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "009"
-down_revision: Union[str, Sequence[str], None] = "008"
+revision: str = "011"
+down_revision: Union[str, Sequence[str], None] = "010"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
