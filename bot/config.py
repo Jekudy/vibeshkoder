@@ -6,6 +6,9 @@ import secrets
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
+_MIN_WEB_PASSWORD_LENGTH = 12
+_MIN_WEB_SESSION_SECRET_LENGTH = 32
+
 
 class Settings(BaseSettings):
     BOT_TOKEN: str
@@ -29,27 +32,47 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_web_password(self) -> Settings:
-        if self.WEB_PASSWORD is not None:
+        if self.WEB_PASSWORD is None:
+            if self.DEV_MODE:
+                logging.warning("WEB_PASSWORD is not set; generated an ephemeral dev password")
+                self.WEB_PASSWORD = secrets.token_urlsafe(16)
+                return self
+
+            raise ValueError("WEB_PASSWORD must be at least 12 characters in production")
+
+        if len(self.WEB_PASSWORD) >= _MIN_WEB_PASSWORD_LENGTH:
             return self
 
         if self.DEV_MODE:
-            logging.warning("WEB_PASSWORD is not set; generated an ephemeral dev password")
-            self.WEB_PASSWORD = secrets.token_urlsafe(16)
+            logging.warning("WEB_PASSWORD is shorter than 12 characters; accepted in DEV_MODE only")
             return self
 
-        raise ValueError("WEB_PASSWORD is required when DEV_MODE=false")
+        raise ValueError("WEB_PASSWORD must be at least 12 characters in production")
 
     @model_validator(mode="after")
     def validate_web_session_secret(self) -> Settings:
-        if self.WEB_SESSION_SECRET is not None:
+        if self.WEB_SESSION_SECRET is None:
+            if self.DEV_MODE:
+                logging.warning(
+                    "WEB_SESSION_SECRET is not set; generated an ephemeral dev session secret"
+                )
+                self.WEB_SESSION_SECRET = secrets.token_urlsafe(32)
+                return self
+
+            raise ValueError(
+                "WEB_SESSION_SECRET must be at least 32 characters in production"
+            )
+
+        if len(self.WEB_SESSION_SECRET) >= _MIN_WEB_SESSION_SECRET_LENGTH:
             return self
 
         if self.DEV_MODE:
-            logging.warning("WEB_SESSION_SECRET is not set; generated an ephemeral dev session secret")
-            self.WEB_SESSION_SECRET = secrets.token_urlsafe(32)
+            logging.warning(
+                "WEB_SESSION_SECRET is shorter than 32 characters; accepted in DEV_MODE only"
+            )
             return self
 
-        raise ValueError("WEB_SESSION_SECRET is required when DEV_MODE=false")
+        raise ValueError("WEB_SESSION_SECRET must be at least 32 characters in production")
 
 
 settings = Settings()  # type: ignore[call-arg]
