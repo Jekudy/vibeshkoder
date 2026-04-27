@@ -35,6 +35,18 @@ def format_admin_nudge(name: str, username: str, app_id: int) -> str:
     )
 
 
+async def _log_vouch_deadline_cas_lost(session, app_id: int, branch: str) -> None:
+    observed_app = await ApplicationRepo.get(session, app_id)
+    logger.info(
+        "scheduler.cas_lost",
+        extra={
+            "app_id": app_id,
+            "branch": branch,
+            "observed_status": observed_app.status if observed_app else None,
+        },
+    )
+
+
 async def check_vouch_deadlines(bot: Bot) -> None:
     """Check pending applications for 48h nudge and 72h auto-reject."""
     async with async_session() as session:
@@ -89,12 +101,16 @@ async def check_vouch_deadlines(bot: Bot) -> None:
                     await bot.send_message(chat_id=app.user_id, text=NUDGE_MSG)
                 except Exception:
                     logger.warning("Failed to nudge user %s", app.user_id)
-                await ApplicationRepo.update_status(
+                nudged = await ApplicationRepo.update_status_if(
                     session,
                     app.id,
-                    "pending",
+                    expected_from="pending",
+                    new_status="pending",
                     nudged_newcomer_at=datetime.now(timezone.utc),
                 )
+                if not nudged:
+                    await _log_vouch_deadline_cas_lost(session, app.id, "nudge")
+                    continue
 
             # Notify admins
             if app.notified_admin_at is None:
@@ -109,12 +125,16 @@ async def check_vouch_deadlines(bot: Bot) -> None:
                         )
                     except Exception:
                         logger.warning("Failed to notify admin %s", admin_id)
-                await ApplicationRepo.update_status(
+                notified = await ApplicationRepo.update_status_if(
                     session,
                     app.id,
-                    "pending",
+                    expected_from="pending",
+                    new_status="pending",
                     notified_admin_at=datetime.now(timezone.utc),
                 )
+                if not notified:
+                    await _log_vouch_deadline_cas_lost(session, app.id, "notify")
+                    continue
 
         await session.commit()
 
