@@ -103,6 +103,7 @@ async def test_new_fields_persist(db_session) -> None:
     chat_id = _random_chat_id()
     message_id = _next_message_id()
     when = datetime.now(timezone.utc)
+    updated = datetime.now(timezone.utc)
 
     await _ensure_user(db_session, user_id)
 
@@ -118,7 +119,9 @@ async def test_new_fields_persist(db_session) -> None:
         message_kind="text",
         memory_policy="normal",
         visibility="member",
+        is_redacted=True,
         content_hash="abc123",
+        updated_at=updated,
     )
     db_session.add(row)
     await db_session.flush()
@@ -132,6 +135,8 @@ async def test_new_fields_persist(db_session) -> None:
     assert fetched.caption == "caption text"
     assert fetched.message_kind == "text"
     assert fetched.content_hash == "abc123"
+    assert fetched.is_redacted is True
+    assert fetched.updated_at is not None
 
 
 # ─── check constraints ─────────────────────────────────────────────────────────────────────
@@ -285,3 +290,8 @@ def test_chat_messages_metadata_includes_new_columns_and_indexes(app_env) -> Non
     constraint_names = {c.name for c in table.constraints if c.name}
     assert "ck_chat_messages_memory_policy" in constraint_names
     assert "ck_chat_messages_visibility" in constraint_names
+
+    # FK to telegram_updates.id must be present and named (Codex/Claude both flagged
+    # FK-name divergence as a real source of create_all / alembic drift).
+    fk_names = {fk.name for fk in table.foreign_keys if fk.name}
+    assert "fk_chat_messages_raw_update_id" in fk_names

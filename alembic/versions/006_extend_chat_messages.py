@@ -139,7 +139,9 @@ def upgrade() -> None:
 
     # No data backfill needed — server_defaults populate memory_policy='normal' and
     # visibility='member' for existing rows automatically. content_hash stays NULL for
-    # legacy rows (T1-07 backfill computes it for new message_versions v1 rows).
+    # legacy chat_messages rows; computation strategy is owned by T1-08 and applied to
+    # message_versions v1 rows by T1-07 (legacy chat_messages.content_hash remains NULL
+    # forever — only the version table carries the hash going forward).
 
 
 def downgrade() -> None:
