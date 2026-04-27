@@ -24,6 +24,7 @@ class UserRepo:
                 username=username,
                 first_name=first_name,
                 last_name=last_name,
+                is_imported_only=False,
             )
             .on_conflict_do_update(
                 index_elements=[User.id],
@@ -31,6 +32,7 @@ class UserRepo:
                     "username": username,
                     "first_name": first_name,
                     "last_name": last_name,
+                    "is_imported_only": False,
                 },
             )
         )

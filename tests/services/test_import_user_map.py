@@ -264,3 +264,81 @@ async def test_is_ghost_user(db_session) -> None:
 
     assert await is_ghost_user(db_session, live.id) is False
     assert await is_ghost_user(db_session, ghost_user_id) is True
+
+
+# ─── CRITICAL-1: ghost→live transition via gatekeeper upsert ─────────────────
+
+async def test_ghost_to_live_transition_via_upsert(db_session) -> None:
+    """Ghost row created by import must flip to live when gatekeeper upsert runs."""
+    from bot.db.repos.user import UserRepo
+    from bot.services.import_user_map import is_ghost_user, resolve_export_user
+
+    tg_id = _rand_tg_id()
+
+    # Create ghost via import path
+    ghost_id = await resolve_export_user(
+        db_session, f"user{tg_id}", display_name="Imported"
+    )
+    assert ghost_id == tg_id
+    assert await is_ghost_user(db_session, tg_id) is True
+
+    # Simulate live registration: user DMs the bot → UserRepo.upsert is called
+    user = await UserRepo.upsert(
+        db_session,
+        telegram_id=tg_id,
+        username=None,
+        first_name="RealName",
+        last_name=None,
+    )
+
+    # Ghost must now be live
+    assert await is_ghost_user(db_session, tg_id) is False
+    assert user.first_name == "RealName"
+
+
+# ─── MEDIUM-1: negative export id rejection ──────────────────────────────────
+
+async def test_resolve_negative_user_tail_raises(db_session) -> None:
+    """'user-5' → ValueError; negative tails are not allowed."""
+    from bot.services.import_user_map import resolve_export_user
+
+    with pytest.raises(ValueError, match="negative export ids not allowed"):
+        await resolve_export_user(db_session, "user-5")
+
+
+async def test_resolve_negative_channel_tail_raises(db_session) -> None:
+    """'channel-5' → ValueError; negative tails are not allowed."""
+    from bot.services.import_user_map import resolve_export_user
+
+    with pytest.raises(ValueError, match="negative export ids not allowed"):
+        await resolve_export_user(db_session, "channel-5")
+
+
+# ─── HIGH-1: live user resolution does not set imported flag ─────────────────
+
+async def test_live_user_resolution_does_not_set_imported_flag(db_session) -> None:
+    """Pre-existing live user: resolve_export_user returns correct id; is_imported_only stays False."""
+    from bot.db.repos.user import UserRepo
+    from bot.services.import_user_map import is_ghost_user, resolve_export_user
+
+    tg_id = _rand_tg_id()
+
+    # Pre-create live user
+    await UserRepo.upsert(
+        db_session,
+        telegram_id=tg_id,
+        username=None,
+        first_name="LivePerson",
+        last_name=None,
+    )
+
+    user = await _get_user(db_session, tg_id)
+    assert user is not None
+    assert user.is_imported_only is False
+
+    # Import resolves the same id
+    resolved = await resolve_export_user(db_session, f"user{tg_id}")
+
+    assert resolved == tg_id
+    # Flag must still be False — import path must NOT set it to True
+    assert await is_ghost_user(db_session, tg_id) is False

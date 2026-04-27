@@ -74,35 +74,60 @@ same row. Future phases may split per-channel identity.
 
 **Cross-reference:** `telegram-desktop-export-schema.md` §6.
 
+**Sentinel reservation:** The value `-1` AND the entire range of negative integers is
+reserved for import-internal sentinels in the `users` table. Real Telegram user ids are
+always positive. Telegram CHAT ids can be negative (e.g. supergroup ids in the
+`-1001...` range) but those are NOT stored in `users.id`. A future "per-channel ghost"
+ticket that wants to use the channel id as the ghost's `user_id` MUST pick a different
+mapping (e.g. `1_000_000_000_000 + channel_id`, or a separate sentinels table) to avoid
+colliding with the anonymous-channel singleton.
+
 ---
 
-## `is_imported_only` Flag Semantics
+## `is_imported_only` Flag Lifecycle
 
 `users.is_imported_only` (Boolean, NOT NULL, default `false`) is the formal marker for
 ghost users.
 
 | State | Meaning |
 |-------|---------|
-| `false` (default) | Live user — created by the gatekeeper registration flow |
-| `true` | Ghost user — created by the import service; never interacted with the bot |
+| `false` (default) | Live user — created or confirmed by the gatekeeper registration flow |
+| `true` | Ghost user — created by the import service; never registered with the bot |
 
-**Rules:**
+### Flag set to TRUE
 
-1. The flag is set to `True` **only on ghost row creation** by the import service.
-2. The flag is **NEVER automatically flipped** in either direction by the import service.
-3. Live users (`is_imported_only=False`) and ghost users (`is_imported_only=True`) are
-   **NEVER merged**. If a ghost's `tg_id` later becomes a real Telegram user (they DM the
-   gatekeeper and a live row is required), the registration path creates a **new live row**
-   — the ghost is left untouched. This avoids retroactively giving a live user the
-   import-only data history.
-4. **If a row already exists for a tg_id**, `_create_ghost_user` returns it unchanged
-   regardless of its current `is_imported_only` value:
-   - Live row exists → returned as-is (is_imported_only=False stays False).
-   - Ghost row exists → returned as-is (is_imported_only=True stays True).
+The flag is set to `True` **only** when the import path creates a user row that did not
+exist before (`_create_ghost_user` INSERT). It is **NEVER** set to `True` on existing
+rows: a live user being touched by an import call returns its existing id with
+`is_imported_only` unchanged.
 
-**ag-sa risk R2:** User identity collision — ghost users merged with live users by
-display_name match → cross-user privacy leak. This policy is the mitigation:
-`is_imported_only` is the explicit boundary, and the import service never crosses it.
+### Flag set to FALSE (ghost-to-live transition)
+
+The flag is set to `False` when the gatekeeper's live-registration path
+(`UserRepo.upsert(telegram_id=...)`, called from `bot/handlers/start.py` and other
+gatekeeper entry points) writes the row. If the row already existed as a ghost, the
+`ON CONFLICT DO UPDATE` clause overwrites the name fields **AND clears the flag** — the
+user transitions from "imported-only history" to "live, gatekeeper-known". This is the
+**only** ghost-to-live transition path. Imports cannot perform it; only the live
+registration path can.
+
+This means `is_ghost_user(user_id)` reflects "this row was last touched by the import
+path and has **never** been touched by live registration since".
+
+### Privacy invariant (ag-sa risk R2)
+
+Imports cannot promote themselves to live status. A user imported as a ghost remains a
+ghost until they DM the gatekeeper. From that point on, the row is a live row by
+definition; the historical imported messages remain attributed to the same `user_id` (see
+"Attribution Semantics Under Live/Ghost Overlap" below).
+
+**If a row already exists for a tg_id**, `_create_ghost_user` returns it unchanged
+regardless of its current `is_imported_only` value:
+- Live row exists → returned as-is (`is_imported_only=False` stays `False`).
+- Ghost row exists → returned as-is (`is_imported_only=True` stays `True`).
+
+The `_create_ghost_user` function is the import-internal helper; it never flips live rows
+to ghost. Only `UserRepo.upsert` (the live-registration path) can flip ghost to live.
 
 ---
 
@@ -172,6 +197,7 @@ for live users and for non-existent ids (fail-safe).
 | `export_id=None` | Returns `None`; no DB write. |
 | Unknown prefix (e.g. `"bot42"`) | Raises `ValueError("unrecognised export_id shape: ...")`. |
 | Non-numeric tail (e.g. `"userabc"`) | Raises `ValueError`. |
+| Negative tail (e.g. `"user-5"`, `"channel-5"`) | Raises `ValueError("negative export ids not allowed: ...")`. |
 | Row exists for tg_id | Returned unchanged regardless of `is_imported_only`; no upsert. |
 | Concurrent imports same tg_id | `INSERT ... ON CONFLICT DO NOTHING RETURNING` + SELECT fallback; both callers get the same row. |
 
@@ -200,6 +226,29 @@ race condition that can create duplicate rows (the PK `users.id` is unique).
 
 ---
 
+## Attribution Semantics Under Live/Ghost Overlap
+
+When `resolve_export_user(session, "user<N>")` is called and a **live** user with `id=N`
+already exists, the function returns `N`. The imported message's `chat_messages.user_id`
+is set to `N` directly.
+
+This means imported historical messages are **permanently attributed** to the live
+member's row. A community member can later see their own pre-membership history attached
+to their identity.
+
+This is a deliberate product choice: **identity continuity > separate-history-bucket**.
+Splitting (e.g. "always create a parallel ghost regardless of live existence") is
+rejected because it would break Q&A / search citations across the live/import boundary.
+
+**For issue #103:** write `chat_messages.user_id = resolve_export_user(from_id)` directly.
+Do NOT introduce a parallel "imported user id" column.
+
+**Cross-reference:** `AUTHORIZED_SCOPE.md` "Critical safety rule for `#offrecord`" still
+applies — content from imported messages routes through `detect_policy` exactly as live
+messages do, regardless of attribution.
+
+---
+
 ## Out of Scope
 
 The following are explicitly deferred and NOT authorized in this cycle:
@@ -208,8 +257,14 @@ The following are explicitly deferred and NOT authorized in this cycle:
   do not update ghost or live display names.
 - **Per-channel ghost identity splitting** — all `channel<N>` posts collapse to one user.
   Splitting by channel id is deferred to a future phase.
-- **Ghost-to-live merge** — there is no merge path. A ghost and a live user for the same
-  Telegram id coexist as separate rows. The live registration flow creates a new row; the
-  ghost retains its import history.
 - **Ghost cleanup / expiry** — ghost rows are permanent unless explicitly deleted via the
   forget / rollback path (T2-NEW-G, issue #104).
+- **Bulk-resolve API for #102 (rate-limit + chunking):** current implementation is
+  per-call (one SELECT-then-INSERT round-trip per `resolve_export_user`). A bulk variant
+  (e.g. `resolve_export_users(session, list_of_export_ids) → dict`) is deferred to
+  #102 / #103 and is not provided here.
+- **Distinguishing live vs absent in `is_ghost_user()`:** currently returns `False` for
+  both "live row exists" and "no row at all" — caller must validate id existence
+  separately. A `user_status(user_id) → Literal['live', 'ghost', 'absent']` helper is
+  deferred until a downstream ticket needs it (e.g. #98 reply resolver may surface this
+  need).
