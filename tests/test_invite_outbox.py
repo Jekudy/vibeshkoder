@@ -431,13 +431,17 @@ async def test_invite_outbox_unique_pending_per_application(db_session) -> None:
             await db_session.flush()
 
     rows = (
-        await db_session.execute(
-            select(InviteOutbox).where(
-                InviteOutbox.application_id == app.id,
-                InviteOutbox.status == "pending",
+        (
+            await db_session.execute(
+                select(InviteOutbox).where(
+                    InviteOutbox.application_id == app.id,
+                    InviteOutbox.status == "pending",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert [row.id for row in rows] == [first.id]
 
 
@@ -465,6 +469,4 @@ def test_invite_outbox_model_registered() -> None:
     assert "ix_invite_outbox_pending_unique" in indexes
     pending_unique = indexes["ix_invite_outbox_pending_unique"]
     assert pending_unique.unique is True
-    assert str(pending_unique.dialect_options["postgresql"]["where"]) == (
-        "status = 'pending'"
-    )
+    assert str(pending_unique.dialect_options["postgresql"]["where"]) == ("status = 'pending'")

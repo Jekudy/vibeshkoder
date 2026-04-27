@@ -101,15 +101,11 @@ def test_filling_user_using_forwarded_invite_rejected(app_env, monkeypatch, capl
     event.bot.ban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
     event.bot.unban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
     update_status.assert_not_called()
-    user_set_member.assert_awaited_once_with(
-        session, 222, is_member=False, left_at=ANY
-    )
+    user_set_member.assert_awaited_once_with(session, 222, is_member=False, left_at=ANY)
     assert "status='filling'" in caplog.text
 
 
-def test_handle_join_legit_returning_member_with_valid_vouch_passes(
-    app_env, monkeypatch
-) -> None:
+def test_handle_join_legit_returning_member_with_valid_vouch_passes(app_env, monkeypatch) -> None:
     handler = import_module("bot.handlers.chat_events")
     session = AsyncMock()
     event = _join_event()
@@ -126,17 +122,13 @@ def test_handle_join_legit_returning_member_with_valid_vouch_passes(
 
     event.bot.ban_chat_member.assert_not_called()
     event.bot.unban_chat_member.assert_not_called()
-    user_set_member.assert_awaited_once_with(
-        session, 222, is_member=True, joined_at=ANY
-    )
+    user_set_member.assert_awaited_once_with(session, 222, is_member=True, joined_at=ANY)
     handler.IntroRepo.get.assert_awaited_once_with(session, 222)
     handler.IntroRepo.upsert.assert_not_called()
     update_status.assert_not_called()
 
 
-def test_handle_join_ex_member_with_intro_no_vouch_rejected(
-    app_env, monkeypatch, caplog
-) -> None:
+def test_handle_join_ex_member_with_intro_no_vouch_rejected(app_env, monkeypatch, caplog) -> None:
     handler = import_module("bot.handlers.chat_events")
     session = AsyncMock()
     event = _join_event()
@@ -154,18 +146,14 @@ def test_handle_join_ex_member_with_intro_no_vouch_rejected(
 
     event.bot.ban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
     event.bot.unban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
-    user_set_member.assert_awaited_once_with(
-        session, 222, is_member=False, left_at=ANY
-    )
+    user_set_member.assert_awaited_once_with(session, 222, is_member=False, left_at=ANY)
     handler.IntroRepo.get.assert_not_called()
     handler.IntroRepo.upsert.assert_not_called()
     update_status.assert_not_called()
     assert "status='rejected'" in caplog.text
 
 
-def test_handle_join_forwarded_invite_ex_member_blocked(
-    app_env, monkeypatch, caplog
-) -> None:
+def test_handle_join_forwarded_invite_ex_member_blocked(app_env, monkeypatch, caplog) -> None:
     handler = import_module("bot.handlers.chat_events")
     session = AsyncMock()
     event = _join_event()
@@ -183,9 +171,7 @@ def test_handle_join_forwarded_invite_ex_member_blocked(
 
     event.bot.ban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
     event.bot.unban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
-    user_set_member.assert_awaited_once_with(
-        session, 222, is_member=False, left_at=ANY
-    )
+    user_set_member.assert_awaited_once_with(session, 222, is_member=False, left_at=ANY)
     handler.IntroRepo.get.assert_not_called()
     handler.IntroRepo.upsert.assert_not_called()
     update_status.assert_not_called()

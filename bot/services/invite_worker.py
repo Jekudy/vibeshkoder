@@ -70,9 +70,7 @@ async def process_invite_outbox(bot: Bot) -> None:
                             "invite_worker.privacy_block_skipped",
                             extra={
                                 "app_id": row.application_id,
-                                "observed_status": (
-                                    app.status if app is not None else None
-                                ),
+                                "observed_status": (app.status if app is not None else None),
                             },
                         )
                 logger.warning(
