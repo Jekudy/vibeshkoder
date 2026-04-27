@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from types import SimpleNamespace
@@ -238,3 +239,183 @@ def test_pending_within_threshold_not_returned() -> None:
     )
 
     assert pending_ids == []
+
+
+def test_check_vouch_deadlines_pending_app_nudged(app_env, monkeypatch) -> None:
+    async def run() -> None:
+        models = import_module("bot.db.models")
+        scheduler = import_module("bot.services.scheduler")
+        now = datetime.now(timezone.utc)
+        app = models.Application(
+            user_id=2004,
+            status="pending",
+            created_at=now - timedelta(hours=50),
+            submitted_at=now,
+            notified_admin_at=now,
+        )
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(models.Base.metadata.create_all)
+
+            async with sessionmaker() as session:
+                session.add(app)
+                await session.commit()
+
+                monkeypatch.setattr(
+                    scheduler,
+                    "async_session",
+                    lambda: _AsyncSessionContext(session),
+                )
+                bot = SimpleNamespace(send_message=AsyncMock())
+
+                await scheduler.check_vouch_deadlines(bot)
+
+                await session.refresh(app)
+                assert app.status == "pending"
+                assert app.nudged_newcomer_at is not None
+                bot.send_message.assert_awaited_once_with(
+                    chat_id=app.user_id,
+                    text=scheduler.NUDGE_MSG,
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_check_vouch_deadlines_concurrent_vouch_preserved(
+    app_env, monkeypatch, caplog
+) -> None:
+    async def run() -> None:
+        models = import_module("bot.db.models")
+        scheduler = import_module("bot.services.scheduler")
+        now = datetime.now(timezone.utc)
+        app = models.Application(
+            user_id=2005,
+            status="pending",
+            created_at=now - timedelta(hours=50),
+            submitted_at=now,
+            notified_admin_at=now,
+        )
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def lose_nudge_cas(session, app_id, **_kwargs):
+            await session.execute(
+                update(models.Application)
+                .where(models.Application.id == app_id)
+                .values(status="vouched")
+            )
+            await session.flush()
+            await session.refresh(app)
+            return False
+
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(models.Base.metadata.create_all)
+
+            async with sessionmaker() as session:
+                session.add(app)
+                await session.commit()
+
+                monkeypatch.setattr(
+                    scheduler,
+                    "async_session",
+                    lambda: _AsyncSessionContext(session),
+                )
+                monkeypatch.setattr(
+                    scheduler.ApplicationRepo,
+                    "update_status_if",
+                    lose_nudge_cas,
+                )
+                bot = SimpleNamespace(send_message=AsyncMock())
+
+                with caplog.at_level(logging.INFO, logger="bot.services.scheduler"):
+                    await scheduler.check_vouch_deadlines(bot)
+
+                await session.refresh(app)
+                assert app.status == "vouched"
+                assert app.nudged_newcomer_at is None
+                records = [
+                    record
+                    for record in caplog.records
+                    if record.message == "scheduler.cas_lost"
+                ]
+                assert len(records) == 1
+                assert records[0].app_id == app.id
+                assert records[0].branch == "nudge"
+                assert records[0].observed_status == "vouched"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_check_vouch_deadlines_rejected_app_skipped(
+    app_env, monkeypatch, caplog
+) -> None:
+    async def run() -> None:
+        models = import_module("bot.db.models")
+        scheduler = import_module("bot.services.scheduler")
+        now = datetime.now(timezone.utc)
+        app = models.Application(
+            user_id=2006,
+            status="pending",
+            created_at=now - timedelta(hours=50),
+            submitted_at=now,
+            nudged_newcomer_at=now - timedelta(hours=1),
+        )
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def lose_notify_cas(session, app_id, **_kwargs):
+            await session.execute(
+                update(models.Application)
+                .where(models.Application.id == app_id)
+                .values(status="rejected")
+            )
+            await session.flush()
+            await session.refresh(app)
+            return False
+
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(models.Base.metadata.create_all)
+
+            async with sessionmaker() as session:
+                session.add(app)
+                await session.commit()
+
+                monkeypatch.setattr(
+                    scheduler,
+                    "async_session",
+                    lambda: _AsyncSessionContext(session),
+                )
+                monkeypatch.setattr(
+                    scheduler.ApplicationRepo,
+                    "update_status_if",
+                    lose_notify_cas,
+                )
+                bot = SimpleNamespace(send_message=AsyncMock())
+
+                with caplog.at_level(logging.INFO, logger="bot.services.scheduler"):
+                    await scheduler.check_vouch_deadlines(bot)
+
+                await session.refresh(app)
+                assert app.status == "rejected"
+                assert app.notified_admin_at is None
+                records = [
+                    record
+                    for record in caplog.records
+                    if record.message == "scheduler.cas_lost"
+                ]
+                assert len(records) == 1
+                assert records[0].app_id == app.id
+                assert records[0].branch == "notify"
+                assert records[0].observed_status == "rejected"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
