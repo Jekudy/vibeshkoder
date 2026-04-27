@@ -14,6 +14,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -165,8 +166,16 @@ class ChatMessage(Base):
     message_thread_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     caption: Mapped[str | None] = mapped_column(Text, nullable=True)
     message_kind: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # Forward-ref to message_versions.id; T1-06 will add the FK constraint.
-    current_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # T1-06 closes the forward-ref: FK to message_versions.id (defined later in this file).
+    current_version_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey(
+            "message_versions.id",
+            name="fk_chat_messages_current_version_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
     memory_policy: Mapped[str] = mapped_column(
         String(32), nullable=False, default="normal", server_default="normal"
     )
@@ -179,6 +188,78 @@ class ChatMessage(Base):
     content_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+
+class MessageVersion(Base):
+    """Provenance + edit history of a ``chat_messages`` row (T1-06).
+
+    Every persisted message has at least one version (v1, captured at insert time). When
+    a Telegram edit arrives (T1-14) and the content hash changes, a new row is appended
+    with ``version_seq = max + 1``. Citations from the q&a layer (Phase 4) point at a
+    specific ``message_version_id``, not at the parent ``chat_messages`` row, so claims
+    remain stable even after future edits.
+
+    Idempotency: ``(chat_message_id, content_hash)`` should be unique in practice — the
+    repo's ``insert_version`` returns the existing row if a version with the same hash
+    already exists for the same message. This is checked in code; the DB still allows it
+    via the looser ``(chat_message_id, version_seq)`` unique constraint, which is the
+    structural invariant.
+
+    On ``forget`` (Phase 3), versions are hard-deleted (CASCADE from chat_messages) or
+    redacted in place (``is_redacted=True``, content fields nulled). The ON DELETE
+    SET NULL on ``chat_messages.current_version_id`` keeps the message row visible
+    even when its versions are wiped.
+    """
+
+    __tablename__ = "message_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "chat_message_id",
+            "version_seq",
+            name="uq_message_versions_chat_message_seq",
+        ),
+        Index("ix_message_versions_content_hash", "content_hash"),
+        Index("ix_message_versions_captured_at", "captured_at"),
+        Index("ix_message_versions_chat_message_id", "chat_message_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_message_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "chat_messages.id",
+            name="fk_message_versions_chat_message_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    version_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    normalized_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entities_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    edit_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=func.now(),
+        server_default=func.now(),
+        nullable=False,
+    )
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    raw_update_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey(
+            "telegram_updates.id",
+            name="fk_message_versions_raw_update_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    is_redacted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
     )
 
 
