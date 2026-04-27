@@ -175,3 +175,49 @@ class ForgetEventRepo:
             f"{actual.status!r} → {status!r}. "
             f"Allowed from {actual.status!r}: {sorted(allowed_next) or '[]'}"
         )
+
+    @staticmethod
+    async def update_cascade_status(
+        session: AsyncSession,
+        forget_event_id: int,
+        *,
+        cascade_status: dict,
+    ) -> ForgetEvent:
+        """Checkpoint cascade progress on a row in ``status='processing'``.
+
+        Sprint 3 (#96) cascade primitive. Separate from ``mark_status`` so the cascade
+        worker can write per-layer progress mid-cascade without transitioning state.
+        ``mark_status`` rejects ``processing → processing`` (not in the state machine);
+        without this method, a worker crash mid-cascade would lose all per-layer progress.
+
+        Atomic ``UPDATE ... WHERE id = ? AND status = 'processing' RETURNING``. Rejects
+        any other current status (including ``pending`` — the row must be claimed first
+        via ``mark_status(status='processing')`` — and the terminal states).
+
+        Flushes; does not commit. Caller controls the transaction lifecycle.
+
+        Raises ``ValueError`` if the row does not exist or is not in ``processing``.
+        """
+        stmt = (
+            update(ForgetEvent)
+            .where(ForgetEvent.id == forget_event_id)
+            .where(ForgetEvent.status == "processing")
+            .values(cascade_status=cascade_status, updated_at=func.now())
+            .returning(ForgetEvent)
+        )
+        result = await session.execute(stmt)
+        row = result.scalars().first()
+        if row is not None:
+            await session.flush()
+            return row
+
+        # Either the id doesn't exist or the row is not in 'processing'.
+        actual = await session.get(
+            ForgetEvent, forget_event_id, populate_existing=True
+        )
+        if actual is None:
+            raise ValueError(f"ForgetEvent(id={forget_event_id}) not found")
+        raise ValueError(
+            f"update_cascade_status requires status='processing'; "
+            f"ForgetEvent(id={forget_event_id}) is in {actual.status!r}."
+        )

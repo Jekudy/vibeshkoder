@@ -14,6 +14,7 @@ from bot.db.repos.application import ApplicationRepo
 from bot.db.repos.intro import IntroRepo
 from bot.db.repos.user import UserRepo
 from bot.html_escape import html_escape
+from bot.services.forget_cascade import cascade_worker_tick
 from bot.services.invite_worker import process_invite_outbox
 from bot.texts import (
     ADMIN_NUDGE_MSG,
@@ -261,6 +262,21 @@ def start_scheduler(bot: Bot) -> None:
         minutes=5,
         id="sync_google_sheets",
         replace_existing=True,
+    )
+    # T3-04 (#96): forget cascade worker. Default 30s interval matches the
+    # invite outbox precedent (lowest-latency persistent queue we operate).
+    # Gated by feature flag ``memory.forget.cascade_worker.enabled`` (default
+    # OFF) — the tick reads the flag every fire and is a strict no-op when
+    # disabled, so this wiring is safe to land in production with the flag off.
+    scheduler.add_job(
+        cascade_worker_tick,
+        "interval",
+        seconds=30,
+        id="forget_cascade_worker",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
     scheduler.start()
     logger.info("Scheduler started")

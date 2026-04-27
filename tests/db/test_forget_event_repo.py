@@ -416,3 +416,89 @@ async def test_failed_state_is_terminal(db_session) -> None:
     # Attempt to re-enter processing from failed must raise ValueError.
     with pytest.raises(ValueError, match="failed"):
         await ForgetEventRepo.mark_status(db_session, ev.id, status="processing")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# update_cascade_status — cascade checkpoint primitive (Sprint 3 / #96)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# update_cascade_status is the cascade worker's checkpoint primitive. It writes a
+# new ``cascade_status`` value WHILE the row stays in ``status='processing'``. This
+# is intentionally separate from ``mark_status``: the cascade worker may need to
+# checkpoint per-layer progress mid-cascade WITHOUT transitioning state, which
+# ``mark_status`` would refuse (``processing → processing`` is not a valid state-
+# machine edge). Without this separation, mid-cascade restart-safety is impossible.
+
+
+async def test_update_cascade_status_succeeds_in_processing(db_session) -> None:
+    from bot.db.repos.forget_event import ForgetEventRepo
+
+    ev = await ForgetEventRepo.create(
+        db_session,
+        target_type="message",
+        target_id=None,
+        actor_user_id=None,
+        authorized_by="system",
+        tombstone_key=f"message:-checkpoint:{next(_key_counter)}",
+    )
+    await ForgetEventRepo.mark_status(db_session, ev.id, status="processing")
+
+    payload = {"chat_messages": {"status": "completed", "rows": 1}}
+    updated = await ForgetEventRepo.update_cascade_status(
+        db_session, ev.id, cascade_status=payload
+    )
+
+    assert updated.id == ev.id
+    assert updated.status == "processing"
+    assert updated.cascade_status == payload
+
+
+async def test_update_cascade_status_rejected_in_pending(db_session) -> None:
+    """Cannot checkpoint a row that hasn't been claimed yet."""
+    from bot.db.repos.forget_event import ForgetEventRepo
+
+    ev = await ForgetEventRepo.create(
+        db_session,
+        target_type="message",
+        target_id=None,
+        actor_user_id=None,
+        authorized_by="system",
+        tombstone_key=f"message:-pending-cp:{next(_key_counter)}",
+    )
+    assert ev.status == "pending"
+
+    with pytest.raises(ValueError, match="pending"):
+        await ForgetEventRepo.update_cascade_status(
+            db_session, ev.id, cascade_status={"x": 1}
+        )
+
+
+async def test_update_cascade_status_rejected_in_completed(db_session) -> None:
+    """Cannot rewrite cascade_status on a finished row."""
+    from bot.db.repos.forget_event import ForgetEventRepo
+
+    ev = await ForgetEventRepo.create(
+        db_session,
+        target_type="message",
+        target_id=None,
+        actor_user_id=None,
+        authorized_by="system",
+        tombstone_key=f"message:-done-cp:{next(_key_counter)}",
+    )
+    await ForgetEventRepo.mark_status(db_session, ev.id, status="processing")
+    await ForgetEventRepo.mark_status(db_session, ev.id, status="completed")
+
+    with pytest.raises(ValueError, match="completed"):
+        await ForgetEventRepo.update_cascade_status(
+            db_session, ev.id, cascade_status={"x": 1}
+        )
+
+
+async def test_update_cascade_status_rejected_on_missing_id(db_session) -> None:
+    """A non-existent id must raise (not silently no-op)."""
+    from bot.db.repos.forget_event import ForgetEventRepo
+
+    with pytest.raises(ValueError, match="not found"):
+        await ForgetEventRepo.update_cascade_status(
+            db_session, 999_999_999, cascade_status={"x": 1}
+        )
