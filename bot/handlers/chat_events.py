@@ -144,7 +144,7 @@ async def _handle_join(
 ) -> None:
     now = datetime.now(timezone.utc)
 
-    # Upsert user and mark as member
+    # Upsert user before admission decisions so the reject path can track kicks.
     await UserRepo.upsert(
         session,
         telegram_id=tg_user.id,
@@ -152,6 +152,21 @@ async def _handle_join(
         first_name=tg_user.first_name,
         last_name=tg_user.last_name,
     )
+
+    is_admin = tg_user.id in settings.ADMIN_IDS
+    active_app = None
+
+    if is_admin:
+        logger.info("Admin user %s joined without gatekeeper admission", tg_user.id)
+    else:
+        # Check for active vouched application with a user-bound invite.
+        active_app = await ApplicationRepo.get_active(session, tg_user.id)
+        rejection_reason = _admission_rejection_reason(active_app, tg_user.id)
+
+        if rejection_reason is not None:
+            await _reject_join(event, session, tg_user, now, rejection_reason)
+            return
+
     await UserRepo.set_member(
         session, tg_user.id, is_member=True, joined_at=now
     )
@@ -164,16 +179,7 @@ async def _handle_join(
         )
         return
 
-    if tg_user.id in settings.ADMIN_IDS:
-        logger.info("Admin user %s joined without gatekeeper admission", tg_user.id)
-        return
-
-    # Check for active vouched application with a user-bound invite.
-    active_app = await ApplicationRepo.get_active(session, tg_user.id)
-    rejection_reason = _admission_rejection_reason(active_app, tg_user.id)
-
-    if rejection_reason is not None:
-        await _reject_join(event, session, tg_user, now, rejection_reason)
+    if is_admin:
         return
 
     await ApplicationRepo.update_status(

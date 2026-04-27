@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, call
+from unittest.mock import ANY, AsyncMock
 
 from tests.conftest import import_module
 
@@ -54,6 +54,7 @@ def _patch_join_dependencies(
     monkeypatch,
     *,
     active_app: SimpleNamespace | None,
+    existing_intro: SimpleNamespace | None = None,
 ) -> tuple[AsyncMock, AsyncMock]:
     user_upsert = AsyncMock(return_value=_db_user())
     user_set_member = AsyncMock()
@@ -62,14 +63,22 @@ def _patch_join_dependencies(
     monkeypatch.setattr(handler.UserRepo, "upsert", user_upsert)
     monkeypatch.setattr(handler.UserRepo, "set_member", user_set_member)
     monkeypatch.setattr(handler.UserRepo, "get", user_get)
-    monkeypatch.setattr(handler.IntroRepo, "get", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        handler.IntroRepo,
+        "get",
+        AsyncMock(return_value=existing_intro),
+    )
     monkeypatch.setattr(
         handler.ApplicationRepo,
         "get_active",
         AsyncMock(return_value=active_app),
     )
     monkeypatch.setattr(handler.ApplicationRepo, "update_status", AsyncMock())
-    monkeypatch.setattr(handler.QuestionnaireRepo, "get_answers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        handler.QuestionnaireRepo,
+        "get_answers",
+        AsyncMock(return_value=[]),
+    )
     monkeypatch.setattr(handler.IntroRepo, "upsert", AsyncMock())
 
     return user_set_member, handler.ApplicationRepo.update_status
@@ -94,13 +103,95 @@ def test_filling_user_using_forwarded_invite_rejected(
     event.bot.ban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
     event.bot.unban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
     update_status.assert_not_called()
-    user_set_member.assert_has_awaits(
-        [
-            call(session, 222, is_member=True, joined_at=ANY),
-            call(session, 222, is_member=False, left_at=ANY),
-        ]
+    user_set_member.assert_awaited_once_with(
+        session, 222, is_member=False, left_at=ANY
     )
     assert "status='filling'" in caplog.text
+
+
+def test_handle_join_legit_returning_member_with_valid_vouch_passes(
+    app_env, monkeypatch
+) -> None:
+    handler = import_module("bot.handlers.chat_events")
+    session = AsyncMock()
+    event = _join_event()
+    tg_user = _user(222)
+    existing_intro = SimpleNamespace(user_id=222, intro_text="old intro")
+    user_set_member, update_status = _patch_join_dependencies(
+        handler,
+        monkeypatch,
+        active_app=_application(status="vouched", invite_user_id=222),
+        existing_intro=existing_intro,
+    )
+
+    asyncio.run(handler._handle_join(event, session, tg_user))
+
+    event.bot.ban_chat_member.assert_not_called()
+    event.bot.unban_chat_member.assert_not_called()
+    user_set_member.assert_awaited_once_with(
+        session, 222, is_member=True, joined_at=ANY
+    )
+    handler.IntroRepo.get.assert_awaited_once_with(session, 222)
+    handler.IntroRepo.upsert.assert_not_called()
+    update_status.assert_not_called()
+
+
+def test_handle_join_ex_member_with_intro_no_vouch_rejected(
+    app_env, monkeypatch, caplog
+) -> None:
+    handler = import_module("bot.handlers.chat_events")
+    session = AsyncMock()
+    event = _join_event()
+    tg_user = _user(222)
+    existing_intro = SimpleNamespace(user_id=222, intro_text="old intro")
+    user_set_member, update_status = _patch_join_dependencies(
+        handler,
+        monkeypatch,
+        active_app=_application(status="rejected", invite_user_id=222),
+        existing_intro=existing_intro,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(handler._handle_join(event, session, tg_user))
+
+    event.bot.ban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
+    event.bot.unban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
+    user_set_member.assert_awaited_once_with(
+        session, 222, is_member=False, left_at=ANY
+    )
+    handler.IntroRepo.get.assert_not_called()
+    handler.IntroRepo.upsert.assert_not_called()
+    update_status.assert_not_called()
+    assert "status='rejected'" in caplog.text
+
+
+def test_handle_join_forwarded_invite_ex_member_blocked(
+    app_env, monkeypatch, caplog
+) -> None:
+    handler = import_module("bot.handlers.chat_events")
+    session = AsyncMock()
+    event = _join_event()
+    tg_user = _user(222)
+    existing_intro = SimpleNamespace(user_id=222, intro_text="old intro")
+    user_set_member, update_status = _patch_join_dependencies(
+        handler,
+        monkeypatch,
+        active_app=None,
+        existing_intro=existing_intro,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(handler._handle_join(event, session, tg_user))
+
+    event.bot.ban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
+    event.bot.unban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
+    user_set_member.assert_awaited_once_with(
+        session, 222, is_member=False, left_at=ANY
+    )
+    handler.IntroRepo.get.assert_not_called()
+    handler.IntroRepo.upsert.assert_not_called()
+    update_status.assert_not_called()
+    assert "no active application" in caplog.text
 
 
 def test_pending_user_join_rejected(app_env, monkeypatch) -> None:
