@@ -38,10 +38,11 @@ when the operator clicked "Export". The `edited` / `edited_unixtime` fields conf
 an edit happened, but provide no record of what the original text was, how many times the
 message changed, or what intermediate states looked like.
 
-Live ingestion, by contrast, captures every edit as a separate `message_versions` row
-(via the `edited_message` Telegram Bot API update, handler T1-14). The result is a
-faithful chain: `version_seq=1` for the original, `version_seq=2` for the first edit,
-and so on.
+Live ingestion, by contrast, captures every CONTENT-CHANGING edit (for a known prior
+message) as a separate `message_versions` row via the `edited_message` Telegram Bot API
+update (handler T1-14); edits with an unchanged hash or an unknown prior message are
+skipped — see §2 detailed semantics. The result is a faithful chain: `version_seq=1`
+for the original, `version_seq=2` for the first content-changing edit, and so on.
 
 When an operator imports a TD export into a community that also has live ingestion, the
 system needs a coherent policy for what an imported edited message looks like in the DB —
@@ -176,9 +177,14 @@ Option C is rejected.
 
 ## 4. Recommendation
 
-**Adopt Options A/B as a single approach.** Import every TD message (including those with
-`edited` set) as a single `message_versions` row with `version_seq=1` and a boolean
-marker `imported_final=TRUE` on the `message_versions` row.
+**Adopt Options A/B as a single approach.** Import every user-authored TD message
+(service messages are skipped per `telegram-desktop-export-schema.md` §3) as a new
+`message_versions` row using `MessageVersionRepo.insert_version` (which assigns
+`version_seq = max(existing version_seq) + 1` per chat_message; for a fresh
+chat_message that means `version_seq=1`). When a live row already exists for the same
+`(chat_id, message_id)`, the overlap rule in §5 applies — import skips. Every row
+created by the import gets a boolean marker `imported_final=TRUE` on the
+`message_versions` row.
 
 ### Where to place the marker
 
@@ -250,8 +256,9 @@ the existing FK chain: `message_versions.raw_update_id → telegram_updates.inge
 3. **Write cost**: the Boolean denormalisation is a single column set at insert time. It
    adds no ongoing cost relative to rows that would already be written with `raw_update_id`.
 4. **Audit trail preserved**: the FK chain (`raw_update_id → ingestion_run_id →
-   run_type`) is retained on the row as the audit trail of last resort. If `imported_final`
-   ever drifts from the chain, the chain is the ground truth and can be used to correct it.
+   run_type`) is retained on the row as the AUDIT trail of last resort. If `imported_final`
+   ever drifts from the chain, the chain is the cross-check — #103 is responsible for
+   keeping them consistent on every write. In normal operation they never disagree.
 
 ### `imported_final=TRUE` for all imported rows, not just edited ones
 
@@ -274,18 +281,18 @@ separate boolean, e.g. `imported_was_edited`, on the same `message_versions` row
 is out of scope for this ticket but is documented as future work in §8.
 
 Invariant: `imported_final=TRUE` denormalises provenance for query efficiency and audit
-clarity. The boolean is the source of truth at the `message_versions` row level; the FK
-chain is the audit trail. The FK chain resolves as:
-`message_versions.raw_update_id → telegram_updates.ingestion_run_id →
-ingestion_runs.run_type`. A row's `imported_final` MUST be TRUE iff that chain resolves
-to `ingestion_runs.run_type = 'import'`. The boolean denormalisation avoids a JOIN to
+clarity. The `imported_final` Boolean is the OPERATIONAL source of truth at the row
+level — every read-side query against `message_versions` filters/groups on this column
+directly. The FK chain (`raw_update_id → telegram_updates.ingestion_run_id →
+ingestion_runs.run_type`) is the AUDIT trail: if drift is ever suspected, the chain is
+the cross-check. A row's `imported_final` MUST be TRUE iff that chain resolves to
+`ingestion_runs.run_type = 'import'`. The boolean denormalisation avoids a JOIN to
 `telegram_updates` + `ingestion_runs` on every read-side query — a single Boolean column
 is cheaper to filter than a two-table join on hot read paths. Downstream consumers
 (q&a, search, citations) treat provenance as a row-level attribute, not a chain attribute.
-The FK chain remains the audit trail of last resort if the boolean ever drifts (e.g.
-from a bug in the import apply path). `#103` must keep them consistent: every row written
-by an import run sets `imported_final=TRUE`; every row written by live ingestion leaves
-it `FALSE`.
+#103 is responsible for keeping them consistent on every write: every row written by an
+import run sets `imported_final=TRUE`; every row written by live ingestion leaves it
+`FALSE`. There is no scenario in normal operation where they disagree.
 
 ---
 
@@ -346,8 +353,10 @@ implementation lands entirely in #103 (T2-03, Stream Delta).
 
 7. **Dry-run parser (#94, T2-01)** does NOT write `message_versions` rows. However, the
    dry-run stats output (#99, T2-02) SHOULD report the count of messages with `edited`
-   set as "would import as v1 with `imported_final=TRUE`". This gives operators visibility
-   into how many messages have only their final state preserved.
+   set as "would import as a new `message_versions` row with `imported_final=TRUE`
+   (version_seq=1 if no live row exists for that chat_message; skip otherwise per §5
+   overlap rule), edit history unrecoverable." This gives operators visibility into how
+   many messages have only their final state preserved.
 
 ### What #103 must NOT do
 
@@ -402,9 +411,9 @@ surface is responsible for rendering it appropriately in Phase 4.
 |-----------|-----------|
 | `docs/memory-system/telegram-desktop-export-schema.md §4` (T2-NEW-A, issue #91) | Establishes the structural fact: TD export is a snapshot, not a history. This policy doc elaborates the response to that constraint. |
 | Issue #94 (T2-01) dry-run parser | The parser MUST surface the count of messages with `edited` set in its dry-run output (#99). Cross-ref: #99 T2-02 stats doc. |
-| Issue #99 (T2-02) dry-run stats | Stats SHOULD report "N messages with `edited` set — would import as v1 with `imported_final=TRUE`, edit history unrecoverable." |
+| Issue #99 (T2-02) dry-run stats | Stats SHOULD report "N messages with `edited` set — would import as a new `message_versions` row with `imported_final=TRUE` (version_seq=1 if no live row exists; skip otherwise per §5 overlap rule), edit history unrecoverable." |
 | Issue #103 (T2-03) import apply, Stream Delta | Implements this policy: the Alembic migration, `imported_final` writes, `edit_date` population. This doc is the authoritative spec for that work. |
-| `bot/handlers/edited_message.py` (T1-14) | Live edit handler. Documents the contrast story: live ingestion creates full v(n+1) chains; import creates only v1 with a marker. |
+| `bot/handlers/edited_message.py` (T1-14) | Live edit handler. Documents the contrast story: live ingestion creates full v(n+1) chains; import creates a new row (version_seq=1 for a fresh chat_message; skips if a live row already exists — §5 overlap rule) with `imported_final=TRUE`. |
 | `bot/services/content_hash.py` (T1-08) | The chv1 hash recipe. Import apply must compute hashes using the same recipe for all imported `message_versions` rows. |
 | `docs/memory-system/HANDOFF.md` — `message_versions` semantics | Canonical table description. `imported_final` column is additive; it does not change `version_seq` semantics or the `(chat_message_id, content_hash)` idempotency key. |
 | `docs/memory-system/AUTHORIZED_SCOPE.md` — "Telegram import rule" | Dry-run vs apply boundary. This policy is binding only for apply (#103). |
@@ -423,6 +432,6 @@ surface is responsible for rendering it appropriately in Phase 4.
 | Citation surface treatment of `imported_final=TRUE` rows (UX: "imported snapshot" caveat) | Phase 4 |
 | Splitting `imported_was_edited` (was the TD message marked edited?) from `imported_final` (was this row built from a static archive?) | Future work — not scoped for this ticket or #103; document here for record |
 | Recovering lost edit history | Impossible — Telegram does not expose it |
-| Merging imported rows with simultaneously live-ingested rows for the same `(chat_id, message_id)` | Covered by `MessageVersionRepo.insert_version` idempotency on `(chat_message_id, content_hash)`. No new policy needed beyond what T1-06 + T1-14 already implement. |
+| Merging imported rows with simultaneously live-ingested rows for the same `(chat_id, message_id)` | Overlap is handled by the explicit policy in §5 (skip insert when a live row exists + stats counter). The existing `MessageVersionRepo.insert_version` idempotency on `(chat_message_id, content_hash)` is a SEPARATE safety net (catches identical-content re-imports), not a substitute for the §5 skip rule. |
 | Per-channel-import variation (e.g. only some chats get `imported_final=TRUE`) | Not scoped; the simpler invariant (all import-run rows get `imported_final=TRUE`) is preferred |
 | Recovering v(n+1) from a future hypothetical Telegram API | Not on any roadmap; would be a separate Phase 5+ design |
