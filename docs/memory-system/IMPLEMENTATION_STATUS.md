@@ -1,6 +1,6 @@
 # Memory System — Implementation Status
 
-**Last updated:** 2026-04-27
+**Last updated:** 2026-04-27 (Phase 2 — Stream Alpha sprint #67)
 **Branch:** `feat/memory-foundation` (worktree `.worktrees/memory`)
 **Source of truth:** this file is updated after every PR merge into `main`.
 
@@ -91,6 +91,12 @@ Three parallel tracks possible from day 1 (no shared deps):
 | Issue | Ticket   | Status | Notes |
 |-------|----------|--------|-------|
 | #91   | T2-NEW-A | done   | Sprint Bravo-01 / PR #TBD. Two-commit branch (286b46a + 3f691bc). New `docs/memory-system/telegram-desktop-export-schema.md` (10 sections: envelope, message envelope, message_kind taxonomy + mixed-array text form, edit history, reply/forward fields, identity (anonymous channel), media references, #offrecord governance quote from AUTHORIZED_SCOPE.md, schema versioning, out-of-scope cross-refs). Three anonymized fixtures under `tests/fixtures/td_export/`: `small_chat.json` (6 msgs incl. mixed-array text edge case), `edited_messages.json` (5 msgs with both #nomem and #offrecord), `replies_with_media.json` (8 msgs with A→B→C reply chain, anonymous channel post, dangling reply for #98). 12 stdlib-only tests in `tests/fixtures/test_td_export_fixtures.py` (all pass). Unblocks #93, #94, #98, #99, #103, #106. |
+
+### Phase 2 — Stream Alpha progress (Phase 1 cleanup chain)
+
+| Issue | Status | Notes |
+|-------|--------|-------|
+| #67   | done   | Sprint Alpha-01 / PR #120. Two-commit branch (`11e80df` feat + `cec051f` review fixes). Closes the `MessageRepo.save` "stale `memory_policy` on duplicate delivery" bug flagged on PR #63. Implements recommended fix combo (1)+(3) plus defensive (2): (1) alembic migration `013_offrecord_marks_unique_partial.py` adds partial UNIQUE INDEX `ix_offrecord_marks_chat_message_id_mark_type ON offrecord_marks (chat_message_id, mark_type) WHERE chat_message_id IS NOT NULL` with a one-shot pre-create DELETE-by-min(id) guard against pre-existing duplicates from the T1-13→#67 bug window; (3) `MessageRepo.save` switches to `ON CONFLICT DO UPDATE SET memory_policy=EXCLUDED.memory_policy, is_redacted=EXCLUDED.is_redacted` ONLY for the policy fields the caller explicitly passes (immutables `text`/`caption`/`raw_json`/`date`/`user_id`/etc. never appear in `set_clause`); legacy callers passing both policy args as `None` retain the original `ON CONFLICT DO NOTHING + SELECT` semantics (no `NULL`-clobber); (2) `OffrecordMarkRepo.create_for_message` becomes idempotent via `pg_insert(...).on_conflict_do_nothing(index_elements=['chat_message_id','mark_type'], index_where=text("chat_message_id IS NOT NULL")).returning(...)` + `SELECT` fallback so redelivery is a true no-op (no duplicate audit rows, no `IntegrityError`). New tests: 5 in `tests/db/test_message_repo.py` (refresh-policy on dup, both-None preserves existing, only-policy doesn't clobber `is_redacted`, irreversibility extended to assert `caption`+`raw_json` immutable, `is_redacted` flip-back guard) + 1 in `tests/db/test_offrecord_mark_repo.py` (repo idempotency) + 1 in `tests/handlers/test_chat_messages_redelivery_idempotent.py` (handler-level integration: same `#offrecord` update fed twice → exactly 1 row in both `chat_messages` and `offrecord_marks`). Dual review: Codex tech `APPROVE`, Claude product `ACCEPTED`. CI: 4/4 green. Unblocks the `#67/#80/#81/#89 → persist_message_with_policy()` critical path. |
 
 ## Phases 4–12
 
