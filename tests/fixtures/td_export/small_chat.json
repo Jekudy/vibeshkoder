@@ -1,0 +1,86 @@
+{
+  "name": "Vibe Community Chat",
+  "type": "private_supergroup",
+  "id": -1001999999999,
+  "messages": [
+    {
+      "id": 1001,
+      "type": "message",
+      "date": "2024-01-15T10:00:00",
+      "date_unixtime": "1705312800",
+      "from": "User One",
+      "from_id": "user1000001",
+      "text": "Hello everyone! Glad to be here.",
+      "text_entities": [
+        {"type": "plain", "text": "Hello everyone! Glad to be here."}
+      ]
+    },
+    {
+      "id": 1002,
+      "type": "message",
+      "date": "2024-01-15T10:05:00",
+      "date_unixtime": "1705313100",
+      "from": "User Two",
+      "from_id": "user1000002",
+      "photo": "photos/photo_1@15-01-2024_10-05-00.jpg",
+      "width": 1280,
+      "height": 960,
+      "text": "Check out this view from the meetup!",
+      "text_entities": [
+        {"type": "plain", "text": "Check out this view from the meetup!"}
+      ]
+    },
+    {
+      "id": 1003,
+      "type": "message",
+      "date": "2024-01-15T10:12:00",
+      "date_unixtime": "1705313520",
+      "from": "User Three",
+      "from_id": "user1000003",
+      "media_type": "voice_message",
+      "file": "voice_messages/audio_1@15-01-2024_10-12-00.ogg",
+      "mime_type": "audio/ogg",
+      "duration_seconds": 8,
+      "text": "",
+      "text_entities": []
+    },
+    {
+      "id": 1004,
+      "type": "message",
+      "date": "2024-01-15T10:18:00",
+      "date_unixtime": "1705313880",
+      "from": "User One",
+      "from_id": "user1000001",
+      "reply_to_message_id": 1001,
+      "text": "Thanks for the warm welcome, everyone!",
+      "text_entities": [
+        {"type": "plain", "text": "Thanks for the warm welcome, everyone!"}
+      ]
+    },
+    {
+      "id": 1005,
+      "type": "message",
+      "date": "2024-01-15T10:25:00",
+      "date_unixtime": "1705314300",
+      "from": "User Two",
+      "from_id": "user1000002",
+      "forwarded_from": "Tech News Daily",
+      "text": "Interesting article about community building:",
+      "text_entities": [
+        {"type": "plain", "text": "Interesting article about community building:"},
+        {"type": "text_link", "text": "read more", "href": "https://example.com/article"}
+      ]
+    },
+    {
+      "id": 1006,
+      "type": "service",
+      "date": "2024-01-15T10:30:00",
+      "date_unixtime": "1705314600",
+      "actor": "User Three",
+      "actor_id": "user1000003",
+      "action": "join_group_by_link",
+      "text": "",
+      "text_entities": []
+    }
+  ]
+}

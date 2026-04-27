@@ -1,0 +1,119 @@
+{
+  "name": "Vibe Community Chat",
+  "type": "private_supergroup",
+  "id": -1001999999999,
+  "messages": [
+    {
+      "id": 3001,
+      "type": "message",
+      "date": "2024-03-05T14:00:00",
+      "date_unixtime": "1709647200",
+      "from": "User One",
+      "from_id": "user1000001",
+      "text": "Has anyone tried the new onboarding flow yet?",
+      "text_entities": [
+        {"type": "plain", "text": "Has anyone tried the new onboarding flow yet?"}
+      ]
+    },
+    {
+      "id": 3002,
+      "type": "message",
+      "date": "2024-03-05T14:05:00",
+      "date_unixtime": "1709647500",
+      "from": "User Two",
+      "from_id": "user1000002",
+      "reply_to_message_id": 3001,
+      "text": "Yes! Here is a screenshot of the welcome screen.",
+      "text_entities": [
+        {"type": "plain", "text": "Yes! Here is a screenshot of the welcome screen."}
+      ]
+    },
+    {
+      "id": 3003,
+      "type": "message",
+      "date": "2024-03-05T14:10:00",
+      "date_unixtime": "1709647800",
+      "from": "User Three",
+      "from_id": "user1000003",
+      "reply_to_message_id": 3002,
+      "text": "Thanks, that is helpful context!",
+      "text_entities": [
+        {"type": "plain", "text": "Thanks, that is helpful context!"}
+      ]
+    },
+    {
+      "id": 3004,
+      "type": "message",
+      "date": "2024-03-05T14:15:00",
+      "date_unixtime": "1709648100",
+      "from": "User One",
+      "from_id": "user1000001",
+      "reply_to_message_id": 3001,
+      "photo": "photos/photo_4@05-03-2024_14-15-00.jpg",
+      "width": 1280,
+      "height": 720,
+      "text": "Here is what the flow looks like on mobile.",
+      "text_entities": [
+        {"type": "plain", "text": "Here is what the flow looks like on mobile."}
+      ]
+    },
+    {
+      "id": 3005,
+      "type": "message",
+      "date": "2024-03-05T14:20:00",
+      "date_unixtime": "1709648400",
+      "from": "User Two",
+      "from_id": "user1000002",
+      "reply_to_message_id": 3004,
+      "media_type": "video_file",
+      "file": "video_files/video_1@05-03-2024_14-20-00.mp4",
+      "mime_type": "video/mp4",
+      "duration_seconds": 12,
+      "thumbnail": "video_files/video_1@05-03-2024_14-20-00.jpg",
+      "width": 1280,
+      "height": 720,
+      "text": "And here is a quick walkthrough video.",
+      "text_entities": [
+        {"type": "plain", "text": "And here is a quick walkthrough video."}
+      ]
+    },
+    {
+      "id": 3006,
+      "type": "message",
+      "date": "2024-03-05T14:25:00",
+      "date_unixtime": "1709648700",
+      "from": "Community Announcements",
+      "from_id": "channel1000050",
+      "forwarded_from": "Community Announcements",
+      "text": "New release notes are available at our website.",
+      "text_entities": [
+        {"type": "plain", "text": "New release notes are available at our website."}
+      ]
+    },
+    {
+      "id": 3007,
+      "type": "message",
+      "date": "2024-03-05T14:30:00",
+      "date_unixtime": "1709649000",
+      "from": "User Three",
+      "from_id": "user1000003",
+      "reply_to_message_id": 2999,
+      "text": "Following up on the earlier discussion from last week.",
+      "text_entities": [
+        {"type": "plain", "text": "Following up on the earlier discussion from last week."}
+      ]
+    },
+    {
+      "id": 3008,
+      "type": "message",
+      "date": "2024-03-05T14:35:00",
+      "date_unixtime": "1709649300",
+      "from": "User One",
+      "from_id": "user1000001",
+      "text": "Great session today, everyone. See you next week!",
+      "text_entities": [
+        {"type": "plain", "text": "Great session today, everyone. See you next week!"}
+      ]
+    }
+  ]
+}
