@@ -62,6 +62,10 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
    `tests/fixtures/td_export/`. Cross-stream contract: import schema details (envelope,
    message_kind taxonomy, edit/reply semantics, anonymous channel posts, mixed-array text
    form), governance quote, and downstream-ticket cross-refs.
+7. `docs/memory-system/import-edit-history.md` — Telegram Desktop import edit-history policy.
+   Read BEFORE implementing #103 import apply. Defines: `message_versions.imported_final=TRUE`
+   marker, version_seq overlap semantics (live wins; import skips when live row exists),
+   governance unchanged (`detect_policy` still runs). Schema/migration land in #103.
 
 Issue tracker for memory cycle: **GitHub Issues** (label `phase:0`, `phase:1`, etc.). The
 `nt` (Notion) plugin remains the tracker for non-memory work in this repo if any.

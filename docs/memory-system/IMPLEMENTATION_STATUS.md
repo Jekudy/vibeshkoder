@@ -100,6 +100,7 @@ Three parallel tracks possible from day 1 (no shared deps):
 | Issue | Ticket   | Status | Notes |
 |-------|----------|--------|-------|
 | #91   | T2-NEW-A | done   | Sprint Bravo-01 / PR #TBD. Two-commit branch (286b46a + 3f691bc). New `docs/memory-system/telegram-desktop-export-schema.md` (10 sections: envelope, message envelope, message_kind taxonomy + mixed-array text form, edit history, reply/forward fields, identity (anonymous channel), media references, #offrecord governance quote from AUTHORIZED_SCOPE.md, schema versioning, out-of-scope cross-refs). Three anonymized fixtures under `tests/fixtures/td_export/`: `small_chat.json` (6 msgs incl. mixed-array text edge case), `edited_messages.json` (5 msgs with both #nomem and #offrecord), `replies_with_media.json` (8 msgs with A→B→C reply chain, anonymous channel post, dangling reply for #98). 12 stdlib-only tests in `tests/fixtures/test_td_export_fixtures.py` (all pass). Unblocks #93, #94, #98, #99, #103, #106. |
+| #106  | T2-NEW-H | done   | Sprint Bravo-03 / PR #TBD. New `docs/memory-system/import-edit-history.md` + binding-rule append to `AUTHORIZED_SCOPE.md` under "Telegram import rule". Decision: imported messages get `imported_final=TRUE` marker on `message_versions` row (denormalised provenance; FK chain `raw_update_id → telegram_updates.ingestion_run_id` is audit trail). Schema/migration deferred to #103. |
 
 ### Phase 2 — Stream Alpha progress (Phase 1 cleanup chain)
 
