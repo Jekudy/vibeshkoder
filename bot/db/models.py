@@ -43,6 +43,13 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=func.now(), server_default=func.now(), onupdate=func.now()
     )
+    # T2-NEW-B: ghost-user flag for Telegram Desktop import.
+    # Set to True only by the import service for users whose Telegram account is not
+    # represented by a live gatekeeper row (deleted accounts, anonymous channel posts).
+    # NEVER flipped back to False; NEVER used to overwrite a live user's row.
+    is_imported_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false"), default=False
+    )
 
     intro: Mapped[Intro | None] = relationship(
         "Intro", back_populates="user", foreign_keys="[Intro.user_id]"

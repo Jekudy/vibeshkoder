@@ -46,6 +46,16 @@ class UserRepo:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def get_by_tg_id(session: AsyncSession, tg_id: int) -> User | None:
+        """Look up a user by Telegram user id (users.id == tg_id).
+
+        Alias for ``get`` with an explicit name that matches import-path terminology.
+        ``users.id`` IS the Telegram user id — there is no separate ``tg_id`` column.
+        """
+        result = await session.execute(select(User).where(User.id == tg_id))
+        return result.scalar_one_or_none()
+
+    @staticmethod
     async def get_members(session: AsyncSession) -> list[User]:
         result = await session.execute(select(User).where(User.is_member.is_(True)))
         return list(result.scalars().all())
