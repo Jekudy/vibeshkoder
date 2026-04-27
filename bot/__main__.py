@@ -13,6 +13,7 @@ from bot.handlers import (
     chat_events,
     chat_messages,
     edited_message,
+    forget_reply,
     forward_lookup,
     questionnaire,
     start,
@@ -108,6 +109,7 @@ async def main() -> None:
         chat_events.router,
         forward_lookup.router,
         edited_message.router,  # T1-14: edited_message handler (before chat_messages catch-all)
+        forget_reply.router,   # T3-02: /forget command handler (before chat_messages catch-all)
         chat_messages.router,  # lowest priority — catches all group messages
     )
 
