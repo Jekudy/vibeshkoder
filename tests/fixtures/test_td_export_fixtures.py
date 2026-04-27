@@ -258,16 +258,15 @@ def test_message_kinds_match_taxonomy():
 # ---------------------------------------------------------------------------
 
 def test_each_message_has_date_unixtime():
-    """Every NON-service message in every fixture must have a 'date_unixtime' field
-    (string representation of a unix timestamp). Service messages may omit it."""
+    """Every message in every fixture must have a 'date_unixtime' field (string
+    representation of a unix timestamp). Per real TD export shape, this includes
+    service messages — date_unixtime is a top-level common field."""
     for path in ALL_FIXTURES:
         result = json.loads(path.read_text(encoding="utf-8"))
         for i, msg in enumerate(result["messages"]):
-            if msg.get("type") == "service":
-                continue  # service messages may omit date_unixtime
             assert "date_unixtime" in msg, (
-                f"{path.name}[{i}] (id={msg.get('id')}): "
-                f"non-service message missing 'date_unixtime' field"
+                f"{path.name}[{i}] (id={msg.get('id')}, type={msg.get('type')}): "
+                f"message missing 'date_unixtime' field"
             )
             assert isinstance(msg["date_unixtime"], str), (
                 f"{path.name}[{i}] (id={msg.get('id')}): "

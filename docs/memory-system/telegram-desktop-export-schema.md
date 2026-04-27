@@ -32,8 +32,12 @@ internal `message_kind` taxonomy. The companion fixture set lives at
 ### Supported export type
 
 We support: **single chat JSON export** produced by:
-> Telegram Desktop → Settings → Advanced → Export Telegram data → "Export chat history"
+> Open the target chat in Telegram Desktop → ⋯ menu (top-right) → "Export chat history"
 > → format: **Machine-readable JSON**
+
+(The full-account export flow `Settings → Advanced → Export Telegram data` produces a
+different envelope with a top-level `chats: [...]` list and is **not** the supported input
+format — see §1 supported-export-types table for how to handle full archives.)
 
 We do NOT support:
 - HTML export (Telegram Desktop's other export format)
@@ -172,10 +176,19 @@ them so the parser knows what to ignore.
 
 ## 3. Message types and `message_kind` mapping
 
-The table below maps TD export field shapes to the project's `message_kind` taxonomy. This
-taxonomy is defined by `bot/services/normalization.py::_KIND_PROBES` and must match exactly.
-The inline helper `_infer_kind` in `tests/fixtures/test_td_export_fixtures.py` implements
-this mapping for fixture validation without importing from `bot/`.
+The table below maps TD export field shapes to the project's `message_kind` taxonomy. The
+canonical taxonomy (the *set* of allowed values) is defined by
+`bot/services/normalization.py::_KIND_PROBES`; this doc reuses the same value names
+(`text`, `photo`, `video`, `voice`, `audio`, `document`, `sticker`, `animation`,
+`video_note`, `location`, `contact`, `poll`, `dice`, `forward`, `service`, `unknown`).
+
+The *discriminators* differ: `_KIND_PROBES` reads aiogram message attributes (e.g.
+`forward_origin`, `photo`, `voice`, `new_chat_members`); TD export has no aiogram surface
+and uses different field shapes (e.g. `forwarded_from` string, `media_type` discriminator,
+`type: "service"` flag). The mapping below translates TD shapes to the matching
+`message_kind` value; the inline helper `_infer_kind` in
+`tests/fixtures/test_td_export_fixtures.py` implements this mapping for fixture validation
+without importing from `bot/`.
 
 **Priority order matters** — a message with both `forwarded_from` and `photo` is classified
 as `forward`. TD export uses `forwarded_from` (a string display-name field) as the forward
