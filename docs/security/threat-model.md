@@ -158,7 +158,7 @@ Defer обоснование везде: **no observed incident в этом пр
 ## Limitations of this model
 
 - **Single-admin assumption baked in.** Когда придёт второй admin, threat model заново.
-- **No supply chain attack** explicitly modeled (T1 covers some, не all). pip cache poisoning, GHCR registry compromise — out of scope v1.
+- **Supply chain coverage shallow.** T9 + A12 + TB7 модель упоминают, но конкретные техники (pip cache poisoning, GHCR registry compromise via stolen PAT, dependency typosquat) детально не разрабатываются. Mitigation в backlog (HIGH-14 dependabot, MID-26 hash pin, H7 trivy) — без observed incident, defer per re-ranking rule.
 - **No nation-state actor.** Если сообщество станет интересно адресной угрозе — модель не покрывает.
 - **No physical attack on VPS** (datacenter access). Trust assumption: Hostinger как provider.
 
