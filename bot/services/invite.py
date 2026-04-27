@@ -8,13 +8,15 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 logger = logging.getLogger(__name__)
 
 
-async def create_invite(bot: Bot, chat_id: int, app_id: int) -> str:
+async def create_invite(bot: Bot, chat_id: int, app_id: int, user_id: int) -> str:
     """Create a one-time invite link for the community chat."""
     link = await bot.create_chat_invite_link(
         chat_id=chat_id,
         member_limit=1,
+        creates_join_request=False,
         name=f"app-{app_id}",
     )
+    logger.info("Created invite for app %s bound to user %s", app_id, user_id)
     return link.invite_link
 
 
@@ -27,7 +29,7 @@ async def try_send_invite(
     If sending the DM fails due to privacy, returns (False, None).
     """
     try:
-        invite_link = await create_invite(bot, chat_id, app_id)
+        invite_link = await create_invite(bot, chat_id, app_id, user_id)
     except Exception:
         logger.exception("Failed to create invite link for app %s", app_id)
         return False, None

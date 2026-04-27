@@ -66,6 +66,7 @@ async def handle_vouch(
             status="vouched",
             vouched_by=voucher_id,
             vouched_at=datetime.now(timezone.utc),
+            invite_user_id=app.user_id,
         )
         .returning(Application.id)
     )
@@ -156,7 +157,9 @@ async def handle_ready(
     )
 
     if success:
-        await ApplicationRepo.update_status(session, app_id, "vouched")
+        await ApplicationRepo.update_status(
+            session, app_id, "vouched", invite_user_id=app.user_id
+        )
         if callback.message is not None:
             await callback.message.edit_text(
                 "Инвайт отправлен! Проверь личные сообщения."
