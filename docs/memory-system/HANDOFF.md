@@ -1042,6 +1042,23 @@ and review checklist for the corresponding tickets. Numbering matches the ag-sa 
 - caption persists — T1-11
 - `#nomem` excluded from memory derived layers — T1-12 / T1-13
 
+### §11.1 Dual-team independent implementation pattern
+
+When to apply:
+- Ticket touches privacy-critical irreversibility (offrecord, redaction, retention).
+- Bug would be invisible to unit tests (data-flow / state-transition logic).
+- Cost of post-merge fix > cost of 2x agent time.
+
+Protocol:
+1. Spawn Team A and Team B in isolated worktrees, same ticket spec, NO cross-talk.
+2. Both submit PR drafts.
+3. Codex reviews both diffs side-by-side, flags divergences.
+4. Merge winning approach OR synthesis.
+
+Precedent: T1-14 (PR #75 + hotfix #90) — Codex caught privacy bug in Team A's diff
+(`new_policy != "offrecord"` was too broad, restored content on offrecord→normal flip).
+Next candidates: T2-03 (import apply), any T-* touching `message_versions` retention.
+
 ---
 
 ## §12. Rollout and deployment plan
