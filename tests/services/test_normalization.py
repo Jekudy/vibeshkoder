@@ -143,6 +143,19 @@ def test_classify_forward_takes_priority_over_text(app_env) -> None:
     assert classify_message_kind(msg) == "forward"
 
 
+def test_classify_forward_takes_priority_over_caption(app_env) -> None:
+    """A forwarded photo with caption is still 'forward' — author attribution wins
+    over media-kind classification for downstream q&a citation correctness."""
+    from bot.services.normalization import classify_message_kind
+
+    msg = _msg(
+        forward_origin=SimpleNamespace(type="channel"),
+        photo=[SimpleNamespace(file_id="x")],
+        caption="forwarded caption",
+    )
+    assert classify_message_kind(msg) == "forward"
+
+
 def test_classify_service_message(app_env) -> None:
     from bot.services.normalization import classify_message_kind
 

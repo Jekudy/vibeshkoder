@@ -49,6 +49,14 @@ async def save_chat_message(
     # that would also discard the UserRepo.upsert and set_member work above.
     # T1-11 caption is now first-class — persist raw_json whenever there is content
     # (text OR caption), not only when text is set.
+    #
+    # TODO(T1-12): raw_json here includes caption verbatim. The #offrecord ordering
+    # rule from AUTHORIZED_SCOPE.md is currently enforced ONLY in the
+    # telegram_updates path via bot/services/ingestion.py — chat_messages.raw_json
+    # bypasses governance.detect_policy() entirely until T1-12 lands the real
+    # detector. This is the same gap that exists for the text path; T1-12 must close
+    # both. Until then, operators flipping memory.ingestion.raw_updates.enabled will
+    # also expose chat_messages.raw_json for any caption-bearing media messages.
     await MessageRepo.save(
         session,
         message_id=message.message_id,
