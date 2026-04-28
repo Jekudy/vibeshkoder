@@ -216,11 +216,14 @@ class MessageVersion(Base):
     specific ``message_version_id``, not at the parent ``chat_messages`` row, so claims
     remain stable even after future edits.
 
-    Idempotency: ``(chat_message_id, content_hash)`` should be unique in practice — the
-    repo's ``insert_version`` returns the existing row if a version with the same hash
-    already exists for the same message. This is checked in code; the DB still allows it
-    via the looser ``(chat_message_id, version_seq)`` unique constraint, which is the
-    structural invariant.
+    Idempotency: a DB-level UNIQUE constraint on ``(chat_message_id, content_hash)``
+    (``uq_message_versions_chat_message_content_hash``) enforces idempotency at the storage
+    layer. ``MessageVersionRepo.insert_version`` uses a savepoint + reselect pattern:
+    concurrent callers that slip past the initial ``get_by_hash`` check hit an
+    ``IntegrityError`` inside ``begin_nested()``, which rolls back only the sub-transaction;
+    the loser then reselects the winner's row and returns it cleanly. The separate
+    ``(chat_message_id, version_seq)`` unique constraint (``uq_message_versions_chat_message_seq``)
+    remains the structural sequence invariant.
 
     On ``forget`` (Phase 3), versions are hard-deleted (CASCADE from chat_messages) or
     redacted in place (``is_redacted=True``, content fields nulled). The ON DELETE

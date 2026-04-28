@@ -362,3 +362,56 @@ async def test_insert_version_integrity_error_path_reselects_existing(db_session
 
     assert result.id == existing_row.id
     assert result.version_seq == 1
+
+
+async def test_insert_version_savepoint_branch_reselects_on_integrity_error(
+    db_session, monkeypatch
+) -> None:
+    """Force the savepoint+reselect branch by bypassing get_by_hash on first call.
+
+    Setup: insert v1 via insert_version (real path). Then monkeypatch
+    MessageVersionRepo.get_by_hash to return None ONCE (simulating a stale read /
+    TOCTOU window), then defer to the real impl on subsequent calls. Calling
+    insert_version with the same content_hash MUST:
+      - Enter begin_nested() (because get_by_hash returned None).
+      - Hit IntegrityError on the duplicate INSERT (UNIQUE constraint).
+      - Reselect via the unmocked get_by_hash and return the existing row.
+      - NOT propagate IntegrityError.
+    """
+    from bot.db.repos.message_version import MessageVersionRepo
+
+    msg_id = await _make_chat_message(db_session)
+
+    # Insert v1 through the real path so the UNIQUE constraint row exists in the DB.
+    v1 = await MessageVersionRepo.insert_version(
+        db_session,
+        chat_message_id=msg_id,
+        content_hash="toctou-hash",
+        text="first writer wins",
+    )
+
+    # Patch get_by_hash to lie ONCE — return None regardless of DB state.
+    real_get_by_hash = MessageVersionRepo.get_by_hash
+    call_count = {"n": 0}
+
+    async def fake_get_by_hash(session, chat_message_id, content_hash):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None  # lie — simulate stale read / TOCTOU window
+        return await real_get_by_hash(session, chat_message_id, content_hash)
+
+    monkeypatch.setattr(MessageVersionRepo, "get_by_hash", staticmethod(fake_get_by_hash))
+
+    # insert_version sees get_by_hash → None (lie), enters begin_nested, attempts INSERT,
+    # hits IntegrityError from uq_message_versions_chat_message_content_hash,
+    # rolls back the savepoint, then calls real get_by_hash → returns v1.
+    result = await MessageVersionRepo.insert_version(
+        db_session,
+        chat_message_id=msg_id,
+        content_hash="toctou-hash",
+        text="late writer loses",
+    )
+
+    assert result.id == v1.id
+    assert result.version_seq == v1.version_seq
+    assert call_count["n"] == 2  # one lie + one real reselect inside except branch
