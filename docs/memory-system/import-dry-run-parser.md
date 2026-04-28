@@ -181,6 +181,17 @@ on the DB:
   (`same_run` → `prior_run` → `live`). These are reply chains that will land
   with `chat_messages.reply_to_message_id = NULL` under apply.
 
+  **Multiplicity semantics (option A):** this is a count of *messages*, not
+  unique unresolved target ids. Two messages that both reply to the same missing
+  target contribute 2 to `db_broken_reply_count`. This lets the operator gauge
+  "how many messages will have broken replies after apply" — the number relevant
+  for a go/no-go decision.
+
+  **Intra-export targets are excluded:** if a reply target is present in the
+  export itself (even if not yet in the DB), it is *not* counted as broken —
+  apply will create that target before resolving the reply. Only targets absent
+  from both the export *and* the DB count against this field.
+
 All three default to `0` / `()` on the offline path so the offline
 `parse_export(path)` API and existing #94 callers stay byte-for-byte compatible
 — no field is non-optional. The frozen-dataclass NO-content guarantee
