@@ -22,6 +22,18 @@ logger = logging.getLogger(__name__)
 
 
 def _cmd_import_dry_run(args: argparse.Namespace) -> int:
+    """Entry point for import_dry_run subcommand.
+
+    Without --with-db: parses offline, prints JSON report.
+    With --with-db: opens DB session, enriches with duplicate/reply stats, prints
+    operator-readable summary.
+    """
+    if getattr(args, "with_db", False):
+        return asyncio.run(_cmd_import_dry_run_with_db(args))
+    return _cmd_import_dry_run_offline(args)
+
+
+def _cmd_import_dry_run_offline(args: argparse.Namespace) -> int:
     from bot.services.import_parser import parse_export
 
     path = Path(args.export_path).expanduser().resolve()
@@ -48,6 +60,50 @@ def _cmd_import_dry_run(args: argparse.Namespace) -> int:
         payload["date_range_end"] = payload["date_range_end"].isoformat()
 
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+async def _cmd_import_dry_run_with_db(args: argparse.Namespace) -> int:
+    """DB-aware dry-run: enriches report with duplicate / broken-reply stats."""
+    from bot.services.import_dry_run import parse_export_with_db
+
+    path = Path(args.export_path).expanduser().resolve()
+    if not path.is_file():
+        print(f"ERROR: file not found: {path}", file=sys.stderr)
+        return 2
+
+    # Read chat_id from the export envelope (needed to scope DB queries).
+    try:
+        chat_id = _read_chat_id_from_envelope(path)
+    except (ValueError, OSError) as e:
+        print(f"ERROR: could not read chat_id from export envelope: {e}", file=sys.stderr)
+        return 2
+
+    import bot.db.engine as _db_engine
+
+    try:
+        async with _db_engine.async_session() as session:
+            report = await parse_export_with_db(path, session, chat_id)
+            # Do NOT commit: parse_export_with_db creates a synthetic dry_run run
+            # that must be rolled back. The async_session context manager rolls back
+            # on exit without commit.
+    except FileNotFoundError as e:
+        print(f"ERROR: file not found: {e}", file=sys.stderr)
+        return 2
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"ERROR: parse failed: {e}", file=sys.stderr)
+        return 1
+
+    # Operator-readable summary
+    policy = report.policy_marker_counts
+    offrecord_count = policy.get("offrecord", 0)
+    nomem_count = policy.get("nomem", 0)
+    print(
+        f"{report.db_duplicate_count} duplicates would be skipped, "
+        f"{offrecord_count} offrecord messages, "
+        f"{nomem_count} nomem, "
+        f"{report.db_broken_reply_count} broken reply chains."
+    )
     return 0
 
 
@@ -232,6 +288,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Parse a Telegram Desktop export JSON and print stats (no DB writes).",
     )
     p_import.add_argument("export_path", type=str)
+    p_import.add_argument(
+        "--with-db",
+        action="store_true",
+        default=False,
+        dest="with_db",
+        help=(
+            "Enrich report with DB-backed stats: duplicate detection and broken "
+            "reply chain count. Prints operator-readable summary instead of JSON."
+        ),
+    )
     p_import.set_defaults(func=_cmd_import_dry_run)
 
     # import_apply subcommand

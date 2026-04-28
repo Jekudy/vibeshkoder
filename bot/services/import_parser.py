@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Literal
@@ -126,6 +126,21 @@ class ImportDryRunReport:
 
     parse_warnings: list[str]
     """Soft-fail warnings from tolerant-reader. Empty for clean exports."""
+
+    # --- DB-aware fields (T2-02) ---
+    # These are populated by parse_export_with_db(); parse_export() leaves them at defaults.
+
+    db_duplicate_count: int = field(default=0)
+    """Count of export message ids that already exist in chat_messages for this chat.
+    Set by parse_export_with_db(); 0 when no DB context."""
+
+    db_duplicate_export_msg_ids: list[int] = field(default_factory=list)
+    """Sorted list of export message ids that collide with existing chat_messages rows.
+    Set by parse_export_with_db(); empty list when no DB context."""
+
+    db_broken_reply_count: int = field(default=0)
+    """Count of replies whose target cannot be resolved via reply_resolver (DB-aware).
+    Set by parse_export_with_db(); 0 when no DB context."""
 
 
 # ---------------------------------------------------------------------------
