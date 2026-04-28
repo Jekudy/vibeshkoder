@@ -32,6 +32,13 @@ scoping rule, one performance contract.
   compute resolved-vs-unresolved breakdowns and feed `aggregate_resolutions`
   into the stats report. No DB writes happen — dry-run is read-only by the
   same contract `import-dry-run-parser.md` documents.
+
+  The `resolve_reply` signature requires a real `ingestion_run_id` (non-Optional). For
+  dry-run consumers (#99 stats) that do not have a real ingestion run, create a synthetic
+  `IngestionRun` with `run_type='dry_run'` first. The resolver does not enforce `run_type`
+  — it uses `ingestion_run_id` only to scope same_run lookups. The dry_run row gives the
+  resolver a stable scope without writing real import data.
+
 - **During #103 apply per-message persist:** as each export message is being
   staged for insert, `resolve_reply` (single id) or `resolve_reply_batch`
   (chunk) maps its `reply_to_message_id` so the persisted `chat_messages` row
@@ -51,7 +58,6 @@ async def resolve_reply(
     ingestion_run_id: int,
     *,
     chat_id: int,
-    max_chain_depth: int = 8,
 ) -> ReplyResolution
 
 async def resolve_reply_batch(
@@ -69,8 +75,8 @@ def aggregate_resolutions(
 
 `ReplyResolution` is a `@dataclass(frozen=True)` with `export_msg_id`,
 `chat_message_id` (None when unresolved), `resolved_via` (one of `same_run`,
-`prior_run`, `live`, `unresolved`), and `chain_depth`. `ReplyResolverStats`
-aggregates a batch into per-bucket counts plus `chain_max_depth`. Both are
+`prior_run`, `live`, `unresolved`), and `chain_depth` (always 0 — direct-lookup
+only). `ReplyResolverStats` aggregates a batch into per-bucket counts. Both are
 frozen so consumers cannot mutate them by accident — important when the same
 result dict travels through stats reporting and audit trails.
 
@@ -141,13 +147,10 @@ chain length. More importantly, the two consumers want different things:
   reconstruction is a query-time concern (Phase 4+ q&a), not an apply-time
   concern.
 
-The internal `_follow_chain` helper exists with cycle detection (visited-set,
-bounded by `max_chain_depth`) for any future caller that genuinely needs deep
-traversal — but the public API does not expose it as default behaviour.
 Consumers that need deeper traversal iterate explicitly: call `resolve_reply`,
-inspect the result, and call again on the resolved row's
-`reply_to_message_id` if needed. Making this iteration explicit keeps the
-resolver's cost model legible.
+inspect the result, and call again on the resolved row's `reply_to_message_id`
+if needed. Making this iteration explicit keeps the resolver's cost model
+legible and avoids per-call recursion overhead.
 
 ---
 
@@ -171,14 +174,16 @@ itself flushes or commits prematurely.
 
 The single-id path issues at most three queries (one per resolved-via bucket
 that misses, terminating at the first hit or after `live`). The batch path
-issues **at most three queries total** for any input size N — one per bucket,
-each restricted to the still-unresolved remainder. There is no N+1: the
-common shape ("resolve all replies in this 5,000-message export") completes
-in three round-trips regardless of N.
+issues **at most four queries total** for any input size N — one same-run bulk
+query, one prior-run bulk query, and up to two live bulk queries (first pass
+for rows with a live `raw_update_id`, second pass for legacy `raw_update_id IS
+NULL` rows). Each pass is restricted to the still-unresolved remainder. There
+is no N+1: the common shape ("resolve all replies in this 5,000-message
+export") completes in at most four round-trips regardless of N.
 
 This contract is exercised by a dedicated batch test that asserts the query
-count, so a future regression that reintroduces per-id lookup will fail the
-test, not silently degrade apply throughput.
+count (≤ 4), so a future regression that reintroduces per-id lookup will fail
+the test, not silently degrade apply throughput.
 
 ---
 

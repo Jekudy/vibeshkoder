@@ -207,6 +207,52 @@ async def test_resolve_cross_run(db_session) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 2b: prior_run filter excludes runs newer than the current run
+# ---------------------------------------------------------------------------
+
+
+async def test_prior_run_excludes_newer_runs(db_session) -> None:
+    """prior_run must select strictly older runs (started_at < current_run.started_at).
+
+    Setup: runs at t=1 (oldest), t=2 (current), t=3 (newest).
+    Message exists only in run-1 and run-3.
+    Resolving from run-2 should pick run-1 (older), NOT run-3 (newer).
+    """
+    from bot.services.import_reply_resolver import resolve_reply
+    from bot.db.repos.ingestion_run import IngestionRunRepo
+
+    chat_id = _rand_chat_id()
+    export_msg_id = _rand_msg_id()
+    user_id = _rand_user_id()
+
+    await _ensure_user(db_session, user_id)
+
+    # Create three runs in order (auto-timestamps from DB; insert sequentially)
+    run1 = await IngestionRunRepo.create(db_session, run_type="import", source_name="export1.json")
+    run2 = await IngestionRunRepo.create(db_session, run_type="import", source_name="export2.json")
+    run3 = await IngestionRunRepo.create(db_session, run_type="import", source_name="export3.json")
+
+    # Place the message in run1 and run3 (NOT in run2 which is "current")
+    _, cm_run1 = await _create_imported_message(db_session, chat_id, export_msg_id, run1.id, user_id)
+    _, cm_run3 = await _create_imported_message(db_session, chat_id, export_msg_id, run3.id, user_id)
+
+    # Resolving from run2: prior should be run1 (older), not run3 (newer)
+    result = await resolve_reply(
+        db_session,
+        export_msg_id=export_msg_id,
+        ingestion_run_id=run2.id,
+        chat_id=chat_id,
+    )
+
+    assert result.resolved_via == "prior_run"
+    # Must resolve to run1's chat_message, not run3's
+    assert result.chat_message_id == cm_run1.id, (
+        f"Expected cm_run1.id={cm_run1.id}, got {result.chat_message_id} "
+        f"(cm_run3.id={cm_run3.id} would indicate a newer run was selected)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Test 3: Unresolved (target missing)
 # ---------------------------------------------------------------------------
 
@@ -295,19 +341,18 @@ async def test_resolve_forward_chain(db_session) -> None:
     assert cm_a.reply_to_message_id == msg_b_id
 
 
-async def test_resolve_chain_depth_incremented(db_session) -> None:
-    """When msg-A's resolved row has an unresolved reply_to_message_id, the resolver
-    follows it. chain_depth reflects the number of hops taken."""
+async def test_resolve_chain_depth_stays_zero_for_direct_hits(db_session) -> None:
+    """chain_depth is always 0 for direct hits. The resolver does not traverse
+    reply_to_message_id hops — consumers iterate themselves if they need depth.
+    This test confirms that resolving msg-B (which has reply_to_message_id set) still
+    returns chain_depth=0 because B is found directly."""
     from bot.services.import_reply_resolver import resolve_reply
 
     chat_id = _rand_chat_id()
     # msg-C: the root message (no reply)
-    # msg-B: replies to msg-C (import-imported, so resolvable)
-    # msg-A: replies to msg-B (also imported)
-    # Resolving the reply chain for msg-A should follow: A→B (chain_depth=0 direct hit)
-    # The forward-chain concept in the spec is: if a hit's chat_messages.reply_to_message_id
-    # is itself another export_id we haven't resolved, follow it. This is chain_depth tracking.
-    # Here we test resolving msg-B which has reply_to_message_id = msg-C's export_id.
+    # msg-B: replies to msg-C (also imported)
+    # Resolving B is a direct hit → chain_depth stays 0; resolver does not follow
+    # B's reply_to_message_id to C.
 
     msg_b_id = _rand_msg_id()
     msg_c_id = _rand_msg_id()
@@ -323,7 +368,7 @@ async def test_resolve_chain_depth_incremented(db_session) -> None:
         db_session, chat_id, msg_b_id, run.id, user_id, reply_to_message_id=msg_c_id
     )
 
-    # Resolving B is a direct hit (chain_depth=0 — B is in this run directly)
+    # Resolving B is a direct hit — chain_depth must be 0 (no chain traversal)
     result_b = await resolve_reply(
         db_session,
         export_msg_id=msg_b_id,
@@ -333,10 +378,8 @@ async def test_resolve_chain_depth_incremented(db_session) -> None:
     assert result_b.chat_message_id == cm_b.id
     assert result_b.chain_depth == 0
 
-    # The resolved row B has reply_to_message_id = msg_c_id. The service resolves B
-    # and returns chain_depth=0 since B is found directly.
-    # The forward chain is followed when we resolve B's *reply target* recursively.
-    # In this implementation: chain_depth=0 means B was a direct hit, no chain traversal needed.
+    # The resolved row B has reply_to_message_id = msg_c_id, but the resolver
+    # does not follow it — chain_depth=0 confirms direct-lookup-only semantics.
     assert cm_b.reply_to_message_id == msg_c_id
 
 
@@ -345,8 +388,10 @@ async def test_resolve_chain_depth_incremented(db_session) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_cycle_detection_does_not_loop_forever(db_session) -> None:
-    """Manually crafted cyclic reply chain → no infinite loop; returns within max_chain_depth."""
+async def test_unresolved_returns_unresolved_for_unknown_target(db_session) -> None:
+    """An export_msg_id whose reply target is not in any run resolves to unresolved.
+    This also confirms that cyclic reply_to_message_id values in DB rows do not cause
+    any looping — the resolver is direct-lookup only and returns immediately."""
     from bot.services.import_reply_resolver import resolve_reply
 
     chat_id = _rand_chat_id()
@@ -357,7 +402,7 @@ async def test_cycle_detection_does_not_loop_forever(db_session) -> None:
     await _ensure_user(db_session, user_id)
     run = await _create_import_run(db_session)
 
-    # msg-X replies to msg-Y, msg-Y replies to msg-X (cycle)
+    # msg-X replies to msg-Y, msg-Y replies to msg-X (cycle in reply_to_message_id)
     _, cm_x = await _create_imported_message(
         db_session, chat_id, msg_x_id, run.id, user_id, reply_to_message_id=msg_y_id
     )
@@ -365,18 +410,28 @@ async def test_cycle_detection_does_not_loop_forever(db_session) -> None:
         db_session, chat_id, msg_y_id, run.id, user_id, reply_to_message_id=msg_x_id
     )
 
-    # Resolving X should still succeed (direct hit), chain_depth=0
+    # Resolving X returns X's chat_message directly (direct hit), chain_depth=0.
+    # No looping occurs because the resolver does not traverse reply_to_message_id.
     result = await resolve_reply(
         db_session,
         export_msg_id=msg_x_id,
         ingestion_run_id=run.id,
         chat_id=chat_id,
-        max_chain_depth=8,
     )
 
-    # Must return without hanging; X itself is a direct hit
     assert result.chat_message_id == cm_x.id
     assert result.chain_depth == 0
+
+    # An unknown id has no match → unresolved
+    missing_id = _rand_msg_id()
+    result_missing = await resolve_reply(
+        db_session,
+        export_msg_id=missing_id,
+        ingestion_run_id=run.id,
+        chat_id=chat_id,
+    )
+    assert result_missing.chat_message_id is None
+    assert result_missing.resolved_via == "unresolved"
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +494,9 @@ async def test_resolve_live_match(db_session) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_aggregate_resolutions(db_session) -> None:
-    """aggregate_resolutions correctly counts each resolved_via category."""
+def test_aggregate_resolutions() -> None:
+    """aggregate_resolutions correctly counts each resolved_via category.
+    Pure-Python: no DB session required."""
     from bot.services.import_reply_resolver import (
         ReplyResolution,
         ReplyResolverStats,
@@ -464,7 +520,6 @@ async def test_aggregate_resolutions(db_session) -> None:
     assert stats.resolved_prior_run == 1
     assert stats.resolved_live == 1
     assert stats.unresolved == 2
-    assert stats.chain_max_depth == 1
 
 
 # ---------------------------------------------------------------------------
@@ -510,8 +565,9 @@ async def test_batch_resolve_no_n_plus_one(db_session) -> None:
         )
 
     assert len(results) == n
-    # Batch must use fewer queries than n (i.e., not one query per message)
-    assert call_count < n, f"Expected batch to issue <{n} queries, got {call_count}"
+    # Batch must issue at most 4 queries (same-run + prior-run + live-pass1 + live-pass2)
+    # regardless of N — not one query per message.
+    assert call_count <= 4, f"Expected batch to issue ≤4 queries, got {call_count}"
 
     # All should be resolved
     for eid in export_ids:

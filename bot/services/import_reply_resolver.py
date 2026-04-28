@@ -10,13 +10,13 @@ Resolution priority order:
    points to a live TelegramUpdate (run_type='live').
 4. **unresolved** — no match found.
 
-Forward-chain follow: after a direct hit, if the resolved ChatMessage's
-``reply_to_message_id`` itself needs to be resolved, callers may call resolve_reply again.
-The ``chain_depth`` on a *direct* resolution is always 0. Chain depth is incremented only
-when the resolver follows ``reply_to_message_id`` hops through resolved rows — this is used
-internally by the cycle-aware chain follower in ``_follow_chain``.
+Forward-chain semantics: a Telegram reply has exactly one direct target. The resolver
+returns that target's chat_messages.id in a single lookup. Consumers that need to traverse
+a chain of replies (i.e., resolve the resolved row's own reply target) must iterate
+themselves. This avoids per-call recursion overhead and is sufficient for the #103 apply
+path's per-message walk.
 
-Batch API: ``resolve_reply_batch`` issues two bulk queries instead of N individual queries,
+Batch API: ``resolve_reply_batch`` issues bulk queries instead of N individual queries,
 avoiding N+1 for N export ids.
 
 Consumers: #99 (dry-run stats) and #103 (import apply). Do NOT call this from Stream Alpha
@@ -31,6 +31,7 @@ from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from bot.db.models import ChatMessage, IngestionRun, TelegramUpdate
 
@@ -64,7 +65,6 @@ class ReplyResolverStats:
     resolved_prior_run: int
     resolved_live: int
     unresolved: int
-    chain_max_depth: int
 
 
 # ---------------------------------------------------------------------------
@@ -78,22 +78,26 @@ async def resolve_reply(
     ingestion_run_id: int,
     *,
     chat_id: int,
-    max_chain_depth: int = 8,
 ) -> ReplyResolution:
     """Resolve one export_msg_id to a chat_messages.id.
 
     Resolution order: same_run → prior_run → live → unresolved.
 
-    ``chain_depth`` is always 0 for a direct resolution. It is incremented only when
-    ``_follow_chain`` traverses reply_to_message_id hops — which in current usage
-    means a caller explicitly follows the reply chain of the resolved row.
+    ``chain_depth`` is always 0 for a direct resolution. The resolver performs a
+    single lookup — it does not traverse ``reply_to_message_id`` hops on the resolved
+    row. Consumers that need deeper chain traversal iterate explicitly.
+
+    For dry-run consumers (#99 stats) that do not yet have a real ingestion_run,
+    create a synthetic ``IngestionRun`` with ``run_type='dry_run'`` first. The resolver
+    does not enforce run_type — it uses the provided ingestion_run_id only to scope
+    same_run lookups. The dry_run row gives the resolver a stable scope without
+    writing real import data.
 
     Args:
         session: Active AsyncSession (no commit issued here).
         export_msg_id: The integer message id from the Telegram Desktop export.
         ingestion_run_id: The current ingestion run's id (used for same-run priority).
         chat_id: Scopes the lookup to this chat only.
-        max_chain_depth: Maximum forward-chain hops before giving up (cycle guard).
 
     Returns:
         ReplyResolution with chat_message_id=None when unresolved.
@@ -146,10 +150,9 @@ async def resolve_reply_batch(
 ) -> dict[int, ReplyResolution]:
     """Resolve a list of export_msg_ids in bulk (avoids N+1).
 
-    Issues at most 3 DB queries regardless of how many ids are in the list:
-    - One bulk query for same-run matches.
-    - One bulk query for prior-run matches (only for unresolved remainder).
-    - One bulk query for live matches (only for still-unresolved remainder).
+    Issues at most 4 DB queries regardless of how many ids are in the list
+    (1 same-run + 1 prior-run + 1 live-with-raw-update-id + 1 live-NULL-fallback).
+    Constant bound regardless of N.
 
     Args:
         session: Active AsyncSession.
@@ -230,14 +233,13 @@ def aggregate_resolutions(resolutions: dict[int, ReplyResolution]) -> ReplyResol
         resolutions: Dict as returned by resolve_reply_batch.
 
     Returns:
-        ReplyResolverStats with per-category counts and max chain depth.
+        ReplyResolverStats with per-category counts.
     """
     total = len(resolutions)
     same_run = 0
     prior_run = 0
     live = 0
     unresolved = 0
-    max_depth = 0
 
     for r in resolutions.values():
         if r.resolved_via == "same_run":
@@ -246,10 +248,10 @@ def aggregate_resolutions(resolutions: dict[int, ReplyResolution]) -> ReplyResol
             prior_run += 1
         elif r.resolved_via == "live":
             live += 1
-        else:
+        elif r.resolved_via == "unresolved":
             unresolved += 1
-        if r.chain_depth > max_depth:
-            max_depth = r.chain_depth
+        else:
+            raise ValueError(f"Unknown resolved_via: {r.resolved_via!r}")
 
     return ReplyResolverStats(
         total=total,
@@ -257,7 +259,6 @@ def aggregate_resolutions(resolutions: dict[int, ReplyResolution]) -> ReplyResol
         resolved_prior_run=prior_run,
         resolved_live=live,
         unresolved=unresolved,
-        chain_max_depth=max_depth,
     )
 
 
@@ -283,6 +284,7 @@ async def _lookup_import(
             ChatMessage.raw_update_id == TelegramUpdate.id,
         )
         .where(
+            ChatMessage.chat_id == chat_id,
             TelegramUpdate.chat_id == chat_id,
             TelegramUpdate.message_id == export_msg_id,
             TelegramUpdate.ingestion_run_id == ingestion_run_id,
@@ -302,9 +304,20 @@ async def _lookup_prior_import(
 ) -> int | None:
     """Find chat_messages.id from any prior import run for this chat.
 
-    Excludes the current ingestion run (already checked by ``_lookup_import``).
-    Picks the most recent prior run's match (order by ingestion_run_id DESC).
+    "Prior" means strictly older than the current run (candidate.started_at <
+    current_run.started_at). This prevents a newer run from being selected as
+    "prior" when the resolver is invoked for a non-latest run.
+    Tie-breaker: candidate.id DESC.
     """
+    # Scalar subquery: started_at of the current run (used as upper bound)
+    current_started_at_sq = (
+        select(IngestionRun.started_at)
+        .where(IngestionRun.id == current_ingestion_run_id)
+        .scalar_subquery()
+    )
+
+    CandidateRun = aliased(IngestionRun)
+
     stmt = (
         select(ChatMessage.id)
         .join(
@@ -312,17 +325,18 @@ async def _lookup_prior_import(
             ChatMessage.raw_update_id == TelegramUpdate.id,
         )
         .join(
-            IngestionRun,
-            TelegramUpdate.ingestion_run_id == IngestionRun.id,
+            CandidateRun,
+            TelegramUpdate.ingestion_run_id == CandidateRun.id,
         )
         .where(
             TelegramUpdate.chat_id == chat_id,
+            ChatMessage.chat_id == chat_id,
             TelegramUpdate.message_id == export_msg_id,
             TelegramUpdate.update_type == _IMPORT_UPDATE_TYPE,
-            TelegramUpdate.ingestion_run_id != current_ingestion_run_id,
-            IngestionRun.run_type == "import",
+            CandidateRun.run_type == "import",
+            CandidateRun.started_at < current_started_at_sq,
         )
-        .order_by(IngestionRun.started_at.desc())
+        .order_by(CandidateRun.started_at.desc(), CandidateRun.id.desc())
         .limit(1)
     )
     result = await session.execute(stmt)
@@ -399,6 +413,7 @@ async def _bulk_lookup_import(
             ChatMessage.raw_update_id == TelegramUpdate.id,
         )
         .where(
+            ChatMessage.chat_id == chat_id,
             TelegramUpdate.chat_id == chat_id,
             TelegramUpdate.message_id.in_(export_msg_ids),
             TelegramUpdate.ingestion_run_id == ingestion_run_id,
@@ -423,25 +438,35 @@ async def _bulk_lookup_prior_import(
     if not export_msg_ids:
         return {}
 
-    # Fetch all candidates from prior import runs; we'll pick best per message_id in Python
+    # Fetch all candidates strictly older than the current run; pick best per message_id in Python.
+    # "Strictly older" = candidate.started_at < current_run.started_at (Fix 2: prevents a newer
+    # run from being selected as "prior" when this resolver is invoked for a non-latest run).
+    current_started_at_sq = (
+        select(IngestionRun.started_at)
+        .where(IngestionRun.id == current_ingestion_run_id)
+        .scalar_subquery()
+    )
+    CandidateRun = aliased(IngestionRun)
+
     stmt = (
-        select(TelegramUpdate.message_id, ChatMessage.id, IngestionRun.started_at)
+        select(TelegramUpdate.message_id, ChatMessage.id, CandidateRun.started_at)
         .join(
             ChatMessage,
             ChatMessage.raw_update_id == TelegramUpdate.id,
         )
         .join(
-            IngestionRun,
-            TelegramUpdate.ingestion_run_id == IngestionRun.id,
+            CandidateRun,
+            TelegramUpdate.ingestion_run_id == CandidateRun.id,
         )
         .where(
+            ChatMessage.chat_id == chat_id,
             TelegramUpdate.chat_id == chat_id,
             TelegramUpdate.message_id.in_(export_msg_ids),
             TelegramUpdate.update_type == _IMPORT_UPDATE_TYPE,
-            TelegramUpdate.ingestion_run_id != current_ingestion_run_id,
-            IngestionRun.run_type == "import",
+            CandidateRun.run_type == "import",
+            CandidateRun.started_at < current_started_at_sq,
         )
-        .order_by(IngestionRun.started_at.desc())
+        .order_by(CandidateRun.started_at.desc(), CandidateRun.id.desc())
     )
     result = await session.execute(stmt)
     rows = result.all()

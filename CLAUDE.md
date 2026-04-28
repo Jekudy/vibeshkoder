@@ -83,7 +83,7 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
     BEFORE touching `bot/services/import_reply_resolver.py` or before #99 (T2-02 dry-run stats) /
     #103 (T2-03 apply) consume reply mappings. Defines: priority order (same_run → prior_run →
     live → unresolved), chat_id scoping (never resolves across chat boundaries), batch query
-    semantics (3 queries max regardless of N — no N+1), `ReplyResolution` / `ReplyResolverStats`
+    semantics (4 queries max regardless of N — no N+1), `ReplyResolution` / `ReplyResolverStats`
     API contract, read-only invariant (NO DB writes; safe inside any transaction), forward-chain
     direct-lookup design choice (chain_depth always 0; consumers iterate if they need deeper
     traversal). Cross-refs #91 schema, #93 user mapping, #94 dry-run parser.
