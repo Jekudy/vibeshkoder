@@ -136,7 +136,16 @@ class MessageRepo:
                 )
                 .returning(ChatMessage)
             )
-            result = await session.execute(stmt)
+            # populate_existing=True is REQUIRED here. The CASE expressions in set_clause
+            # are evaluated server-side, so the post-update value can differ from the
+            # EXCLUDED value we passed in (e.g. an upgrade normal→offrecord goes through,
+            # while a downgrade offrecord→normal is blocked). Without populate_existing,
+            # SQLAlchemy's identity map returns the CACHED ORM instance from a prior save
+            # in the same session and silently discards the RETURNING-clause attributes
+            # — leaving the test (and the caller) seeing the pre-update value. This is
+            # the documented behaviour of returning(<orm_class>) when an identity-mapped
+            # row exists. The flag forces attributes to be refreshed from RETURNING data.
+            result = await session.execute(stmt, execution_options={"populate_existing": True})
             row = result.scalar_one()
             await session.flush()
             return row
