@@ -279,6 +279,7 @@ def test_message_version_metadata_smoke(app_env) -> None:
         "content_hash",
         "raw_update_id",
         "is_redacted",
+        "imported_final",
     } == cols
 
     constraint_names = {c.name for c in table.constraints if c.name}

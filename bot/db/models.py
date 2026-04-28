@@ -282,6 +282,12 @@ class MessageVersion(Base):
     is_redacted: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # T2-03 / #103 (per #106): provenance flag for rows constructed from a static
+    # Telegram Desktop archive. TRUE iff this row was written by an import run;
+    # FALSE for live ingestion. See docs/memory-system/import-edit-history.md.
+    imported_final: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
 
 class OffrecordMark(Base):

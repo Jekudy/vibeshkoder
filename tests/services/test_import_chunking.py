@@ -214,6 +214,7 @@ def test_cli_chunk_size_zero_rejected() -> None:
     exit_code = None
     try:
         with (
+            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
             patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
@@ -267,6 +268,7 @@ def test_cli_chunk_size_negative_rejected() -> None:
     exit_code = None
     try:
         with (
+            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
             patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
@@ -319,6 +321,7 @@ def test_cli_chunk_size_excessive_rejected() -> None:
     exit_code = None
     try:
         with (
+            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
             patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
@@ -340,11 +343,13 @@ def test_cli_chunk_size_overrides_invalid_env() -> None:
 
     Fix 2: CLI override is applied BEFORE load_chunking_config validation.
     """
+    import datetime
     import io
     import sys
     from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock, patch
 
+    from bot.services.import_apply import ImportApplyReport
     from bot.services.import_chunking import ChunkingConfig
 
     FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "td_export"
@@ -360,7 +365,13 @@ def test_cli_chunk_size_overrides_invalid_env() -> None:
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=None)
 
-    run_apply_mock = AsyncMock(return_value=None)
+    fake_report = ImportApplyReport(
+        ingestion_run_id=12,
+        chat_id=9999,
+        source_path=str(SMALL_CHAT),
+        started_at=datetime.datetime.now(datetime.timezone.utc),
+    )
+    run_apply_mock = AsyncMock(return_value=fake_report)
 
     from types import ModuleType
 
@@ -376,7 +387,9 @@ def test_cli_chunk_size_overrides_invalid_env() -> None:
     exit_code = None
     try:
         with (
+            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
             patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch("bot.services.import_checkpoint.finalize_run", new=AsyncMock()),
             patch("bot.db.engine.async_session", return_value=mock_session),
             # env has invalid IMPORT_APPLY_CHUNK_SIZE but CLI provides valid --chunk-size
             patch.dict("os.environ", {"IMPORT_APPLY_CHUNK_SIZE": "abc"}),
@@ -497,11 +510,13 @@ def test_cli_import_apply_passes_chunking_config_to_run_apply() -> None:
     run_apply is mocked via sys.modules injection; we assert it was called with the
     expected chunking_config kwarg.
     """
+    import datetime
     import io
     import sys
     from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock, patch
 
+    from bot.services.import_apply import ImportApplyReport
     from bot.services.import_chunking import ChunkingConfig
 
     FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "td_export"
@@ -517,7 +532,13 @@ def test_cli_import_apply_passes_chunking_config_to_run_apply() -> None:
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=None)
 
-    run_apply_mock = AsyncMock(return_value=None)
+    fake_report = ImportApplyReport(
+        ingestion_run_id=7,
+        chat_id=-1001999999999,
+        source_path=str(SMALL_CHAT),
+        started_at=datetime.datetime.now(datetime.timezone.utc),
+    )
+    run_apply_mock = AsyncMock(return_value=fake_report)
     fake_module = _make_fake_import_apply_module(run_apply_mock)
 
     from bot.cli import main
@@ -530,7 +551,9 @@ def test_cli_import_apply_passes_chunking_config_to_run_apply() -> None:
 
     try:
         with (
+            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
             patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch("bot.services.import_checkpoint.finalize_run", new=AsyncMock()),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("os.environ", {"IMPORT_APPLY_CHUNK_SIZE": "100"}),
             patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
@@ -562,11 +585,13 @@ def test_cli_import_apply_passes_chunking_config_to_run_apply() -> None:
 
 def test_cli_import_apply_chunk_size_cli_arg_overrides_env() -> None:
     """--chunk-size CLI arg overrides IMPORT_APPLY_CHUNK_SIZE env var."""
+    import datetime
     import io
     import sys
     from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock, patch
 
+    from bot.services.import_apply import ImportApplyReport
     from bot.services.import_chunking import ChunkingConfig
 
     FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "td_export"
@@ -582,7 +607,13 @@ def test_cli_import_apply_chunk_size_cli_arg_overrides_env() -> None:
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=None)
 
-    run_apply_mock = AsyncMock(return_value=None)
+    fake_report = ImportApplyReport(
+        ingestion_run_id=8,
+        chat_id=-1001999999999,
+        source_path=str(SMALL_CHAT),
+        started_at=datetime.datetime.now(datetime.timezone.utc),
+    )
+    run_apply_mock = AsyncMock(return_value=fake_report)
     fake_module = _make_fake_import_apply_module(run_apply_mock)
 
     from bot.cli import main
@@ -595,7 +626,9 @@ def test_cli_import_apply_chunk_size_cli_arg_overrides_env() -> None:
 
     try:
         with (
+            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
             patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch("bot.services.import_checkpoint.finalize_run", new=AsyncMock()),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("os.environ", {"IMPORT_APPLY_CHUNK_SIZE": "300"}),
             patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),

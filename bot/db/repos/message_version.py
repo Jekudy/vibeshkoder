@@ -56,12 +56,18 @@ class MessageVersionRepo:
         edit_date: datetime | None = None,
         raw_update_id: int | None = None,
         is_redacted: bool = False,
+        imported_final: bool = False,
     ) -> MessageVersion:
         """Idempotent version insert.
 
         Returns the existing version row if ``(chat_message_id, content_hash)`` already
         exists; otherwise creates a new row at ``version_seq = max + 1``. Flushes; does
         not commit.
+
+        ``imported_final`` (T2-03 / #103, see #106): set to True only by the import apply
+        path. Live ingestion leaves it False. The column is denormalised provenance — the
+        FK chain ``raw_update_id → telegram_updates.ingestion_run_id → run_type`` remains
+        the audit trail. See ``docs/memory-system/import-edit-history.md``.
 
         Concurrency safety: the INSERT is wrapped in a savepoint (``session.begin_nested``).
         If two concurrent callers both pass the ``get_by_hash`` check (TOCTOU window) and
@@ -93,6 +99,7 @@ class MessageVersionRepo:
                     content_hash=content_hash,
                     raw_update_id=raw_update_id,
                     is_redacted=is_redacted,
+                    imported_final=imported_final,
                 )
                 session.add(row)
                 await session.flush()

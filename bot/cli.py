@@ -18,6 +18,8 @@ import os
 import sys
 from pathlib import Path
 
+from sqlalchemy.exc import SQLAlchemyError
+
 logger = logging.getLogger(__name__)
 
 
@@ -122,8 +124,7 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
     Step 1: Resolve path + compute source_hash.
     Step 2: Call init_or_resume_run to get the resume decision.
     Step 3: Dispatch based on decision mode.
-    Step 4: Lazily import bot.services.import_apply.run_apply (Stream Delta #103).
-            If ImportError → exit 4 with operator-facing message.
+    Step 4: Run bot.services.import_apply.run_apply (Stream Delta #103).
     """
     from bot.services.import_checkpoint import finalize_run, init_or_resume_run
 
@@ -156,6 +157,17 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
     import bot.db.engine as _db_engine
 
     async with _db_engine.async_session() as session:
+        # Feature-flag gate: memory.import.apply.enabled (default OFF). Read BEFORE
+        # creating an ingestion_run so a disabled run leaves zero footprint.
+        from bot.db.repos.feature_flag import FeatureFlagRepo
+
+        if not await FeatureFlagRepo.get(session, IMPORT_APPLY_FLAG):
+            print(
+                "import apply disabled (feature flag "
+                f"'{IMPORT_APPLY_FLAG}' is OFF). Enable via SQL before retrying."
+            )
+            return 0
+
         decision = await init_or_resume_run(
             session,
             source_path=str(path),
@@ -180,16 +192,8 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
             )
             return 3
 
-        # start_fresh or resume_existing → try to call the apply path (#103).
-        try:
-            from bot.services.import_apply import run_apply  # type: ignore[import]
-        except ImportError:
-            print(
-                "import_apply not yet implemented (#103) — "
-                "checkpoint/resume infrastructure (#101) is ready.",
-                file=sys.stderr,
-            )
-            return 4
+        # start_fresh or resume_existing → import the apply path (#103).
+        from bot.services.import_apply import run_apply
 
         # Load chunking config from env; CLI --chunk-size overrides the env var.
         # IMPORTANT: apply CLI override BEFORE calling load_chunking_config so that an
@@ -205,18 +209,17 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
             print(f"ERROR: invalid chunking config: {exc}", file=sys.stderr)
             return 2
 
-        # Apply path is available (future #103 case).
         ingestion_run_id = decision.ingestion_run_id
         resume_point = decision.last_processed_export_msg_id
 
         try:
-            await run_apply(
+            report = await run_apply(
                 session,
                 ingestion_run_id=ingestion_run_id,
                 resume_point=resume_point,
                 chunking_config=chunking_config,
             )
-        except Exception as exc:
+        except (ValueError, RuntimeError, OSError, SQLAlchemyError, json.JSONDecodeError) as exc:
             # Fix 5: if run_apply raised a DB error, the session may be in
             # PendingRollback state. Calling finalize_run on an aborted tx would
             # raise a secondary exception masking the original.
@@ -225,7 +228,7 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
             original_exc = exc
             try:
                 await session.rollback()
-            except Exception as rb_err:
+            except SQLAlchemyError as rb_err:
                 logger.warning("rollback failed after run_apply error: %s", rb_err)
 
             try:
@@ -234,21 +237,85 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
                         fresh_session,
                         ingestion_run_id=ingestion_run_id,
                         final_status="failed",
-                        error_payload={"error_type": type(original_exc).__name__, "message": str(original_exc)},
+                        error_payload={
+                            "error_type": type(original_exc).__name__,
+                            "message": "import apply runtime error",
+                        },
                     )
                     await fresh_session.commit()
-            except Exception as fin_err:
+            except (ValueError, SQLAlchemyError) as fin_err:
                 logger.warning(
-                    "finalize_run failed for run %s after apply error (original: %s): %s",
+                    "finalize_run failed for run %s after apply error (original_type=%s): %s",
                     ingestion_run_id,
-                    original_exc,
+                    type(original_exc).__name__,
                     fin_err,
                 )
-            raise original_exc
+            print(
+                f"ERROR: import apply failed: {type(original_exc).__name__}",
+                file=sys.stderr,
+            )
+            return 5
 
+        # Mark the run completed with final stats. finalize_run is idempotent.
+        await finalize_run(
+            session,
+            ingestion_run_id=ingestion_run_id,
+            final_status="completed",
+        )
+        # Persist final stats (counts) into stats_json via deep-merge.
+        await _save_apply_final_stats(session, report)
         await session.commit()
 
+        # Operator-readable summary
+        print(
+            f"[import_apply] run {ingestion_run_id} completed: "
+            f"applied={report.applied_count}, "
+            f"duplicate={report.skipped_duplicate_count}, "
+            f"tombstone={report.skipped_tombstone_count}, "
+            f"governance={report.skipped_governance_count}, "
+            f"errors={report.error_count}, "
+            f"chunks={report.chunks_processed}"
+        )
+
     return 0
+
+
+# Feature flag key controlling whether import apply is allowed to run. Default OFF.
+# Operators flip it via SQL once the apply path is verified in their env.
+IMPORT_APPLY_FLAG = "memory.import.apply.enabled"
+
+
+async def _save_apply_final_stats(session, report) -> None:
+    """Deep-merge the apply report's counts into ingestion_runs.stats_json.
+
+    Mirrors save_checkpoint's deep-merge so other operator-set keys survive.
+    Called once at the end of a successful run.
+    """
+    from sqlalchemy import text
+
+    patch = {
+        "applied_count": report.applied_count,
+        "skipped_duplicate_count": report.skipped_duplicate_count,
+        "skipped_tombstone_count": report.skipped_tombstone_count,
+        "skipped_governance_count": report.skipped_governance_count,
+        "skipped_resume_count": report.skipped_resume_count,
+        "skipped_service_count": report.skipped_service_count,
+        "skipped_overlap_count": report.skipped_overlap_count,
+        "error_count": report.error_count,
+        "error_export_msg_ids": report.error_export_msg_ids,
+        "chunks_processed": report.chunks_processed,
+        "last_processed_export_msg_id": report.last_processed_export_msg_id,
+    }
+    await session.execute(
+        text(
+            """
+            UPDATE ingestion_runs
+               SET stats_json = COALESCE(stats_json::jsonb, '{}'::jsonb) || CAST(:patch AS jsonb)
+             WHERE id = :id
+            """
+        ),
+        {"id": report.ingestion_run_id, "patch": json.dumps(patch)},
+    )
 
 
 def _read_chat_id_from_envelope(path: Path) -> int:

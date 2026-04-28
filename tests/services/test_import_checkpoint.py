@@ -460,41 +460,36 @@ def _invoke_cli(argv: list[str]) -> tuple[int, str, str]:
     return rc, buf_out.getvalue(), buf_err.getvalue()
 
 
-# Test 10: CLI smoke — import_apply <fixture.json> (no --resume) → exits 4, prints start_fresh
-def test_cli_import_apply_no_resume_exits_4() -> None:
-    """Without a DB / apply implementation, import_apply must exit 4 (apply not implemented).
-
-    The CLI parses args, reads the file, computes source_hash, calls init_or_resume_run
-    (which needs a DB), so we mock the DB session + init_or_resume_run to return
-    start_fresh decision, then observe the exit 4 from the lazy ImportError path.
+# Test 10: CLI smoke — feature flag OFF → exits 0, prints "disabled"
+def test_cli_import_apply_flag_disabled_exits_0() -> None:
+    """When memory.import.apply.enabled flag is OFF (default), import_apply exits 0
+    with an operator-facing message.  No ingestion_run row is created.
     """
-    from unittest.mock import MagicMock
-
-    mock_decision = MagicMock()
-    mock_decision.mode = "start_fresh"
-    mock_decision.ingestion_run_id = 1
-    mock_decision.last_processed_export_msg_id = None
-    mock_decision.reason = "new run"
-
-    # Mock the session context manager returned by async_session()
+    # Mock the session context manager returned by async_session().
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=None)
 
     with (
-        patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+        patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=False)),
         patch("bot.db.engine.async_session", return_value=mock_session),
     ):
         rc, stdout, stderr = _invoke_cli(["import_apply", str(SMALL_CHAT)])
 
-    assert rc == 4, f"Expected exit 4 (apply not implemented), got {rc}. stderr: {stderr!r}"
-    assert "not yet implemented" in stderr.lower() or "#103" in stderr
+    assert rc == 0, f"Expected exit 0 (flag OFF), got {rc}. stdout: {stdout!r}"
+    assert "disabled" in stdout.lower() or "off" in stdout.lower(), (
+        f"Expected 'disabled'/'off' in stdout, got: {stdout!r}"
+    )
 
 
-# Test 11: CLI smoke — --resume on no-prior-run → start_fresh, exits 4
-def test_cli_import_apply_resume_on_no_prior_run_exits_4() -> None:
-    """--resume when no prior run exists → start_fresh (harmless) → exits 4 (apply not impl)."""
+# Test 11: CLI smoke — --resume on no-prior-run → start_fresh, run_apply called, exits 0
+def test_cli_import_apply_resume_on_no_prior_run_runs_apply() -> None:
+    """--resume when no prior run exists → start_fresh decision → run_apply is invoked.
+    Verifies the post-#103 happy path: with flag ON and start_fresh, run_apply is called.
+    """
     from unittest.mock import MagicMock
+
+    from bot.services.import_apply import ImportApplyReport
 
     mock_decision = MagicMock()
     mock_decision.mode = "start_fresh"
@@ -502,17 +497,29 @@ def test_cli_import_apply_resume_on_no_prior_run_exits_4() -> None:
     mock_decision.last_processed_export_msg_id = None
     mock_decision.reason = "no prior run; starting fresh despite --resume"
 
+    fake_report = ImportApplyReport(
+        ingestion_run_id=2,
+        chat_id=9999,
+        source_path=str(SMALL_CHAT),
+        started_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        applied_count=3,
+    )
+
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=None)
 
     with (
+        patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
         patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+        patch("bot.services.import_checkpoint.finalize_run", new=AsyncMock()),
+        patch("bot.services.import_apply.run_apply", new=AsyncMock(return_value=fake_report)),
         patch("bot.db.engine.async_session", return_value=mock_session),
     ):
         rc, stdout, stderr = _invoke_cli(["import_apply", "--resume", str(SMALL_CHAT)])
 
-    assert rc == 4, f"Expected exit 4, got {rc}"
+    assert rc == 0, f"Expected exit 0, got {rc}. stderr: {stderr!r}"
+    assert "completed" in stdout.lower(), f"Expected 'completed' in stdout, got: {stdout!r}"
 
 
 # Test 12: CLI smoke — no --resume on partial run (status=failed) → exits 3
@@ -531,6 +538,7 @@ def test_cli_import_apply_no_resume_on_partial_run_exits_3() -> None:
     mock_session.__aexit__ = AsyncMock(return_value=None)
 
     with (
+        patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
         patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
         patch("bot.db.engine.async_session", return_value=mock_session),
     ):
