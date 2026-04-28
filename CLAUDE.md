@@ -87,6 +87,18 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
     API contract, read-only invariant (NO DB writes; safe inside any transaction), forward-chain
     direct-lookup design choice (chain_depth always 0; consumers iterate if they need deeper
     traversal). Cross-refs #91 schema, #93 user mapping, #94 dry-run parser.
+11. `docs/memory-system/import-checkpoint.md` — Telegram Desktop import apply checkpoint /
+    resume infrastructure. Read BEFORE touching `bot/services/import_checkpoint.py`,
+    `bot/cli.py::import_apply`, or implementing #103 (Stream Delta apply). Defines:
+    resume decision matrix (`start_fresh` / `resume_existing` / `block_partial_present`),
+    `ingestion_runs.stats_json.last_processed_export_msg_id` deep-merge contract (atomic
+    `UPDATE ... SET stats_json = COALESCE(stats_json, '{}') || CAST(:patch AS jsonb)`), partial
+    UNIQUE index on `(source_hash) WHERE status='running'` (race-safe at-most-one running
+    import per export), `source_hash` sha256 dedup, CLI exit codes (3=block partial-present,
+    4=apply-not-implemented placeholder until #103), `finalize_run` idempotency, lazy
+    `run_apply` import dance. Cross-refs #94 dry-run parser, #98 reply resolver, #103 apply
+    (deferred). HIGH-RISK boundary: idempotency / no-double-write / no-orphan-rows
+    invariants.
 
 Issue tracker for memory cycle: **GitHub Issues** (label `phase:0`, `phase:1`, etc.). The
 `nt` (Notion) plugin remains the tracker for non-memory work in this repo if any.
