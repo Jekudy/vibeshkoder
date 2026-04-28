@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import MessageVersion
@@ -62,32 +63,45 @@ class MessageVersionRepo:
         exists; otherwise creates a new row at ``version_seq = max + 1``. Flushes; does
         not commit.
 
-        Concurrency: the check-then-create pattern is safe in this codebase because the
-        bot is deployed single-instance (one polling consumer per environment, see
-        HANDOFF.md §0). If we ever go multi-instance, two concurrent calls reading the
-        same ``max`` and inserting the same ``version_seq`` would lose the race at the
-        unique constraint ``uq_message_versions_chat_message_seq`` and surface as
-        ``IntegrityError`` — the caller would have to handle it. No retry is built in;
-        adding it is left for the multi-instance migration.
+        Concurrency safety: the INSERT is wrapped in a savepoint (``session.begin_nested``).
+        If two concurrent callers both pass the ``get_by_hash`` check (TOCTOU window) and
+        race to insert the same ``(chat_message_id, content_hash)``, one of them will hit
+        the ``uq_message_versions_chat_message_content_hash`` unique constraint and receive
+        an ``IntegrityError``. The savepoint rolls back only the failed sub-transaction,
+        leaving the outer session intact. The losing caller then reselects the winner's row
+        via ``get_by_hash`` and returns it. Any other ``IntegrityError`` (FK violation, NOT
+        NULL, etc.) is re-raised so the caller sees the real problem.
         """
         existing = await MessageVersionRepo.get_by_hash(session, chat_message_id, content_hash)
         if existing is not None:
             return existing
 
-        next_seq = (await MessageVersionRepo.get_max_version_seq(session, chat_message_id)) + 1
+        try:
+            async with session.begin_nested():
+                next_seq = (
+                    await MessageVersionRepo.get_max_version_seq(session, chat_message_id)
+                ) + 1
 
-        row = MessageVersion(
-            chat_message_id=chat_message_id,
-            version_seq=next_seq,
-            text=text,
-            caption=caption,
-            normalized_text=normalized_text,
-            entities_json=entities_json,
-            edit_date=edit_date,
-            content_hash=content_hash,
-            raw_update_id=raw_update_id,
-            is_redacted=is_redacted,
-        )
-        session.add(row)
-        await session.flush()
+                row = MessageVersion(
+                    chat_message_id=chat_message_id,
+                    version_seq=next_seq,
+                    text=text,
+                    caption=caption,
+                    normalized_text=normalized_text,
+                    entities_json=entities_json,
+                    edit_date=edit_date,
+                    content_hash=content_hash,
+                    raw_update_id=raw_update_id,
+                    is_redacted=is_redacted,
+                )
+                session.add(row)
+                await session.flush()
+        except IntegrityError:
+            # Concurrent insert won the race on uq_message_versions_chat_message_content_hash.
+            # Reselect and return their row.
+            existing = await MessageVersionRepo.get_by_hash(session, chat_message_id, content_hash)
+            if existing is not None:
+                return existing
+            raise  # unrelated IntegrityError (FK, NOT NULL, etc.) — let caller see it
+
         return row

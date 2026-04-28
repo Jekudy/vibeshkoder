@@ -235,6 +235,11 @@ class MessageVersion(Base):
             "version_seq",
             name="uq_message_versions_chat_message_seq",
         ),
+        UniqueConstraint(
+            "chat_message_id",
+            "content_hash",
+            name="uq_message_versions_chat_message_content_hash",
+        ),
         Index("ix_message_versions_content_hash", "content_hash"),
         Index("ix_message_versions_captured_at", "captured_at"),
         Index("ix_message_versions_chat_message_id", "chat_message_id"),
