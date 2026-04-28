@@ -72,8 +72,15 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
    flag, anonymous channel singleton, privacy R2 (imports cannot promote themselves to live;
    only the gatekeeper live-registration path flips ghost→live by clearing `is_imported_only`),
    display_name first-write-wins, attribution semantics under live/import overlap.
+9. `docs/memory-system/import-dry-run-parser.md` — Telegram Desktop dry-run parser. Read BEFORE
+   touching `bot/services/import_parser.py` or invoking `python -m bot.cli import_dry_run`.
+   Defines: `ImportDryRunReport` field semantics, single-chat-only input contract (full-account
+   exports rejected), NO-content guarantee (`asdict(report)` carries zero message bodies),
+   `governance.detect_policy` invocation contract (called per user message, service messages
+   skipped), operator pre-flight role before any #103 apply run. Cross-refs #91 schema, #93
+   user mapping, #106 edit-history policy.
 
 Issue tracker for memory cycle: **GitHub Issues** (label `phase:0`, `phase:1`, etc.). The
 `nt` (Notion) plugin remains the tracker for non-memory work in this repo if any.
 
-<!-- updated-by-superflow:2026-04-27 -->
+<!-- updated-by-superflow:2026-04-28 -->
