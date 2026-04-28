@@ -184,6 +184,8 @@ def test_ingestion_run_model_registered(app_env) -> None:
         "id",
         "run_type",
         "source_name",
+        # T2-NEW-E (#101): source_hash for checkpoint/resume dedup
+        "source_hash",
         "started_at",
         "finished_at",
         "status",

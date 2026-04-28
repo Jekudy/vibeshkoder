@@ -586,11 +586,22 @@ class IngestionRun(Base):
             "started_at",
         ),
         Index("ix_ingestion_runs_status", "status"),
+        # T2-NEW-E (#101): at most one RUNNING import run per source_hash.
+        # Completed/failed rows for the same source_hash are allowed.
+        Index(
+            "ix_ingestion_runs_source_hash_running",
+            "source_hash",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_type: Mapped[str] = mapped_column(String(32), nullable=False)
     source_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # T2-NEW-E (#101): SHA-256 of the export file bytes. Used by checkpoint/resume logic
+    # to locate a prior partial run for the same source file. NULL for live and dry_run rows.
+    source_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=func.now(), server_default=func.now(), nullable=False
     )
