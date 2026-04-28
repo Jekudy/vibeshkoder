@@ -717,16 +717,16 @@ async def test_message_hash_target_records_skipped(db_session) -> None:
     ev = await db_session.get(ForgetEvent, event_id, populate_existing=True)
     assert ev.status == "completed"
 
-    # Phase-1 layers: skipped with the new reason
-    for layer in ("chat_messages", "message_versions"):
+    # ALL 6 layers: uniformly skipped with target_type_not_supported_yet
+    from bot.services.forget_cascade import CASCADE_LAYER_ORDER
+
+    for layer in CASCADE_LAYER_ORDER:
         assert ev.cascade_status[layer]["status"] == "skipped", (
             f"Layer {layer} should be skipped for message_hash target, got: {ev.cascade_status[layer]}"
         )
-        assert ev.cascade_status[layer]["reason"] == "target_type_not_supported_yet"
-
-    # Phase-4+ layers: still skipped with table_not_exists
-    for layer in ("message_entities", "message_links", "attachments", "fts_rows"):
-        assert ev.cascade_status[layer]["status"] == "skipped"
+        assert ev.cascade_status[layer]["reason"] == "target_type_not_supported_yet", (
+            f"Layer {layer} should have reason='target_type_not_supported_yet', got: {ev.cascade_status[layer]}"
+        )
 
 
 async def test_export_target_records_skipped(db_session) -> None:
@@ -749,9 +749,16 @@ async def test_export_target_records_skipped(db_session) -> None:
     ev = await db_session.get(ForgetEvent, event_id, populate_existing=True)
     assert ev.status == "completed"
 
-    for layer in ("chat_messages", "message_versions"):
-        assert ev.cascade_status[layer]["status"] == "skipped"
-        assert ev.cascade_status[layer]["reason"] == "target_type_not_supported_yet"
+    # ALL 6 layers: uniformly skipped with target_type_not_supported_yet
+    from bot.services.forget_cascade import CASCADE_LAYER_ORDER
+
+    for layer in CASCADE_LAYER_ORDER:
+        assert ev.cascade_status[layer]["status"] == "skipped", (
+            f"Layer {layer} should be skipped for export target, got: {ev.cascade_status[layer]}"
+        )
+        assert ev.cascade_status[layer]["reason"] == "target_type_not_supported_yet", (
+            f"Layer {layer} should have reason='target_type_not_supported_yet', got: {ev.cascade_status[layer]}"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

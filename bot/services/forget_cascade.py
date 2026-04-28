@@ -267,9 +267,10 @@ async def _process_one_event(session: AsyncSession, event) -> None:
                 continue
 
             if event.target_type in _SKIP_TARGET_TYPES:
-                # Unsupported target_type: record skip with reason so the audit
-                # trail is explicit. Phase 4+ layers with table_not_exists also
-                # land here as skipped, but with a different reason.
+                # Uniform reason: target_type_not_supported_yet (regardless of whether
+                # the layer's table exists yet — the dominant reason is the outer
+                # unsupported target_type). Phase-1 layers include rows=0 for consistency
+                # with the supported-target_type completion shape.
                 if layer in _LAYER_FUNCS:
                     cascade_state[layer] = {
                         "status": "skipped",
@@ -279,7 +280,7 @@ async def _process_one_event(session: AsyncSession, event) -> None:
                 else:
                     cascade_state[layer] = {
                         "status": "skipped",
-                        "reason": "table_not_exists",
+                        "reason": "target_type_not_supported_yet",
                     }
             elif layer in _LAYER_FUNCS:
                 rows = await _LAYER_FUNCS[layer](session, event)
