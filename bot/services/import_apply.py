@@ -8,31 +8,34 @@ per imported message and routes content through ``persist_message_with_policy``
 
 Pipeline per export message (chronological order, in-chunk):
 
-1. Resume gate     — skip if ``export_msg_id <= last_processed_export_msg_id``.
-2. Tombstone gate  — chunk-level ``batch_check_tombstones_by_message_key`` (#97).
-3. Duplicate gate  — ``chat_messages`` lookup by ``(chat_id, message_id)``.
-4. User resolution — ``import_user_map.resolve_export_user`` (#93). Ghost users
-                     are created with ``is_imported_only=True``.
-5. Reply resolver  — ``import_reply_resolver`` priority order (same_run > prior_run
-                     > live > unresolved) (#98). Read-only.
-6. Synthetic raw   — Write a ``telegram_updates`` row with ``update_id=NULL`` and
-                     ``ingestion_run_id`` set. Audit row stays even when governance
-                     rejects the content.
-7. Governance      — ``governance.detect_policy`` runs after the synthetic audit row.
-                     ``offrecord`` keeps only that audit row and skips persistence.
-8. Persist         — for non-offrecord outcomes, ``persist_message_with_policy`` (#89)
-                     writes ``chat_messages``.
-9. Edit history    — ``MessageVersionRepo.insert_version(imported_final=True)`` per
-                     #106. Skipped when a live row already exists for the same
-                     ``(chat_id, message_id)`` (live wins).
-10. Checkpoint     — once per CHUNK, ``save_checkpoint`` deep-merges
-                     ``last_processed_export_msg_id`` into ``stats_json``.
+    1. Resume gate      — skip if ``export_msg_id <= last_processed_export_msg_id``.
+    2. Tombstone gate   — chunk-level ``batch_check_tombstones_by_message_key`` (#97).
+    3. Duplicate gate   — ``chat_messages`` or prior import audit row lookup.
+    4. User resolution  — ``import_user_map.resolve_export_user`` (#93). Ghost users
+                      are created with ``is_imported_only=True``.
+    5. Full tombstone   — ``check_tombstone`` with content_hash + ``user:{tg_id}`` before
+                      the synthetic raw insert.
+    6. Reply resolver   — ``import_reply_resolver`` priority order (same_run > prior_run
+                      > live > unresolved) (#98). Translates cm PK to message_id.
+    7. Synthetic raw    — Write a ``telegram_updates`` row with ``update_id=NULL`` and
+                      ``ingestion_run_id`` set. Audit row stays even when governance
+                      rejects the content.
+    8. Governance       — ``governance.detect_policy`` runs after the synthetic audit row.
+                      ``offrecord`` keeps only that audit row and skips persistence.
+    9. Persist          — for non-offrecord outcomes, ``persist_message_with_policy`` (#89)
+                      writes ``chat_messages``.
+    10. Edit history    — ``MessageVersionRepo.insert_version(imported_final=True)`` per
+                      #106. Skipped when persist returns a row whose ``raw_update_id``
+                      is not the synthetic raw id (live overlap won).
+    11. Checkpoint      — once per CHUNK, ``save_checkpoint`` deep-merges
+                      ``last_processed_export_msg_id`` into ``stats_json`` in the same
+                      transaction as the chunk data.
 
 Cross-stream contract:
-- Acquires a single ``AsyncConnection`` from the caller's session and holds it for
-  the full apply run. ``acquire_advisory_lock`` (#102) wraps the loop. Per-chunk
-  ``session.commit()`` releases each chunk's transaction without releasing the
-  underlying connection.
+- With advisory locking enabled, engine-bound callers get a fresh
+  ``AsyncConnection`` and a fresh ``AsyncSession(bind=conn)`` for the full apply run.
+  Per-chunk ``session.commit()`` releases each chunk's transaction without releasing
+  the lock connection.
 
 Hard invariants (verified by tests in tests/services/test_import_apply.py):
 - Idempotent: re-running on the same export produces zero net DB changes.
@@ -59,8 +62,9 @@ from types import SimpleNamespace
 from typing import Any, Iterable
 
 from sqlalchemy import select
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from bot.db.models import ChatMessage, IngestionRun
 from bot.db.repos.message_version import MessageVersionRepo
@@ -71,7 +75,10 @@ from bot.services.import_checkpoint import save_checkpoint
 from bot.services.import_chunking import ChunkingConfig, acquire_advisory_lock
 from bot.services.import_parser import _classify_td_kind, _extract_text_string
 from bot.services.import_reply_resolver import resolve_reply_batch
-from bot.services.import_tombstone import batch_check_tombstones_by_message_key
+from bot.services.import_tombstone import (
+    batch_check_tombstones_by_message_key,
+    check_tombstone,
+)
 from bot.services.import_user_map import resolve_export_user
 from bot.services.message_persistence import persist_message_with_policy
 
@@ -114,6 +121,9 @@ class ImportApplyReport:
     skipped_tombstone_count: int = 0
     """Message blocked by forget_events tombstone."""
 
+    tombstone_skip_export_msg_ids: list[int] = field(default_factory=list)
+    """Capped list of export_msg_ids blocked by tombstones."""
+
     skipped_governance_count: int = 0
     """detect_policy returned offrecord — synthetic audit row kept, content not persisted."""
 
@@ -153,9 +163,10 @@ async def run_apply(
     """Run the import apply path for the ingestion_run identified by ``ingestion_run_id``.
 
     Args:
-        session: Active AsyncSession. Will be committed per chunk. The session's bound
-            connection is used for the advisory lock — caller MUST NOT cycle connections
-            on this session (single-process CLI design satisfies this).
+        session: Active AsyncSession. Will be committed per chunk when no separate lock
+            connection is needed. When the session is engine-bound and advisory locking is
+            enabled, run_apply opens one AsyncConnection and binds a fresh AsyncSession to
+            it for the whole apply so the connection-scoped lock cannot be lost to pooling.
         ingestion_run_id: The PK of the IngestionRun row created by ``init_or_resume_run``.
         resume_point: ``last_processed_export_msg_id`` from a prior partial run. ``None``
             for a fresh run. Messages with ``export_msg_id <= resume_point`` are skipped.
@@ -175,43 +186,26 @@ async def run_apply(
         chunking_config=chunking_config,
     )
 
-    # Resolve the run row to read chat_id and source_name. Use NOWAIT-free read to
-    # tolerate a concurrent reader that's looking at the same row for finalize_run.
-    run_row = await _load_run(session, ingestion_run_id)
-    chat_id = _extract_chat_id_from_run(run_row)
-    report.chat_id = chat_id
+    async def _prepare_and_run(apply_session: AsyncSession) -> None:
+        # Resolve the run row to read chat_id and source_name. Use NOWAIT-free read to
+        # tolerate a concurrent reader that's looking at the same row for finalize_run.
+        run_row = await _load_run(apply_session, ingestion_run_id)
+        chat_id = _extract_chat_id_from_run(run_row)
+        report.chat_id = chat_id
 
-    source_path = export_path or run_row.source_name or ""
-    if not source_path:
-        raise RuntimeError(
-            f"ingestion_run {ingestion_run_id}: source_name is empty and no export_path "
-            "override provided — cannot locate export file"
-        )
-    path = Path(source_path).expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"export file not found: {path}")
-    report.source_path = str(path)
-
-    # NOTE on lock semantics: pg_advisory_lock is connection-scoped. We pull the
-    # session's bound connection and hold it for the lock lifetime. session.commit()
-    # ends each per-chunk tx but does NOT release the underlying conn from the
-    # session — the lock survives across chunk commits. See import-chunking.md §
-    # "Connection-scope requirement".
-    if chunking_config.use_advisory_lock:
-        connection = await session.connection()
-        async with acquire_advisory_lock(connection, ingestion_run_id):
-            await _run_apply_loop(
-                session,
-                report=report,
-                run_row=run_row,
-                path=path,
-                chat_id=chat_id,
-                resume_point=resume_point,
-                chunking_config=chunking_config,
+        source_path = export_path or run_row.source_name or ""
+        if not source_path:
+            raise RuntimeError(
+                f"ingestion_run {ingestion_run_id}: source_name is empty and no export_path "
+                "override provided — cannot locate export file"
             )
-    else:
+        path = Path(source_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"export file not found: {path}")
+        report.source_path = str(path)
+
         await _run_apply_loop(
-            session,
+            apply_session,
             report=report,
             run_row=run_row,
             path=path,
@@ -219,6 +213,34 @@ async def run_apply(
             resume_point=resume_point,
             chunking_config=chunking_config,
         )
+
+    try:
+        if chunking_config.use_advisory_lock:
+            async_engine = _get_bound_async_engine(session)
+            if async_engine is not None:
+                # pg_advisory_lock is connection-scoped. For pooled sessions, bind the
+                # entire apply to one explicit AsyncConnection so per-chunk commits cannot
+                # swap the connection underneath the lock.
+                async with async_engine.connect() as connection:
+                    async with acquire_advisory_lock(connection, ingestion_run_id):
+                        async with AsyncSession(
+                            bind=connection,
+                            expire_on_commit=False,
+                        ) as locked_session:
+                            await _prepare_and_run(locked_session)
+            else:
+                # Tests and explicitly connection-bound callers already provide a single
+                # AsyncConnection. Reuse it rather than opening an invisible second
+                # connection that would not see the caller's uncommitted fixture data.
+                connection = await session.connection()
+                async with acquire_advisory_lock(connection, ingestion_run_id):
+                    await _prepare_and_run(session)
+        else:
+            await _prepare_and_run(session)
+    except BaseException as exc:
+        report.finished_at = datetime.now(tz=timezone.utc)
+        setattr(exc, "import_apply_report", report)
+        raise
 
     report.finished_at = datetime.now(tz=timezone.utc)
     return report
@@ -255,67 +277,78 @@ async def _run_apply_loop(
     for chunk_start in range(0, len(messages), chunk_size):
         chunk = messages[chunk_start : chunk_start + chunk_size]
 
-        # Tombstone gate — one bulk SELECT per chunk (#97). Chunks containing only
-        # service messages still call this so the contract is uniform; it's a single
-        # query so the cost is negligible.
-        export_ids = [int(m["id"]) for m in chunk if isinstance(m.get("id"), int)]
-        tombstone_hits = await batch_check_tombstones_by_message_key(
-            session,
-            chat_id=chat_id,
-            export_msg_ids=export_ids,
-        )
-
-        # Process chunk inside a single per-chunk transaction. session.commit() at
-        # the end commits the chunk; if an exception escapes, the caller (CLI)
-        # rolls back the session and finalize_run records the failed status.
+        # Process chunk inside a single per-chunk transaction. Each message gets a
+        # SAVEPOINT so validation/mapping failures roll back only that message. The
+        # checkpoint is written inside the same outer transaction as the chunk data;
+        # one commit makes both visible atomically.
+        chunk_snapshot = _snapshot_report(report)
         last_id_in_chunk: int | None = None
-        for msg in chunk:
-            try:
-                advance = await _apply_one_message(
-                    session,
-                    msg=msg,
-                    chat_id=chat_id,
-                    ingestion_run_id=report.ingestion_run_id,
-                    tombstone_hits=tombstone_hits,
-                    report=report,
-                )
-            except (ValueError, RuntimeError, SQLAlchemyError) as exc:
-                # Per-message envelope: log + bump error counters; chunk continues.
-                report.error_count += 1
-                if len(report.error_export_msg_ids) < _ERROR_ID_CAP:
-                    msg_id = msg.get("id")
-                    if isinstance(msg_id, int):
-                        report.error_export_msg_ids.append(msg_id)
-                logger.error(
-                    "import_apply: per-message error",
-                    extra={
-                        "ingestion_run_id": report.ingestion_run_id,
-                        "chat_id": chat_id,
-                        "export_msg_id": msg.get("id"),
-                        "error_type": type(exc).__name__,
-                    },
-                )
-                # Continue with next message — DO NOT advance last_id_in_chunk.
-                advance = None
-
-            if advance is not None:
-                last_id_in_chunk = advance
-
-        # Commit the chunk. Per-chunk commits make checkpoint state durable.
-        await session.commit()
-        report.chunks_processed += 1
-
-        # Persist checkpoint AFTER commit so the chunk's writes are visible if
-        # the caller crashes between commit and save_checkpoint (re-run will
-        # re-apply, hit the duplicate gate, and continue).
-        if last_id_in_chunk is not None:
-            await save_checkpoint(
+        try:
+            # Tombstone gate — one bulk SELECT per chunk (#97). Chunks containing only
+            # service messages still call this so the contract is uniform; it's a single
+            # query so the cost is negligible.
+            export_ids = [int(m["id"]) for m in chunk if isinstance(m.get("id"), int)]
+            tombstone_hits = await batch_check_tombstones_by_message_key(
                 session,
-                ingestion_run_id=report.ingestion_run_id,
-                last_processed_export_msg_id=last_id_in_chunk,
-                chunk_index=chunk_index,
+                chat_id=chat_id,
+                export_msg_ids=export_ids,
             )
-            report.last_processed_export_msg_id = last_id_in_chunk
+
+            for msg in chunk:
+                try:
+                    async with session.begin_nested():
+                        advance = await _apply_one_message(
+                            session,
+                            msg=msg,
+                            chat_id=chat_id,
+                            ingestion_run_id=report.ingestion_run_id,
+                            tombstone_hits=tombstone_hits,
+                            report=report,
+                        )
+                except SQLAlchemyError:
+                    logger.error(
+                        "import_apply: per-message database error; aborting chunk",
+                        extra={
+                            "ingestion_run_id": report.ingestion_run_id,
+                            "chat_id": chat_id,
+                            "export_msg_id": msg.get("id"),
+                        },
+                    )
+                    raise
+                except (ValueError, RuntimeError) as exc:
+                    _record_message_error(report, msg=msg, chat_id=chat_id, exc=exc)
+                    # Continue with next message — DO NOT advance last_id_in_chunk.
+                    advance = None
+
+                if advance is not None:
+                    last_id_in_chunk = advance
+
+            if last_id_in_chunk is not None:
+                await save_checkpoint(
+                    session,
+                    ingestion_run_id=report.ingestion_run_id,
+                    last_processed_export_msg_id=last_id_in_chunk,
+                    chunk_index=chunk_index,
+                )
+                report.last_processed_export_msg_id = last_id_in_chunk
+
+            # Commit the chunk data and checkpoint together.
+            await session.commit()
+        except BaseException:
+            try:
+                await session.rollback()
+            except SQLAlchemyError as rb_err:
+                logger.warning(
+                    "import_apply: rollback failed after chunk error "
+                    "(ingestion_run_id=%s, chunk_index=%s): %s",
+                    report.ingestion_run_id,
+                    chunk_index,
+                    rb_err,
+                )
+            _restore_report(report, chunk_snapshot)
+            raise
+
+        report.chunks_processed += 1
 
         chunk_index += 1
 
@@ -357,12 +390,19 @@ async def _apply_one_message(
 
     # 1. Tombstone gate (#97) — message is in the chunk-level hit set.
     if msg_id in tombstone_hits:
-        report.skipped_tombstone_count += 1
+        _record_tombstone_skip(report, msg_id)
         return msg_id
 
     # 2. Duplicate gate — chat_messages already has this (chat_id, message_id).
     existing_cm_id = await _find_existing_chat_message_id(session, chat_id, msg_id)
     if existing_cm_id is not None:
+        report.skipped_duplicate_count += 1
+        return msg_id
+
+    # Offrecord idempotency gate — offrecord messages keep only the synthetic audit
+    # telegram_updates row, so chat_messages cannot serve as their duplicate marker.
+    existing_import_update_id = await _find_existing_import_update_id(session, chat_id, msg_id)
+    if existing_import_update_id is not None:
         report.skipped_duplicate_count += 1
         return msg_id
 
@@ -389,7 +429,33 @@ async def _apply_one_message(
         )
         return msg_id
 
-    # 4. Reply resolution (#98). Read-only — no writes.
+    # 4. Build kind + text/caption per parser semantics. Mirrors what the dry-run
+    # parser counts so apply-side governance verdicts match dry-run preview.
+    kind = _classify_td_kind(msg, warnings=None)
+    text_value, caption_value = _extract_text_caption_for_kind(msg, kind)
+
+    # 5. Compute content hash (chv1) before the full tombstone check so message_hash
+    # tombstones are also honored. The new privacy-critical bit is user:{tg_id}.
+    text_entities = msg.get("text_entities") if isinstance(msg.get("text_entities"), list) else None
+    content_hash = compute_content_hash(
+        text=text_value,
+        caption=caption_value,
+        message_kind=kind,
+        entities=text_entities,
+    )
+
+    tombstone = await check_tombstone(
+        session,
+        chat_id=chat_id,
+        message_id=msg_id,
+        content_hash=content_hash,
+        user_tg_id=user_id,
+    )
+    if tombstone is not None:
+        _record_tombstone_skip(report, msg_id)
+        return msg_id
+
+    # 6. Reply resolution (#98). Read-only — no writes.
     reply_export_id_raw = msg.get("reply_to_message_id")
     reply_export_id: int | None = (
         reply_export_id_raw if isinstance(reply_export_id_raw, int) else None
@@ -404,27 +470,13 @@ async def _apply_one_message(
         )
         resolution = resolutions.get(reply_export_id)
         if resolution is not None and resolution.chat_message_id is not None:
-            # The resolver returns chat_messages.id — but persist expects a Telegram
-            # message_id (i.e. the per-chat sequence). We still pass the raw export
-            # reply id forward into the message duck (live behaviour: handler stores
-            # the Telegram message_id of the parent). The resolved cm_id is logged
-            # but not directly written; persist's normalization extracts
-            # reply_to_message_id from the duck's reply_to_message.message_id field.
-            resolved_reply_to_message_id = reply_export_id
-
-    # 5. Build kind + text/caption per parser semantics. Mirrors what the dry-run
-    # parser counts so apply-side governance verdicts match dry-run preview.
-    kind = _classify_td_kind(msg, warnings=None)
-    text_value, caption_value = _extract_text_caption_for_kind(msg, kind)
-
-    # 6. Compute content hash (chv1) for the version row idempotency key.
-    text_entities = msg.get("text_entities") if isinstance(msg.get("text_entities"), list) else None
-    content_hash = compute_content_hash(
-        text=text_value,
-        caption=caption_value,
-        message_kind=kind,
-        entities=text_entities,
-    )
+            # The resolver returns chat_messages.id. Persist expects the live-handler
+            # equivalent Telegram message_id of the parent, so translate the PK before
+            # building the importer duck. If the row vanished, drop the pointer.
+            resolved_reply_to_message_id = await _find_chat_message_message_id_by_id(
+                session,
+                resolution.chat_message_id,
+            )
 
     # 7. Synthetic raw row — written FIRST and ALWAYS (even for offrecord), tagged
     # with ingestion_run_id so #104 rollback can locate it. update_id MUST be NULL.
@@ -479,7 +531,8 @@ async def _apply_one_message(
     # could have been written between the dup-check and persist (live ingestion
     # racing with import). Re-check using raw_update_id of the parent row.
     persisted_cm = persist_result.chat_message
-    if _is_live_chat_message(persisted_cm):
+    if _is_live_chat_message(persisted_cm, synthetic_raw_update_id=raw_row.id):
+        # TODO: when #89 grows a created: bool return, switch to that.
         # Live row pre-existed → skip imported version per overlap rule.
         report.skipped_overlap_count += 1
     else:
@@ -720,26 +773,108 @@ async def _find_existing_chat_message_id(
     return result.scalar_one_or_none()
 
 
-def _is_live_chat_message(cm: ChatMessage) -> bool:
+async def _find_existing_import_update_id(
+    session: AsyncSession, chat_id: int, message_id: int
+) -> int | None:
+    """Return an existing import synthetic update id for offrecord idempotency."""
+    from bot.db.models import TelegramUpdate
+
+    stmt = (
+        select(TelegramUpdate.id)
+        .where(
+            TelegramUpdate.chat_id == chat_id,
+            TelegramUpdate.message_id == message_id,
+            TelegramUpdate.update_type == _IMPORT_UPDATE_TYPE,
+        )
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _find_chat_message_message_id_by_id(
+    session: AsyncSession,
+    chat_message_id: int,
+) -> int | None:
+    """Translate chat_messages.id to the live-handler-equivalent message_id."""
+    stmt = select(ChatMessage.message_id).where(ChatMessage.id == chat_message_id).limit(1)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+def _record_tombstone_skip(report: ImportApplyReport, export_msg_id: int) -> None:
+    report.skipped_tombstone_count += 1
+    if len(report.tombstone_skip_export_msg_ids) < _ERROR_ID_CAP:
+        report.tombstone_skip_export_msg_ids.append(export_msg_id)
+
+
+def _record_message_error(
+    report: ImportApplyReport,
+    *,
+    msg: dict[str, Any],
+    chat_id: int,
+    exc: BaseException,
+) -> None:
+    # Per-message envelope: log + bump error counters; chunk continues.
+    report.error_count += 1
+    if len(report.error_export_msg_ids) < _ERROR_ID_CAP:
+        msg_id = msg.get("id")
+        if isinstance(msg_id, int):
+            report.error_export_msg_ids.append(msg_id)
+    logger.error(
+        "import_apply: per-message error",
+        extra={
+            "ingestion_run_id": report.ingestion_run_id,
+            "chat_id": chat_id,
+            "export_msg_id": msg.get("id"),
+            "error_type": type(exc).__name__,
+        },
+    )
+
+
+_REPORT_SNAPSHOT_FIELDS = (
+    "applied_count",
+    "skipped_duplicate_count",
+    "skipped_tombstone_count",
+    "skipped_governance_count",
+    "skipped_resume_count",
+    "skipped_service_count",
+    "skipped_overlap_count",
+    "error_count",
+    "error_export_msg_ids",
+    "tombstone_skip_export_msg_ids",
+    "last_processed_export_msg_id",
+    "chunks_processed",
+)
+
+
+def _snapshot_report(report: ImportApplyReport) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for field_name in _REPORT_SNAPSHOT_FIELDS:
+        value = getattr(report, field_name)
+        snapshot[field_name] = list(value) if isinstance(value, list) else value
+    return snapshot
+
+
+def _restore_report(report: ImportApplyReport, snapshot: dict[str, Any]) -> None:
+    for field_name, value in snapshot.items():
+        setattr(report, field_name, list(value) if isinstance(value, list) else value)
+
+
+def _get_bound_async_engine(session: AsyncSession) -> AsyncEngine | None:
+    """Return the AsyncEngine behind an engine-bound AsyncSession, if any."""
+    sync_bind = session.get_bind()
+    if not isinstance(sync_bind, Engine):
+        return None
+    return AsyncEngine._retrieve_proxy_for_target(sync_bind)
+
+
+def _is_live_chat_message(cm: ChatMessage, *, synthetic_raw_update_id: int) -> bool:
     """Decide whether the row was created by live ingestion (not import).
 
     persist_message_with_policy returns the row resulting from the upsert:
     - On a fresh insert, the row carries our raw_update_id and is import-owned.
     - On a conflict (live row pre-existed), the row carries the original raw_update_id
-      from live ingestion. Detecting this via the raw_update_id pointer is unreliable
-      because both live and import rows have non-NULL raw_update_id. The imported_final
-      flag on the version row is the correct signal — but that doesn't exist yet at
-      this point because we haven't called insert_version.
-
-    Pragmatic check: the duplicate gate at step 2 already rules out the case where a
-    chat_messages row pre-existed before this apply call. So if persist returned a row
-    whose memory_policy is set BUT id is NOT one we just minted, it indicates an upsert
-    conflict — hence overlap. The simpler signal is: if the duplicate-gate fired, we
-    bailed before persist. So at the persist step the row is always our INSERT.
-
-    This helper currently always returns False — the duplicate gate covers the case.
-    Kept for explicit naming and future cross-stream protection if a race introduces
-    a window between the dup check and persist.
+      from live ingestion. Compare against the synthetic raw row we just inserted.
     """
-    # NOTE: deliberate False — duplicate gate handles overlap. See docstring.
-    return False
+    return cm.raw_update_id != synthetic_raw_update_id

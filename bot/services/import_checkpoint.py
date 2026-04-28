@@ -175,13 +175,10 @@ async def save_checkpoint(
 
     Uses PostgreSQL jsonb merge (||) to perform the deep-merge atomically.
 
-    COMMIT CONTRACT: this function commits the transaction immediately after the UPDATE.
-    Caller DOES NOT need (and MUST NOT wrap in) a separate outer transaction around this
-    call. The immediate commit guarantees:
-    (a) checkpoint state is durable per chunk — a hard-kill between chunks loses at most
-        one chunk of work;
-    (b) the partial unique index sees the new run row immediately for concurrent CLI
-        invocations (stat = 'running' is visible to the index predicate).
+    TRANSACTION CONTRACT: this function does not commit. The caller owns the transaction
+    boundary and should call save_checkpoint inside the same transaction as the chunk's
+    data writes, then commit once. This makes the chunk's data and checkpoint visible
+    atomically.
     """
     now_iso = datetime.now(tz=timezone.utc).isoformat()
     patch = {
@@ -205,10 +202,7 @@ async def save_checkpoint(
         ),
         {"id": ingestion_run_id, "patch": json.dumps(patch)},
     )
-    # Commit explicitly so each checkpoint is durable. Callers (#103) should treat
-    # save_checkpoint as self-committing. If called inside a caller-managed tx, the
-    # caller is responsible for not re-opening a nested tx around this call.
-    await session.commit()
+    # No commit here: import_apply commits the chunk's data and checkpoint together.
 
 
 async def load_checkpoint(

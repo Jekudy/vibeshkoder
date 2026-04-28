@@ -19,9 +19,9 @@ Cross-stream invariants asserted explicitly (test 10 = direct-insert audit).
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import text as sa_text
@@ -31,6 +31,7 @@ pytestmark = pytest.mark.usefixtures("app_env")
 FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "td_export"
 SMALL_CHAT = FIXTURE_DIR / "small_chat.json"
 EDITED_MESSAGES = FIXTURE_DIR / "edited_messages.json"
+REPLIES_WITH_MEDIA = FIXTURE_DIR / "replies_with_media.json"
 
 
 # ─── helpers ───────────────────────────────────────────────────────────────────
@@ -207,6 +208,65 @@ async def test_apply_is_idempotent(db_session) -> None:
     # Synthetic telegram_updates for run2: zero (duplicate gate fires before insert).
     assert await _count_telegram_updates(db_session, run2) == 0
 
+    # Offrecord sub-case: edited_messages has one #offrecord message that creates only
+    # a synthetic audit row on the first run. The second run must treat that audit row
+    # as the duplicate marker and create zero new telegram_updates.
+    edited_run1 = await _create_apply_run(
+        db_session,
+        source_path=str(EDITED_MESSAGES),
+        chat_id=chat_id,
+        source_hash="hash_idempotent_offrecord_first",
+    )
+    edited_rep1 = await run_apply(
+        db_session,
+        ingestion_run_id=edited_run1,
+        resume_point=None,
+        chunking_config=_default_chunking(),
+    )
+    assert edited_rep1.applied_count == 4
+    assert edited_rep1.skipped_governance_count == 1
+
+    edited_counts_before_second = await db_session.execute(
+        sa_text(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM chat_messages WHERE chat_id = :cid),
+                (SELECT COUNT(*) FROM telegram_updates WHERE chat_id = :cid AND update_type = 'import_message')
+            """
+        ),
+        {"cid": chat_id},
+    )
+    cm_before, tu_before = map(int, edited_counts_before_second.one())
+
+    edited_run2 = await _create_apply_run(
+        db_session,
+        source_path=str(EDITED_MESSAGES),
+        chat_id=chat_id,
+        source_hash="hash_idempotent_offrecord_second",
+    )
+    edited_rep2 = await run_apply(
+        db_session,
+        ingestion_run_id=edited_run2,
+        resume_point=None,
+        chunking_config=_default_chunking(),
+    )
+    assert edited_rep2.applied_count == 0
+    assert edited_rep2.skipped_duplicate_count == 5
+    assert await _count_telegram_updates(db_session, edited_run2) == 0
+
+    edited_counts_after_second = await db_session.execute(
+        sa_text(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM chat_messages WHERE chat_id = :cid),
+                (SELECT COUNT(*) FROM telegram_updates WHERE chat_id = :cid AND update_type = 'import_message')
+            """
+        ),
+        {"cid": chat_id},
+    )
+    cm_after, tu_after = map(int, edited_counts_after_second.one())
+    assert (cm_after, tu_after) == (cm_before, tu_before)
+
 
 # ─── Test 3: Tombstone gate ───────────────────────────────────────────────────
 
@@ -271,6 +331,62 @@ async def test_apply_tombstone_blocks_message(db_session) -> None:
         {"cid": chat_id, "mid": blocked_msg_id},
     )
     assert int(blocked.scalar_one()) == 0
+
+
+async def test_apply_user_tombstone_blocks_all_sender_messages(db_session) -> None:
+    """A user:{tg_id} tombstone must block every resolved sender message before
+    synthetic telegram_updates or chat_messages rows are written."""
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services.import_apply import run_apply
+
+    chat_id = -1001999999999
+    blocked_user_id = 1000001
+    blocked_msg_ids = [3001, 3004, 3008]  # user1000001 in replies_with_media fixture
+
+    await ForgetEventRepo.create(
+        db_session,
+        target_type="user",
+        target_id=str(blocked_user_id),
+        actor_user_id=None,
+        authorized_by="system",
+        tombstone_key=f"user:{blocked_user_id}",
+    )
+    await db_session.flush()
+
+    run_id = await _create_apply_run(
+        db_session,
+        source_path=str(REPLIES_WITH_MEDIA),
+        chat_id=chat_id,
+        source_hash="hash_user_tombstone_block",
+    )
+
+    report = await run_apply(
+        db_session,
+        ingestion_run_id=run_id,
+        resume_point=None,
+        chunking_config=_default_chunking(),
+    )
+
+    assert report.skipped_tombstone_count == 3
+    assert report.tombstone_skip_export_msg_ids == blocked_msg_ids
+
+    blocked_cm = await db_session.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE chat_id = :cid AND user_id = :uid"
+        ),
+        {"cid": chat_id, "uid": blocked_user_id},
+    )
+    assert int(blocked_cm.scalar_one()) == 0
+
+    blocked_updates = await db_session.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM telegram_updates "
+            "WHERE ingestion_run_id = :rid AND message_id IN (3001, 3004, 3008)"
+        ),
+        {"rid": run_id},
+    )
+    assert int(blocked_updates.scalar_one()) == 0
 
 
 # ─── Test 4: Governance gate ──────────────────────────────────────────────────
@@ -343,7 +459,7 @@ async def test_apply_governance_offrecord_keeps_only_synthetic_audit_row(db_sess
 
 async def test_apply_resolves_intra_export_reply(db_session) -> None:
     """small_chat fixture has msg 1004 replying to msg 1001. After apply, the reply
-    target export-id is preserved on the chat_messages row."""
+    target uses the resolved chat_messages.message_id, not the resolver's raw PK."""
     from bot.services.import_apply import run_apply
 
     chat_id = -1001999999999
@@ -369,6 +485,101 @@ async def test_apply_resolves_intra_export_reply(db_session) -> None:
         {"cid": chat_id, "mid": 1004},
     )
     assert reply_row.scalar_one() == 1001
+
+    # Translation guard: the resolver returns chat_messages.id. Seed a live parent whose
+    # TelegramUpdate.message_id (7777) differs from chat_messages.message_id (424242);
+    # apply must store 424242 as the live-handler-equivalent reply target.
+    await db_session.execute(
+        sa_text(
+            """
+            INSERT INTO users (id, first_name, is_imported_only)
+            VALUES (4242, 'Live Parent', false)
+            ON CONFLICT (id) DO NOTHING
+            """
+        )
+    )
+    live_run_id = (
+        await db_session.execute(
+            sa_text(
+                """
+                INSERT INTO ingestion_runs (run_type, status)
+                VALUES ('live', 'running')
+                RETURNING id
+                """
+            )
+        )
+    ).scalar_one()
+    live_raw_id = (
+        await db_session.execute(
+            sa_text(
+                """
+                INSERT INTO telegram_updates (
+                    update_type, update_id, chat_id, message_id, ingestion_run_id
+                )
+                VALUES ('message', 7777000, :cid, 7777, :rid)
+                RETURNING id
+                """
+            ),
+            {"cid": -3003, "rid": live_run_id},
+        )
+    ).scalar_one()
+    await db_session.execute(
+        sa_text(
+            """
+            INSERT INTO chat_messages (
+                message_id, chat_id, user_id, text, date, raw_update_id
+            )
+            VALUES (424242, :cid, 4242, 'parent', now(), :raw_id)
+            """
+        ),
+        {"cid": -3003, "raw_id": live_raw_id},
+    )
+    await db_session.flush()
+
+    reply_export = {
+        "name": "Reply Translation Chat",
+        "type": "private_supergroup",
+        "id": -3003,
+        "messages": [
+            {
+                "id": 7778,
+                "type": "message",
+                "date": "2024-03-01T10:00:00",
+                "date_unixtime": "1709287200",
+                "from": "Child User",
+                "from_id": "user5555",
+                "reply_to_message_id": 7777,
+                "text": "child",
+                "text_entities": [{"type": "plain", "text": "child"}],
+            }
+        ],
+    }
+    tmp = FIXTURE_DIR / "_tmp_reply_translation.json"
+    tmp.write_text(json.dumps(reply_export), encoding="utf-8")
+    try:
+        translation_run_id = await _create_apply_run(
+            db_session,
+            source_path=str(tmp),
+            chat_id=-3003,
+            source_hash="hash_reply_translation",
+        )
+        await run_apply(
+            db_session,
+            ingestion_run_id=translation_run_id,
+            resume_point=None,
+            chunking_config=_default_chunking(),
+        )
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    translated_reply = await db_session.execute(
+        sa_text(
+            "SELECT reply_to_message_id FROM chat_messages "
+            "WHERE chat_id = :cid AND message_id = 7778"
+        ),
+        {"cid": -3003},
+    )
+    assert translated_reply.scalar_one() == 424242
 
 
 # ─── Test 6: Edit history / imported_final ────────────────────────────────────
@@ -422,6 +633,123 @@ async def test_apply_sets_imported_final_and_edit_date(db_session) -> None:
     assert by_msg_id[2005][1] is None
 
 
+async def test_apply_skips_version_when_live_row_wins_overlap_race(db_session) -> None:
+    """If a live row appears after the duplicate gate but before persist, the import
+    synthetic raw row remains but imported_final version insertion is skipped."""
+    from bot.services.import_apply import run_apply
+
+    chat_id = -4004
+    await db_session.execute(
+        sa_text(
+            """
+            INSERT INTO users (id, first_name, is_imported_only)
+            VALUES (900001, 'Live Race User', false)
+            ON CONFLICT (id) DO NOTHING
+            """
+        )
+    )
+    live_run_id = (
+        await db_session.execute(
+            sa_text(
+                "INSERT INTO ingestion_runs (run_type, status) "
+                "VALUES ('live', 'running') RETURNING id"
+            )
+        )
+    ).scalar_one()
+    live_raw_id = (
+        await db_session.execute(
+            sa_text(
+                """
+                INSERT INTO telegram_updates (
+                    update_type, update_id, chat_id, message_id, ingestion_run_id
+                )
+                VALUES ('message', 9001000, :cid, 9001, :rid)
+                RETURNING id
+                """
+            ),
+            {"cid": chat_id, "rid": live_run_id},
+        )
+    ).scalar_one()
+    live_cm_id = (
+        await db_session.execute(
+            sa_text(
+                """
+                INSERT INTO chat_messages (
+                    message_id, chat_id, user_id, text, date, raw_update_id
+                )
+                VALUES (9001, :cid, 900001, 'live won', now(), :raw_id)
+                RETURNING id
+                """
+            ),
+            {"cid": chat_id, "raw_id": live_raw_id},
+        )
+    ).scalar_one()
+    await db_session.flush()
+
+    overlap_export = {
+        "name": "Overlap Race Chat",
+        "type": "private_supergroup",
+        "id": chat_id,
+        "messages": [
+            {
+                "id": 9001,
+                "type": "message",
+                "date": "2024-03-01T10:00:00",
+                "date_unixtime": "1709287200",
+                "from": "Live Race User",
+                "from_id": "user900001",
+                "text": "import lost",
+                "text_entities": [{"type": "plain", "text": "import lost"}],
+            }
+        ],
+    }
+    tmp = FIXTURE_DIR / "_tmp_overlap_race.json"
+    tmp.write_text(json.dumps(overlap_export), encoding="utf-8")
+    try:
+        run_id = await _create_apply_run(
+            db_session,
+            source_path=str(tmp),
+            chat_id=chat_id,
+            source_hash="hash_overlap_race",
+        )
+
+        async def _miss_duplicate_gate(session, chat_id_arg, message_id_arg):
+            assert chat_id_arg == chat_id
+            assert message_id_arg == 9001
+            return None
+
+        with patch("bot.services.import_apply._find_existing_chat_message_id", new=_miss_duplicate_gate):
+            report = await run_apply(
+                db_session,
+                ingestion_run_id=run_id,
+                resume_point=None,
+                chunking_config=_default_chunking(),
+            )
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    assert report.applied_count == 0
+    assert report.skipped_overlap_count == 1
+
+    imported_versions = await db_session.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM message_versions "
+            "WHERE chat_message_id = :cmid AND imported_final IS TRUE"
+        ),
+        {"cmid": live_cm_id},
+    )
+    assert int(imported_versions.scalar_one()) == 0
+
+    synthetic_updates = await db_session.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM telegram_updates "
+            "WHERE ingestion_run_id = :rid AND message_id = 9001"
+        ),
+        {"rid": run_id},
+    )
+    assert int(synthetic_updates.scalar_one()) == 1
+
+
 # ─── Test 7: Checkpoint / resume from mid-chunk failure ───────────────────────
 
 
@@ -469,21 +797,29 @@ async def test_apply_advisory_lock_acquired(db_session) -> None:
         source_hash="hash_advisory_lock_spy",
     )
 
-    spy_calls: list[tuple] = []
+    lock_connection_ids: list[int] = []
+    persist_connection_ids: list[int] = []
 
     # Wrap the original context manager so we can record invocation but keep behaviour.
     import bot.services.import_apply as apply_mod
     original_lock = apply_mod.acquire_advisory_lock
+    original_persist = apply_mod.persist_message_with_policy
 
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
     async def _spy_lock(connection, run_id_arg):
-        spy_calls.append((id(connection), run_id_arg))
+        lock_connection_ids.append(id(connection))
+        assert run_id_arg == run_id
         async with original_lock(connection, run_id_arg):
             yield
 
-    with patch("bot.services.import_apply.acquire_advisory_lock", new=_spy_lock):
+    async def _spy_persist(session, message, **kwargs):
+        persist_connection_ids.append(id(await session.connection()))
+        return await original_persist(session, message, **kwargs)
+
+    with patch("bot.services.import_apply.acquire_advisory_lock", new=_spy_lock), \
+         patch("bot.services.import_apply.persist_message_with_policy", new=_spy_persist):
         await run_apply(
             db_session,
             ingestion_run_id=run_id,
@@ -491,9 +827,9 @@ async def test_apply_advisory_lock_acquired(db_session) -> None:
             chunking_config=_default_chunking(advisory_lock=True),
         )
 
-    assert len(spy_calls) == 1
-    _conn_id, recorded_run_id = spy_calls[0]
-    assert recorded_run_id == run_id
+    assert len(lock_connection_ids) == 1
+    assert persist_connection_ids
+    assert set(persist_connection_ids) == {lock_connection_ids[0]}
 
 
 # ─── Test 9: Chunking — checkpoint advances per chunk ─────────────────────────
@@ -561,15 +897,17 @@ def test_import_apply_module_has_no_direct_chat_messages_insert() -> None:
     """
     src = Path(__file__).parents[2] / "bot" / "services" / "import_apply.py"
     text = src.read_text(encoding="utf-8")
-    forbidden_substrings = [
-        "INSERT INTO chat_messages",
-        "insert(ChatMessage)",
-        "pg_insert(ChatMessage)",
-        "session.add(ChatMessage(",
+    forbidden_patterns = [
+        r"INSERT\s+INTO\s+chat_messages",
+        r"\binsert\s*\(\s*ChatMessage",
+        r"\bsa\.insert\s*\(\s*ChatMessage",
+        r"\bpg_insert\s*\(\s*ChatMessage",
+        r"session\.execute\s*\(\s*text\s*\(\s*['\"]\s*INSERT\s+INTO\s+chat_messages",
+        r"session\.add\s*\(\s*ChatMessage\s*\(",
     ]
-    for needle in forbidden_substrings:
-        assert needle not in text, (
-            f"bot/services/import_apply.py contains forbidden substring {needle!r} — "
+    for pattern in forbidden_patterns:
+        assert re.search(pattern, text, flags=re.IGNORECASE) is None, (
+            f"bot/services/import_apply.py matches forbidden pattern {pattern!r} — "
             "apply MUST go through persist_message_with_policy (ADR-0007)."
         )
 
@@ -617,7 +955,8 @@ async def test_apply_audit_trail_stats_json(db_session) -> None:
 
 async def test_apply_resilient_to_bad_user_resolution(db_session) -> None:
     """A message with from_id=None (malformed) should bump error_count and continue
-    with the rest of the chunk — not abort the whole run."""
+    with the rest of the chunk. A later validation RuntimeError rolls back only that
+    message's savepoint, including its synthetic telegram_updates row."""
     from bot.services.import_apply import run_apply
 
     # Build a tiny synthetic export with one good and one bad message.
@@ -646,6 +985,16 @@ async def test_apply_resilient_to_bad_user_resolution(db_session) -> None:
                 "text": "no sender",
                 "text_entities": [{"type": "plain", "text": "no sender"}],
             },
+            {
+                "id": 7003,
+                "type": "message",
+                "date": "2024-03-01T10:02:00",
+                "date_unixtime": "1709287320",
+                "from": "User Later",
+                "from_id": "user2000002",
+                "text": "roll back my synthetic raw row",
+                "text_entities": [{"type": "plain", "text": "roll back my synthetic raw row"}],
+            },
         ],
     }
     tmp = Path(__file__).parents[1] / "fixtures" / "td_export" / "_tmp_bad_export.json"
@@ -657,15 +1006,35 @@ async def test_apply_resilient_to_bad_user_resolution(db_session) -> None:
             chat_id=-2002,
             source_hash="hash_bad_export_resilient",
         )
-        report = await run_apply(
-            db_session,
-            ingestion_run_id=run_id,
-            resume_point=None,
-            chunking_config=_default_chunking(),
-        )
+        import bot.services.import_apply as apply_mod
+
+        original_persist = apply_mod.persist_message_with_policy
+
+        async def _persist_or_raise(session, message, **kwargs):
+            if message.message_id == 7003:
+                raise RuntimeError("synthetic validation failure after raw insert")
+            return await original_persist(session, message, **kwargs)
+
+        with patch("bot.services.import_apply.persist_message_with_policy", new=_persist_or_raise):
+            report = await run_apply(
+                db_session,
+                ingestion_run_id=run_id,
+                resume_point=None,
+                chunking_config=_default_chunking(),
+            )
 
         assert report.applied_count == 1  # only the good message
-        assert report.error_count == 1
+        assert report.error_count == 2
         assert 7002 in report.error_export_msg_ids
+        assert 7003 in report.error_export_msg_ids
+
+        raw_7003 = await db_session.execute(
+            sa_text(
+                "SELECT COUNT(*) FROM telegram_updates "
+                "WHERE ingestion_run_id = :rid AND message_id = 7003"
+            ),
+            {"rid": run_id},
+        )
+        assert int(raw_7003.scalar_one()) == 0
     finally:
         tmp.unlink(missing_ok=True)
