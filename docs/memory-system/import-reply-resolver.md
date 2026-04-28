@@ -93,7 +93,8 @@ The resolver tries four buckets in a fixed order and returns the first hit:
    common case; resolving it locally avoids cross-run lookups that would
    otherwise dominate query cost.
 2. **prior_run** — Same join shape, but across any earlier import run for the
-   same chat (ordered by `ingestion_run_id DESC`). Why second: re-imports of
+   same chat (filtered by `started_at < current_run.started_at`, tie-broken by
+   `id DESC`). Why second: re-imports of
    the same chat onto an existing memory state are a real workflow (an
    operator extends an import after Telegram Desktop produced an updated
    export). Replies in the new run can legitimately point at messages from the

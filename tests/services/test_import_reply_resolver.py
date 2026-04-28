@@ -217,9 +217,15 @@ async def test_prior_run_excludes_newer_runs(db_session) -> None:
     Setup: runs at t=1 (oldest), t=2 (current), t=3 (newest).
     Message exists only in run-1 and run-3.
     Resolving from run-2 should pick run-1 (older), NOT run-3 (newer).
+
+    Uses explicit started_at values because PostgreSQL `now()` is transaction-stable —
+    multiple inserts inside a single test transaction would otherwise share the same
+    timestamp and the strict-less-than filter would return no candidates.
     """
+    from datetime import datetime, timedelta, timezone
+
+    from bot.db.models import IngestionRun
     from bot.services.import_reply_resolver import resolve_reply
-    from bot.db.repos.ingestion_run import IngestionRunRepo
 
     chat_id = _rand_chat_id()
     export_msg_id = _rand_msg_id()
@@ -227,10 +233,28 @@ async def test_prior_run_excludes_newer_runs(db_session) -> None:
 
     await _ensure_user(db_session, user_id)
 
-    # Create three runs in order (auto-timestamps from DB; insert sequentially)
-    run1 = await IngestionRunRepo.create(db_session, run_type="import", source_name="export1.json")
-    run2 = await IngestionRunRepo.create(db_session, run_type="import", source_name="export2.json")
-    run3 = await IngestionRunRepo.create(db_session, run_type="import", source_name="export3.json")
+    # Explicit started_at: oldest → current → newest, 1 hour apart.
+    base = datetime.now(timezone.utc) - timedelta(hours=3)
+    run1 = IngestionRun(
+        run_type="import",
+        source_name="export1.json",
+        status="running",
+        started_at=base,
+    )
+    run2 = IngestionRun(
+        run_type="import",
+        source_name="export2.json",
+        status="running",
+        started_at=base + timedelta(hours=1),
+    )
+    run3 = IngestionRun(
+        run_type="import",
+        source_name="export3.json",
+        status="running",
+        started_at=base + timedelta(hours=2),
+    )
+    db_session.add_all([run1, run2, run3])
+    await db_session.flush()
 
     # Place the message in run1 and run3 (NOT in run2 which is "current")
     _, cm_run1 = await _create_imported_message(db_session, chat_id, export_msg_id, run1.id, user_id)
