@@ -73,12 +73,17 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
    only the gatekeeper live-registration path flips ghost→live by clearing `is_imported_only`),
    display_name first-write-wins, attribution semantics under live/import overlap.
 9. `docs/memory-system/import-dry-run-parser.md` — Telegram Desktop dry-run parser. Read BEFORE
-   touching `bot/services/import_parser.py` or invoking `python -m bot.cli import_dry_run`.
+   touching `bot/services/import_parser.py`, `bot/services/import_dry_run.py`, or invoking
+   `python -m bot.cli import_dry_run [--with-db] <path>`.
    Defines: `ImportDryRunReport` field semantics, single-chat-only input contract (full-account
    exports rejected), NO-content guarantee (`asdict(report)` carries zero message bodies),
    `governance.detect_policy` invocation contract (called per user message, service messages
-   skipped), operator pre-flight role before any #103 apply run. Cross-refs #91 schema, #93
-   user mapping, #106 edit-history policy.
+   skipped), operator pre-flight role before any #103 apply run. Also covers the DB-aware
+   mode (`parse_export_with_db(path, session, chat_id) -> ImportDryRunReport` + CLI
+   `--with-db` flag) which extends the offline report with `db_duplicate_count` /
+   `db_duplicate_export_msg_ids` / `db_broken_reply_count` (#99 / T2-02), backed by a
+   synthetic `IngestionRun(run_type='dry_run')` for `import_reply_resolver` scope.
+   Cross-refs #91 schema, #93 user mapping, #98 reply resolver, #106 edit-history policy.
 10. `docs/memory-system/import-reply-resolver.md` — Telegram Desktop import reply resolver. Read
     BEFORE touching `bot/services/import_reply_resolver.py` or before #99 (T2-02 dry-run stats) /
     #103 (T2-03 apply) consume reply mappings. Defines: priority order (same_run → prior_run →
