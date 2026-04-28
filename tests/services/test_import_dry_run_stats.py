@@ -282,7 +282,6 @@ async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -
     from contextlib import asynccontextmanager
     from unittest.mock import patch
 
-    from bot.cli import main
 
     chat_id = _rand_chat_id()
     user_id = _rand_user_id()
@@ -310,12 +309,20 @@ async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -
     async def _fake_session_ctx():
         yield db_session
 
+    # Call the async CLI handler directly (NOT main → asyncio.run → asyncio.run loop conflict
+    # under pytest-asyncio mode=auto, which already runs us inside an event loop).
+    import argparse
+
+    from bot.cli import _cmd_import_dry_run_with_db
+
+    args = argparse.Namespace(export_path=str(f), with_db=True)
+
     buf = io.StringIO()
     old_stdout = sys.stdout
     sys.stdout = buf
     try:
         with patch("bot.db.engine.async_session", return_value=_fake_session_ctx()):
-            rc = main(["import_dry_run", "--with-db", str(f)])
+            rc = await _cmd_import_dry_run_with_db(args)
     finally:
         sys.stdout = old_stdout
 
