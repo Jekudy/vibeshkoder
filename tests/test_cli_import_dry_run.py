@@ -11,8 +11,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "td_export"
 SMALL_CHAT = FIXTURE_DIR / "small_chat.json"
 
