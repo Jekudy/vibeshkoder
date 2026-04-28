@@ -93,21 +93,32 @@ async def init_or_resume_run(
     same source_hash, our INSERT will raise IntegrityError (partial unique index). We
     catch it, re-query, and return block_partial_present.
     """
-    # Look for any existing partial run for this source_hash.
-    existing = await _find_partial_run(session, source_hash)
+    # First: look for a partial run matching the EXACT same source_hash.
+    existing = await _find_partial_run_by_hash(session, source_hash)
 
     if existing is None:
-        # Also check for any running run with a DIFFERENT source_hash — this handles the
-        # "there's a running run for a different file" safety case, but since our partial
-        # unique index is on source_hash, we don't need to block on that scenario. The
-        # only blocking case with a different hash is when --resume is passed (user thinks
-        # they are resuming the same file but the file changed). We detect this below.
-        #
-        # No prior partial run of any kind for this hash → start fresh.
+        # No run matches this exact hash. But there may be a non-terminal run for the
+        # SAME source_path with a DIFFERENT hash (file was re-exported / modified).
+        # That is the hash-mismatch safety case: operator passes --resume thinking they
+        # are resuming a prior run, but the file changed. Detect and block.
+        if resume:
+            path_conflict = await _find_partial_run_by_path(session, source_path)
+            if path_conflict is not None and path_conflict.status in _PARTIAL_STATUSES:
+                prior_hash = path_conflict.source_hash or ""
+                return ResumeDecision(
+                    mode="block_partial_present",
+                    ingestion_run_id=None,
+                    last_processed_export_msg_id=None,
+                    reason=(
+                        f"Source hash mismatch — resume not safe. "
+                        f"Existing partial run {path_conflict.id} for path '{source_path}' has "
+                        f"hash {prior_hash[:16]}..., but current file hash is {source_hash[:16]}.... "
+                        "Finalize or cancel the old run first, or re-export from the original file."
+                    ),
+                )
         return await _create_fresh_run(session, source_path=source_path, source_hash=source_hash, chat_id=chat_id)
 
     prior_status = existing.status
-    prior_hash = existing.source_hash
 
     # If prior run is completed → treat as fresh (completed runs are immutable).
     if prior_status not in _PARTIAL_STATUSES:
@@ -118,21 +129,6 @@ async def init_or_resume_run(
             source_hash[:16],
         )
         return await _create_fresh_run(session, source_path=source_path, source_hash=source_hash, chat_id=chat_id)
-
-    # Prior run is running or failed (partial).
-    # Hash-mismatch safety check: if the user passed --resume but the file changed.
-    if prior_hash != source_hash:
-        return ResumeDecision(
-            mode="block_partial_present",
-            ingestion_run_id=None,
-            last_processed_export_msg_id=None,
-            reason=(
-                f"Source hash mismatch — resume not safe. "
-                f"Existing partial run {existing.id} has hash {(prior_hash or '')[:16]}..., "
-                f"but current file hash is {source_hash[:16]}.... "
-                "Finalize or cancel the old run first."
-            ),
-        )
 
     if not resume:
         return ResumeDecision(
@@ -266,20 +262,41 @@ async def finalize_run(
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
 
-async def _find_partial_run(
+async def _find_partial_run_by_hash(
     session: AsyncSession,
     source_hash: str,
 ) -> IngestionRun | None:
-    """Find the most recent non-completed run for this source_hash, if any.
+    """Find the most recent import run matching source_hash exactly (any status).
 
-    Returns the most recently started run (any status) matching the hash, or None.
-    We return any status so the caller can decide what to do (completed = start fresh,
-    partial = block or resume).
+    Returns any status so the caller can decide (completed → start fresh, partial → block/resume).
     """
     stmt = (
         select(IngestionRun)
         .where(
             IngestionRun.source_hash == source_hash,
+            IngestionRun.run_type == "import",
+        )
+        .order_by(IngestionRun.started_at.desc())
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _find_partial_run_by_path(
+    session: AsyncSession,
+    source_path: str,
+) -> IngestionRun | None:
+    """Find the most recent import run for a source_path (regardless of hash).
+
+    Used for the hash-mismatch safety check: the operator re-exported the file (new hash)
+    but a partial run for the OLD hash of the same path is still in-progress.
+    Returns any status; caller checks .status and .source_hash.
+    """
+    stmt = (
+        select(IngestionRun)
+        .where(
+            IngestionRun.source_name == source_path,
             IngestionRun.run_type == "import",
         )
         .order_by(IngestionRun.started_at.desc())
@@ -316,7 +333,7 @@ async def _create_fresh_run(
         # Concurrent caller already inserted a running row for this source_hash.
         await session.rollback()
         # Re-query to get the winning row.
-        existing = await _find_partial_run(session, source_hash)
+        existing = await _find_partial_run_by_hash(session, source_hash)
         return ResumeDecision(
             mode="block_partial_present",
             ingestion_run_id=None,

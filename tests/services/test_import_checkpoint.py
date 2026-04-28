@@ -201,21 +201,29 @@ async def test_block_on_partial_run_no_resume(db_session) -> None:
     assert "resume" in decision.reason.lower() or "partial" in decision.reason.lower()
 
 
-# Test 6: block on hash mismatch (existing partial, different source_hash, resume=True)
+# Test 6: block on hash mismatch (SAME path, different source_hash, resume=True)
 async def test_block_on_hash_mismatch(db_session) -> None:
+    """The operator ran import_apply against /tmp/export_006.json (hash_old_006),
+    the run is still partial (running). They re-exported the file, producing a new
+    SHA-256 (hash_new_006), but call --resume with the new file at the same path.
+    The infrastructure must block: resuming a run started against a different file content
+    is unsafe.
+    """
     from bot.services.import_checkpoint import init_or_resume_run
 
+    same_path = "/tmp/export_006.json"
     await _create_partial_run(
         db_session,
+        source_path=same_path,
         source_hash="hash_old_006",
         status="running",
     )
 
-    # Different source_hash — resume cannot be safe
+    # Same path, different content hash (file was re-exported) — resume is not safe
     decision = await init_or_resume_run(
         db_session,
-        source_path="/tmp/different_export.json",
-        source_hash="hash_new_006",  # Different!
+        source_path=same_path,     # SAME path
+        source_hash="hash_new_006",  # Different content hash!
         chat_id=-1001,
         resume=True,
     )
