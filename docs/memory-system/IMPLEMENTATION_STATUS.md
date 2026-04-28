@@ -1,6 +1,6 @@
 # Memory System — Implementation Status
 
-**Last updated:** 2026-04-27 (Phase 2 — Stream Alpha sprint #67, Stream Charlie sprint T3-01)
+**Last updated:** 2026-04-28 (Phase 2 — Stream Alpha sprint #67, Stream Charlie sprints T3-01 + T3-04)
 **Active worktrees (Phase 2):** `.worktrees/p2-alpha` (`phase/p2-alpha`), `.worktrees/p2-bravo` (`phase/p2-bravo`), `.worktrees/p2-charlie` (`phase/p2-charlie`). Phase 1 closed on `main` 2026-04-27.
 **Source of truth:** this file is updated after every PR merge into `main`.
 
@@ -103,6 +103,13 @@ Three parallel tracks possible from day 1 (no shared deps):
 | #106  | T2-NEW-H | done   | Sprint Bravo-03 / PR #TBD. New `docs/memory-system/import-edit-history.md` + binding-rule append to `AUTHORIZED_SCOPE.md` under "Telegram import rule". Decision: imported messages get `imported_final=TRUE` marker on `message_versions` row (denormalised provenance; FK chain `raw_update_id → telegram_updates.ingestion_run_id` is audit trail). Schema/migration deferred to #103. |
 | #93   | T2-NEW-B | done   | Sprint Bravo-02 / PR #TBD. New `bot/services/import_user_map.py` + 17 tests + alembic migration 015 (`users.is_imported_only` flag, sparse partial index) + new doc `docs/memory-system/import-user-mapping.md`. Three cases (known/unknown/anonymous channel) with privacy R2 mitigation: imports cannot promote themselves to live; only the gatekeeper live-registration path flips ghost→live (via `UserRepo.upsert` clearing `is_imported_only`). Display_name first-write-wins; negative export-id tails rejected (parser hardening); attribution semantics under live/import overlap explicit (imported messages permanently attributed to live member's row when overlap occurs). |
 
+### Phase 2 — Stream Charlie progress
+
+| Issue | Ticket | Status | Notes |
+|-------|--------|--------|-------|
+| #92   | T3-01  | done   | Foundation: forget_events table + repo. Sprint Charlie-01 / PR #122. 5 commits on main: `af29b25` feat (initial), `d22185f` race safety + JSONB + ordering fix (Codex round 1), `2cde618` identity-map fix in mark_status fallback (Codex round 2), `f8549b8` docs DONE, `825e6e2` stale Branch header replacement. Alembic migration `014_add_forget_events.py`. New `bot/db/repos/forget_event.py` with race-safe `create()` (INSERT ... ON CONFLICT (tombstone_key) DO NOTHING RETURNING + fallback SELECT), `get_by_tombstone_key`, `list_pending` (FIFO `(created_at ASC, id ASC)`), `mark_status` (atomic `UPDATE ... WHERE status IN (allowed_old) RETURNING`; pending → processing → {completed | failed}; terminal states are dead-ends). 14 tests in `tests/db/test_forget_event_repo.py`. 4 rounds Codex review (HIGH×2 race safety + MEDIUM JSONB + LOW ordering + HIGH identity-map fix). |
+| #96   | T3-04  | done   | Sprint Charlie-03 / PR #TBD. Three-commit branch (`2dda016` initial + `688fc26` CRITICAL fix + `1b5a07d` uniformity fix). HIGH-RISK skeleton — irreversible content destruction. New `bot/services/forget_cascade.py` (~300 lines): `run_cascade_worker_once(session, batch_size=10)` + `cascade_worker_tick()` production wrapper. Cascade order matches HANDOFF §10 EXACTLY: chat_messages → message_versions → message_entities → message_links → attachments → fts_rows. Per-event try/except, per-layer checkpoint via new `ForgetEventRepo.update_cascade_status` (atomic `UPDATE ... WHERE id=? AND status='processing' RETURNING` — Option A architecture; preserves `mark_status` state machine semantics). Restart-safe: skips layers with `status='completed'`. Cascade content semantics: `target_type='message'` NULLs text/caption/raw_json + sets is_redacted=True + memory_policy='forgotten' on chat_messages; NULLs text/caption/normalized_text/entities_json + sets is_redacted=True on message_versions; content_hash PRESERVED per ADR-0003 (citation stability). `target_type='user'` walks ALL chat_messages WHERE user_id = CAST(target_id AS BIGINT); message_versions cascaded via subquery on chat_messages.user_id (resolves correctly after layer 1 NULLs). `target_type ∈ {message_hash, export}` recorded as `{status: 'skipped', reason: 'target_type_not_supported_yet'}` per layer; event finalizes as `completed`. Phase 4+ layers (entities/links/attachments/fts_rows) recorded as `{status: 'skipped', reason: 'table_not_exists'}` for supported target_types. `bot/services/scheduler.py` (+16 lines additive): APScheduler interval 30s, `max_instances=1, coalesce=True, misfire_grace_time=60`, gated by feature flag `memory.forget.cascade_worker.enabled` (default OFF). Worker tick reads flag EVERY fire (not cached). Tests: 12 cascade + 19 repo = 31 new; full suite 274 passed (post-rebase). Reviews: deep-analyst PASS, ag-reviewer PASS, Claude product-reviewer ACCEPTED, Codex 3-round (FAIL → REQUEST_CHANGES → APPROVE — closed CRITICAL target_type fallthrough + MEDIUM concurrent test gap + LOW failed-state test gap + reason field uniformity). |
+
 ### Phase 2 — Stream Alpha progress (Phase 1 cleanup chain)
 
 | Issue | Status | Notes |
@@ -161,4 +168,4 @@ After each PR merge into `main`:
    superseded, write `superseded by T#-##` in Notes.
 5. Update `Last updated` at the top.
 
-<!-- updated-by-superflow:2026-04-27 -->
+<!-- updated-by-superflow:2026-04-28 -->
