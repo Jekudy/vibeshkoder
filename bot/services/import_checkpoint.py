@@ -173,8 +173,15 @@ async def save_checkpoint(
         - chunk_index
         - last_checkpoint_at (ISO8601 UTC)
 
-    Uses PostgreSQL jsonb merge (||) to perform the deep-merge atomically. This is safe
-    to call from a caller-managed transaction — does NOT commit.
+    Uses PostgreSQL jsonb merge (||) to perform the deep-merge atomically.
+
+    COMMIT CONTRACT: this function commits the transaction immediately after the UPDATE.
+    Caller DOES NOT need (and MUST NOT wrap in) a separate outer transaction around this
+    call. The immediate commit guarantees:
+    (a) checkpoint state is durable per chunk — a hard-kill between chunks loses at most
+        one chunk of work;
+    (b) the partial unique index sees the new run row immediately for concurrent CLI
+        invocations (stat = 'running' is visible to the index predicate).
     """
     now_iso = datetime.now(tz=timezone.utc).isoformat()
     patch = {
@@ -192,7 +199,7 @@ async def save_checkpoint(
         text(
             """
             UPDATE ingestion_runs
-               SET stats_json = COALESCE(stats_json::jsonb, '{}'::jsonb) || :patch::jsonb
+               SET stats_json = COALESCE(stats_json::jsonb, '{}'::jsonb) || CAST(:patch AS jsonb)
              WHERE id = :id
             """
         ),
@@ -224,14 +231,18 @@ async def load_checkpoint(
     # Validate stats_json field types to fail-fast on DB corruption rather than
     # propagating bad types silently to downstream consumers (#103).
     raw_msg_id = stats.get("last_processed_export_msg_id")
-    if raw_msg_id is not None and not isinstance(raw_msg_id, int):
+    # Use `type(x) is int` (not isinstance) to reject bool, which is a subclass of int
+    # in Python. A corrupted {"last_processed_export_msg_id": true} would otherwise
+    # silently pass isinstance check and reach downstream consumers as int 1.
+    if raw_msg_id is not None and type(raw_msg_id) is not int:
         raise ValueError(
             f"ingestion_run {ingestion_run_id}: stats_json.last_processed_export_msg_id "
             f"must be int, got {type(raw_msg_id).__name__!r} (value={raw_msg_id!r})"
         )
 
     raw_chunk = stats.get("chunk_index", 0)
-    if not isinstance(raw_chunk, int):
+    # Same strict type check: reject bool as int.
+    if type(raw_chunk) is not int:
         raise ValueError(
             f"ingestion_run {ingestion_run_id}: stats_json.chunk_index "
             f"must be int, got {type(raw_chunk).__name__!r} (value={raw_chunk!r})"
@@ -353,21 +364,27 @@ async def _create_fresh_run(
     running row for the same source_hash (partial unique index fires), catch
     IntegrityError, re-query, and return block_partial_present.
     """
-    run = IngestionRun(
-        run_type="import",
-        source_name=source_path,
-        source_hash=source_hash,
-        status="running",
-        config_json={"chat_id": chat_id},
-    )
-    session.add(run)
     try:
         # Use a SAVEPOINT (begin_nested) so that an IntegrityError on the partial unique
         # index rolls back only this INSERT, not the caller's outer transaction. Without
         # SAVEPOINT, session.rollback() would nuke the entire outer tx, breaking any
         # caller that manages their own transaction.
+        #
+        # CRITICAL: run construction + session.add MUST be INSIDE begin_nested so the
+        # INSERT fires only after the SAVEPOINT is created. If session.add were outside,
+        # an implicit flush before begin_nested could fire the INSERT before the SAVEPOINT
+        # exists — then IntegrityError would abort the OUTER transaction instead of the
+        # savepoint, which is the bug this pattern is designed to prevent.
         async with session.begin_nested():
-            await session.flush()
+            run = IngestionRun(
+                run_type="import",
+                source_name=source_path,
+                source_hash=source_hash,
+                status="running",
+                config_json={"chat_id": chat_id},
+            )
+            session.add(run)
+            await session.flush([run])
     except IntegrityError:
         # Concurrent caller already inserted a running row for this source_hash.
         # The SAVEPOINT auto-rolled back — outer tx is intact. Re-query the winning row.

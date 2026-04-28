@@ -614,41 +614,54 @@ async def test_finalize_completed_is_terminal(db_session) -> None:
     assert row[1] is None, "error_json must not be written on no-op finalize"
 
 
-# ─── Fix 3: IntegrityError branch via mocked session.flush ────────────────────
+# ─── Fix 3 / R2-2: IntegrityError branch via mocked session.flush (inside begin_nested) ──
 
 
-# Test 8b: _create_fresh_run catches IntegrityError via SAVEPOINT and re-queries
+# Test 8b: _create_fresh_run catches IntegrityError from session.flush inside begin_nested
 def test_create_fresh_run_integrity_error_branch() -> None:
     """Offline test: _create_fresh_run handles IntegrityError from session.flush
-    via SAVEPOINT (begin_nested), re-queries, and returns block_partial_present.
+    raised INSIDE begin_nested, re-queries, and returns block_partial_present.
 
-    Simulates the concurrent-INSERT race: two CLIs both see no prior run, both
-    call _create_fresh_run; the second one hits IntegrityError on the partial
-    unique index.
+    This test reflects the R2-2 fix: session.add + flush are now INSIDE begin_nested.
+    We simulate the production failure mode by patching session.flush to raise
+    IntegrityError on the first call (mimicking the partial unique index violation).
+
+    Verifies:
+    (a) The IntegrityError is caught by the except clause.
+    (b) _find_partial_run_by_hash is called (re-query for the winning row).
+    (c) result.mode == 'block_partial_present' with the concurrent run's id in reason.
     """
     import asyncio
+    from contextlib import asynccontextmanager
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from sqlalchemy.exc import IntegrityError
 
     from bot.services.import_checkpoint import _create_fresh_run
 
-    # Mock IngestionRun returned by session.add + flush
+    # The winning concurrent run that begin_nested's re-query will find
     mock_existing_run = MagicMock()
     mock_existing_run.id = 42
 
-    # We need to simulate: begin_nested() context manager raises IntegrityError on __aexit__
-    # Then re-query (_find_partial_run_by_hash) returns the winning run.
-    mock_nested_ctx = AsyncMock()
-    mock_nested_ctx.__aenter__ = AsyncMock(return_value=mock_nested_ctx)
-    # Simulate IntegrityError raised when the SAVEPOINT flushes/commits
-    mock_nested_ctx.__aexit__ = AsyncMock(
-        side_effect=IntegrityError("UNIQUE constraint", {}, Exception("unique violation"))
-    )
+    # A realistic async context manager for begin_nested: it enters, lets the body run,
+    # and on normal exit commits the savepoint. On exception it rolls back and re-raises.
+    # This is the real SQLAlchemy behaviour we are testing against.
+    @asynccontextmanager
+    async def _real_begin_nested():
+        # __aenter__: nothing special (SQLAlchemy would issue SAVEPOINT here)
+        try:
+            yield
+        except Exception:
+            # __aexit__ with exception: rollback savepoint and re-raise
+            raise
 
     mock_session = AsyncMock()
     mock_session.add = MagicMock()
-    mock_session.begin_nested = MagicMock(return_value=mock_nested_ctx)
+    mock_session.begin_nested = MagicMock(side_effect=_real_begin_nested)
+    # session.flush raises IntegrityError on first call (the partial-unique-index violation)
+    mock_session.flush = AsyncMock(
+        side_effect=IntegrityError("UNIQUE constraint", {}, Exception("unique violation"))
+    )
 
     async def run() -> None:
         with patch(
@@ -736,3 +749,108 @@ async def test_load_checkpoint_rejects_bad_timestamp(db_session) -> None:
 
     with pytest.raises(ValueError, match="last_checkpoint_at"):
         await load_checkpoint(db_session, run_id)
+
+
+# ─── R2-4: bool-as-int rejection ──────────────────────────────────────────────
+
+
+# Test 15: load_checkpoint rejects bool as int (R2-4 strict type check)
+async def test_load_checkpoint_rejects_bool_as_int(db_session) -> None:
+    """stats_json.chunk_index = True (bool) must raise ValueError.
+
+    Python's isinstance(True, int) returns True because bool subclasses int.
+    The strict `type(x) is int` check (R2-4 fix) must catch this corruption case.
+    """
+    from sqlalchemy import text
+
+    from bot.services.import_checkpoint import load_checkpoint
+
+    run_id = await _create_partial_run(db_session, source_hash="hash_bool_015", status="running")
+    # Write chunk_index as JSON boolean true — PostgreSQL stores it as boolean,
+    # Python json decoder deserialises it as bool True, which is NOT a valid int.
+    await db_session.execute(
+        text(
+            "UPDATE ingestion_runs SET stats_json = '{\"chunk_index\": true}'::jsonb "
+            "WHERE id = :id"
+        ),
+        {"id": run_id},
+    )
+    await db_session.flush()
+
+    with pytest.raises(ValueError, match="chunk_index"):
+        await load_checkpoint(db_session, run_id)
+
+
+# ─── R2-1: DB-backed roundtrip for save_checkpoint (CAST(:patch AS jsonb)) ───
+
+
+# Test 16: save_checkpoint DB roundtrip — patch persisted and merged correctly
+async def test_save_checkpoint_db_roundtrip(db_session) -> None:
+    """DB-backed integration test for save_checkpoint's CAST(:patch AS jsonb) SQL.
+
+    Verifies:
+    (a) The UPDATE executes without error under SQLAlchemy 2.0 text() with CAST.
+    (b) The patch dict is correctly merged into stats_json (deep-merge semantics).
+    (c) A second save_checkpoint call overwrites checkpoint keys and preserves other keys.
+
+    This test specifically guards against regression of the R2-1 bug where
+    `:patch::jsonb` did not correctly bind through the cast in SQLAlchemy text().
+    """
+    from sqlalchemy import text
+
+    from bot.services.import_checkpoint import init_or_resume_run, save_checkpoint
+
+    decision = await init_or_resume_run(
+        db_session,
+        source_path="/tmp/export_r2_1.json",
+        source_hash="hash_r2_1_016",
+        chat_id=-1001,
+        resume=False,
+    )
+    run_id = decision.ingestion_run_id
+
+    # Pre-seed an operator-set key to verify deep-merge preservation
+    await db_session.execute(
+        text("UPDATE ingestion_runs SET stats_json = '{\"op_key\": \"preserved\"}'::jsonb WHERE id = :id"),
+        {"id": run_id},
+    )
+    await db_session.flush()
+
+    # First checkpoint save — this must succeed (R2-1: CAST(:patch AS jsonb) fix)
+    await save_checkpoint(
+        db_session,
+        ingestion_run_id=run_id,
+        last_processed_export_msg_id=77,
+        chunk_index=2,
+    )
+
+    row = (await db_session.execute(
+        text("SELECT stats_json FROM ingestion_runs WHERE id = :id"),
+        {"id": run_id},
+    )).one()
+    stats = row[0]
+
+    assert stats["last_processed_export_msg_id"] == 77, (
+        f"Expected 77, got {stats.get('last_processed_export_msg_id')!r}. "
+        "R2-1 regression: CAST(:patch AS jsonb) may not be binding correctly."
+    )
+    assert stats["chunk_index"] == 2
+    assert "last_checkpoint_at" in stats
+    assert stats.get("op_key") == "preserved", "Deep-merge must preserve operator-set keys"
+
+    # Second save — must update checkpoint keys, preserve op_key, overwrite prior values
+    await save_checkpoint(
+        db_session,
+        ingestion_run_id=run_id,
+        last_processed_export_msg_id=155,
+        chunk_index=3,
+    )
+
+    row2 = (await db_session.execute(
+        text("SELECT stats_json FROM ingestion_runs WHERE id = :id"),
+        {"id": run_id},
+    )).one()
+    stats2 = row2[0]
+    assert stats2["last_processed_export_msg_id"] == 155
+    assert stats2["chunk_index"] == 3
+    assert stats2.get("op_key") == "preserved"

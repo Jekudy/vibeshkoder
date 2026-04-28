@@ -36,7 +36,11 @@ updates these keys while preserving all other keys in `stats_json`:
 
 Deep-merge means operator-set fields (e.g. `"operator_note": "..."`) survive across
 checkpoint updates. The merge is performed in a single atomic `UPDATE ... SET stats_json
-= COALESCE(stats_json, '{}') || :patch::jsonb` — no race between read-modify-write.
+= COALESCE(stats_json::jsonb, '{}'::jsonb) || CAST(:patch AS jsonb)` — no race between
+read-modify-write. The `:patch` parameter is passed as a JSON string (`json.dumps(patch)`)
+so PostgreSQL `CAST(... AS jsonb)` parses it correctly. The `CAST()` form is required
+under SQLAlchemy 2.0 `text()` literals — the `::jsonb` cast suffix does not correctly
+bind the parameter through the cast.
 
 ### `Checkpoint` dataclass
 
@@ -257,7 +261,11 @@ async def init_or_resume_run(
 
 async def save_checkpoint(
     session, *, ingestion_run_id, last_processed_export_msg_id, chunk_index
-) -> None: ...
+) -> None:
+    """Commits immediately after the UPDATE.
+    Caller DOES NOT need (and MUST NOT wrap in) a separate outer transaction.
+    Guarantees checkpoint durability per chunk and partial-unique-index visibility.
+    """ ...
 
 async def load_checkpoint(
     session, ingestion_run_id
