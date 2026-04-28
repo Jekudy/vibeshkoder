@@ -287,3 +287,91 @@ def test_governance_called_per_message():
         report = parse_export(SMALL_CHAT)
         # Must be called for each user message (5), NOT for service messages
         assert mock_dp.call_count == report.user_messages
+
+
+# ---------------------------------------------------------------------------
+# 21. Fix 1 — text_entities fallback for governance when text is empty
+# ---------------------------------------------------------------------------
+
+def test_text_entities_fallback_detects_nomem_policy(tmp_path: Path):
+    """When text='' but text_entities contains #nomem, governance must fire."""
+    export = {
+        "id": -100111,
+        "name": "Test",
+        "type": "private_supergroup",
+        "messages": [
+            {
+                "id": 9001,
+                "type": "message",
+                "date": "2024-01-15T10:00:00",
+                "date_unixtime": "1705312800",
+                "from": "Alice",
+                "from_id": "user9001",
+                "text": "",
+                "text_entities": [
+                    {"type": "hashtag", "text": "#nomem"},
+                    {"type": "plain", "text": " some text"},
+                ],
+            }
+        ],
+    }
+    f = tmp_path / "entities_only.json"
+    f.write_text(json.dumps(export), encoding="utf-8")
+    from bot.services.import_parser import parse_export
+    report = parse_export(f)
+    assert report.policy_marker_counts["nomem"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 22. Fix 2 — _extract_text_string tolerant about malformed array elements
+# ---------------------------------------------------------------------------
+
+def test_extract_text_string_tolerant_mixed_array():
+    """Must not crash on non-str/non-dict items; coerce ints, skip None text, recurse lists."""
+    from bot.services.import_parser import _extract_text_string
+    # 'a' → kept, 5 → coerced to '5', {type:x, text:None} → skip (None text),
+    # {type:y} → no text key → skip, ['nested', 'list'] → recurse to 'nestedlist'
+    result = _extract_text_string(["a", 5, {"type": "x", "text": None}, {"type": "y"}, ["nested", "list"]])
+    assert result == "a5nestedlist"
+
+
+# ---------------------------------------------------------------------------
+# 23. Fix 3 — _classify_td_kind returns 'unknown' + warning for unknown media_type
+# ---------------------------------------------------------------------------
+
+def test_classify_td_kind_unknown_media_type_emits_warning():
+    """Unknown media_type → return 'unknown', append a warning string."""
+    from bot.services.import_parser import _classify_td_kind
+    warnings: list[str] = []
+    result = _classify_td_kind({"type": "message", "media_type": "unknown_xyz", "text": "hello"}, warnings=warnings)
+    assert result == "unknown"
+    assert any("unknown_xyz" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# 24. Fix 5 — parse warning emitted for non-str from_id
+# ---------------------------------------------------------------------------
+
+def test_parse_warning_for_int_from_id(tmp_path: Path):
+    """from_id=12345 (int) must emit a parse warning."""
+    export = {
+        "id": -100222,
+        "name": "Test",
+        "type": "private_supergroup",
+        "messages": [
+            {
+                "id": 9002,
+                "type": "message",
+                "date": "2024-01-15T10:00:00",
+                "date_unixtime": "1705312800",
+                "from": "Bob",
+                "from_id": 12345,  # int instead of str
+                "text": "hello",
+            }
+        ],
+    }
+    f = tmp_path / "int_from_id.json"
+    f.write_text(json.dumps(export), encoding="utf-8")
+    from bot.services.import_parser import parse_export
+    report = parse_export(f)
+    assert any("from_id" in w for w in report.parse_warnings)

@@ -59,7 +59,10 @@ SUPPORTED_CHAT_TYPES: frozenset[str] = frozenset({
 
 @dataclass(frozen=True)
 class ImportDryRunReport:
-    """Summary report from a dry-run parse. NO content is included — only counts and metadata."""
+    """Summary report from a dry-run parse. NO content is included — only counts and metadata.
+
+    # NOTE: frozen=True does not deep-freeze list/dict fields; downstream consumers must treat these as read-only.
+    """
 
     source_file: str
     """Absolute path to the export JSON."""
@@ -190,7 +193,7 @@ def parse_export(path: str | Path) -> ImportDryRunReport:
         if dt is not None:
             all_datetimes.append(dt)
 
-        kind = _classify_td_kind(msg)
+        kind = _classify_td_kind(msg, warnings)
         kind_counter[kind] += 1
 
         if msg_type == "service":
@@ -205,6 +208,11 @@ def parse_export(path: str | Path) -> ImportDryRunReport:
             all_from_ids.append(from_id)
             if from_id.startswith("channel"):
                 anonymous_channel_count += 1
+        elif from_id is not None:
+            warnings.append(
+                f"messages[id={msg_id}]: expected from_id to be str, got "
+                f"{type(from_id).__name__}; skipping for distinct-user count"
+            )
 
         if "edited" in msg:
             edited_count += 1
@@ -217,9 +225,14 @@ def parse_export(path: str | Path) -> ImportDryRunReport:
 
         reply_to = msg.get("reply_to_message_id")
         if reply_to is not None:
-            reply_count += 1
             if isinstance(reply_to, int):
+                reply_count += 1
                 all_reply_targets.append(reply_to)
+            else:
+                warnings.append(
+                    f"messages[id={msg_id}]: expected reply_to_message_id to be int, got "
+                    f"{type(reply_to).__name__}; skipping reply tracking"
+                )
 
         # Governance classification (must be called for every user message)
         text_str, caption_str = _extract_text_content(msg, kind)
@@ -281,6 +294,7 @@ def _load_envelope(path: Path, warnings: list[str]) -> dict:
 
     try:
         with path.open(encoding="utf-8") as fh:
+            # NOTE: full file is read into memory; size guard deferred to follow-up ticket — see PR description.
             data = json.load(fh)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Failed to parse JSON from {path}: {exc}") from exc
@@ -308,7 +322,7 @@ def _load_envelope(path: Path, warnings: list[str]) -> dict:
     return data
 
 
-def _classify_td_kind(msg: dict) -> MessageKind:
+def _classify_td_kind(msg: dict, warnings: list[str] | None = None) -> MessageKind:
     """Classify a TD export message dict into a MessageKind value.
 
     Priority order (highest to lowest):
@@ -322,6 +336,10 @@ def _classify_td_kind(msg: dict) -> MessageKind:
 
     This mirrors the priority table in docs/memory-system/telegram-desktop-export-schema.md §3.
     Service and forward outrank media kinds to match the live-ingestion _KIND_PROBES priority.
+
+    Args:
+        msg: The message dict from the TD export.
+        warnings: If provided, unknown media_type values are appended as parse warnings.
     """
     if msg.get("type") == "service":
         return "service"
@@ -342,6 +360,13 @@ def _classify_td_kind(msg: dict) -> MessageKind:
         }
         if media_type in _MEDIA_TYPE_MAP:
             return _MEDIA_TYPE_MAP[media_type]
+        # Unknown media_type: return 'unknown' and emit a parse warning.
+        # This prevents silently misclassifying new TD media kinds as 'text'.
+        if warnings is not None:
+            warnings.append(
+                f"Unknown media_type {media_type!r}; classifying as 'unknown'."
+            )
+        return "unknown"
 
     # photo field without media_type discriminator
     if msg.get("photo"):
@@ -374,6 +399,14 @@ def _extract_text_string(text_field) -> str:
     - A mixed array of plain strings and entity dicts (each with a ``text`` key).
     - None or missing: returns empty string.
 
+    Tolerant: non-str/non-dict items in the array are skipped or coerced:
+    - int/float → coerced to str.
+    - dict with non-string ``text`` value (e.g. None, nested dict) → skipped.
+    - nested list → recursed into.
+    - anything else unexpected → skipped without raising.
+
+    Always returns a str. Never raises.
+
     Example mixed array:
         ["Hello ", {"type": "bold", "text": "world"}]
         → "Hello world"
@@ -382,13 +415,24 @@ def _extract_text_string(text_field) -> str:
         return ""
     if isinstance(text_field, str):
         return text_field
+    if isinstance(text_field, (int, float)):
+        return str(text_field)
     if isinstance(text_field, list):
         parts: list[str] = []
         for item in text_field:
             if isinstance(item, str):
                 parts.append(item)
+            elif isinstance(item, (int, float)):
+                parts.append(str(item))
+            elif isinstance(item, list):
+                # Recurse into nested lists (defensive; TD doesn't normally produce these)
+                parts.append(_extract_text_string(item))
             elif isinstance(item, dict):
-                parts.append(item.get("text", ""))
+                text_val = item.get("text")
+                if isinstance(text_val, str):
+                    parts.append(text_val)
+                # Non-string text values (None, nested dict, int, etc.) are skipped
+            # Any other type (bool, bytes, etc.) is skipped without raising
         return "".join(parts)
     return ""
 
@@ -407,9 +451,19 @@ def _extract_text_content(msg: dict, kind: MessageKind) -> tuple[str, str]:
 
     Service messages: both empty (governance not called for service messages, but
     this helper may still be invoked for completeness; caller skips service msgs).
+
+    Fallback: if ``text`` is empty/missing but ``text_entities`` is present, flatten
+    ``text_entities`` to extract the full text content. This handles malformed exports
+    where governance hashtags (#nomem, #offrecord) are present only in text_entities.
     """
     raw_text = msg.get("text", "")
     text_str = _extract_text_string(raw_text)
+
+    # Fallback to text_entities when text is empty: governance hashtags may live there
+    if not text_str:
+        entities = msg.get("text_entities")
+        if entities is not None:
+            text_str = _extract_text_string(entities)
 
     if kind in MEDIA_KINDS:
         # TD text field is the caption for media messages
@@ -447,7 +501,7 @@ def _to_datetime(
         try:
             ts = float(unix_str)
             return datetime.fromtimestamp(ts, tz=timezone.utc)
-        except (ValueError, TypeError, OSError) as exc:
+        except (ValueError, TypeError, OSError, OverflowError) as exc:
             warnings.append(f"Could not parse date_unixtime {unix_str!r}: {exc}")
 
     if iso_str is not None:
