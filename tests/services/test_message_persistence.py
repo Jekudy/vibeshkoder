@@ -12,10 +12,9 @@ Coverage:
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -184,7 +183,7 @@ async def test_persist_normal_text_message_returns_result(app_env) -> None:
     session = AsyncMock()
 
     with (
-        patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()) as mock_lock,
+        patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
         patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_row)) as mock_save,
         patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()) as mock_mark,
     ):
