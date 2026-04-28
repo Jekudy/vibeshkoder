@@ -84,6 +84,9 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
    `db_duplicate_export_msg_ids` / `db_broken_reply_count` (#99 / T2-02), backed by a
    synthetic `IngestionRun(run_type='dry_run')` for `import_reply_resolver` scope.
    Cross-refs #91 schema, #93 user mapping, #98 reply resolver, #106 edit-history policy.
+   Also covers tombstone collision stats added per #100 (T2-NEW-D): `tombstone_skip_count` /
+   `tombstone_skip_export_msg_ids` surface messages blocked by a forget event; tombstone wins
+   over duplicate (a message matching both is counted only as tombstone skip); DB-aware mode only.
 10. `docs/memory-system/import-reply-resolver.md` — Telegram Desktop import reply resolver. Read
     BEFORE touching `bot/services/import_reply_resolver.py` or before #99 (T2-02 dry-run stats) /
     #103 (T2-03 apply) consume reply mappings. Defines: priority order (same_run → prior_run →
