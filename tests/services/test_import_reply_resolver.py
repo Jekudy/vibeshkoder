@@ -47,11 +47,26 @@ def _rand_user_id() -> int:
     return random.randint(900_000_000, 999_999_999)
 
 
-async def _create_import_run(session) -> object:
-    """Create a completed import ingestion_run row."""
-    from bot.db.repos.ingestion_run import IngestionRunRepo
+async def _create_import_run(session, *, started_offset_seconds: int = 0) -> object:
+    """Create an import ingestion_run row.
 
-    return await IngestionRunRepo.create(session, run_type="import", source_name="test_export.json")
+    PostgreSQL `now()` is transaction-stable — multiple inserts in one tx share
+    the same default `started_at`. For tests that need ordered runs (cross-run,
+    prior_run filtering), pass `started_offset_seconds` to spread timestamps.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from bot.db.models import IngestionRun
+
+    run = IngestionRun(
+        run_type="import",
+        source_name="test_export.json",
+        status="running",
+        started_at=datetime.now(timezone.utc) + timedelta(seconds=started_offset_seconds),
+    )
+    session.add(run)
+    await session.flush()
+    return run
 
 
 async def _create_live_run(session) -> object:
@@ -189,8 +204,10 @@ async def test_resolve_cross_run(db_session) -> None:
     user_id = _rand_user_id()
 
     await _ensure_user(db_session, user_id)
-    run1 = await _create_import_run(db_session)
-    run2 = await _create_import_run(db_session)
+    # run1 must be strictly older than run2 — explicit started_at offsets bypass
+    # PostgreSQL transaction-stable now() collisions.
+    run1 = await _create_import_run(db_session, started_offset_seconds=-3600)
+    run2 = await _create_import_run(db_session, started_offset_seconds=0)
 
     _, cm = await _create_imported_message(db_session, chat_id, export_msg_id, run1.id, user_id)
 
