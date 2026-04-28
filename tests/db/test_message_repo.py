@@ -402,13 +402,23 @@ async def test_save_duplicate_does_not_overwrite_text_when_refreshing_policy(db_
 async def test_save_duplicate_with_only_policy_normal_does_not_unflip_redacted(
     db_session,
 ) -> None:
-    """Asymmetric privacy invariant: ``is_redacted=True`` must NEVER be flipped back
-    to ``False`` by a policy-only re-save that does not explicitly pass ``is_redacted``.
+    """Asymmetric privacy invariant under sticky semantics (Sprint #80 fixup):
+
+    Two stickiness rules apply to a duplicate save against an existing offrecord +
+    is_redacted=True row:
+
+    1. ``memory_policy``: sticky — once 'offrecord', cannot be downgraded to 'normal'
+       by a re-save, even if the caller explicitly passes ``memory_policy='normal'``.
+       The CASE WHEN expression in MessageRepo.save short-circuits to keep 'offrecord'.
+    2. ``is_redacted``: sticky AND set-clause-selective — once True, cannot be flipped
+       back to False. Additionally, if the caller does NOT pass ``is_redacted`` at all,
+       the field is excluded from the SET clause entirely (#67 selectivity).
 
     Scenario: a message was first saved as offrecord (is_redacted=True). A duplicate
-    delivery arrives with memory_policy='normal' only — no ``is_redacted`` kwarg. The
-    ``set_clause`` selectivity in MessageRepo.save must leave ``is_redacted`` at True
-    because the caller did not declare intent to change it.
+    delivery arrives with ``memory_policy='normal'`` only — no ``is_redacted`` kwarg.
+    Both fields must remain at their more-restrictive values:
+    - ``memory_policy`` stays 'offrecord' (sticky CASE blocks the downgrade).
+    - ``is_redacted`` stays True (caller did not declare it AND sticky would block False).
     """
     from bot.db.repos.message import MessageRepo
 
@@ -442,9 +452,11 @@ async def test_save_duplicate_with_only_policy_normal_does_not_unflip_redacted(
         memory_policy="normal",
     )
 
-    # memory_policy changed (caller declared it).
-    assert second.memory_policy == "normal"
-    # is_redacted must remain True — the caller did not declare it, so it must not flip back.
+    # memory_policy stays 'offrecord' — sticky CASE blocks the downgrade even though
+    # the caller explicitly declared 'normal'. This is the post-Sprint-#80 contract.
+    assert second.memory_policy == "offrecord"
+    # is_redacted must remain True — caller did not declare it (selectivity preserved
+    # the field), and even if they had, the sticky CASE would still block False.
     assert second.is_redacted is True
 
 
