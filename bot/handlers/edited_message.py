@@ -12,9 +12,11 @@ When a Telegram user edits a message the bot has previously ingested, this handl
    - ``normal → offrecord``: retroactively nulls ``text``, ``caption``, ``raw_json``;
      sets ``is_redacted=True``; updates ``memory_policy='offrecord'``; creates
      ``offrecord_marks`` row — all in the same transaction.
-   - ``offrecord → normal``: updates ``memory_policy='normal'`` but does NOT restore
-     content (irreversibility doctrine — content already lost on first ingest; see
-     HANDOFF.md §10).
+   - ``offrecord → anything``: NO-OP (sticky offrecord; Codex Sprint #80 Finding 1).
+     Once a row is offrecord it stays offrecord. ``memory_policy`` is NOT changed,
+     no audit row is created, and any inserted ``message_versions`` row carries
+     redacted state (text=None, caption=None, is_redacted=True, redacted-state
+     content_hash). Mirrors the ``MessageRepo.save`` sticky CASE clause.
    - ``normal → nomem`` or ``nomem → normal`` and similar: updates ``memory_policy``.
 7. Unknown prior message (no row for ``(chat_id, message_id)``): logs a warning and
    returns. No placeholder row created (locked scope item 4).
@@ -23,15 +25,16 @@ Transaction model: all mutations happen inside the ``DbSessionMiddleware`` sessi
 ``session.flush()`` is called by repos internally. The middleware commits at handler exit.
 No partial flushes with side-effects before the full logic is complete.
 
-Irreversibility note (BLOCKER #2 / HANDOFF.md §10):
+Irreversibility note (BLOCKER #2 / HANDOFF.md §10 / Codex Sprint #80 Finding 1):
 When a message that was first ingested as ``#offrecord`` (content redacted, NULL
-text/caption) is later edited to remove the ``#offrecord`` token, the new policy
-becomes ``normal``. However, the original content was already lost — the DB row has
-``text=NULL, caption=NULL`` with no recovery path (the raw content was never stored).
-The handler sets ``memory_policy='normal'`` but leaves content fields NULL. Future
-edits that carry actual content will create a new ``message_versions`` row with
-chv1 hash of that content; citations will point at that version. The original content
-remains unrecoverable and will not be restored.
+text/caption) is later edited to remove the ``#offrecord`` token, the row stays
+offrecord — sticky policy. ``memory_policy`` is NOT downgraded back to ``normal`` /
+``nomem`` and the edited content is NOT persisted into ``message_versions`` (a
+restored ``content_hash`` would let anyone with read access to the audit table verify
+"was content X said?" via chv1(X) lookup, defeating the offrecord guarantee).
+The original content was already lost on first ingest and remains unrecoverable;
+later edits add no observable state — the row's offrecord_marks audit row remains
+the canonical record of the transition.
 """
 
 from __future__ import annotations
@@ -186,9 +189,21 @@ async def _update_memory_policy(
 ) -> None:
     """Update memory_policy for non-offrecord policy changes.
 
-    Handles: normal→nomem, nomem→normal, offrecord→normal (irreversibility applies).
-    Does NOT restore content for offrecord→normal flips per irreversibility doctrine.
+    Handles: normal→nomem, nomem→normal. Refuses to downgrade an offrecord row
+    (sticky offrecord — see Codex Sprint #80 review Finding 1, MessageRepo.save CASE).
+
+    The handler-layer guard at ``handle_edited_message`` (Step 5) prevents calling this
+    helper on an offrecord row in the first place. The early-return below is defense in
+    depth: any FUTURE caller that forgets the sticky check still cannot violate the
+    privacy invariant. Mirrors the ``MessageRepo.save`` ``ON CONFLICT DO UPDATE``
+    sticky CASE clause.
     """
+    # Sticky offrecord: this helper must NOT downgrade.
+    # MessageRepo.save's CASE handles the upsert path; this is the edit-handler
+    # raw-UPDATE path. If the row is already offrecord, refuse to change policy.
+    if row.memory_policy == "offrecord":
+        return  # no-op; invariant preserved
+
     await session.execute(
         update(ChatMessage).where(ChatMessage.id == row.id).values(memory_policy=new_policy)
     )
@@ -262,6 +277,14 @@ async def handle_edited_message(
     # Step 5: handle policy flips — BEFORE version insertion so policy state is correct.
     old_policy = existing.memory_policy
 
+    # Codex Sprint #80 review (Finding 1 CRITICAL): sticky offrecord. Once the row's
+    # stored ``memory_policy`` is ``'offrecord'``, NO later edit may downgrade it back to
+    # ``'normal'`` or ``'nomem'`` — and equally importantly, the handler must NOT persist
+    # the restored edit content into ``message_versions`` (would leak the redacted text
+    # via ``content_hash`` + ``text``). The previous logic took the ``elif`` branch on
+    # offrecord→normal, called ``_update_memory_policy`` to flip the policy back, and
+    # later inserted a version row carrying ``text=<edited>`` + ``is_redacted=False`` —
+    # privacy bypass. Mirrors the ``MessageRepo.save`` sticky CASE clause.
     if new_policy == "offrecord" and old_policy != "offrecord":
         # normal/nomem → offrecord: retroactively zero out content (BLOCKER #1).
         thread_id = getattr(message, "message_thread_id", None)
@@ -269,8 +292,15 @@ async def handle_edited_message(
         # After flip, content is nulled — version text/caption must also be null.
         # Recompute hash with null content to reflect actual stored state.
         # Use the new_hash as-is; the version row will have is_redacted=True.
+    elif old_policy == "offrecord":
+        # Sticky offrecord: detected ``new_policy != 'offrecord'`` is ignored. We do NOT
+        # call ``_update_memory_policy`` (which would change the row's memory_policy) and
+        # we do NOT create an audit ``offrecord_marks`` row (no transition occurred).
+        # Step 6 below treats the edit as a redacted version (is_redacted_version=True)
+        # so any inserted version row carries None content + redacted-state hash.
+        pass
     elif new_policy != old_policy:
-        # Any other policy transition (offrecord→normal, normal→nomem, nomem→normal).
+        # Other transitions (normal↔nomem). Old policy is normal or nomem here.
         thread_id = getattr(message, "message_thread_id", None)
         await _update_memory_policy(session, existing, new_policy, mark_payload, user_id, thread_id)
 
@@ -302,13 +332,19 @@ async def handle_edited_message(
         entities=None,  # existing row doesn't store normalized entities in chat_messages
     )
 
-    # PRIVACY (Codex review HIGH): for offrecord versions we MUST NOT store the chv1 of
-    # the un-redacted edit content as ``content_hash`` in ``message_versions``. Doing so
-    # would let anyone with read access to the audit table verify "was content X said?"
-    # by computing chv1(X) and grep'ing the column. Phase 1 invariant requires that
-    # offrecord content fingerprints are NOT durably stored.
+    # PRIVACY (Codex review HIGH + Sprint #80 Finding 1): for offrecord versions we MUST
+    # NOT store the chv1 of the un-redacted edit content as ``content_hash`` in
+    # ``message_versions``. Doing so would let anyone with read access to the audit table
+    # verify "was content X said?" by computing chv1(X) and grep'ing the column. Phase 1
+    # invariant requires that offrecord content fingerprints are NOT durably stored.
     #
-    # Fix: when ``new_policy == "offrecord"``, both the lookup hash and the stored
+    # Sticky offrecord: the redacted version state covers both
+    #   (a) ``new_policy == 'offrecord'`` (this edit asks for offrecord), and
+    #   (b) ``old_policy == 'offrecord'`` (the row is already offrecord — sticky path).
+    # In case (b) the user dropped the ``#offrecord`` token but the row is permanently
+    # offrecord, so the version row must still be redacted.
+    #
+    # Fix: when the version is redacted, both the lookup hash and the stored
     # ``content_hash`` are computed from the redacted state (None text, None caption,
     # message_kind, None entities) instead of the raw edit content. This means:
     # - Re-confirmation edits of an already-offrecord row produce the same redacted-state
@@ -319,7 +355,10 @@ async def handle_edited_message(
     #   created. Note this means we do NOT insert a fresh v(n+1) on the flip itself —
     #   the parent row's policy/is_redacted/memory_policy fields carry the state change.
     #   ``offrecord_marks`` is the audit timeline for this transition.
-    is_redacted_version = new_policy == "offrecord"
+    # - Sticky offrecord (old_policy=='offrecord'): existing row already has text=None,
+    #   so ``existing_chv1`` equals the redacted-state hash → short-circuit → no
+    #   privacy-leaking version row is ever inserted.
+    is_redacted_version = new_policy == "offrecord" or old_policy == "offrecord"
     if is_redacted_version:
         hash_to_check = compute_content_hash(
             text=None, caption=None, message_kind=message_kind, entities=None

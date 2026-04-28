@@ -382,27 +382,39 @@ def test_apply_offrecord_flip_redacts_existing_message_versions(app_env) -> None
     _ = (sa_update, MessageVersion, ChatMessage)
 
 
-# ─── Test 4: offrecord → normal flip: no content restoration ─────────────────
+# ─── Test 4: offrecord → normal flip is a NO-OP for policy AND content ──────
 
 
-def test_edit_offrecord_to_normal_flip_no_restoration(app_env, monkeypatch) -> None:
-    """Edit removing #offrecord from offrecord row: policy becomes normal, text stays NULL.
-    Irreversibility doctrine — content already lost."""
+def test_edited_message_offrecord_to_normal_is_noop_for_policy_and_content(
+    app_env, monkeypatch
+) -> None:
+    """Sticky offrecord (Codex Sprint #80 fixup, Finding 1 CRITICAL).
+
+    Edit removing #offrecord from a row whose stored policy is already 'offrecord' must:
+    1. NOT call ``_update_memory_policy`` — the row stays offrecord (sticky policy).
+    2. NOT insert a ``message_versions`` row carrying the raw edited text/caption — even
+       though the redacted-state hash differs from chv1(text). Doing so would persist the
+       restored content fingerprint in the audit table, defeating the offrecord guarantee.
+    3. NOT write text/caption back onto the parent ``chat_messages`` row.
+
+    The previous implementation took the ``elif new_policy != old_policy`` branch on
+    offrecord→normal, called ``_update_memory_policy`` to flip the row back to 'normal',
+    and then proceeded to insert a v(n+1) version row with ``text=<edited>``,
+    ``is_redacted=False``, and ``content_hash=chv1(<edited>)`` — privacy bypass.
+    """
     handler = import_module("bot.handlers.edited_message")
 
     msg_id = _random_message_id()
     chat_id = -1001234567890
-    # Edited message no longer contains #offrecord
     message = _make_message(
         message_id=msg_id, chat_id=chat_id, text="clean message without offrecord"
     )
 
-    # Row is already offrecord with text=None (content was lost on first ingest)
     existing_row = _make_chat_message_row(
         id=10,
         message_id=msg_id,
         chat_id=chat_id,
-        text=None,  # content already lost
+        text=None,
         caption=None,
         memory_policy="offrecord",
         is_redacted=True,
@@ -427,13 +439,180 @@ def test_edit_offrecord_to_normal_flip_no_restoration(app_env, monkeypatch) -> N
 
     asyncio.run(handler.handle_edited_message(message, session))
 
-    # Policy update must be called with "normal"
-    mock_update_policy.assert_awaited_once()
-    args = mock_update_policy.call_args
-    assert args.args[2] == "normal"  # positional: session, row, new_policy
+    # 1. Policy MUST NOT be updated — row stays offrecord.
+    mock_update_policy.assert_not_awaited()
 
-    # Content must NOT be restored — we do not call _apply_offrecord_flip
-    # (no way to verify text wasn't set from this test, but the flow doesn't write it)
+    # 2. No version row may be inserted with raw text/caption. Either insert_version is
+    #    not called at all (idempotency on redacted-state hash), or — if it is — text
+    #    and caption are None and is_redacted is True.
+    if mock_insert_version.await_count > 0:
+        kwargs = mock_insert_version.call_args.kwargs
+        assert kwargs.get("text") is None, (
+            "PRIVACY VIOLATION: offrecord→normal edit inserted version row with raw "
+            f"text. kwargs={kwargs}"
+        )
+        assert kwargs.get("caption") is None, (
+            "PRIVACY VIOLATION: offrecord→normal edit inserted version row with raw "
+            f"caption. kwargs={kwargs}"
+        )
+        assert kwargs.get("is_redacted") is True, (
+            "PRIVACY VIOLATION: offrecord→normal edit inserted version row with "
+            f"is_redacted=False. kwargs={kwargs}"
+        )
+
+
+def test_edited_message_offrecord_to_nomem_is_noop(app_env, monkeypatch) -> None:
+    """Sticky offrecord — same invariant for ``#nomem`` instead of normal.
+
+    An offrecord row must reject any policy downgrade, including offrecord→nomem.
+    """
+    handler = import_module("bot.handlers.edited_message")
+
+    msg_id = _random_message_id()
+    chat_id = -1001234567890
+    message = _make_message(
+        message_id=msg_id, chat_id=chat_id, text="please #nomem this"
+    )
+
+    existing_row = _make_chat_message_row(
+        id=12,
+        message_id=msg_id,
+        chat_id=chat_id,
+        text=None,
+        caption=None,
+        memory_policy="offrecord",
+        is_redacted=True,
+    )
+
+    mock_find = AsyncMock(return_value=existing_row)
+    mock_update_policy = AsyncMock()
+    mock_get_by_hash = AsyncMock(return_value=None)
+    mock_insert_version = AsyncMock(return_value=_make_version_row(id=2, version_seq=2))
+
+    session = AsyncMock()
+    session.refresh = AsyncMock()
+    session.execute = AsyncMock(
+        return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=existing_row))
+    )
+    session.flush = AsyncMock()
+
+    monkeypatch.setattr(handler, "_find_chat_message", mock_find)
+    monkeypatch.setattr(handler, "_update_memory_policy", mock_update_policy)
+    monkeypatch.setattr(handler.MessageVersionRepo, "get_by_hash", mock_get_by_hash)
+    monkeypatch.setattr(handler.MessageVersionRepo, "insert_version", mock_insert_version)
+
+    asyncio.run(handler.handle_edited_message(message, session))
+
+    mock_update_policy.assert_not_awaited()
+    if mock_insert_version.await_count > 0:
+        kwargs = mock_insert_version.call_args.kwargs
+        assert kwargs.get("text") is None
+        assert kwargs.get("caption") is None
+        assert kwargs.get("is_redacted") is True
+
+
+def test_edited_message_offrecord_caption_only_edit_is_noop(
+    app_env, monkeypatch
+) -> None:
+    """Sticky offrecord covers caption-only edits on media (Finding 3 caption coverage).
+
+    A photo message that was offrecord-flipped must reject any later caption edit that
+    drops the #offrecord token — same invariant as the text path.
+    """
+    handler = import_module("bot.handlers.edited_message")
+
+    msg_id = _random_message_id()
+    chat_id = -1001234567890
+    message = _make_message(
+        message_id=msg_id,
+        chat_id=chat_id,
+        text=None,
+        caption="now a clean caption",
+        photo=object(),
+    )
+
+    existing_row = _make_chat_message_row(
+        id=13,
+        message_id=msg_id,
+        chat_id=chat_id,
+        text=None,
+        caption=None,
+        message_kind="photo",
+        memory_policy="offrecord",
+        is_redacted=True,
+    )
+
+    mock_find = AsyncMock(return_value=existing_row)
+    mock_update_policy = AsyncMock()
+    mock_get_by_hash = AsyncMock(return_value=None)
+    mock_insert_version = AsyncMock(return_value=_make_version_row(id=2, version_seq=2))
+
+    session = AsyncMock()
+    session.refresh = AsyncMock()
+    session.execute = AsyncMock(
+        return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=existing_row))
+    )
+    session.flush = AsyncMock()
+
+    monkeypatch.setattr(handler, "_find_chat_message", mock_find)
+    monkeypatch.setattr(handler, "_update_memory_policy", mock_update_policy)
+    monkeypatch.setattr(handler.MessageVersionRepo, "get_by_hash", mock_get_by_hash)
+    monkeypatch.setattr(handler.MessageVersionRepo, "insert_version", mock_insert_version)
+
+    asyncio.run(handler.handle_edited_message(message, session))
+
+    mock_update_policy.assert_not_awaited()
+    if mock_insert_version.await_count > 0:
+        kwargs = mock_insert_version.call_args.kwargs
+        assert kwargs.get("text") is None
+        assert kwargs.get("caption") is None
+        assert kwargs.get("is_redacted") is True
+
+
+def test_update_memory_policy_helper_refuses_to_downgrade_offrecord(
+    app_env,
+) -> None:
+    """Defense in depth (Finding 1 part 2): ``_update_memory_policy`` must short-circuit
+    to a no-op when the row is already 'offrecord'.
+
+    This is belt-and-suspenders: even if a future caller forgets the sticky check at the
+    handler layer, this helper must NEVER write a non-offrecord policy onto an offrecord
+    row. Mirrors the ``MessageRepo.save`` sticky CASE.
+    """
+    import asyncio
+
+    handler = import_module("bot.handlers.edited_message")
+
+    captured: list = []
+
+    async def capture_execute(stmt, *args, **kwargs):
+        captured.append(stmt)
+        return MagicMock()
+
+    row = MagicMock()
+    row.id = 99
+    row.memory_policy = "offrecord"
+
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=capture_execute)
+    session.flush = AsyncMock()
+
+    asyncio.run(
+        handler._update_memory_policy(
+            session,
+            row,
+            "normal",
+            mark_payload=None,
+            set_by_user_id=None,
+            thread_id=None,
+        )
+    )
+
+    # Helper must issue ZERO statements when the row is already offrecord.
+    assert captured == [], (
+        "PRIVACY VIOLATION: _update_memory_policy issued statements for an "
+        f"offrecord→normal call. Captured: {captured}"
+    )
 
 
 def test_edit_offrecord_to_normal_does_not_write_text_caption_to_parent(
@@ -511,6 +690,36 @@ def test_edit_offrecord_to_normal_does_not_write_text_caption_to_parent(
         assert "raw_json" not in upd_values, (
             f"PRIVACY VIOLATION: raw_json leaked into parent row on "
             f"offrecord→normal flip. Captured update: {upd_values}"
+        )
+        # Sticky offrecord (Codex Sprint #80 Finding 1): the parent row must NOT have
+        # ``memory_policy`` flipped back to 'normal' / 'nomem' either.
+        if "memory_policy" in upd_values:
+            policy_val = upd_values["memory_policy"]
+            for attr in ("value", "effective_value"):
+                if hasattr(policy_val, attr):
+                    policy_val = getattr(policy_val, attr)
+            assert policy_val == "offrecord", (
+                f"PRIVACY VIOLATION: parent row's memory_policy downgraded from "
+                f"'offrecord' to {policy_val!r} on edit. Captured update: {upd_values}"
+            )
+
+    # Sticky offrecord (Codex Sprint #80 Finding 1): if a version row WAS inserted
+    # (depends on stored existing.text vs edited content shape), it MUST NOT carry
+    # the raw edited text/caption — that would persist a content fingerprint on the
+    # audit table.
+    if mock_insert_version.await_count > 0:
+        kwargs = mock_insert_version.call_args.kwargs
+        assert kwargs.get("text") is None, (
+            f"PRIVACY VIOLATION: version row inserted with raw text on offrecord→normal "
+            f"flip. kwargs={kwargs}"
+        )
+        assert kwargs.get("caption") is None, (
+            f"PRIVACY VIOLATION: version row inserted with raw caption on offrecord→normal "
+            f"flip. kwargs={kwargs}"
+        )
+        assert kwargs.get("is_redacted") is True, (
+            f"PRIVACY VIOLATION: version row inserted with is_redacted=False on "
+            f"offrecord→normal flip. kwargs={kwargs}"
         )
 
 
