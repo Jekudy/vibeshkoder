@@ -37,18 +37,27 @@ Per export message, the apply loop follows this order:
 
 1. **Checkpoint skip** — if `export_msg_id <= last_processed_export_msg_id`, skip.
 2. **Tombstone gate** — per chunk, call `batch_check_tombstones_by_message_key(...)`.
-3. **Duplicate gate** — lookup `chat_messages` by `(chat_id, message_id)`.
+3. **Duplicate gate** — lookup `chat_messages` by `(chat_id, message_id)`. If no
+   `chat_messages` row exists, also lookup a prior synthetic import `telegram_updates`
+   row so audit-only `offrecord` messages are idempotent.
 4. **User mapping** — call `resolve_export_user(...)`; create ghost users if needed.
-5. **Reply resolution** — read-only `resolve_reply_batch(...)` from #98.
-6. **Synthetic telegram update** — insert `telegram_updates` with `update_id=NULL` and
+5. **Full tombstone check** — after user mapping and before any synthetic update, call
+   `check_tombstone(chat_id, message_id, content_hash, user_tg_id)` so `user:{tg_id}`
+   tombstones from `/forget_me` block all sender messages.
+6. **Reply resolution** — read-only `resolve_reply_batch(...)` from #98. The resolver
+   returns `chat_messages.id`; apply translates that PK to `chat_messages.message_id`.
+   Unresolved replies are dropped (`None`).
+7. **Synthetic telegram update** — insert `telegram_updates` with `update_id=NULL` and
    `ingestion_run_id=<this run>`.
-7. **Governance call** — call `detect_policy(text, caption)` for the user message.
-8. **Persist via helper** — for non-`offrecord` outcomes only, call
+8. **Governance call** — call `detect_policy(text, caption)` for the user message.
+9. **Persist via helper** — for non-`offrecord` outcomes only, call
    `persist_message_with_policy(...)`.
-9. **Edit-history row** — create `message_versions` with `imported_final=TRUE` for
-   imported content; skip when a live row already exists.
-10. **Checkpoint advance** — once per chunk, `save_checkpoint(...)` deep-merges
-    `last_processed_export_msg_id`.
+10. **Edit-history row** — create `message_versions` with `imported_final=TRUE` for
+    imported content. If `persist_message_with_policy(...)` returns a row whose
+    `raw_update_id` differs from the synthetic update row id, a live row won the race;
+    skip the version insert and increment `skipped_overlap_count`.
+11. **Checkpoint advance** — once per chunk, `save_checkpoint(...)` deep-merges
+    `last_processed_export_msg_id` inside the same transaction as the chunk writes.
 
 Per-message pseudocode:
 
@@ -59,8 +68,14 @@ elif export_msg_id in tombstone_hits:
     skip_tombstone()
 elif chat_message_exists(chat_id, export_msg_id):
     skip_duplicate()
+elif import_audit_row_exists(chat_id, export_msg_id):
+    skip_duplicate()
 else:
     user_id = resolve_export_user(...)
+    content_hash = compute_content_hash(...)
+    if check_tombstone(..., content_hash=content_hash, user_tg_id=user_id):
+        skip_tombstone()
+        continue
     reply_to = resolve_reply_batch(...)
     raw = insert_synthetic_telegram_update(update_id=None, ingestion_run_id=run_id)
     policy, _ = detect_policy(text, caption)
@@ -69,7 +84,10 @@ else:
         skip_governance()
     else:
         saved = persist_message_with_policy(..., raw_update_id=raw.id, source="import")
-        insert_version(saved.id, imported_final=True)
+        if saved.raw_update_id == raw.id:
+            insert_version(saved.id, imported_final=True)
+        else:
+            skip_overlap()
 ```
 
 Service messages are skipped per #94. They do not call `detect_policy`, do not create a
@@ -79,9 +97,13 @@ synthetic update, and do not create `chat_messages`.
 
 ## Idempotency Mechanisms
 
-- **Tombstone gate:** tombstoned export message ids are blocked before user mapping, reply
-  resolution, synthetic update, or content persistence.
+- **Tombstone gate:** message-key tombstones are blocked before user mapping, reply
+  resolution, synthetic update, or content persistence. After user mapping, the full
+  `check_tombstone(...)` call also blocks content-hash and `user:{tg_id}` tombstones
+  before any synthetic update is written.
 - **Duplicate gate:** existing `(chat_id, message_id)` rows skip before synthetic update.
+  For audit-only `offrecord` messages, an existing synthetic import `telegram_updates`
+  row is also a duplicate marker.
 - **`source_hash` partial UNIQUE:** `ingestion_runs.source_hash` has a partial unique index
   for `status='running'`, preventing two running imports for the same export.
 - **Checkpoint resume:** resumed runs skip messages at or below
@@ -129,6 +151,10 @@ Overlap rule:
 - If no live row exists, import creates the version row.
 - If a live `chat_messages` row already exists for `(chat_id, message_id)`, import skips;
   live provenance wins.
+- If a live row wins the race between the duplicate gate and the helper upsert, the helper
+  returns a row whose `raw_update_id` is not the synthetic raw id created by this apply
+  message. Apply leaves the synthetic audit row, increments `skipped_overlap_count`, and
+  skips `MessageVersionRepo.insert_version(...)`.
 - If an imported row later receives a live edit, the later live version keeps
   `imported_final=FALSE`.
 
@@ -148,8 +174,9 @@ The checkpoint is stored in `ingestion_runs.stats_json`:
 }
 ```
 
-Apply advances the checkpoint once per committed chunk, never per message. The update uses
-the #101 deep-merge shape:
+Apply advances the checkpoint once per chunk, never per message. The checkpoint update runs
+inside the same outer transaction as that chunk's message writes, then the chunk commits
+once. The update uses the #101 deep-merge shape:
 
 ```sql
 UPDATE ingestion_runs
@@ -158,8 +185,8 @@ UPDATE ingestion_runs
 ```
 
 Resume reads `last_processed_export_msg_id` and skips all export messages at or below that
-id. If a chunk commits but the checkpoint write fails, re-running is still safe: duplicate
-gates absorb already-written messages.
+id. Because chunk data and checkpoint commit together, a rollback exposes neither the
+chunk's rows nor its checkpoint advance.
 
 ---
 
@@ -178,15 +205,18 @@ advisory-lock settings.
 
 When `use_advisory_lock=True`, `run_apply` calls
 `acquire_advisory_lock(connection, ingestion_run_id)` and holds one `AsyncConnection` for
-the full apply lifetime. PostgreSQL advisory locks are connection-scoped and stacked, so
-the caller must not re-enter the same lock on the same connection.
+the full apply lifetime. If the caller's session is engine-bound, apply explicitly opens
+`engine.connect()` and creates a fresh `AsyncSession(bind=connection)` for all chunk work.
+If the caller already supplied a connection-bound session (test fixture / explicit caller),
+apply reuses that connection. PostgreSQL advisory locks are connection-scoped and stacked,
+so the caller must not re-enter the same lock on the same connection.
 
 ---
 
 ## Error Policy
 
-Per-message expected failures are caught as specific types (`ValueError`, `RuntimeError`,
-`SQLAlchemyError`), logged with:
+Per-message expected validation/mapping failures are caught as specific types
+(`ValueError`, `RuntimeError`) inside a per-message SAVEPOINT, logged with:
 
 - `export_msg_id`
 - `chat_id`
@@ -195,12 +225,21 @@ Per-message expected failures are caught as specific types (`ValueError`, `Runti
 
 No message text, captions, entities, or raw bodies are logged.
 
-Per-message failures increment `error_count`, append the export id to the capped
-`error_export_msg_ids` list, and continue the chunk.
+Per-message failures roll back that message's SAVEPOINT, increment `error_count`, append
+the export id to the capped `error_export_msg_ids` list, and continue the chunk.
+
+`SQLAlchemyError` is not swallowed at per-message level. It aborts the current chunk,
+rolls back the outer chunk transaction, restores in-memory report counters to the last
+committed chunk, and propagates to the CLI.
 
 Per-chunk infrastructure errors are not swallowed. They propagate to the CLI, which rolls
-back the active session, finalizes the ingestion run as `failed`, sets `finished_at`, and
-returns exit code `5`.
+back the active session, best-effort persists partial apply stats from the attached report,
+finalizes the ingestion run as `failed`, sets `finished_at`, and returns exit code `5`.
+
+Cancellation handling: `asyncio.CancelledError` and other `BaseException` subclasses enter
+the same failed-finalization path and are then re-raised. A hard process kill before Python
+cleanup can still leave `ingestion_runs.status='running'`; the partial-present check at the
+next startup classifies that run and requires `--resume` or manual finalization.
 
 No fallback defaults are invented for required state. Missing `chat_id`, missing run rows,
 or unreadable export files fail fast.

@@ -548,6 +548,80 @@ def test_cli_import_apply_no_resume_on_partial_run_exits_3() -> None:
     assert "resume" in stderr.lower() or "partial" in stderr.lower()
 
 
+async def test_cli_import_apply_failure_persists_partial_stats(db_session) -> None:
+    """When run_apply fails after partial progress, CLI persists report counts before
+    finalize_run(failed)."""
+    from types import SimpleNamespace
+
+    from sqlalchemy import text
+
+    from bot.cli import _cmd_import_apply_async
+    from bot.services.import_apply import ImportApplyReport
+
+    class _SessionContext:
+        async def __aenter__(self):
+            return db_session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    def _session_factory():
+        return _SessionContext()
+
+    async def _failing_run_apply(session, *, ingestion_run_id, resume_point, chunking_config):
+        report = ImportApplyReport(
+            ingestion_run_id=ingestion_run_id,
+            chat_id=-1001999999999,
+            source_path=str(SMALL_CHAT),
+            started_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            applied_count=2,
+            skipped_duplicate_count=1,
+            error_count=1,
+            error_export_msg_ids=[1004],
+            chunks_processed=1,
+            last_processed_export_msg_id=1003,
+        )
+        exc = RuntimeError("simulated chunk infra failure")
+        exc.import_apply_report = report
+        raise exc
+
+    args = SimpleNamespace(
+        export_path=str(SMALL_CHAT),
+        resume=False,
+        chunk_size=2,
+    )
+
+    with (
+        patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
+        patch("bot.services.import_apply.run_apply", new=_failing_run_apply),
+        patch("bot.db.engine.async_session", new=_session_factory),
+    ):
+        rc = await _cmd_import_apply_async(args)
+
+    assert rc == 5
+    row = (
+        await db_session.execute(
+            text(
+                """
+                SELECT status, stats_json
+                FROM ingestion_runs
+                WHERE source_name = :source_name
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            {"source_name": str(SMALL_CHAT.resolve())},
+        )
+    ).one()
+    status, stats = row
+    assert status == "failed"
+    assert stats["applied_count"] == 2
+    assert stats["skipped_duplicate_count"] == 1
+    assert stats["error_count"] == 1
+    assert stats["error_export_msg_ids"] == [1004]
+    assert stats["chunks_processed"] == 1
+
+
 # ─── Fix 1 regression: failed → completed transition ──────────────────────────
 
 

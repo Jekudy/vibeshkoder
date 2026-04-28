@@ -226,35 +226,27 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
             # Strategy: rollback primary session, open a FRESH session for finalize,
             # swallow finalize errors (log only), then re-raise the ORIGINAL exception.
             original_exc = exc
-            try:
-                await session.rollback()
-            except SQLAlchemyError as rb_err:
-                logger.warning("rollback failed after run_apply error: %s", rb_err)
-
-            try:
-                async with _db_engine.async_session() as fresh_session:
-                    await finalize_run(
-                        fresh_session,
-                        ingestion_run_id=ingestion_run_id,
-                        final_status="failed",
-                        error_payload={
-                            "error_type": type(original_exc).__name__,
-                            "message": "import apply runtime error",
-                        },
-                    )
-                    await fresh_session.commit()
-            except (ValueError, SQLAlchemyError) as fin_err:
-                logger.warning(
-                    "finalize_run failed for run %s after apply error (original_type=%s): %s",
-                    ingestion_run_id,
-                    type(original_exc).__name__,
-                    fin_err,
-                )
+            await _finalize_failed_apply(
+                _db_engine,
+                session=session,
+                finalize_run=finalize_run,
+                ingestion_run_id=ingestion_run_id,
+                original_exc=original_exc,
+            )
             print(
                 f"ERROR: import apply failed: {type(original_exc).__name__}",
                 file=sys.stderr,
             )
             return 5
+        except BaseException as exc:
+            await _finalize_failed_apply(
+                _db_engine,
+                session=session,
+                finalize_run=finalize_run,
+                ingestion_run_id=ingestion_run_id,
+                original_exc=exc,
+            )
+            raise
 
         # Mark the run completed with final stats. finalize_run is idempotent.
         await finalize_run(
@@ -297,6 +289,7 @@ async def _save_apply_final_stats(session, report) -> None:
         "applied_count": report.applied_count,
         "skipped_duplicate_count": report.skipped_duplicate_count,
         "skipped_tombstone_count": report.skipped_tombstone_count,
+        "tombstone_skip_export_msg_ids": report.tombstone_skip_export_msg_ids,
         "skipped_governance_count": report.skipped_governance_count,
         "skipped_resume_count": report.skipped_resume_count,
         "skipped_service_count": report.skipped_service_count,
@@ -316,6 +309,62 @@ async def _save_apply_final_stats(session, report) -> None:
         ),
         {"id": report.ingestion_run_id, "patch": json.dumps(patch)},
     )
+
+
+async def _finalize_failed_apply(
+    db_engine_module,
+    *,
+    session,
+    finalize_run,
+    ingestion_run_id: int,
+    original_exc: BaseException,
+) -> None:
+    """Persist best-effort failure state after run_apply raises."""
+    partial_report = getattr(original_exc, "import_apply_report", None)
+    try:
+        await session.rollback()
+    except SQLAlchemyError as rb_err:
+        logger.warning("rollback failed after run_apply error: %s", rb_err)
+
+    try:
+        async with db_engine_module.async_session() as fresh_session:
+            if partial_report is not None:
+                try:
+                    await _save_apply_final_stats(fresh_session, partial_report)
+                except (ValueError, RuntimeError, SQLAlchemyError) as stats_err:
+                    logger.warning(
+                        "saving partial import_apply stats failed for run %s "
+                        "(original_type=%s): %s",
+                        ingestion_run_id,
+                        type(original_exc).__name__,
+                        stats_err,
+                    )
+                    try:
+                        await fresh_session.rollback()
+                    except SQLAlchemyError as rb_err:
+                        logger.warning(
+                            "rollback failed after partial stats error for run %s: %s",
+                            ingestion_run_id,
+                            rb_err,
+                        )
+
+            await finalize_run(
+                fresh_session,
+                ingestion_run_id=ingestion_run_id,
+                final_status="failed",
+                error_payload={
+                    "error_type": type(original_exc).__name__,
+                    "message": "import apply runtime error",
+                },
+            )
+            await fresh_session.commit()
+    except (ValueError, SQLAlchemyError) as fin_err:
+        logger.warning(
+            "finalize_run failed for run %s after apply error (original_type=%s): %s",
+            ingestion_run_id,
+            type(original_exc).__name__,
+            fin_err,
+        )
 
 
 def _read_chat_id_from_envelope(path: Path) -> int:
