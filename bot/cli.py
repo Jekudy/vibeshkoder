@@ -104,6 +104,10 @@ async def _cmd_import_dry_run_with_db(args: argparse.Namespace) -> int:
         f"{nomem_count} nomem, "
         f"{report.db_broken_reply_count} broken reply chains."
     )
+    print(
+        f"Tombstone skip:   {report.tombstone_skip_count} messages match existing tombstones "
+        f"(would be skipped on apply)"
+    )
     return 0
 
 

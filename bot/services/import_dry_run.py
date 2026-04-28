@@ -30,6 +30,7 @@ from bot.db.models import ChatMessage
 from bot.db.repos.ingestion_run import IngestionRunRepo
 from bot.services.import_parser import ImportDryRunReport, parse_export
 from bot.services.import_reply_resolver import resolve_reply_batch
+from bot.services.import_tombstone import batch_check_tombstones_by_message_key
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +70,26 @@ async def parse_export_with_db(
     # Step 1: run sync parser
     base_report = parse_export(path)
 
-    # Step 2: DB duplicate detection
-    # Collect all export message ids (int) from the parsed export.
+    # Step 2: Collect all export message ids (int) from the parsed export.
     all_export_ids = _extract_export_msg_ids(path)
-    db_duplicate_export_msg_ids = await _find_db_duplicates(session, chat_id, all_export_ids)
+
+    # Step 2a: Tombstone collision detection (T2-NEW-D / #100).
+    # Must be computed BEFORE duplicate detection so that the precedence rule
+    # (tombstone bucket wins over duplicate bucket) can be applied correctly.
+    # One batch SELECT only — no per-message N+1.
+    tombstone_hit_ids: set[int] = await batch_check_tombstones_by_message_key(
+        session,
+        chat_id=chat_id,
+        export_msg_ids=all_export_ids,
+    )
+    tombstone_skip_export_msg_ids: list[int] = sorted(tombstone_hit_ids)
+    tombstone_skip_count = len(tombstone_skip_export_msg_ids)
+
+    # Step 2b: DB duplicate detection.
+    # Exclude ids that are already classified as tombstone hits so that the tombstone
+    # bucket wins over the duplicate bucket on collision (task contract §4).
+    non_tombstone_ids = [mid for mid in all_export_ids if mid not in tombstone_hit_ids]
+    db_duplicate_export_msg_ids = await _find_db_duplicates(session, chat_id, non_tombstone_ids)
     db_duplicate_count = len(db_duplicate_export_msg_ids)
 
     # Step 3: Create synthetic dry_run ingestion_run for reply resolver scope.
@@ -117,7 +134,7 @@ async def parse_export_with_db(
             )
 
     # Step 5: Build enriched report (frozen dataclass — must construct fresh).
-    # We rebuild from base_report fields plus the new db_* values.
+    # We rebuild from base_report fields plus the new db_* and tombstone_* values.
     return ImportDryRunReport(
         source_file=base_report.source_file,
         chat_id=base_report.chat_id,
@@ -143,6 +160,8 @@ async def parse_export_with_db(
         db_duplicate_count=db_duplicate_count,
         db_duplicate_export_msg_ids=db_duplicate_export_msg_ids,
         db_broken_reply_count=db_broken_reply_count,
+        tombstone_skip_count=tombstone_skip_count,
+        tombstone_skip_export_msg_ids=tombstone_skip_export_msg_ids,
     )
 
 

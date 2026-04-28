@@ -159,6 +159,46 @@ API (`parse_export(path)`) returns native `datetime` objects.
 
 ## DB-aware mode (`--with-db`)
 
+### Tombstone collision fields (T2-NEW-D / #100)
+
+Two additional fields are populated by `parse_export_with_db()` to surface tombstone
+collisions ahead of the apply run:
+
+| Field | Type | What it tells the operator |
+|-------|------|----------------------------|
+| `tombstone_skip_count` | `int` | Number of export messages whose `message:{chat_id}:{id}` key matches an existing row in `forget_events`. These would be skipped on apply — **NEVER reingest forgotten content**. |
+| `tombstone_skip_export_msg_ids` | `list[int]` | Ordered list of export message ids that would be skipped. Bounded by export size; carries no content (NO-content guarantee holds). |
+
+Both fields default to `0` / `[]` in offline mode (`parse_export(path)` without DB).
+
+**Precedence rule (tombstone > duplicate):** if an export message id is both a DB
+duplicate (already in `chat_messages`) AND a tombstone match (`forget_events` row
+exists), it is classified under `tombstone_skip_*`, NOT under `db_duplicate_*`. The
+operator must see tombstone collisions first — re-ingesting forgotten content requires
+explicit operator decision; a duplicate is merely redundant.
+
+**Scan scope:** the tombstone scan checks only `message:{chat_id}:{msg_id}` keys for
+each export message id. Per-user and per-content-hash tombstones are intentionally
+not checked during dry-run: the dry-run has no message content (NO-content guarantee)
+and does not resolve user ids (ghost-user creation is the apply path's job).
+
+**Read-only:** the tombstone scan is a single bulk `SELECT` only (one query, no N+1).
+Zero writes. Safe inside the synthetic `dry_run` `IngestionRun`.
+
+**CLI output example (`--with-db`):**
+
+```
+3 duplicates would be skipped, 0 offrecord messages, 0 nomem, 1 broken reply chains.
+Tombstone skip:   2 messages match existing tombstones (would be skipped on apply)
+```
+
+The "Tombstone skip:" line appears directly under the duplicate line.
+
+**Cross-references:** #100 (T2-NEW-D), #97 (T3-05 — `import_tombstone_check` batch helper
+`batch_check_tombstones_by_message_key`), §DB-aware mode below.
+
+---
+
 The offline `parse_export(path)` answers questions about the export in isolation
 — shape, kinds, governance distribution, dangling replies *within the export*.
 It cannot answer questions that require the live DB: *"how many of these
@@ -291,10 +331,11 @@ error printed to stderr.
   `chat_messages` / `message_versions` / `telegram_updates`. The synthetic
   `dry_run` `IngestionRun` row is metadata-only — its existence is the
   exception that proves the rule.
-- **No tombstone collision detection.** `db_duplicate_count` is a presence
-  check against `chat_messages`, not against `forget_events`. Tombstone
-  collisions for re-import (#100 / T2-NEW-D) are a separate report on top of
-  this one.
+- **Tombstone collision detection is now in scope.** `tombstone_skip_count` and
+  `tombstone_skip_export_msg_ids` are produced by `parse_export_with_db()` in DB-aware
+  mode. See § "Tombstone collision fields" above. `db_duplicate_count` remains scoped
+  to `chat_messages` existence checks only, and tombstone hits are excluded from the
+  duplicate bucket (tombstone wins on collision).
 - **No content-hash dedup.** Duplicate detection is keyed on
   `(chat_id, export_msg_id)` only, mirroring how #103 apply will dedup.
   Different content with the same id is already an upstream contradiction
@@ -316,8 +357,8 @@ error printed to stderr.
   one chat at a time.
 - **LLM-based content classification.** Governance is regex-based
   (`detect_policy`); no extraction, no Q&A, no catalog work happens here.
-- **Tombstone collision detection.** Surfacing `forget_events` collisions for
-  re-import is #100 (T2-NEW-D), built on top of dry-run output.
+- **Tombstone collision detection** is now implemented (#100 / T2-NEW-D). See
+  § "Tombstone collision fields" in the DB-aware mode section above.
 - **Apply-time stats (rows inserted, ghost users created, runs reused).** Those
   are produced by the apply path itself (#103). Pre-flight DB-aware dry-run
   stats (#99 / T2-02) are covered in the *DB-aware mode* section above.

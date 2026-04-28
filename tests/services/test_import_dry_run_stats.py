@@ -328,10 +328,18 @@ async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -
 
     output = buf.getvalue().strip()
     assert rc == 0, f"Expected exit 0, got {rc}. Output: {output!r}"
-    # Exact format per issue #99 spec:
+    # First line: exact format per issue #99 spec:
     # "N duplicates would be skipped, M offrecord messages, K nomem, J broken reply chains."
-    expected = "1 duplicates would be skipped, 0 offrecord messages, 0 nomem, 1 broken reply chains."
-    assert output == expected, f"Expected exact summary line:\n  {expected!r}\nGot:\n  {output!r}"
+    lines = output.splitlines()
+    expected_line1 = "1 duplicates would be skipped, 0 offrecord messages, 0 nomem, 1 broken reply chains."
+    assert lines[0] == expected_line1, (
+        f"Expected exact first summary line:\n  {expected_line1!r}\nGot:\n  {lines[0]!r}"
+    )
+    # Second line: tombstone summary (issue #100 extension). No tombstones in this test.
+    assert len(lines) >= 2, f"Expected at least 2 output lines, got: {output!r}"
+    assert "Tombstone skip:" in lines[1], (
+        f"Expected 'Tombstone skip:' in second line, got: {lines[1]!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

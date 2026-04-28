@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import copy
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import ForgetEvent
@@ -162,3 +163,50 @@ def record_tombstone_skip(
     )
 
     return base
+
+
+async def batch_check_tombstones_by_message_key(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    export_msg_ids: list[int],
+) -> set[int]:
+    """Return the set of export_msg_ids that have a ``message:{chat_id}:{msg_id}`` tombstone.
+
+    Issues a SINGLE bulk SELECT against forget_events. No per-message N+1 queries.
+    Read-only. Safe to call inside any transaction (including the synthetic dry_run).
+
+    Only checks the ``message:{chat_id}:{msg_id}`` key format — the most specific key
+    for an export message. For the dry-run tombstone report (#100), per-user and
+    per-hash tombstones are intentionally NOT checked: the dry-run does not have access
+    to message content hashes (no text stored, NO-content guarantee) or pre-resolved
+    user ids (ghost-user creation is the apply path's job). The message-location key is
+    sufficient to surface the most operator-relevant collision signal.
+
+    Args:
+        session: Active AsyncSession. Not committed by this function.
+        chat_id: The chat scope to build tombstone keys for.
+        export_msg_ids: List of integer message ids from the export.
+
+    Returns:
+        Set of export_msg_ids whose ``message:{chat_id}:{id}`` tombstone key exists
+        in ``forget_events``. Empty set if no collisions or input is empty.
+    """
+    if not export_msg_ids:
+        return set()
+
+    # Build the set of tombstone keys to look up: ``message:{chat_id}:{msg_id}``
+    key_to_msg_id: dict[str, int] = {
+        f"message:{chat_id}:{mid}": mid for mid in export_msg_ids
+    }
+    candidate_keys = list(key_to_msg_id.keys())
+
+    stmt = (
+        select(ForgetEvent.tombstone_key)
+        .where(ForgetEvent.tombstone_key.in_(candidate_keys))
+    )
+    result = await session.execute(stmt)
+    matched_keys = {row[0] for row in result.all()}
+
+    # Map matched tombstone_keys back to export_msg_ids
+    return {key_to_msg_id[k] for k in matched_keys if k in key_to_msg_id}

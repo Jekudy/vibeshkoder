@@ -142,6 +142,21 @@ class ImportDryRunReport:
     """Count of replies whose target cannot be resolved via reply_resolver (DB-aware).
     Set by parse_export_with_db(); 0 when no DB context."""
 
+    # --- Tombstone collision fields (T2-NEW-D / #100) ---
+    # Populated by parse_export_with_db(); offline parse_export() leaves them at defaults.
+    # Separate from db_duplicate_* — different operator decision:
+    #   duplicate = already ingested OK (safe to skip)
+    #   tombstone = forgotten on purpose (NEVER reingest, requires operator attention)
+
+    tombstone_skip_count: int = field(default=0)
+    """Count of export messages whose tombstone_key matches an existing row in forget_events.
+    Set by parse_export_with_db(); 0 when no DB context."""
+
+    tombstone_skip_export_msg_ids: list[int] = field(default_factory=list)
+    """Ordered list of export message ids that would be skipped due to existing tombstones.
+    Set by parse_export_with_db(); empty list when no DB context.
+    Capped at the same size as the export — bounded by export size, never content-bearing."""
+
 
 # ---------------------------------------------------------------------------
 # Public API
