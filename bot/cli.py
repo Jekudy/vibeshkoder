@@ -130,17 +130,29 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
             )
             return 4
 
+        # Load chunking config from env; CLI --chunk-size overrides the env var.
+        from bot.services.import_chunking import ChunkingConfig, load_chunking_config
+
+        chunking_config = load_chunking_config()
+        # CLI --chunk-size takes precedence over IMPORT_APPLY_CHUNK_SIZE env var.
+        # args.chunk_size is None when --chunk-size was not passed (env var or default applies).
+        if args.chunk_size is not None and args.chunk_size != chunking_config.chunk_size:
+            chunking_config = ChunkingConfig(
+                chunk_size=args.chunk_size,
+                sleep_between_chunks_ms=chunking_config.sleep_between_chunks_ms,
+                use_advisory_lock=chunking_config.use_advisory_lock,
+            )
+
         # Apply path is available (future #103 case).
         ingestion_run_id = decision.ingestion_run_id
         resume_point = decision.last_processed_export_msg_id
-        chunk_size = args.chunk_size
 
         try:
             await run_apply(
                 session,
                 ingestion_run_id=ingestion_run_id,
                 resume_point=resume_point,
-                chunk_size=chunk_size,
+                chunking_config=chunking_config,
             )
         except Exception as exc:
             # Fix 5: if run_apply raised a DB error, the session may be in
@@ -235,9 +247,12 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.add_argument(
         "--chunk-size",
         type=int,
-        default=500,
+        default=None,
         dest="chunk_size",
-        help="Number of messages per DB transaction chunk (default: 500).",
+        help=(
+            "Number of messages per DB transaction chunk. "
+            "Overrides IMPORT_APPLY_CHUNK_SIZE env var. Default: 500 (from env or built-in)."
+        ),
     )
     p_apply.set_defaults(func=_cmd_import_apply)
 
