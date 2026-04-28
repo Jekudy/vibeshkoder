@@ -19,6 +19,22 @@ Because the work is done in the same transaction Alembic opens for the migration
 on first deployment; if the dataset grows past this, a future ticket will switch to a
 data-only migration that opens its own connection outside Alembic.
 
+Concurrency safety (Codex Sprint #80 Finding 2 HIGH):
+Per-row protocol makes this migration race-safe even if run during live ingestion:
+
+1. ``pg_advisory_xact_lock(hashtext('chat_msg:{chat_id}:{message_id}'))`` — same key
+   format as ``bot/db/locks.py:21``. Serializes against any concurrent transaction
+   (live edited_message, chat_messages handlers) for the same message row.
+2. Re-read the row with ``FOR UPDATE`` after the lock. Picks up any offrecord flip or
+   ``current_version_id`` write that landed between the batch SELECT and lock
+   acquisition.
+3. If post-lock ``current_version_id IS NOT NULL`` — a concurrent live handler already
+   wrote v1 — skip this row (idempotent).
+4. Build ``message_versions`` from the POST-LOCK fresh values (text, caption,
+   is_redacted). A concurrent normal→offrecord flip nulls text/caption and sets
+   is_redacted=True; using stale pre-lock values would persist an UNREDACTED version
+   row (privacy bypass).
+
 Revision ID: 008
 Revises: 007
 Create Date: 2026-04-27
@@ -42,7 +58,7 @@ _BATCH_SIZE = 1000
 
 _SELECT_LEGACY = sa.text(
     """
-    SELECT id, text, caption, message_kind, date, raw_update_id, is_redacted
+    SELECT id, chat_id, message_id, text, caption, message_kind, date, raw_update_id, is_redacted
     FROM chat_messages
     WHERE current_version_id IS NULL
     ORDER BY id
@@ -85,32 +101,60 @@ def upgrade() -> None:
             break
 
         for row in rows:
+            # 1. Per-row advisory lock — same key format as bot/db/locks.py:21.
+            # Serializes against concurrent live handlers (edited_message, chat_messages)
+            # for this exact message row.
+            lock_key = f"chat_msg:{row.chat_id}:{row.message_id}"
+            bind.execute(
+                sa.text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": lock_key}
+            )
+
+            # 2. Re-read row with FOR UPDATE to pick up any offrecord flip or
+            # current_version_id write that landed between the batch SELECT and the
+            # lock acquisition above.
+            fresh = bind.execute(
+                sa.text(
+                    "SELECT id, text, caption, message_kind, date, raw_update_id,"
+                    " is_redacted, current_version_id"
+                    " FROM chat_messages WHERE id = :id FOR UPDATE"
+                ),
+                {"id": row.id},
+            ).one()
+
+            # 3. Skip if a concurrent live handler already wrote v1 for this row.
+            if fresh.current_version_id is not None:
+                continue
+
+            # 4. Build version from POST-LOCK fresh values. A concurrent
+            # normal→offrecord flip nulls text/caption and sets is_redacted=True;
+            # using stale pre-lock values would persist an UNREDACTED version row
+            # (privacy bypass).
             content_hash = compute_content_hash(
-                text=row.text,
-                caption=row.caption,
-                message_kind=row.message_kind,
+                text=fresh.text,
+                caption=fresh.caption,
+                message_kind=fresh.message_kind,
                 entities=None,
             )
             inserted = bind.execute(
                 _INSERT_VERSION,
                 {
-                    "chat_message_id": row.id,
-                    "text": row.text,
-                    "caption": row.caption,
-                    "normalized_text": row.text,
+                    "chat_message_id": fresh.id,
+                    "text": fresh.text,
+                    "caption": fresh.caption,
+                    "normalized_text": fresh.text,
                     # Pin to the original message moment so q&a citations remain stable
                     # regardless of when the migration ran (per HANDOFF.md §6 #5 +
                     # issue #31 acceptance "captured_at=date").
-                    "captured_at": row.date,
+                    "captured_at": fresh.date,
                     "content_hash": content_hash,
-                    "raw_update_id": row.raw_update_id,
-                    "is_redacted": row.is_redacted,
+                    "raw_update_id": fresh.raw_update_id,
+                    "is_redacted": fresh.is_redacted,
                 },
             )
             version_id = inserted.scalar()
             bind.execute(
                 _UPDATE_PARENT,
-                {"version_id": version_id, "chat_message_id": row.id},
+                {"version_id": version_id, "chat_message_id": fresh.id},
             )
             total += 1
 
