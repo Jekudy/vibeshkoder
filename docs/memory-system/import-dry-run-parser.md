@@ -1,9 +1,10 @@
 # Import Dry-Run Parser
 
-**Document:** T2-01 (issue #94)
+**Document:** T2-01 (issue #94) + T2-02 DB-aware extension (issue #99)
 **Status:** implemented
 **Date:** 2026-04-28
-**Scope:** `bot/services/import_parser.py`, `bot/cli.py` (`import_dry_run` subcommand)
+**Scope:** `bot/services/import_parser.py`, `bot/services/import_dry_run.py`,
+`bot/cli.py` (`import_dry_run [--with-db]` subcommand)
 
 ---
 
@@ -156,6 +157,140 @@ API (`parse_export(path)`) returns native `datetime` objects.
 
 ---
 
+## DB-aware mode (`--with-db`)
+
+The offline `parse_export(path)` answers questions about the export in isolation
+— shape, kinds, governance distribution, dangling replies *within the export*.
+It cannot answer questions that require the live DB: *"how many of these
+messages already exist?"*, *"how many replies will fail to resolve against
+prior runs / live ingestion?"*. Those are the questions an operator actually
+needs answered before authorising apply.
+
+DB-aware mode (T2-02 / #99) extends the report with three counts that depend
+on the DB:
+
+- `db_duplicate_count: int` — messages whose `(chat_id, export_msg_id)` already
+  exists in `chat_messages` from a prior import or from live ingestion. Apply
+  (#103) will skip these via the same lookup; dry-run surfaces the count
+  ahead of time.
+- `db_duplicate_export_msg_ids: tuple[int, ...]` — the actual export ids of the
+  duplicates. Bounded by export size; carries no content. Useful for spot-check
+  / audit trail.
+- `db_broken_reply_count: int` — messages whose `reply_to.message_id` resolves
+  to **unresolved** through the import reply-resolver priority chain
+  (`same_run` → `prior_run` → `live`). These are reply chains that will land
+  with `chat_messages.reply_to_message_id = NULL` under apply.
+
+All three default to `0` / `()` on the offline path so the offline
+`parse_export(path)` API and existing #94 callers stay byte-for-byte compatible
+— no field is non-optional. The frozen-dataclass NO-content guarantee
+(§ NO-Content Guarantee above) holds: the new fields carry counts and export
+ids, never message text.
+
+### When To Use
+
+Run `--with-db` when the operator wants to know, before flipping the apply
+switch:
+
+1. *How many messages would be skipped as duplicates?* — re-import of an
+   already-applied export should report close to 100 % duplicates; surprising
+   low counts mean the operator is about to apply a different export than they
+   think.
+2. *How many reply chains would land broken?* — high `db_broken_reply_count`
+   means most reply parents live outside the export and outside any prior
+   imported run, which is usually a sign the operator should also import the
+   referenced earlier chats first.
+
+The offline `parse_export(path)` remains the right tool when the DB is not
+available (CI, fixture validation, schema regression tests).
+
+### API
+
+```python
+from bot.services.import_dry_run import parse_export_with_db
+
+async with session_factory() as session:
+    report = await parse_export_with_db(
+        path="/path/to/result.json",
+        session=session,
+        chat_id=community_chat_id,  # operator-supplied target chat
+    )
+```
+
+`parse_export_with_db` runs the offline `parse_export(path)` first (cheap, no
+DB), then issues a small fixed number of DB queries to compute the three new
+fields. It returns the same `ImportDryRunReport` dataclass with the DB fields
+populated.
+
+### Synthetic `dry_run` IngestionRun
+
+Reply resolution is delegated to `bot.services.import_reply_resolver`
+(#98 / T2-NEW-C), which scopes lookups by `ingestion_run_id`. The resolver
+needs *some* run id — it is not designed to operate run-less. The dry-run
+path therefore creates a **synthetic** `IngestionRun(run_type='dry_run')` row
+(per the T1-02 check constraint that already lists `dry_run` as a legal
+value) before invoking the resolver, then reuses that id as
+`current_run.id`.
+
+Rationale:
+
+- It gives the resolver a stable, queryable scope without polluting
+  `live` / `import` runs.
+- The row is intentionally metadata-only — no `chat_messages` /
+  `message_versions` / `telegram_updates` are written under it. The
+  NO-content guarantee still holds for the DB-aware path.
+- In the test suite the synthetic run is rolled back with the rest of the
+  fixture transaction. In the CLI it is left in place as an audit row
+  (when did the operator run a DB-aware dry-run, against which export, with
+  what counts) — `stats_json` carries the report's count fields, `error_json`
+  is NULL.
+- It is **not** reused: every `parse_export_with_db` call creates a fresh
+  `dry_run` row. They are cheap and chronologically interesting.
+
+The synthetic row is **not** treated as a `prior_run` by subsequent dry-runs
+or by #103 apply (the resolver's `prior_run` lookup filters on
+`run_type IN ('live', 'import')` only, never `dry_run`).
+
+### CLI Usage
+
+```bash
+python -m bot.cli import_dry_run --with-db /path/to/result.json
+```
+
+Without `--with-db`, the CLI runs the offline path (T2-01 default) and the new
+fields are present in JSON output with their default values (`0` / `[]`).
+
+Operator-facing summary printed to stderr after the JSON body:
+
+```
+N duplicates would be skipped, M offrecord, K nomem, J broken reply chains.
+```
+
+`N` = `db_duplicate_count`, `M` = `policy_marker_counts.offrecord`, `K` =
+`policy_marker_counts.nomem`, `J` = `db_broken_reply_count`. Operators are
+expected to read this line first; the full JSON is for audit / scripting.
+
+Exit codes for `--with-db` are the same as for the offline path (`0` /
+`1` / `2`); DB connectivity failure produces exit `1` with the underlying
+error printed to stderr.
+
+### Out-of-Scope (DB-aware mode)
+
+- **No content writes.** `parse_export_with_db` does not write any
+  `chat_messages` / `message_versions` / `telegram_updates`. The synthetic
+  `dry_run` `IngestionRun` row is metadata-only — its existence is the
+  exception that proves the rule.
+- **No tombstone collision detection.** `db_duplicate_count` is a presence
+  check against `chat_messages`, not against `forget_events`. Tombstone
+  collisions for re-import (#100 / T2-NEW-D) are a separate report on top of
+  this one.
+- **No content-hash dedup.** Duplicate detection is keyed on
+  `(chat_id, export_msg_id)` only, mirroring how #103 apply will dedup.
+  Different content with the same id is already an upstream contradiction
+  the operator must resolve before running apply.
+
+---
+
 ## Out Of Scope / Non-Goals
 
 - **Writing to the DB.** Dry-run is read-only by contract. All writes happen in
@@ -172,7 +307,8 @@ API (`parse_export(path)`) returns native `datetime` objects.
   (`detect_policy`); no extraction, no Q&A, no catalog work happens here.
 - **Tombstone collision detection.** Surfacing `forget_events` collisions for
   re-import is #100 (T2-NEW-D), built on top of dry-run output.
-- **Apply-stats reporting.** Detailed apply-time stats (rows inserted, ghost
-  users created, runs reused) are #99 (T2-02) territory.
+- **Apply-time stats (rows inserted, ghost users created, runs reused).** Those
+  are produced by the apply path itself (#103). Pre-flight DB-aware dry-run
+  stats (#99 / T2-02) are covered in the *DB-aware mode* section above.
 
 <!-- updated-by-superflow:2026-04-28 -->
