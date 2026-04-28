@@ -10,8 +10,8 @@ to locate an existing partial run for the same source.
 
 Additive migration — existing rows get source_hash=NULL (compatible with nullable).
 
-Revision ID: 016
-Revises: 015
+Revision ID: 017
+Revises: 016
 Create Date: 2026-04-28
 """
 
@@ -22,8 +22,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "016"
-down_revision: Union[str, Sequence[str], None] = "015"
+revision: str = "017"
+down_revision: Union[str, Sequence[str], None] = "016"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
