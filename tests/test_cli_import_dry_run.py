@@ -41,29 +41,30 @@ def test_cli_runs_on_small_chat():
     assert payload["total_messages"] == 6
 
 
-def test_cli_returns_nonzero_on_missing_file():
+def test_cli_returns_exit2_on_missing_file():
+    """Documented contract: file-not-found → exit code 2 (distinct from parse-error 1)."""
     rc, _ = _invoke(["import_dry_run", "/nonexistent/path/export.json"])
-    assert rc != 0
+    assert rc == 2
 
 
-def test_cli_returns_nonzero_on_invalid_json(tmp_path: Path):
+def test_cli_returns_exit1_on_invalid_json(tmp_path: Path):
+    """Documented contract: parse error → exit code 1 (distinct from file-not-found 2)."""
     bad = tmp_path / "bad.json"
     bad.write_text("{not valid", encoding="utf-8")
     rc, _ = _invoke(["import_dry_run", str(bad)])
-    assert rc != 0
+    assert rc == 1
 
 
 # ---------------------------------------------------------------------------
 # Fix 6 — CLI wraps FileNotFoundError from parse_export (race condition)
 # ---------------------------------------------------------------------------
 
-def test_cli_returns_nonzero_on_race_deleted_file(tmp_path: Path):
-    """parse_export raising FileNotFoundError must map to non-zero return code (not traceback)."""
+def test_cli_returns_exit2_on_race_deleted_file(tmp_path: Path):
+    """parse_export raising FileNotFoundError mid-call must map to exit code 2 (file-not-found)."""
     from unittest.mock import patch
 
     # Use a real-looking path that passes is_file() check but then simulate
     # parse_export raising FileNotFoundError (race: deleted between check and open).
     with patch("bot.services.import_parser.parse_export", side_effect=FileNotFoundError("race deleted")):
-        # We need is_file() to pass, so use an existing file path
         rc, _ = _invoke(["import_dry_run", str(SMALL_CHAT)])
-    assert rc != 0
+    assert rc == 2

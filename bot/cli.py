@@ -24,7 +24,7 @@ def _cmd_import_dry_run(args: argparse.Namespace) -> int:
         report = parse_export(path)
     except FileNotFoundError as e:
         print(f"ERROR: file not found: {e}", file=sys.stderr)
-        return 1
+        return 2
     except (ValueError, json.JSONDecodeError) as e:
         print(f"ERROR: parse failed: {e}", file=sys.stderr)
         return 1
