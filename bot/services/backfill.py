@@ -88,10 +88,17 @@ async def backfill_v1_message_versions(
 
             # 2. Re-read the row with FOR UPDATE so we pick up any change a concurrent
             # live handler made between the batch SELECT and the lock acquisition.
+            # populate_existing=True is REQUIRED: without it SQLAlchemy's ORM identity-map
+            # returns the cached attributes from the earlier batch SELECT (lines 73-78)
+            # instead of the fresh DB values — the same gotcha fixed in MessageRepo.save
+            # at bot/db/repos/message.py:148. A concurrent offrecord flip that nulled
+            # text/caption and set is_redacted=True would be silently ignored, causing
+            # this backfill to persist a stale UNREDACTED version row (privacy bypass).
             fresh_result = await session.execute(
                 select(ChatMessage)
                 .where(ChatMessage.id == msg.id)
-                .with_for_update(key_share=False)
+                .with_for_update(key_share=False),
+                execution_options={"populate_existing": True},
             )
             fresh = fresh_result.scalar_one()
 
