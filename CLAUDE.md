@@ -103,9 +103,12 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
     limit + advisory lock config. Read BEFORE touching `bot/services/import_chunking.py` or
     implementing #103 (Stream Delta apply). Defines: env vars (`IMPORT_APPLY_CHUNK_SIZE`
     default 500, `IMPORT_APPLY_SLEEP_MS` default 100, `IMPORT_APPLY_ADVISORY_LOCK` default
-    true), `ChunkingConfig` frozen dataclass surface, `acquire_advisory_lock(session,
-    ingestion_run_id)` context manager (deterministic lock_id from SHA-256 → signed int64;
-    auto-release in finally), CLI `--chunk-size` override semantics. Cross-stream contract:
+    true), `ChunkingConfig` frozen dataclass surface (with `__post_init__` range validation),
+    `acquire_advisory_lock(connection: AsyncConnection, ingestion_run_id)` context manager
+    (deterministic lock_id from SHA-256 → signed int64; auto-release in finally; PostgreSQL
+    advisory locks are connection-scoped — caller MUST hold a single AsyncConnection for the
+    full lock lifetime; locks are SESSION-stacked, NOT idempotent — re-entry leaves extra
+    lock count after exit), CLI `--chunk-size` override semantics. Cross-stream contract:
     #103 `run_apply` must accept `chunking_config: ChunkingConfig` kwarg (replaces old
     `chunk_size=` kwarg from #101 placeholder).
 

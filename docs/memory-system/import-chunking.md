@@ -185,7 +185,9 @@ The apply loop in #103 MUST:
 2. Use `chunking_config.chunk_size` to determine batch size.
 3. Call `asyncio.sleep(chunking_config.sleep_between_chunks_ms / 1000)` between chunks.
 4. If `chunking_config.use_advisory_lock` is `True`, wrap the loop in
-   `async with acquire_advisory_lock(session, ingestion_run_id)`.
+   `async with acquire_advisory_lock(connection, ingestion_run_id)` — the
+   first arg is an `AsyncConnection` (not a session) that #103 MUST hold
+   for the full lock lifetime; cycling connections silently loses the lock.
 
 **DO NOT** add the apply loop here. This module is config and lock primitive only.
 

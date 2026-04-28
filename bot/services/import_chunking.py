@@ -17,6 +17,18 @@ Env vars:
     IMPORT_APPLY_SLEEP_MS       int  [0, 60000]   default 100
     IMPORT_APPLY_ADVISORY_LOCK  bool              default true
 
+Advisory lock semantics (IMPORTANT for #103 implementer):
+    PostgreSQL pg_advisory_lock is CONNECTION-scoped. acquire_advisory_lock takes an
+    AsyncConnection (not AsyncSession) and the caller MUST hold that single connection
+    for the full lock lifetime. Cycling connections (e.g., a pooled session that
+    reconnects between commits) silently loses the lock — pg_advisory_unlock returns
+    false and a WARNING is logged.
+
+    Locks are SESSION-stacked, NOT idempotent. Each pg_advisory_lock call requires a
+    matching pg_advisory_unlock. This context manager balances exactly one acquire +
+    one release. Callers MUST NOT re-enter on the same connection — re-entry leaves
+    the connection holding an extra lock count after exit.
+
 Cross-stream boundary:
     DO NOT modify Alpha/Charlie files.
     DO NOT create or modify bot/services/import_apply.py (#103 territory).
