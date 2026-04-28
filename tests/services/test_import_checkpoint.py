@@ -288,6 +288,12 @@ async def test_concurrent_init_partial_unique_index(db_session) -> None:
 
 # Test 9: finalize_run → sets status, finished_at, error_json; idempotent on re-call
 async def test_finalize_run_idempotent(db_session) -> None:
+    """Also verifies Fix 1: re-finalize of a failed run with status='completed' updates the row.
+
+    Before Fix 1, 'failed' was in _TERMINAL_STATUSES, making finalize_run a no-op even
+    when transitioning failed → completed. Now only 'completed'/'cancelled'/'dry_run'
+    are hard-locked terminal states.
+    """
     from bot.services.import_checkpoint import finalize_run, init_or_resume_run
 
     decision = await init_or_resume_run(
@@ -316,7 +322,7 @@ async def test_finalize_run_idempotent(db_session) -> None:
     assert row[1] is not None
     assert row[2]["reason"] == "simulated failure"
 
-    # Re-call (idempotent) — should NOT raise, just log warning
+    # Re-call with same status (idempotent) — should NOT raise, just log warning
     await finalize_run(
         db_session,
         ingestion_run_id=run_id,
@@ -324,13 +330,30 @@ async def test_finalize_run_idempotent(db_session) -> None:
         error_payload={"reason": "second call"},
     )
 
-    # Status unchanged, first call's data preserved (idempotency)
+    # Status unchanged, first call's data preserved (idempotency: failed→failed is no-op)
     row2 = (await db_session.execute(
         text("SELECT status, error_json FROM ingestion_runs WHERE id = :id"),
         {"id": run_id},
     )).one()
     assert row2[0] == "failed"
     # The error_json after idempotent re-call — should be original or updated, but not raise
+
+    # Fix 1 key assertion: failed → completed MUST update the row (failed is resumable,
+    # not terminal-locked). A successful resume+apply must be able to transition to completed.
+    await finalize_run(
+        db_session,
+        ingestion_run_id=run_id,
+        final_status="completed",
+    )
+
+    row3 = (await db_session.execute(
+        text("SELECT status FROM ingestion_runs WHERE id = :id"),
+        {"id": run_id},
+    )).one()
+    assert row3[0] == "completed", (
+        f"failed → completed transition must update the row. "
+        f"Got {row3[0]!r}. This indicates 'failed' is incorrectly in _TERMINAL_STATUSES."
+    )
 
 
 # Test 13 (killer integration proxy): simulated kill at 50% + resume
@@ -385,6 +408,17 @@ async def test_checkpoint_simulated_kill_and_resume(db_session) -> None:
     chk = await load_checkpoint(db_session, run_id)
     assert chk is not None
     assert chk.last_processed_export_msg_id == 50
+
+    # Fix 9 (stronger assertion): re-fetch row and assert status='failed' + error_json payload
+    from sqlalchemy import text
+
+    row = (await db_session.execute(
+        text("SELECT status, error_json FROM ingestion_runs WHERE id = :id"),
+        {"id": run_id},
+    )).one()
+    assert row[0] == "failed", f"Expected status='failed', got {row[0]!r}"
+    assert row[1] is not None, "error_json should not be None after finalize_run(failed)"
+    assert row[1].get("reason") == "simulated kill at 50%", f"Unexpected error_json: {row[1]!r}"
 
     # Now simulate CLI --resume invocation
     decision2 = await init_or_resume_run(
@@ -504,3 +538,201 @@ def test_cli_import_apply_no_resume_on_partial_run_exits_3() -> None:
 
     assert rc == 3, f"Expected exit 3 (block_partial_present), got {rc}. stderr: {stderr!r}"
     assert "resume" in stderr.lower() or "partial" in stderr.lower()
+
+
+# ─── Fix 1 regression: failed → completed transition ──────────────────────────
+
+
+# Test 9b: failed run can be finalized to completed (Fix 1: failed NOT in _TERMINAL_STATUSES)
+async def test_finalize_failed_run_to_completed(db_session) -> None:
+    """A resumed run that succeeded must be able to transition failed → completed.
+
+    Before Fix 1, 'failed' was in _TERMINAL_STATUSES which caused finalize_run to
+    no-op, leaving the run stuck in 'failed' even after a successful resume+apply.
+    """
+    from bot.services.import_checkpoint import finalize_run
+
+    # Create a failed run directly
+    run_id = await _create_partial_run(
+        db_session,
+        source_hash="hash_f2c_009b",
+        status="failed",
+    )
+
+    # After a successful resume+apply, finalize to completed — must NOT be a no-op
+    await finalize_run(
+        db_session,
+        ingestion_run_id=run_id,
+        final_status="completed",
+    )
+
+    from sqlalchemy import text
+
+    row = (await db_session.execute(
+        text("SELECT status, finished_at FROM ingestion_runs WHERE id = :id"),
+        {"id": run_id},
+    )).one()
+    assert row[0] == "completed", (
+        f"Expected status='completed' after failed→completed transition, got {row[0]!r}. "
+        "This indicates 'failed' is incorrectly in _TERMINAL_STATUSES."
+    )
+    assert row[1] is not None, "finished_at should be set when transitioning to completed"
+
+
+# Test 9c: idempotency — completed is truly terminal (cannot re-finalize to failed)
+async def test_finalize_completed_is_terminal(db_session) -> None:
+    """completed runs must be immutable (truly terminal — no re-finalization allowed)."""
+    from bot.services.import_checkpoint import finalize_run, init_or_resume_run
+
+    decision = await init_or_resume_run(
+        db_session,
+        source_path="/tmp/export.json",
+        source_hash="hash_term_009c",
+        chat_id=-1001,
+        resume=False,
+    )
+    run_id = decision.ingestion_run_id
+
+    # Transition running → completed
+    await finalize_run(db_session, ingestion_run_id=run_id, final_status="completed")
+
+    # Attempt to re-finalize as failed — must be a no-op (idempotent, log warning)
+    await finalize_run(
+        db_session,
+        ingestion_run_id=run_id,
+        final_status="failed",
+        error_payload={"reason": "should not overwrite"},
+    )
+
+    from sqlalchemy import text
+
+    row = (await db_session.execute(
+        text("SELECT status, error_json FROM ingestion_runs WHERE id = :id"),
+        {"id": run_id},
+    )).one()
+    assert row[0] == "completed", "completed run must not be re-finalized"
+    assert row[1] is None, "error_json must not be written on no-op finalize"
+
+
+# ─── Fix 3: IntegrityError branch via mocked session.flush ────────────────────
+
+
+# Test 8b: _create_fresh_run catches IntegrityError via SAVEPOINT and re-queries
+def test_create_fresh_run_integrity_error_branch() -> None:
+    """Offline test: _create_fresh_run handles IntegrityError from session.flush
+    via SAVEPOINT (begin_nested), re-queries, and returns block_partial_present.
+
+    Simulates the concurrent-INSERT race: two CLIs both see no prior run, both
+    call _create_fresh_run; the second one hits IntegrityError on the partial
+    unique index.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from sqlalchemy.exc import IntegrityError
+
+    from bot.services.import_checkpoint import _create_fresh_run
+
+    # Mock IngestionRun returned by session.add + flush
+    mock_existing_run = MagicMock()
+    mock_existing_run.id = 42
+
+    # We need to simulate: begin_nested() context manager raises IntegrityError on __aexit__
+    # Then re-query (_find_partial_run_by_hash) returns the winning run.
+    mock_nested_ctx = AsyncMock()
+    mock_nested_ctx.__aenter__ = AsyncMock(return_value=mock_nested_ctx)
+    # Simulate IntegrityError raised when the SAVEPOINT flushes/commits
+    mock_nested_ctx.__aexit__ = AsyncMock(
+        side_effect=IntegrityError("UNIQUE constraint", {}, Exception("unique violation"))
+    )
+
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    mock_session.begin_nested = MagicMock(return_value=mock_nested_ctx)
+
+    async def run() -> None:
+        with patch(
+            "bot.services.import_checkpoint._find_partial_run_by_hash",
+            new=AsyncMock(return_value=mock_existing_run),
+        ):
+            result = await _create_fresh_run(
+                mock_session,
+                source_path="/tmp/export.json",
+                source_hash="hash_race_008b",
+                chat_id=-1001,
+            )
+
+        assert result.mode == "block_partial_present", (
+            f"Expected block_partial_present, got {result.mode!r}"
+        )
+        assert result.ingestion_run_id is None
+        assert "42" in result.reason or "concurrent" in result.reason.lower()
+
+    asyncio.run(run())
+
+
+# ─── Fix 7: load_checkpoint type validation ───────────────────────────────────
+
+
+# Test 14a: load_checkpoint raises ValueError on non-int last_processed_export_msg_id
+async def test_load_checkpoint_rejects_non_int_msg_id(db_session) -> None:
+    """Corrupted stats_json.last_processed_export_msg_id (str) must raise ValueError."""
+    from sqlalchemy import text
+
+    from bot.services.import_checkpoint import load_checkpoint
+
+    run_id = await _create_partial_run(db_session, source_hash="hash_corrupt_014a", status="running")
+    # Corrupt the stats_json: write a string instead of int
+    await db_session.execute(
+        text(
+            "UPDATE ingestion_runs SET stats_json = '{\"last_processed_export_msg_id\": \"abc\"}'::jsonb "
+            "WHERE id = :id"
+        ),
+        {"id": run_id},
+    )
+    await db_session.flush()
+
+    with pytest.raises(ValueError, match="last_processed_export_msg_id"):
+        await load_checkpoint(db_session, run_id)
+
+
+# Test 14b: load_checkpoint raises ValueError on non-int chunk_index
+async def test_load_checkpoint_rejects_non_int_chunk_index(db_session) -> None:
+    """Corrupted stats_json.chunk_index (float) must raise ValueError."""
+    from sqlalchemy import text
+
+    from bot.services.import_checkpoint import load_checkpoint
+
+    run_id = await _create_partial_run(db_session, source_hash="hash_corrupt_014b", status="running")
+    await db_session.execute(
+        text(
+            "UPDATE ingestion_runs SET stats_json = '{\"chunk_index\": \"two\"}'::jsonb "
+            "WHERE id = :id"
+        ),
+        {"id": run_id},
+    )
+    await db_session.flush()
+
+    with pytest.raises(ValueError, match="chunk_index"):
+        await load_checkpoint(db_session, run_id)
+
+
+# Test 14c: load_checkpoint raises ValueError on unparseable last_checkpoint_at
+async def test_load_checkpoint_rejects_bad_timestamp(db_session) -> None:
+    """Corrupted stats_json.last_checkpoint_at (not ISO) must raise ValueError."""
+    from sqlalchemy import text
+
+    from bot.services.import_checkpoint import load_checkpoint
+
+    run_id = await _create_partial_run(db_session, source_hash="hash_corrupt_014c", status="running")
+    await db_session.execute(
+        text(
+            "UPDATE ingestion_runs SET stats_json = '{\"last_checkpoint_at\": \"not-a-date\"}'::jsonb "
+            "WHERE id = :id"
+        ),
+        {"id": run_id},
+    )
+    await db_session.flush()
+
+    with pytest.raises(ValueError, match="last_checkpoint_at"):
+        await load_checkpoint(db_session, run_id)

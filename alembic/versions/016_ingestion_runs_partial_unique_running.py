@@ -38,18 +38,25 @@ def upgrade() -> None:
     # Partial unique index: at most one RUNNING import run per source_hash.
     # WHERE status='running' so completed/failed rows for the same source are allowed
     # (operator may re-import the same file after completing a prior run).
-    op.create_index(
-        "ix_ingestion_runs_source_hash_running",
-        "ingestion_runs",
-        ["source_hash"],
-        unique=True,
-        postgresql_where=sa.text("status = 'running'"),
-    )
+    #
+    # Created CONCURRENTLY (in an autocommit block) so the table is not locked
+    # for writes during index creation on a live database.
+    with op.get_context().autocommit_block():
+        op.create_index(
+            "ix_ingestion_runs_source_hash_running",
+            "ingestion_runs",
+            ["source_hash"],
+            unique=True,
+            postgresql_where=sa.text("status = 'running'"),
+            postgresql_concurrently=True,
+        )
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_ingestion_runs_source_hash_running",
-        table_name="ingestion_runs",
-    )
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            "ix_ingestion_runs_source_hash_running",
+            table_name="ingestion_runs",
+            postgresql_concurrently=True,
+        )
     op.drop_column("ingestion_runs", "source_hash")

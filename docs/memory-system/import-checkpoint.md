@@ -181,6 +181,71 @@ that:
 
 ---
 
+## Operator Playbook
+
+### Cancelling a stuck partial run
+
+If a partial run cannot be resumed (file changed, host migration, operator decision):
+
+```sql
+UPDATE ingestion_runs
+   SET status='cancelled',
+       finished_at=NOW(),
+       error_json='{"reason": "operator cancelled"}'::jsonb
+ WHERE id = <run_id>
+   AND status IN ('running', 'failed');
+```
+
+A future ticket will expose this as `python -m bot.cli import_cancel <run_id>`.
+
+### Identifying stuck running runs
+
+```sql
+SELECT id, source_name, started_at, NOW() - started_at AS age
+  FROM ingestion_runs
+ WHERE run_type = 'import' AND status = 'running'
+ ORDER BY started_at;
+```
+
+If `age` exceeds reasonable apply duration (e.g., > 24h), the run is likely abandoned.
+
+---
+
+## Resume Race Contract for #103
+
+Apply path (#103) MUST atomically flip `status='running'` as its first DB op on resume;
+the partial unique index then enforces single-resumer semantics. Without this, two
+concurrent `--resume` invocations against the same failed run would both proceed.
+
+---
+
+## Operational Follow-ups
+
+The following are tracked as documentation-only (no immediate code change required):
+
+- **Streaming `source_hash`**: currently reads the full file in 1 MB chunks (safe for most
+  exports). True streaming for multi-GB files via `ijson` is a future optimisation.
+- **`source_name` index**: `_find_partial_run_by_path` uses a full table scan on
+  `source_name`. Add `CREATE INDEX ix_ingestion_runs_source_name` if the table grows large.
+- **True IntegrityError-branch test**: `test_create_fresh_run_integrity_error_branch` mocks
+  `session.begin_nested`. A real concurrent-insert test requires two concurrent DB connections
+  and is deferred to a follow-up ticket.
+- **Resume race enforcement in #103**: Stream Delta must enforce the contract documented in
+  the "Resume Race Contract" section above.
+- **Integration test "kill at 50%, resume, identical state"**: to be added in #103 once the
+  apply path exists and can be tested end-to-end.
+
+---
+
+## See Also
+
+- #93 / `import-user-mapping.md` — Telegram Desktop user mapping (ghost users, anonymous channels).
+- #94 / `import-dry-run-parser.md` — Dry-run pre-flight before apply.
+- #103 — Telegram Desktop import apply (Stream Delta, consumer of this checkpoint API).
+- #106 / `import-edit-history.md` — Edit history during import.
+
+---
+
 ## API Reference
 
 See `bot/services/import_checkpoint.py` for full docstrings.

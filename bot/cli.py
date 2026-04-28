@@ -13,8 +13,11 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _cmd_import_dry_run(args: argparse.Namespace) -> int:
@@ -68,9 +71,14 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
         print(f"ERROR: file not found: {path}", file=sys.stderr)
         return 2
 
-    # Compute SHA-256 of the export file.
+    # Compute SHA-256 of the export file using streaming reads (1 MB chunks) to
+    # avoid OOM on large exports. path.read_bytes() on a multi-GB file would crash.
     try:
-        source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        h = hashlib.sha256()
+        with path.open("rb") as _fh:
+            while _chunk := _fh.read(1024 * 1024):
+                h.update(_chunk)
+        source_hash = h.hexdigest()
     except OSError as e:
         print(f"ERROR: could not read file: {e}", file=sys.stderr)
         return 2
@@ -94,6 +102,12 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
             chat_id=chat_id,
             resume=args.resume,
         )
+
+        # Commit the run row immediately (Fix 4): ensures the partial unique index
+        # sees the new 'running' row before run_apply starts, AND that a hard-kill
+        # before the first checkpoint still leaves a recoverable 'running' row in DB.
+        if decision.mode in ("start_fresh", "resume_existing"):
+            await session.commit()
 
         print(f"[import_apply] decision: {decision.mode} — {decision.reason}")
 
@@ -129,14 +143,34 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
                 chunk_size=chunk_size,
             )
         except Exception as exc:
-            await finalize_run(
-                session,
-                ingestion_run_id=ingestion_run_id,
-                final_status="failed",
-                error_payload={"error_type": type(exc).__name__, "message": str(exc)},
-            )
-            await session.commit()
-            raise
+            # Fix 5: if run_apply raised a DB error, the session may be in
+            # PendingRollback state. Calling finalize_run on an aborted tx would
+            # raise a secondary exception masking the original.
+            # Strategy: rollback primary session, open a FRESH session for finalize,
+            # swallow finalize errors (log only), then re-raise the ORIGINAL exception.
+            original_exc = exc
+            try:
+                await session.rollback()
+            except Exception as rb_err:
+                logger.warning("rollback failed after run_apply error: %s", rb_err)
+
+            try:
+                async with _db_engine.async_session() as fresh_session:
+                    await finalize_run(
+                        fresh_session,
+                        ingestion_run_id=ingestion_run_id,
+                        final_status="failed",
+                        error_payload={"error_type": type(original_exc).__name__, "message": str(original_exc)},
+                    )
+                    await fresh_session.commit()
+            except Exception as fin_err:
+                logger.warning(
+                    "finalize_run failed for run %s after apply error (original: %s): %s",
+                    ingestion_run_id,
+                    original_exc,
+                    fin_err,
+                )
+            raise original_exc
 
         await session.commit()
 
@@ -146,11 +180,16 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
 def _read_chat_id_from_envelope(path: Path) -> int:
     """Read the top-level ``id`` field from the export JSON.
 
-    Reads the first 8 KB for speed; falls back to full parse if truncated.
+    Performs a full ``json.load`` of the file. For typical Telegram Desktop exports
+    the envelope fields (``id``, ``name``, ``type``) appear at the top of the JSON
+    object, so the parser will encounter them early; however, the full file is still
+    loaded into memory before returning. A future ticket should add streaming extraction
+    (e.g. via ``ijson``) if very large exports are expected. For now full load is
+    acceptable given exports are typically a few hundred MB at most and this function
+    is called once at CLI startup.
+
     Raises ValueError if the envelope cannot be parsed or has no ``id``.
     """
-    # Try fast path: read first 8 KB and locate the id field.
-    # If the envelope is tiny this always works; for large exports the id is always near the top.
     try:
         with path.open(encoding="utf-8") as fh:
             data = json.load(fh)

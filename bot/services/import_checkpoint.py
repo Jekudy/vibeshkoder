@@ -37,7 +37,11 @@ logger = logging.getLogger(__name__)
 # Non-terminal statuses where a run is considered "in-progress" (partial).
 _PARTIAL_STATUSES = frozenset({"running", "failed"})
 # Terminal statuses — finalize_run is a no-op when status is already in this set.
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "dry_run"})
+# NOTE: "failed" is intentionally NOT here. A failed run is resumable/partial, and
+# a successful resume must be able to transition it to "completed". Only "completed"
+# and "cancelled" are hard-locked (immutable terminal states). "dry_run" is also
+# terminal since dry-run rows are never finalized via this path.
+_TERMINAL_STATUSES = frozenset({"completed", "cancelled", "dry_run"})
 
 
 # ─── Public dataclasses ───────────────────────────────────────────────────────
@@ -178,21 +182,26 @@ async def save_checkpoint(
         "chunk_index": chunk_index,
         "last_checkpoint_at": now_iso,
     }
-    # Use JSONB || merge: preserves existing keys, overwrites checkpoint keys.
-    # COALESCE handles the NULL initial case.
+    # JSONB merge: preserve existing keys, overwrite checkpoint keys atomically.
+    # stats_json column type is JSON (migration 004); we cast to JSONB at use-site for
+    # the || operator. PostgreSQL accepts writing JSONB back into a JSON column implicitly.
+    # COALESCE handles the NULL initial case (first checkpoint on a fresh run).
     import json
 
     await session.execute(
         text(
             """
             UPDATE ingestion_runs
-               SET stats_json = COALESCE(stats_json, '{}'::jsonb) || :patch::jsonb
+               SET stats_json = COALESCE(stats_json::jsonb, '{}'::jsonb) || :patch::jsonb
              WHERE id = :id
             """
         ),
         {"id": ingestion_run_id, "patch": json.dumps(patch)},
     )
-    await session.flush()
+    # Commit explicitly so each checkpoint is durable. Callers (#103) should treat
+    # save_checkpoint as self-committing. If called inside a caller-managed tx, the
+    # caller is responsible for not re-opening a nested tx around this call.
+    await session.commit()
 
 
 async def load_checkpoint(
@@ -211,13 +220,38 @@ async def load_checkpoint(
         return None
 
     stats = run.stats_json or {}
+
+    # Validate stats_json field types to fail-fast on DB corruption rather than
+    # propagating bad types silently to downstream consumers (#103).
+    raw_msg_id = stats.get("last_processed_export_msg_id")
+    if raw_msg_id is not None and not isinstance(raw_msg_id, int):
+        raise ValueError(
+            f"ingestion_run {ingestion_run_id}: stats_json.last_processed_export_msg_id "
+            f"must be int, got {type(raw_msg_id).__name__!r} (value={raw_msg_id!r})"
+        )
+
+    raw_chunk = stats.get("chunk_index", 0)
+    if not isinstance(raw_chunk, int):
+        raise ValueError(
+            f"ingestion_run {ingestion_run_id}: stats_json.chunk_index "
+            f"must be int, got {type(raw_chunk).__name__!r} (value={raw_chunk!r})"
+        )
+
+    raw_ts = stats.get("last_checkpoint_at")
+    parsed_ts = _parse_checkpoint_ts(raw_ts)
+    if raw_ts is not None and parsed_ts is None:
+        raise ValueError(
+            f"ingestion_run {ingestion_run_id}: stats_json.last_checkpoint_at "
+            f"is not parseable as datetime (value={raw_ts!r})"
+        )
+
     return Checkpoint(
         ingestion_run_id=run.id,
         source_path=run.source_name or "",
-        last_processed_export_msg_id=stats.get("last_processed_export_msg_id"),
-        chunk_index=stats.get("chunk_index", 0),
+        last_processed_export_msg_id=raw_msg_id,
+        chunk_index=raw_chunk,
         started_at=run.started_at,
-        last_updated_at=_parse_checkpoint_ts(stats.get("last_checkpoint_at")) or run.started_at,
+        last_updated_at=parsed_ts or run.started_at,
         status=run.status,  # type: ignore[arg-type]
     )
 
@@ -328,11 +362,15 @@ async def _create_fresh_run(
     )
     session.add(run)
     try:
-        await session.flush()
+        # Use a SAVEPOINT (begin_nested) so that an IntegrityError on the partial unique
+        # index rolls back only this INSERT, not the caller's outer transaction. Without
+        # SAVEPOINT, session.rollback() would nuke the entire outer tx, breaking any
+        # caller that manages their own transaction.
+        async with session.begin_nested():
+            await session.flush()
     except IntegrityError:
         # Concurrent caller already inserted a running row for this source_hash.
-        await session.rollback()
-        # Re-query to get the winning row.
+        # The SAVEPOINT auto-rolled back — outer tx is intact. Re-query the winning row.
         existing = await _find_partial_run_by_hash(session, source_hash)
         return ResumeDecision(
             mode="block_partial_present",
