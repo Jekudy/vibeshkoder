@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.db.models import ChatMessage
 from bot.db.repos.ingestion_run import IngestionRunRepo
 from bot.services.import_parser import ImportDryRunReport, parse_export
-from bot.services.import_reply_resolver import aggregate_resolutions, resolve_reply_batch
+from bot.services.import_reply_resolver import resolve_reply_batch
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,10 @@ async def parse_export_with_db(
     2. Query chat_messages for export msg ids that already exist in this chat.
     3. Create a synthetic dry_run IngestionRun (no commit — session stays uncommitted).
     4. Run resolve_reply_batch over the export's reply targets to count broken chains.
+       Intra-export reply targets (target present in this export) are excluded before
+       DB resolution — apply will create them, so they are not broken (Fix 1).
+       db_broken_reply_count counts MESSAGES with broken replies, not unique target ids:
+       two messages replying to the same missing target = 2 (option A semantics, Fix 2).
     5. Return an enriched ImportDryRunReport with db_* fields set.
 
     NEVER commits the session. The synthetic IngestionRun row is flushed but the
@@ -80,18 +84,37 @@ async def parse_export_with_db(
     )
 
     # Step 4: Resolve reply targets against DB.
-    # all_reply_targets: list of reply_to_message_id values from the export's user messages.
+    # all_reply_targets: list of reply_to_message_id values from the export's user messages
+    # (may contain duplicates when multiple messages reply to the same target).
     all_reply_targets = _extract_reply_targets(path)
     db_broken_reply_count = 0
     if all_reply_targets:
-        resolutions = await resolve_reply_batch(
-            session,
-            export_msg_ids=all_reply_targets,
-            ingestion_run_id=dry_run_row.id,
-            chat_id=chat_id,
-        )
-        stats = aggregate_resolutions(resolutions)
-        db_broken_reply_count = stats.unresolved
+        # Fix 1: Exclude reply targets that are present in the export itself.
+        # When apply runs, those messages will be created — so the chain is NOT broken.
+        # Only targets that are absent from both the export AND the DB are truly missing.
+        # Reuse all_export_ids from step 2 (already computed, avoids a 3rd file read).
+        export_msg_ids_set = set(all_export_ids)
+        db_reply_targets = [t for t in all_reply_targets if t not in export_msg_ids_set]
+
+        if db_reply_targets:
+            # Resolve only the deduplicated set of truly-external targets.
+            db_reply_targets_unique = list(dict.fromkeys(db_reply_targets))
+            resolutions = await resolve_reply_batch(
+                session,
+                export_msg_ids=db_reply_targets_unique,
+                ingestion_run_id=dry_run_row.id,
+                chat_id=chat_id,
+            )
+            # Fix 2: Count MESSAGES (not unique target ids) whose reply target is unresolved.
+            # Two messages replying to the same missing target = 2 broken replies (option A
+            # semantics per issue #99 spec: "J broken reply chains" means messages, not targets).
+            # ``resolutions`` is keyed by target_id (deduplicated); we iterate over the full
+            # per-message list to count each message individually.
+            db_broken_reply_count = sum(
+                1 for target_id in db_reply_targets
+                if resolutions.get(target_id) is not None
+                and resolutions[target_id].resolved_via == "unresolved"
+            )
 
     # Step 5: Build enriched report (frozen dataclass — must construct fresh).
     # We rebuild from base_report fields plus the new db_* values.

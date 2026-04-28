@@ -269,7 +269,10 @@ async def test_db_broken_reply_count_no_replies(db_session, tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 
 async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -> None:
-    """import_dry_run --with-db <path> prints the operator summary line.
+    """import_dry_run --with-db <path> prints the EXACT operator summary line.
+
+    Verifies the issue #99 spec verbatim:
+    "N duplicates would be skipped, M offrecord messages, K nomem, J broken reply chains."
 
     The DB session is mocked so no real connection is needed — we patch
     bot.db.engine.async_session to yield the test db_session.
@@ -290,6 +293,7 @@ async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -
     await _create_chat_message(db_session, chat_id, existing_id, user_id)
 
     # Export: existing_id (duplicate) + new_id (no duplicate) + reply to missing
+    # missing_target is NOT in the export, so it IS a broken reply chain.
     new_id = _rand_msg_id()
     missing_target = _rand_msg_id()
     reply_id = _rand_msg_id()
@@ -315,8 +319,79 @@ async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -
     finally:
         sys.stdout = old_stdout
 
-    output = buf.getvalue()
+    output = buf.getvalue().strip()
     assert rc == 0, f"Expected exit 0, got {rc}. Output: {output!r}"
-    # Must contain the operator summary line
-    assert "duplicate" in output.lower()
-    assert "offrecord" in output.lower() or "nomem" in output.lower() or "broken" in output.lower()
+    # Exact format per issue #99 spec:
+    # "N duplicates would be skipped, M offrecord messages, K nomem, J broken reply chains."
+    expected = "1 duplicates would be skipped, 0 offrecord messages, 0 nomem, 1 broken reply chains."
+    assert output == expected, f"Expected exact summary line:\n  {expected!r}\nGot:\n  {output!r}"
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: intra-export reply targets are NOT counted as broken
+# ---------------------------------------------------------------------------
+
+async def test_db_broken_reply_count_excludes_in_export_targets(db_session, tmp_path: Path) -> None:
+    """Reply target present in same export but absent from DB is NOT counted as broken.
+
+    When apply runs, msg-B (the target) will be created first, so the chain is
+    not truly broken. Only targets that are truly missing from both the export
+    and the DB count as broken.
+    """
+    from bot.services.import_dry_run import parse_export_with_db
+
+    chat_id = _rand_chat_id()
+
+    # msg-A replies to msg-B; msg-B is also in the export. Neither in DB.
+    msg_a_id = _rand_msg_id()
+    msg_b_id = _rand_msg_id()
+
+    messages = [
+        _make_message(msg_b_id),                       # target — in export, NOT in DB
+        _make_message(msg_a_id, reply_to=msg_b_id),    # source — reply to msg_b
+    ]
+    export = _make_export(chat_id, messages)
+    f = tmp_path / "export.json"
+    f.write_text(json.dumps(export), encoding="utf-8")
+
+    report = await parse_export_with_db(f, db_session, chat_id)
+
+    # msg_b is in the export → apply will create it → NOT a broken reply chain.
+    assert report.db_broken_reply_count == 0, (
+        f"Expected 0 broken replies (target in export), got {report.db_broken_reply_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: multiplicity — count MESSAGES (not unique target ids)
+# ---------------------------------------------------------------------------
+
+async def test_db_broken_reply_count_counts_messages_not_unique_targets(db_session, tmp_path: Path) -> None:
+    """Two messages that both reply to the same missing target → db_broken_reply_count == 2.
+
+    The resolver deduplicates by target_id internally, but the count must be per-message
+    (option A semantics per issue #99 spec). Two broken messages → 2.
+    """
+    from bot.services.import_dry_run import parse_export_with_db
+
+    chat_id = _rand_chat_id()
+
+    # One missing target (NOT in DB, NOT in export), two messages reply to it.
+    missing_target_id = _rand_msg_id()
+    msg_x_id = _rand_msg_id()
+    msg_y_id = _rand_msg_id()
+
+    messages = [
+        _make_message(msg_x_id, reply_to=missing_target_id),
+        _make_message(msg_y_id, reply_to=missing_target_id),
+    ]
+    export = _make_export(chat_id, messages)
+    f = tmp_path / "export.json"
+    f.write_text(json.dumps(export), encoding="utf-8")
+
+    report = await parse_export_with_db(f, db_session, chat_id)
+
+    # Two messages have broken replies (same missing target but two messages).
+    assert report.db_broken_reply_count == 2, (
+        f"Expected 2 broken replies (two messages, same missing target), got {report.db_broken_reply_count}"
+    )
