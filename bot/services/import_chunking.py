@@ -30,8 +30,13 @@ import struct
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
+import logging
+from typing import AsyncIterator
+
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Config dataclass ─────────────────────────────────────────────────────────
@@ -52,6 +57,16 @@ class ChunkingConfig:
     chunk_size: int
     sleep_between_chunks_ms: int
     use_advisory_lock: bool
+
+    def __post_init__(self) -> None:
+        if not (1 <= self.chunk_size <= 10000):
+            raise ValueError(
+                f"chunk_size must be in [1, 10000], got {self.chunk_size}"
+            )
+        if not (0 <= self.sleep_between_chunks_ms <= 60000):
+            raise ValueError(
+                f"sleep_between_chunks_ms must be in [0, 60000], got {self.sleep_between_chunks_ms}"
+            )
 
 
 # ─── Config loader ────────────────────────────────────────────────────────────
@@ -175,34 +190,57 @@ def _derive_lock_id(ingestion_run_id: int) -> int:
 
 
 @asynccontextmanager
-async def acquire_advisory_lock(session: AsyncSession, ingestion_run_id: int):
+async def acquire_advisory_lock(connection: AsyncConnection, ingestion_run_id: int) -> AsyncIterator[None]:
     """Async context manager: take a PostgreSQL session-level advisory lock on enter,
     release it on exit (even if the body raises).
 
+    IMPORTANT: caller MUST keep this connection alive for the lifetime of the lock.
+    Per-chunk commits in #103 must use this same connection (or a session bound to it),
+    NOT acquire fresh connections from the pool — pg_advisory_lock is connection-scoped
+    and a connection swap silently loses the lock.
+
     The lock key is derived deterministically from ingestion_run_id via _derive_lock_id.
     This ensures:
-    - Same ingestion_run_id → same lock (idempotent single-run protection).
+    - Same ingestion_run_id → same lock (single-run protection).
     - Different ingestion_run_ids → different locks (parallel runs for distinct imports
       do not block each other).
+
+    PostgreSQL session-level advisory locks are STACKED — each pg_advisory_lock call
+    requires a matching pg_advisory_unlock. This context manager balances exactly one
+    acquisition with one unlock. Callers MUST NOT re-enter this context manager on the
+    same connection — re-entry would leave the connection holding an extra lock count
+    after exit.
+
+    On exit, asserts pg_advisory_unlock returns true; logs warning if false (lock was
+    held on a different connection — programmer error in caller).
 
     PostgreSQL session-level advisory locks:
     - pg_advisory_lock(key bigint) — blocks until the lock is acquired.
     - pg_advisory_unlock(key bigint) — releases the lock; called in finally block.
-    - Re-acquisition from the same connection is idempotent (nest count incremented).
 
     Usage::
 
-        async with acquire_advisory_lock(session, ingestion_run_id):
-            # Only one process per ingestion_run_id can be here at a time.
-            await run_apply_chunks(...)
+        async with engine.connect() as conn:
+            async with acquire_advisory_lock(conn, ingestion_run_id):
+                # Only one process per ingestion_run_id can be here at a time.
+                await run_apply_chunks(...)
 
     Raises:
         Any exception raised by the lock acquisition (e.g., DB connection errors) or
         by the body block — the finally clause always attempts pg_advisory_unlock.
     """
     lock_id = _derive_lock_id(ingestion_run_id)
-    await session.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
+    await connection.execute(text("SELECT pg_advisory_lock(:id)"), {"id": lock_id})
     try:
         yield
     finally:
-        await session.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
+        result = await connection.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": lock_id})
+        row = result.first()
+        if row is None or not row[0]:
+            logger.warning(
+                "pg_advisory_unlock returned false for lock_id=%s (ingestion_run_id=%s); "
+                "lock may have been held on a different connection — caller likely cycled "
+                "connections during the lock lifetime",
+                lock_id,
+                ingestion_run_id,
+            )

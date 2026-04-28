@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -131,17 +132,18 @@ async def _cmd_import_apply_async(args: argparse.Namespace) -> int:
             return 4
 
         # Load chunking config from env; CLI --chunk-size overrides the env var.
-        from bot.services.import_chunking import ChunkingConfig, load_chunking_config
+        # IMPORTANT: apply CLI override BEFORE calling load_chunking_config so that an
+        # invalid IMPORT_APPLY_CHUNK_SIZE env var does not block a valid --chunk-size arg.
+        from bot.services.import_chunking import load_chunking_config
 
-        chunking_config = load_chunking_config()
-        # CLI --chunk-size takes precedence over IMPORT_APPLY_CHUNK_SIZE env var.
-        # args.chunk_size is None when --chunk-size was not passed (env var or default applies).
-        if args.chunk_size is not None and args.chunk_size != chunking_config.chunk_size:
-            chunking_config = ChunkingConfig(
-                chunk_size=args.chunk_size,
-                sleep_between_chunks_ms=chunking_config.sleep_between_chunks_ms,
-                use_advisory_lock=chunking_config.use_advisory_lock,
-            )
+        _env = os.environ.copy()
+        if args.chunk_size is not None:
+            _env["IMPORT_APPLY_CHUNK_SIZE"] = str(args.chunk_size)
+        try:
+            chunking_config = load_chunking_config(env=_env)
+        except ValueError as exc:
+            print(f"ERROR: invalid chunking config: {exc}", file=sys.stderr)
+            return 2
 
         # Apply path is available (future #103 case).
         ingestion_run_id = decision.ingestion_run_id

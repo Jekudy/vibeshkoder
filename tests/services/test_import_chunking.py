@@ -137,47 +137,318 @@ def test_load_chunking_config_rejects_non_int_sleep_ms() -> None:
         load_chunking_config(env={"IMPORT_APPLY_SLEEP_MS": "fast"})
 
 
+# ─── Test 3b: ChunkingConfig.__post_init__ validation ────────────────────────
+
+
+def test_chunking_config_rejects_invalid_chunk_size_in_constructor() -> None:
+    """ChunkingConfig constructor rejects chunk_size outside [1, 10000]."""
+    from bot.services.import_chunking import ChunkingConfig
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        ChunkingConfig(chunk_size=0, sleep_between_chunks_ms=100, use_advisory_lock=True)
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        ChunkingConfig(chunk_size=-1, sleep_between_chunks_ms=100, use_advisory_lock=True)
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        ChunkingConfig(chunk_size=10001, sleep_between_chunks_ms=100, use_advisory_lock=True)
+
+
+def test_chunking_config_rejects_invalid_sleep_ms_in_constructor() -> None:
+    """ChunkingConfig constructor rejects sleep_between_chunks_ms outside [0, 60000]."""
+    from bot.services.import_chunking import ChunkingConfig
+
+    with pytest.raises(ValueError, match="sleep_between_chunks_ms"):
+        ChunkingConfig(chunk_size=500, sleep_between_chunks_ms=-1, use_advisory_lock=True)
+
+    with pytest.raises(ValueError, match="sleep_between_chunks_ms"):
+        ChunkingConfig(chunk_size=500, sleep_between_chunks_ms=60001, use_advisory_lock=True)
+
+
+def test_chunking_config_accepts_boundary_values() -> None:
+    """ChunkingConfig accepts boundary values: chunk_size=1, 10000; sleep_ms=0, 60000."""
+    from bot.services.import_chunking import ChunkingConfig
+
+    c = ChunkingConfig(chunk_size=1, sleep_between_chunks_ms=0, use_advisory_lock=False)
+    assert c.chunk_size == 1
+    assert c.sleep_between_chunks_ms == 0
+
+    c2 = ChunkingConfig(chunk_size=10000, sleep_between_chunks_ms=60000, use_advisory_lock=True)
+    assert c2.chunk_size == 10000
+    assert c2.sleep_between_chunks_ms == 60000
+
+
+def test_cli_chunk_size_zero_rejected() -> None:
+    """CLI --chunk-size 0 must produce non-zero exit (via ChunkingConfig.__post_init__)."""
+    import io
+    import sys
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "td_export"
+    SMALL_CHAT = FIXTURE_DIR / "small_chat.json"
+
+    mock_decision = MagicMock()
+    mock_decision.mode = "start_fresh"
+    mock_decision.ingestion_run_id = 9
+    mock_decision.last_processed_export_msg_id = None
+    mock_decision.reason = "new run"
+
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+
+    run_apply_mock = AsyncMock(return_value=None)
+
+    from types import ModuleType
+
+    fake_module = ModuleType("bot.services.import_apply")
+    fake_module.run_apply = run_apply_mock
+
+    from bot.cli import main
+
+    buf_err = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = buf_err
+
+    exit_code = None
+    try:
+        with (
+            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch("bot.db.engine.async_session", return_value=mock_session),
+            patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
+        ):
+            try:
+                exit_code = main(["import_apply", str(SMALL_CHAT), "--chunk-size", "0"])
+            except SystemExit as e:
+                exit_code = e.code
+    finally:
+        sys.stderr = old_stderr
+
+    assert exit_code not in (0, None), (
+        f"--chunk-size 0 must produce a non-zero exit; got {exit_code!r}. "
+        f"stderr: {buf_err.getvalue()!r}"
+    )
+
+
+def test_cli_chunk_size_negative_rejected() -> None:
+    """CLI --chunk-size -1 must produce non-zero exit."""
+    import io
+    import sys
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "td_export"
+    SMALL_CHAT = FIXTURE_DIR / "small_chat.json"
+
+    mock_decision = MagicMock()
+    mock_decision.mode = "start_fresh"
+    mock_decision.ingestion_run_id = 10
+    mock_decision.last_processed_export_msg_id = None
+    mock_decision.reason = "new run"
+
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+
+    run_apply_mock = AsyncMock(return_value=None)
+
+    from types import ModuleType
+
+    fake_module = ModuleType("bot.services.import_apply")
+    fake_module.run_apply = run_apply_mock
+
+    from bot.cli import main
+
+    buf_err = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = buf_err
+
+    exit_code = None
+    try:
+        with (
+            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch("bot.db.engine.async_session", return_value=mock_session),
+            patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
+        ):
+            try:
+                exit_code = main(["import_apply", str(SMALL_CHAT), "--chunk-size", "-1"])
+            except SystemExit as e:
+                exit_code = e.code
+    finally:
+        sys.stderr = old_stderr
+
+    assert exit_code not in (0, None), (
+        f"--chunk-size -1 must produce a non-zero exit; got {exit_code!r}"
+    )
+
+
+def test_cli_chunk_size_excessive_rejected() -> None:
+    """CLI --chunk-size 10001 must produce non-zero exit."""
+    import io
+    import sys
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "td_export"
+    SMALL_CHAT = FIXTURE_DIR / "small_chat.json"
+
+    mock_decision = MagicMock()
+    mock_decision.mode = "start_fresh"
+    mock_decision.ingestion_run_id = 11
+    mock_decision.last_processed_export_msg_id = None
+    mock_decision.reason = "new run"
+
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+
+    run_apply_mock = AsyncMock(return_value=None)
+
+    from types import ModuleType
+
+    fake_module = ModuleType("bot.services.import_apply")
+    fake_module.run_apply = run_apply_mock
+
+    from bot.cli import main
+
+    buf_err = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = buf_err
+
+    exit_code = None
+    try:
+        with (
+            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch("bot.db.engine.async_session", return_value=mock_session),
+            patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
+        ):
+            try:
+                exit_code = main(["import_apply", str(SMALL_CHAT), "--chunk-size", "10001"])
+            except SystemExit as e:
+                exit_code = e.code
+    finally:
+        sys.stderr = old_stderr
+
+    assert exit_code not in (0, None), (
+        f"--chunk-size 10001 must produce a non-zero exit; got {exit_code!r}"
+    )
+
+
+def test_cli_chunk_size_overrides_invalid_env() -> None:
+    """CLI --chunk-size 100 succeeds even when IMPORT_APPLY_CHUNK_SIZE=abc (invalid env).
+
+    Fix 2: CLI override is applied BEFORE load_chunking_config validation.
+    """
+    import io
+    import sys
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from bot.services.import_chunking import ChunkingConfig
+
+    FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "td_export"
+    SMALL_CHAT = FIXTURE_DIR / "small_chat.json"
+
+    mock_decision = MagicMock()
+    mock_decision.mode = "start_fresh"
+    mock_decision.ingestion_run_id = 12
+    mock_decision.last_processed_export_msg_id = None
+    mock_decision.reason = "new run"
+
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+
+    run_apply_mock = AsyncMock(return_value=None)
+
+    from types import ModuleType
+
+    fake_module = ModuleType("bot.services.import_apply")
+    fake_module.run_apply = run_apply_mock
+
+    from bot.cli import main
+
+    buf_err = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = buf_err
+
+    exit_code = None
+    try:
+        with (
+            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch("bot.db.engine.async_session", return_value=mock_session),
+            # env has invalid IMPORT_APPLY_CHUNK_SIZE but CLI provides valid --chunk-size
+            patch.dict("os.environ", {"IMPORT_APPLY_CHUNK_SIZE": "abc"}),
+            patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
+        ):
+            try:
+                exit_code = main(["import_apply", str(SMALL_CHAT), "--chunk-size", "100"])
+            except SystemExit as e:
+                exit_code = e.code
+    finally:
+        sys.stderr = old_stderr
+
+    assert run_apply_mock.called, (
+        f"run_apply must be called when --chunk-size 100 overrides invalid env. "
+        f"exit_code={exit_code!r}, stderr={buf_err.getvalue()!r}"
+    )
+    kwargs = run_apply_mock.call_args.kwargs if run_apply_mock.call_args.kwargs else {}
+    chunking_config = kwargs.get("chunking_config")
+    assert isinstance(chunking_config, ChunkingConfig)
+    assert chunking_config.chunk_size == 100
+
+
 # ─── Test 4: acquire_advisory_lock happy path (DB-backed) ────────────────────
 
 
-async def test_acquire_advisory_lock_happy_path(db_session) -> None:
+async def test_acquire_advisory_lock_happy_path(postgres_engine) -> None:
     """Lock is taken on enter, work executes, lock is released on exit.
 
-    Uses pg_try_advisory_lock to check lock state from the same connection.
-    Since the lock is session-level, re-acquiring from the same connection is
-    idempotent (returns True). After the context manager exits, the lock must
-    be released (pg_try_advisory_lock from a NEW session would succeed, but
-    we verify the exit path did not raise).
+    Uses a single AsyncConnection (connection-scoped lock semantics).
+    Verifies that work inside the context manager completes normally and
+    the context manager exits without raising.
     """
     from bot.services.import_chunking import acquire_advisory_lock
 
     ingestion_run_id = 12345
     work_done = []
 
-    async with acquire_advisory_lock(db_session, ingestion_run_id):
-        work_done.append("step1")
-        work_done.append("step2")
+    async with postgres_engine.connect() as conn:
+        async with acquire_advisory_lock(conn, ingestion_run_id):
+            work_done.append("step1")
+            work_done.append("step2")
 
     assert work_done == ["step1", "step2"]
 
 
-async def test_acquire_advisory_lock_releases_on_exception(db_session) -> None:
-    """Lock is released (pg_advisory_unlock) even when the body raises."""
-    from bot.services.import_chunking import acquire_advisory_lock
+async def test_acquire_advisory_lock_releases_on_exception(postgres_engine) -> None:
+    """Lock is released (pg_advisory_unlock) even when the body raises.
+
+    Verifies from a SEPARATE DB connection that the lock is truly released —
+    not merely re-acquirable from the same connection (stacked locks would
+    allow same-connection re-acquisition even if unlock was missed).
+    """
+    from bot.services.import_chunking import _derive_lock_id, acquire_advisory_lock
     from sqlalchemy import text
 
     ingestion_run_id = 99991
+    lock_id = _derive_lock_id(ingestion_run_id)
 
-    with pytest.raises(RuntimeError, match="simulated failure"):
-        async with acquire_advisory_lock(db_session, ingestion_run_id):
-            raise RuntimeError("simulated failure")
+    # Acquire and raise inside conn1 — should release on exception exit.
+    async with postgres_engine.connect() as conn1:
+        with pytest.raises(RuntimeError, match="boom"):
+            async with acquire_advisory_lock(conn1, ingestion_run_id):
+                raise RuntimeError("boom")
 
-    # After the exception, pg_advisory_unlock must have been called.
-    # We verify by checking no lock remains (pg_advisory_unlock returns True on success).
-    # Simplest: try to take the lock again — should succeed without deadlock.
-    async with acquire_advisory_lock(db_session, ingestion_run_id):
-        result = await db_session.execute(text("SELECT 1"))
-        assert result.scalar() == 1
+    # Verify from a SEPARATE connection that the lock is released.
+    async with postgres_engine.connect() as conn2:
+        result = await conn2.execute(
+            text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}
+        )
+        assert result.scalar() is True, "lock should be releasable from another connection"
+        # Cleanup: release the lock we just acquired on conn2.
+        await conn2.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": lock_id})
 
 
 # ─── Test 5: acquire_advisory_lock — deterministic lock_id ───────────────────

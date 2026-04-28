@@ -79,7 +79,8 @@ The apply loop (#103) MUST respect the chunking config to protect live ingestion
 1. **One chunk = one DB transaction.** Process `chunk_size` messages, commit, checkpoint.
 2. **Sleep between chunks.** After each commit, `await asyncio.sleep(config.sleep_between_chunks_ms / 1000)`.
 3. **Advisory lock first.** If `config.use_advisory_lock` is `True`, acquire the lock via
-   `acquire_advisory_lock(session, ingestion_run_id)` before processing any chunk.
+   `acquire_advisory_lock(connection, ingestion_run_id)` before processing any chunk.
+   The connection must be the same `AsyncConnection` used for all chunk transactions.
 
 This three-part contract isolates apply transactions from live ingestion:
 - Short transactions prevent lock contention with `chat_messages` writers.
@@ -99,12 +100,16 @@ in issue #102.
 ```python
 from bot.services.import_chunking import acquire_advisory_lock
 
-async with acquire_advisory_lock(session, ingestion_run_id):
-    # Apply chunks here — guaranteed single-process per ingestion_run_id
-    for chunk in chunks:
-        await process_chunk(session, chunk)
-        await save_checkpoint(session, ...)
-        await asyncio.sleep(config.sleep_between_chunks_ms / 1000)
+# IMPORTANT: pass AsyncConnection, not AsyncSession.
+# The connection must remain alive for the entire lock lifetime.
+async with engine.connect() as conn:
+    async with acquire_advisory_lock(conn, ingestion_run_id):
+        # Apply chunks here — guaranteed single-process per ingestion_run_id
+        for chunk in chunks:
+            async with conn.begin():
+                await process_chunk(conn, chunk)
+                await save_checkpoint(conn, ...)
+            await asyncio.sleep(config.sleep_between_chunks_ms / 1000)
 ```
 
 ### Lock key derivation
@@ -129,10 +134,41 @@ Properties:
 ### Session-level semantics
 
 `pg_advisory_lock(bigint)` acquires a session-level (connection-level) advisory lock:
-- Re-acquiring from the **same connection** is a no-op (nesting counter incremented).
+- PostgreSQL session-level advisory locks are **STACKED** — each `pg_advisory_lock` call
+  requires a matching `pg_advisory_unlock`. This context manager balances exactly one
+  acquisition with one unlock. **Callers MUST NOT re-enter** this context manager on the
+  same connection — re-entry would leave the connection holding an extra lock count after
+  exit, which would silently survive the inner `finally` block.
 - Lock is automatically released when the DB connection is closed (crash recovery).
 - `pg_advisory_unlock(bigint)` explicitly releases the lock in the `finally` block of
-  `acquire_advisory_lock`.
+  `acquire_advisory_lock`. If `pg_advisory_unlock` returns `false`, a `WARNING` is logged
+  (indicates the lock was held on a different connection — programmer error in caller).
+
+### Connection-scope requirement (CRITICAL)
+
+**Caller MUST hold a single `AsyncConnection` for the full lock lifetime.**
+
+`pg_advisory_lock` is connection-scoped. Under a pooled `AsyncSession`, per-chunk commits
+may release and reacquire the underlying DB connection. If the connection is swapped
+between chunks, the `pg_advisory_unlock` in the `finally` block runs on a different
+connection — leaving the original lock held indefinitely (silent failure).
+
+`acquire_advisory_lock` therefore takes an `AsyncConnection`, not an `AsyncSession`.
+
+Apply path (#103):
+1. Acquire a single `AsyncConnection` at the start of `run_apply`.
+2. Call `acquire_advisory_lock(connection, ingestion_run_id)`.
+3. For each chunk, use `connection.begin()` to open/commit per-chunk transactions on that
+   same connection — **never release the connection until `finalize_run`**.
+
+```python
+async with engine.connect() as conn:
+    async with acquire_advisory_lock(conn, ingestion_run_id):
+        async with conn.begin():
+            # chunk 1 commit
+        async with conn.begin():
+            # chunk 2 commit
+```
 
 ---
 
@@ -199,8 +235,9 @@ def load_chunking_config(env: dict[str, str] | None = None) -> ChunkingConfig:
     """Load from env with defaults. Validates ranges. Raises ValueError on invalid values."""
 
 @asynccontextmanager
-async def acquire_advisory_lock(session: AsyncSession, ingestion_run_id: int):
-    """Session-level PG advisory lock, released in finally (crash-safe)."""
+async def acquire_advisory_lock(connection: AsyncConnection, ingestion_run_id: int):
+    """Connection-scoped PG advisory lock, released in finally (crash-safe).
+    Caller MUST hold a single AsyncConnection for the full lock lifetime."""
 
 def _derive_lock_id(ingestion_run_id: int) -> int:
     """Deterministic SHA-256-based int8 lock key. Exported for testing."""
