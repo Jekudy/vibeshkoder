@@ -68,51 +68,53 @@ async def rollback_ingestion_run(
     """
     connection = await session.connection()
 
-    try:
-        original = await _load_original_run(connection, ingestion_run_id)
-        _validate_original_run(original)
-    except BaseException:
-        await session.rollback()
-        raise
+    original = await _load_original_run(connection, ingestion_run_id)
+    _validate_original_run(original)
 
     async with acquire_advisory_lock(connection, ingestion_run_id):
+        existing_audit = await _find_existing_rollback_audit(
+            connection,
+            ingestion_run_id,
+        )
+        if existing_audit is not None:
+            report = _build_idempotent_report(
+                ingestion_run_id,
+                audit_id=existing_audit[0],
+                stats=existing_audit[1],
+            )
+            # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
+            await session.commit()
+            logger.info(
+                "import_rollback: idempotent no-op",
+                extra={
+                    "original_run_id": ingestion_run_id,
+                    "audit_run_id": report.audit_run_id,
+                },
+            )
+            return report
+
+        await _check_no_downstream_dependents(connection, ingestion_run_id)
+
+        chat_messages_count = await _count_import_chat_messages(
+            connection,
+            ingestion_run_id,
+        )
+        message_versions_count = await _count_import_message_versions(
+            connection,
+            ingestion_run_id,
+        )
+
+        # SAVEPOINT guards the CTE + audit insert block. Any exception inside
+        # rolls back to this point without touching the outer session transaction.
+        # We deliberately avoid session.rollback() here because it issues a full
+        # ROLLBACK on the connection when the session has no active savepoint of its
+        # own (e.g. after a prior session.commit()), which would discard data
+        # committed by earlier operations in the same test/request scope.
+        await connection.execute(text("SAVEPOINT _rollback_entry"))
         try:
-            existing_audit = await _find_existing_rollback_audit(
-                connection,
-                ingestion_run_id,
-            )
-            if existing_audit is not None:
-                report = _build_idempotent_report(
-                    ingestion_run_id,
-                    audit_id=existing_audit[0],
-                    stats=existing_audit[1],
-                )
-                # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
-                await session.commit()
-                logger.info(
-                    "import_rollback: idempotent no-op",
-                    extra={
-                        "original_run_id": ingestion_run_id,
-                        "audit_run_id": report.audit_run_id,
-                    },
-                )
-                return report
-
-            await _check_no_downstream_dependents(connection, ingestion_run_id)
-
-            chat_messages_count = await _count_import_chat_messages(
-                connection,
-                ingestion_run_id,
-            )
-            message_versions_count = await _count_import_message_versions(
-                connection,
-                ingestion_run_id,
-            )
-
             # Single CTE executes both DELETEs atomically in one server round-trip.
             # Atomicity is guaranteed by PostgreSQL: if the statement errors or is
-            # interrupted before execution, neither table is touched. No client-side
-            # SAVEPOINT management is required.
+            # interrupted before execution, neither table is touched.
             atomic_result = await connection.execute(
                 text(
                     """
@@ -142,8 +144,6 @@ async def rollback_ingestion_run(
             # Inner SAVEPOINT for audit-insert race: if concurrent rollback already
             # wrote the audit row (IntegrityError on unique partial index), we roll
             # back only this inner savepoint and re-query the winning row.
-            # The deletes are already committed to the outer transaction at this point;
-            # only the audit INSERT is guarded here.
             await connection.execute(text("SAVEPOINT _rollback_audit"))
             try:
                 audit_run_id = await _insert_rollback_audit(
@@ -160,6 +160,7 @@ async def rollback_ingestion_run(
                     ingestion_run_id,
                 )
                 if race_audit is None:
+                    await connection.execute(text("ROLLBACK TO SAVEPOINT _rollback_entry"))
                     raise
                 race_report = _build_idempotent_report(
                     ingestion_run_id,
@@ -169,25 +170,28 @@ async def rollback_ingestion_run(
             else:
                 await connection.execute(text("RELEASE SAVEPOINT _rollback_audit"))
 
-            # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
-            await session.commit()
-            if race_report is not None:
-                logger.warning(
-                    "rollback race resolved via unique-index fallback",
-                    extra={
-                        "original_run_id": ingestion_run_id,
-                        "audit_run_id": race_report.audit_run_id,
-                        "chat_messages_deleted": race_report.chat_messages_deleted,
-                        "telegram_updates_deleted": race_report.telegram_updates_deleted,
-                        "message_versions_cascade_deleted": (
-                            race_report.message_versions_cascade_deleted
-                        ),
-                    },
-                )
-                return race_report
         except BaseException:
-            await session.rollback()
+            await connection.execute(text("ROLLBACK TO SAVEPOINT _rollback_entry"))
             raise
+        else:
+            await connection.execute(text("RELEASE SAVEPOINT _rollback_entry"))
+
+        # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
+        await session.commit()
+        if race_report is not None:
+            logger.warning(
+                "rollback race resolved via unique-index fallback",
+                extra={
+                    "original_run_id": ingestion_run_id,
+                    "audit_run_id": race_report.audit_run_id,
+                    "chat_messages_deleted": race_report.chat_messages_deleted,
+                    "telegram_updates_deleted": race_report.telegram_updates_deleted,
+                    "message_versions_cascade_deleted": (
+                        race_report.message_versions_cascade_deleted
+                    ),
+                },
+            )
+            return race_report
 
     logger.info(
         "import_rollback: completed",
