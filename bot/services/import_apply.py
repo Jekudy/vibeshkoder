@@ -508,8 +508,9 @@ async def _apply_one_message(
     # do NOT create chat_messages/message_versions rows.
     #
     # H1 fix: mirror message_persistence.py broadened-scan (Sprint #89 Commit 2).
-    # TD poll dict has a top-level "poll" key with "question". TD contact dict has
-    # "first_name" / "last_name" keys at the message level (contact messages).
+    # TD poll dict has a top-level "poll" key with "question". TD contact fields
+    # are NESTED under contact_information (not top-level) — confirmed by
+    # import_parser.py which uses msg.get("contact_information") as discriminator.
     _poll_dict = msg.get("poll") if kind == "poll" else None
     poll_question: str | None = None
     if isinstance(_poll_dict, dict):
@@ -518,11 +519,13 @@ async def _apply_one_message(
             poll_question = _q
     contact_name: str | None = None
     if kind == "contact":
-        _first = msg.get("first_name")
-        _last = msg.get("last_name")
-        parts = [p for p in [_first, _last] if isinstance(p, str) and p]
-        if parts:
-            contact_name = " ".join(parts)
+        _contact_info = msg.get("contact_information")
+        if isinstance(_contact_info, dict):
+            _first = _contact_info.get("first_name")
+            _last = _contact_info.get("last_name")
+            parts = [p for p in [_first, _last] if isinstance(p, str) and p]
+            if parts:
+                contact_name = " ".join(parts)
     policy, _mark_payload = detect_policy(
         text_value,
         caption_value,
@@ -713,7 +716,9 @@ def _build_message_duck(
     # persist_message_with_policy's broadened detect_policy scan (Sprint #89)
     # sees the same content as the step-8 governance gate above.
     # TD poll dict is nested under msg["poll"]["question"].
-    # TD contact fields are at msg level: first_name / last_name.
+    # TD contact fields are NESTED under contact_information (not top-level) —
+    # confirmed by import_parser.py which uses msg.get("contact_information") as
+    # the kind discriminator.
     if message_kind == "poll":
         _poll_dict = msg.get("poll")
         _poll_question: str | None = None
@@ -723,8 +728,9 @@ def _build_message_duck(
                 _poll_question = _q or None
         kind_attrs["poll"] = SimpleNamespace(_imported=True, question=_poll_question)
     if message_kind == "contact":
-        _first = msg.get("first_name") if isinstance(msg.get("first_name"), str) else None
-        _last = msg.get("last_name") if isinstance(msg.get("last_name"), str) else None
+        _contact_info = msg.get("contact_information") if isinstance(msg.get("contact_information"), dict) else None
+        _first = _contact_info.get("first_name") if _contact_info and isinstance(_contact_info.get("first_name"), str) else None
+        _last = _contact_info.get("last_name") if _contact_info and isinstance(_contact_info.get("last_name"), str) else None
         kind_attrs["contact"] = SimpleNamespace(
             _imported=True, first_name=_first, last_name=_last
         )

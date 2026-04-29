@@ -1128,3 +1128,101 @@ async def test_apply_poll_with_offrecord_question_yields_offrecord_policy(db_ses
         )
     finally:
         tmp.unlink(missing_ok=True)
+
+
+async def test_apply_contact_with_offrecord_in_first_name_yields_offrecord_policy(
+    db_session,
+) -> None:
+    """H1 fix coverage: TD contact-shaped message with #offrecord in
+    contact_information.first_name must be detected as offrecord and skipped
+    (not persisted to chat_messages).
+
+    Before the fix, import_apply read msg["first_name"] / msg["last_name"] at
+    the top level — fields that do not exist in the real TD export format.  TD
+    nests them under contact_information: {"first_name": ..., "last_name": ...}.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    from bot.services.import_apply import run_apply
+
+    chat_id = -9902
+
+    contact_export = {
+        "name": "Contact Offrecord Chat",
+        "type": "private_supergroup",
+        "id": chat_id,
+        "messages": [
+            {
+                "id": 9902,
+                "type": "message",
+                "date": "2024-03-01T11:00:00",
+                "date_unixtime": "1709290800",
+                "from": "Sender",
+                "from_id": "user9902001",
+                # TD format: contact fields NESTED under contact_information
+                "contact_information": {
+                    "first_name": "Alice #offrecord",
+                    "last_name": "Smith",
+                    "phone_number": "+1234567890",
+                    "vcard": "",
+                },
+            }
+        ],
+    }
+
+    tmp = (
+        _Path(__file__).parents[1]
+        / "fixtures"
+        / "td_export"
+        / "_tmp_contact_offrecord.json"
+    )
+    tmp.write_text(_json.dumps(contact_export), encoding="utf-8")
+    try:
+        run_id = await _create_apply_run(
+            db_session,
+            source_path=str(tmp),
+            chat_id=chat_id,
+            source_hash="hash_contact_offrecord_h1",
+        )
+
+        await db_session.execute(
+            sa_text(
+                "INSERT INTO users (id, first_name, is_imported_only) "
+                "VALUES (9902001, 'Sender', false) "
+                "ON CONFLICT (id) DO NOTHING"
+            )
+        )
+        await db_session.flush()
+
+        report = await run_apply(
+            db_session,
+            ingestion_run_id=run_id,
+            resume_point=None,
+            chunking_config=_default_chunking(),
+        )
+
+        # The contact with #offrecord in first_name must be skipped via governance.
+        assert report.skipped_governance_count == 1, (
+            f"H1: expected governance skip for contact with #offrecord in "
+            f"contact_information.first_name; "
+            f"got skipped_governance_count={report.skipped_governance_count}, "
+            f"applied_count={report.applied_count}"
+        )
+        assert report.applied_count == 0
+
+        # Verify no chat_messages row persisted.
+        cm_row = await db_session.execute(
+            sa_text(
+                "SELECT memory_policy FROM chat_messages "
+                "WHERE chat_id = :cid AND message_id = 9902"
+            ),
+            {"cid": chat_id},
+        )
+        row = cm_row.fetchone()
+        assert row is None, (
+            f"H1: chat_messages row should not exist for offrecord contact; "
+            f"got memory_policy={row[0] if row else None}"
+        )
+    finally:
+        tmp.unlink(missing_ok=True)
