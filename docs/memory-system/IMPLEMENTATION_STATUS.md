@@ -1,7 +1,7 @@
 # Memory System — Implementation Status
 
-**Last updated:** 2026-04-29 (Phase 2 COMPLETE — 20/20 issues. Final sprint #104 / T2-NEW-G logical rollback per `ingestion_run_id` implemented after #103 import apply.)
-**Active worktrees (Phase 2):** Phase 2 is complete after #104. Historical worktrees: `.worktrees/p2-alpha` (`phase/p2-alpha`), `.worktrees/p2-bravo` (`phase/p2-bravo`), `.worktrees/p2-charlie` (`phase/p2-charlie`). Phase 1 closed on `main` 2026-04-27.
+**Last updated:** 2026-04-29 (Phase 2 CLOSED — 20/20 issues + Final Holistic Review hotfix)
+**Active worktrees (Phase 2):** Phase 2 is complete after #104 + PR #143 hotfix. Historical worktrees: `.worktrees/p2-alpha` (`phase/p2-alpha`), `.worktrees/p2-bravo` (`phase/p2-bravo`), `.worktrees/p2-charlie` (`phase/p2-charlie`), `.worktrees/p2-delta` (Stream Delta). Phase 1 closed on `main` 2026-04-27.
 **Source of truth:** this file is updated after every PR merge into `main`.
 
 ---
@@ -137,6 +137,36 @@ Three parallel tracks possible from day 1 (no shared deps):
 | #103  | T2-03  | done (HIGH-RISK, ready-to-merge) | 2026-04-28 / Sprint Delta-03. Phase 2 finale: `bot/services/import_apply.py::run_apply` applies Telegram Desktop exports through synthetic `telegram_updates` (`update_id=NULL`, `ingestion_run_id=<run>`), tombstone-before-duplicate ordering, #93 user mapping, #98 reply resolver, explicit governance gate, and `persist_message_with_policy()` as the only non-offrecord `chat_messages` writer. `offrecord` keeps only the synthetic audit row and does NOT call the persist helper. `MessageVersionRepo.insert_version(imported_final=True)` implements #106 with Alembic migration `018_add_message_versions_imported_final.py`; live overlap skips. CLI `import_apply` gated by `memory.import.apply.enabled` default OFF; exit codes now 0 / 2 / 3 / 5. New doc `docs/memory-system/import-apply.md`. Tests: targeted `29 passed, 42 skipped`; full suite `255 passed, 197 skipped` (local, timeout enforced via perl because GNU `timeout` is unavailable on macOS). Forward: #104 logical rollback by `ingestion_run_id`. |
 | #104  | T2-NEW-G | done (Phase 2 final) | 2026-04-29 / Sprint Delta-04. New `bot/services/import_rollback.py::rollback_ingestion_run(session, ingestion_run_id) -> RollbackReport` deletes import-owned rows by FK chain only (`chat_messages.raw_update_id → telegram_updates.id → telegram_updates.ingestion_run_id`) with mandatory synthetic guard `telegram_updates.update_id IS NULL`; `message_versions` are counted before delete and removed via `ON DELETE CASCADE`. Single transaction: delete synthetic `telegram_updates` through the first CTE, delete import-owned `chat_messages` through the second CTE, insert audit `ingestion_runs(run_type='rolled_back', status='completed', stats_json.original_run_id=...)`, commit; any failure rolls back all deletes. Idempotency: per-run advisory lock + existing `rolled_back` audit row check; second invocation returns an idempotent report that echoes the prior audit row's delete counts (no further deletes performed) and reuses the audit row id. Race fallback wraps only the audit insert in a SAVEPOINT and catches `IntegrityError` to re-read the winning audit row (`1b97cc5`). Alembic `019_add_ingestion_runs_rolled_back.py` adds `rolled_back` to the run_type check and unique partial index on `stats_json->>'original_run_id'` for rollback audit rows; downgrade has an emergency preflight warning for existing rollback audit rows (`1c9af94`). CLI `rollback_ingestion_run <id>` exits 0 success/idempotent, 2 invalid run type, 3 not found, 4 downstream dependents. New doc `docs/memory-system/import-rollback.md`. Tests: 8 DB-backed scenarios cover small import rollback, idempotency, live-row protection, live-run rejection, unknown-run rejection, audit stats, atomic rollback on second-delete failure, and cascade count. **PHASE 2 CLOSED: 20/20 issues complete.** |
 
+## Phase 2 Final Holistic Review hotfix (PR #143)
+
+Merged 2026-04-29. Five findings identified by dual-review (Claude product reviewer + Codex
+technical reviewer) over the closed Phase 2 surface. Commits landed on `main` as
+`5002f26 fix(p2-fhr): H4 ...`, `e0ffd21`, `0fabc58 fix(p2-fhr): H1 — extract contact fields from contact_information dict`,
+plus earlier merged C1 + H1 + H4 patches.
+
+| ID | Severity | Status | Notes |
+|----|----------|--------|-------|
+| C1 | CRITICAL | FIXED   | `forgotten` is now sticky in `MessageRepo.save` (HANDOFF §1 invariant 9 strengthened). Once `memory_policy='forgotten'`, redelivery cannot downgrade. |
+| H1 | HIGH     | FIXED   | `detect_policy` now scans `poll.question` + `contact_information.{first_name,last_name}`. Restores invariant 8: import path must produce the same governance verdict as the live path. |
+| H2 | HIGH     | VERIFIED CLEAN | Per-message SAVEPOINT already in place in apply path; partial apply on per-message failure is intentional and matches the resume contract. No code change. |
+| H3 | HIGH     | VERIFIED CLEAN | Logical rollback already deletes synthetic orphan `telegram_updates` rows along with their `chat_messages` via the FK chain. No code change. |
+| H4 | HIGH     | FIXED   | Cascade worker now wraps each per-layer write in its own SAVEPOINT, preserving the restart-safe semantic (one bad layer cannot poison the rest of the event). |
+
+## Deferred follow-ups (Phase 2.5 hotfix sprint)
+
+Out-of-scope for Phase 2 closure but logged as named follow-ups. Tracked outside the Phase 2
+ticket grid; will be picked up before or alongside Phase 4 work.
+
+- **#132** — migrate `bot/handlers/edited_message.py` to use `persist_message_with_policy`
+  helper (write-path uniformity; closes the second half of the #68 asymmetry).
+- **CC-2** — anonymous-channel singleton tombstone semantics docs gap (clarify how
+  `target_type='user'` interacts with the anonymous channel ghost user).
+- **CC-3** — `cancel_ingestion_run` CLI subcommand (operator ergonomics; today operators
+  cancel via SQL).
+- **CC-5** — `/forget_me` defensive guard around unguarded `from_user.id` access (privacy
+  hardening; current path is correct under aiogram contract but lacks an explicit None
+  guard).
+
 ## Phases 4–12
 
 Not started. Not authorized. See `AUTHORIZED_SCOPE.md` for gating rules.
@@ -189,4 +219,4 @@ After each PR merge into `main`:
    superseded, write `superseded by T#-##` in Notes.
 5. Update `Last updated` at the top.
 
-<!-- updated-by-superflow:2026-04-28 -->
+<!-- updated-by-superflow:2026-04-29 -->

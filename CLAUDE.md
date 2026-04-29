@@ -34,16 +34,11 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 
 ## Memory System Cycle (active 2026-04-26+)
 
-Phase 1 (foundation: raw archive, message_versions, governance detector, edited_message
-handler) **CLOSED 2026-04-27**. Phase 2 (importer + governance skeleton) is in progress
-on three parallel stream worktrees:
-
-- `.worktrees/p2-alpha` (`phase/p2-alpha`) — Stream Alpha (MessageRepo policy refresh /
-  persist_message_with_policy helper)
-- `.worktrees/p2-bravo` (`phase/p2-bravo`) — Stream Bravo (Telegram Desktop import schema /
-  user mapping / dry-run parser)
-- `.worktrees/p2-charlie` (`phase/p2-charlie`) — Stream Charlie (governance skeleton:
-  forget_events, /forget command, cascade worker, /forget_me)
+Phase 1 closed 2026-04-27. Phase 2 (importer + governance skeleton) **CLOSED 2026-04-29** —
+20/20 issues merged across 4 parallel stream worktrees (Alpha/Bravo/Charlie/Delta) +
+Final Holistic Review hotfix (PR #143). Phase 3 governance skeleton (T3-01..T3-05) merged
+as part of Phase 2 wave. Active phase: Phase 4 (hybrid search + Q&A with citations) —
+in planning.
 
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
@@ -131,4 +126,4 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 Issue tracker for memory cycle: **GitHub Issues** (label `phase:0`, `phase:1`, etc.). The
 `nt` (Notion) plugin remains the tracker for non-memory work in this repo if any.
 
-<!-- updated-by-superflow:2026-04-28 -->
+<!-- updated-by-superflow:2026-04-29 -->

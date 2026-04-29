@@ -27,9 +27,9 @@ phase 0 safety
 |---|--------------------------------------------|-------------|---------------------------------------------------------------------------|
 | 0 | Gatekeeper stabilization                   | YES (now)   | privacy fix, idempotent save, upsert contained, /healthz, regression tests green |
 | 1 | Source of truth + raw archive              | YES (now)   | live message produces raw update + normalized message + v1 version, edits create v2 |
-| 2a| Telegram Desktop import — dry-run          | DONE        | dry-run reports stats; **no content writes**                              |
-| 2b| Telegram Desktop import — apply            | DONE        | gate passed: tombstones + policy detection + apply + rollback net (#104)  |
-| 3 | Governance (`#nomem` / `#offrecord` / `/forget` / tombstones) | STRETCH (T3-01 skeleton only)  | forbidden content excluded from future search/extraction/import           |
+| 2a| Telegram Desktop import — dry-run          | Authorized: DONE 2026-04-29 | dry-run reports stats; **no content writes**                              |
+| 2b| Telegram Desktop import — apply            | Authorized: DONE 2026-04-29 | gate passed: tombstones + policy detection + apply + rollback net (#104) + Final Holistic Review hotfix (PR #143) |
+| 3 | Governance (`#nomem` / `#offrecord` / `/forget` / tombstones) | SKELETON DONE 2026-04-29 (T3-01..T3-05 merged in Phase 2 wave Charlie) | forbidden content excluded from future search/extraction/import           |
 | 4 | Hybrid search + Q&A with citations         | NO          | bot answers from evidence only or refuses; no LLM general knowledge       |
 | 5 | LLM gateway + extraction (events / observations / candidates) | NO  | every LLM call logged in ledger; no forbidden source sent to LLM          |
 | 6 | Knowledge cards + admin review             | NO          | active card requires source + admin approval                              |
@@ -47,6 +47,7 @@ phase 0 safety
 | Gatekeeper safety     | privacy fix, idempotent save, dialect-safe repos, regression tests green                |
 | Source of truth       | raw_updates + message_versions + basic normalization persist                            |
 | Governance            | `#nomem` / `#offrecord` detection, `forget_events`, cascade skeleton, filters           |
+| Governance skeleton (T3-01..T3-05) | Merged in Phase 2 wave Charlie 2026-04-29; full Phase 3 governance criteria are met for the skeleton scope. Full search/extraction filter integration lands in Phase 4+. |
 | Q&A                   | FTS, evidence bundle, citations, refusal, policy filters                                |
 | Extraction            | `llm_gateway`, ledger, source validation, budget guard                                  |
 | Catalog               | cards require sources + admin review                                                    |
