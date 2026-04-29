@@ -102,13 +102,17 @@ class MessageRepo:
             # Build the SET clause with only the fields that were explicitly passed.
             # Immutable fields (ids, text, date, raw_json) are never updated on conflict.
             #
-            # STICKY POLICY (Codex CRITICAL / Sprint #80 fixup):
+            # STICKY POLICY (Codex CRITICAL / Sprint #80 fixup + p2-hotfix C1):
             # memory_policy and is_redacted are monotonically ratcheted toward more-restrictive
             # values. A stale duplicate original delivery (e.g. Telegram polling glitch re-delivers
-            # a message after its #offrecord edit) must NOT downgrade an existing 'offrecord' row
-            # back to 'normal'. The CASE expressions below enforce this invariant atomically in SQL:
+            # a message after its #offrecord edit) must NOT downgrade an existing 'offrecord' or
+            # 'forgotten' row back to 'normal'.
+            #
+            # The CASE expressions below enforce this invariant atomically in SQL:
             #
             #   memory_policy: if the stored value is already 'offrecord', keep 'offrecord';
+            #                  if the stored value is already 'forgotten', keep 'forgotten'
+            #                  (HANDOFF.md §1 invariant 9 — tombstones are durable);
             #                  otherwise adopt the incoming EXCLUDED.memory_policy.
             #
             #   is_redacted:   once True, stays True — OR semantics: existing OR incoming.
@@ -120,6 +124,7 @@ class MessageRepo:
             if memory_policy is not None:
                 set_clause["memory_policy"] = case(
                     (ChatMessage.memory_policy == "offrecord", "offrecord"),
+                    (ChatMessage.memory_policy == "forgotten", "forgotten"),
                     else_=insrt.excluded.memory_policy,
                 )
             if is_redacted is not None:

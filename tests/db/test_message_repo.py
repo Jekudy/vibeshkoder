@@ -608,3 +608,61 @@ async def test_save_duplicate_only_is_redacted_false_does_not_unflag_redacted(
         f"PRIVACY VIOLATION: is_redacted=False stale duplicate unset the redaction flag. "
         f"Got is_redacted={result.is_redacted!r}"
     )
+
+
+# ─── C1: forgotten policy is sticky (invariant 9 — tombstones are durable) ───
+
+
+async def test_save_duplicate_with_normal_does_not_downgrade_forgotten(
+    db_session,
+) -> None:
+    """Invariant 9 (HANDOFF.md §1): tombstones are durable and not casually rolled back.
+
+    Scenario: cascade worker sets memory_policy='forgotten', is_redacted=True on a row.
+    A subsequent stale Telegram redelivery calls MessageRepo.save with
+    memory_policy='normal' and is_redacted=False. The row MUST stay 'forgotten' and
+    is_redacted MUST stay True.
+
+    This is the 'forgotten' analogue of the offrecord stickiness tests above.
+    """
+    from bot.db.repos.message import MessageRepo
+
+    user_id = _random_user_id()
+    chat_id = _random_chat_id()
+    message_id = _random_message_id()
+    when = datetime.now(timezone.utc)
+
+    await _create_user(db_session, user_id)
+
+    # Step 1: cascade worker applies forget → sets forgotten + redacted.
+    await MessageRepo.save(
+        db_session,
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text=None,  # already redacted by cascade
+        date=when,
+        memory_policy="forgotten",
+        is_redacted=True,
+    )
+
+    # Step 2: stale redelivery arrives with memory_policy='normal', is_redacted=False.
+    result = await MessageRepo.save(
+        db_session,
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text="stale original text",
+        date=when,
+        memory_policy="normal",
+        is_redacted=False,
+    )
+
+    assert result.memory_policy == "forgotten", (
+        f"INVARIANT 9 VIOLATION: memory_policy='normal' stale duplicate downgraded 'forgotten' row. "
+        f"Got memory_policy='{result.memory_policy}'"
+    )
+    assert result.is_redacted is True, (
+        f"INVARIANT 9 VIOLATION: is_redacted=False stale duplicate unset redaction on 'forgotten' row. "
+        f"Got is_redacted={result.is_redacted!r}"
+    )
