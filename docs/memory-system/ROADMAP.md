@@ -27,8 +27,8 @@ phase 0 safety
 |---|--------------------------------------------|-------------|---------------------------------------------------------------------------|
 | 0 | Gatekeeper stabilization                   | YES (now)   | privacy fix, idempotent save, upsert contained, /healthz, regression tests green |
 | 1 | Source of truth + raw archive              | YES (now)   | live message produces raw update + normalized message + v1 version, edits create v2 |
-| 2a| Telegram Desktop import — dry-run          | STRETCH     | dry-run reports stats; **no content writes**                              |
-| 2b| Telegram Desktop import — apply            | NO          | requires Phase 3 skeleton (tombstones + policy detection)                 |
+| 2a| Telegram Desktop import — dry-run          | DONE        | dry-run reports stats; **no content writes**                              |
+| 2b| Telegram Desktop import — apply            | DONE        | gate passed: tombstones + policy detection + apply + rollback net (#104)  |
 | 3 | Governance (`#nomem` / `#offrecord` / `/forget` / tombstones) | STRETCH (T3-01 skeleton only)  | forbidden content excluded from future search/extraction/import           |
 | 4 | Hybrid search + Q&A with citations         | NO          | bot answers from evidence only or refuses; no LLM general knowledge       |
 | 5 | LLM gateway + extraction (events / observations / candidates) | NO  | every LLM call logged in ledger; no forbidden source sent to LLM          |

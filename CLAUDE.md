@@ -119,6 +119,14 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
     lock count after exit), CLI `--chunk-size` override semantics. Cross-stream contract:
     #103 `run_apply` must accept `chunking_config: ChunkingConfig` kwarg (replaces old
     `chunk_size=` kwarg from #101 placeholder).
+13. `docs/memory-system/import-rollback.md` — Telegram Desktop import logical rollback.
+    Read BEFORE touching `bot/services/import_rollback.py`, `bot/cli.py::rollback_ingestion_run`,
+    or rollback-related `ingestion_runs` migrations. Defines: the FK-chain selector
+    (`chat_messages.raw_update_id → telegram_updates.id → ingestion_run_id`) with
+    `telegram_updates.update_id IS NULL` synthetic guard, single-transaction delete +
+    audit insert, idempotent `run_type='rolled_back'` audit row keyed by
+    `stats_json.original_run_id`, NO-content logging, live-row protection, tombstones not
+    rolled back, and the Phase 4+ downstream-dependent TODO.
 
 Issue tracker for memory cycle: **GitHub Issues** (label `phase:0`, `phase:1`, etc.). The
 `nt` (Notion) plugin remains the tracker for non-memory work in this repo if any.

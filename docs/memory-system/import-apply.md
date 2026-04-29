@@ -294,6 +294,19 @@ Exit codes:
 Synthetic `telegram_updates` rows record `update_type='import_message'`,
 `update_id=NULL`, `chat_id`, `message_id`, and `ingestion_run_id`.
 
+## Rollback (#104)
+
+Logical rollback uses the synthetic raw rows as the only ownership anchor:
+
+```sql
+chat_messages.raw_update_id -> telegram_updates.id
+telegram_updates.ingestion_run_id = <target>
+telegram_updates.update_id IS NULL
+```
+
+See `docs/memory-system/import-rollback.md` for the operator command, idempotency,
+transactionality, audit-row contract, and the Phase 4+ downstream-dependent TODO.
+
 ---
 
 ## NO-Content Invariant
@@ -325,13 +338,12 @@ fields are not copied into `telegram_updates.raw_json`.
 - **#101** — checkpoint/resume, source hash, partial-present CLI exit code.
 - **#102** — chunking config, sleep, advisory lock.
 - **#106** — `imported_final=TRUE` edit-history policy and migration 018.
-- **#104** — forward: logical rollback by `ingestion_run_id`.
+- **#104** — logical rollback by `ingestion_run_id`.
 
 ---
 
 ## Out Of Scope
 
-- Logical rollback of an import run (#104).
 - Media file copying or storage-layer attachment import.
 - Full-account Telegram exports; apply accepts one chat export at a time.
 - LLM calls, extraction, q&a, catalog, wiki, graph, digest, or public surfaces.
