@@ -249,6 +249,13 @@ async def _process_one_event(session: AsyncSession, event) -> None:
     On success, transitions the row to ``status='completed'`` with the final
     cascade_status. On exception, transitions to ``status='failed'`` with the
     exception captured under ``cascade_status['error']``.
+
+    H4 fix (p2-hotfix): the entire cascade is wrapped in ``begin_nested()``
+    (SAVEPOINT). This ensures that a real PostgreSQL-level DB error in any layer
+    function aborts only this event's sub-transaction, leaving the outer
+    transaction valid so ``run_cascade_worker_once`` can continue with the next
+    event. Without the savepoint, a DB error would abort the outer transaction and
+    subsequent events would fail with InFailedSQLTransactionError.
     """
     # Snapshot current per-layer progress so we can resume.
     cascade_state: dict[str, Any] = dict(event.cascade_status or {})
@@ -283,7 +290,14 @@ async def _process_one_event(session: AsyncSession, event) -> None:
                         "reason": "target_type_not_supported_yet",
                     }
             elif layer in _LAYER_FUNCS:
-                rows = await _LAYER_FUNCS[layer](session, event)
+                # H4 fix (p2-hotfix): wrap each active layer call in a SAVEPOINT so
+                # that a real PostgreSQL-level DB error in one layer aborts only that
+                # layer's sub-transaction, leaving the outer transaction valid. Without
+                # per-layer savepoints, a DB error would abort the outer transaction and
+                # subsequent events in the batch would fail with InFailedSQLTransactionError,
+                # breaking the per-event isolation guarantee.
+                async with session.begin_nested():
+                    rows = await _LAYER_FUNCS[layer](session, event)
                 cascade_state[layer] = {"status": "completed", "rows": rows}
             else:
                 # Phase 4+ layers — table not yet present in this codebase.
@@ -304,6 +318,8 @@ async def _process_one_event(session: AsyncSession, event) -> None:
         cascade_state["error"] = repr(exc)
         # Try to record the failure; if THAT itself fails (e.g. terminal state
         # already set), let the outer exception propagate to the batch loop.
+        # The per-layer begin_nested() savepoint was rolled back on exception exit,
+        # so the outer transaction is still valid here.
         await ForgetEventRepo.mark_status(
             session, event.id, status="failed", cascade_status=cascade_state
         )

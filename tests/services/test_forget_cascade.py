@@ -786,3 +786,80 @@ async def test_scheduler_tick_processes_events_when_flag_on(db_session) -> None:
 
     ev = await ForgetEventRepo.get_by_tombstone_key(db_session, tomb_key)
     assert ev.status == "completed"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# H4: per-event savepoint isolation — real DB error on one event must not abort
+# the outer transaction so remaining events in the batch can still be processed.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def test_per_event_db_error_isolation_via_savepoint(db_session, monkeypatch) -> None:
+    """H4 fix verification: when event B's cascade causes a real SQLAlchemy DB-level
+    error (not a Python-only exception), the worker MUST still process events A and C
+    via savepoint isolation around each event.
+
+    Without ``begin_nested()`` around ``_process_one_event``, a database-level error
+    aborts the outer transaction and all subsequent DB operations in the same session
+    fail with PendingRollbackError — breaking the per-event isolation guarantee
+    documented in the worker's docstring.
+    """
+    from sqlalchemy.exc import ProgrammingError
+
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services import forget_cascade
+
+    # Event A — processes normally.
+    cm_a, _, chat_a, msg_a = await _make_chat_message_with_v1(db_session, text="alpha")
+    tomb_a = f"message:{chat_a}:{msg_a}"
+    await _make_pending_forget_event(
+        db_session, target_type="message", target_id=str(cm_a), tombstone_key=tomb_a
+    )
+
+    # Event B — rigged to raise a real SQLAlchemy DB error (not a Python exception).
+    # ProgrammingError is a sqlalchemy.exc subclass that maps to a PostgreSQL ERROR.
+    # We raise it directly from the layer function; the worker must absorb it without
+    # leaving the outer transaction in an aborted state.
+    cm_b, _, chat_b, msg_b = await _make_chat_message_with_v1(db_session, text="beta")
+    tomb_b = f"message:{chat_b}:{msg_b}"
+    await _make_pending_forget_event(
+        db_session, target_type="message", target_id=str(cm_b), tombstone_key=tomb_b
+    )
+
+    # Event C — must still process even after event B's DB error.
+    cm_c, _, chat_c, msg_c = await _make_chat_message_with_v1(db_session, text="gamma")
+    tomb_c = f"message:{chat_c}:{msg_c}"
+    await _make_pending_forget_event(
+        db_session, target_type="message", target_id=str(cm_c), tombstone_key=tomb_c
+    )
+
+    original = forget_cascade._cascade_chat_messages
+
+    async def _db_error_on_b(session, event):
+        if event.target_id == str(cm_b):
+            # Execute a real invalid SQL statement so PostgreSQL itself aborts
+            # the current (sub)transaction. This is the class of error that
+            # requires savepoint isolation to contain: without begin_nested(),
+            # this aborts the OUTER transaction and all subsequent operations
+            # fail with PendingRollbackError.
+            from sqlalchemy import text as sa_text
+            await session.execute(sa_text("SELECT 1 / 0"))  # division by zero → ERROR
+        return await original(session, event)
+
+    monkeypatch.setitem(forget_cascade._LAYER_FUNCS, "chat_messages", _db_error_on_b)
+
+    stats = await forget_cascade.run_cascade_worker_once(db_session)
+
+    # All three events must be claimed.
+    assert stats["claimed"] == 3, f"expected 3 claimed, got {stats['claimed']}"
+    # Events A and C succeed; event B fails.
+    assert stats["processed"] == 2, f"expected 2 processed, got {stats['processed']}"
+    assert stats["failed"] == 1, f"expected 1 failed, got {stats['failed']}"
+
+    ev_a = await ForgetEventRepo.get_by_tombstone_key(db_session, tomb_a)
+    ev_b = await ForgetEventRepo.get_by_tombstone_key(db_session, tomb_b)
+    ev_c = await ForgetEventRepo.get_by_tombstone_key(db_session, tomb_c)
+
+    assert ev_a.status == "completed", f"event A should be completed, got {ev_a.status}"
+    assert ev_b.status == "failed", f"event B should be failed, got {ev_b.status}"
+    assert ev_c.status == "completed", f"event C should be completed, got {ev_c.status}"
