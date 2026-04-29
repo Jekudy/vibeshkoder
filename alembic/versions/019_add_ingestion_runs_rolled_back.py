@@ -45,6 +45,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Emergency-only downgrade; not expected in normal flow.
+
+    WARNING: if any ingestion_runs rows with run_type='rolled_back' exist when
+    downgrade runs, the recreated CHECK constraint will fail. Operators must DELETE
+    such audit rows manually before downgrade.
+    """
     with op.get_context().autocommit_block():
         op.drop_index(
             "ix_ingestion_runs_rollback_original_unique",

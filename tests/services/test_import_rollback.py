@@ -167,11 +167,55 @@ async def test_rollback_idempotent(db_session) -> None:
 
     assert first.idempotent_skip is False
     assert second.idempotent_skip is True
-    assert second.chat_messages_deleted == 0
-    assert second.telegram_updates_deleted == 0
-    assert second.message_versions_cascade_deleted == 0
+    assert second.chat_messages_deleted == first.chat_messages_deleted
+    assert second.telegram_updates_deleted == first.telegram_updates_deleted
+    assert second.message_versions_cascade_deleted == first.message_versions_cascade_deleted
     assert second.audit_run_id == first.audit_run_id
     assert len(await _rollback_audit_rows(db_session, run_id)) == 1
+
+
+async def test_rollback_race_unique_index_fallback(db_session, monkeypatch) -> None:
+    import bot.services.import_rollback as rollback_mod
+
+    run_id = await _apply_small_import(
+        db_session,
+        source_hash="rollback_race_unique_index_fallback",
+    )
+    first = await rollback_mod.rollback_ingestion_run(db_session, run_id)
+    counts_before_second = await _count_rows(db_session)
+
+    original_find = rollback_mod._find_existing_rollback_audit
+    call_count = 0
+
+    async def _miss_precheck_once(connection, ingestion_run_id):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return None
+        return await original_find(connection, ingestion_run_id)
+
+    monkeypatch.setattr(
+        rollback_mod,
+        "_find_existing_rollback_audit",
+        _miss_precheck_once,
+    )
+
+    second = await rollback_mod.rollback_ingestion_run(db_session, run_id)
+
+    assert second.idempotent_skip is True
+    assert second.audit_run_id == first.audit_run_id
+    assert second.chat_messages_deleted == first.chat_messages_deleted
+    assert second.telegram_updates_deleted == first.telegram_updates_deleted
+    assert second.message_versions_cascade_deleted == first.message_versions_cascade_deleted
+    assert await _count_rows(db_session) == counts_before_second
+    assert await _owned_counts(db_session, run_id) == (0, 0, 0)
+    assert len(await _rollback_audit_rows(db_session, run_id)) == 1
+
+    original_run_exists = await db_session.execute(
+        sa_text("SELECT COUNT(*) FROM ingestion_runs WHERE id = :rid"),
+        {"rid": run_id},
+    )
+    assert int(original_run_exists.scalar_one()) == 1
 
 
 async def test_rollback_does_not_touch_live_rows(db_session) -> None:
@@ -264,6 +308,40 @@ async def test_rollback_does_not_touch_live_rows(db_session) -> None:
     assert await _owned_counts(db_session, run_id) == (0, 0, 0)
 
 
+async def test_rollback_does_not_touch_forget_events(db_session) -> None:
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services.import_rollback import rollback_ingestion_run
+
+    chat_id = -1001999999999
+    message_id = 1001
+    tombstone_key = f"message:{chat_id}:{message_id}"
+    run_id = await _apply_small_import(
+        db_session,
+        source_hash="rollback_forget_events_non_interference",
+    )
+
+    event = await ForgetEventRepo.create(
+        db_session,
+        target_type="message",
+        target_id=str(message_id),
+        actor_user_id=None,
+        authorized_by="system",
+        tombstone_key=tombstone_key,
+    )
+    await db_session.flush()
+
+    before_count = await db_session.execute(sa_text("SELECT COUNT(*) FROM forget_events"))
+
+    await rollback_ingestion_run(db_session, run_id)
+
+    after_count = await db_session.execute(sa_text("SELECT COUNT(*) FROM forget_events"))
+    assert int(after_count.scalar_one()) == int(before_count.scalar_one())
+
+    existing = await ForgetEventRepo.get_by_tombstone_key(db_session, tombstone_key)
+    assert existing is not None
+    assert existing.id == event.id
+
+
 async def test_rollback_rejects_live_run(db_session) -> None:
     from bot.services.import_rollback import InvalidRollbackRunError, rollback_ingestion_run
 
@@ -328,6 +406,42 @@ async def test_rollback_atomic_on_partial_failure(db_session, monkeypatch) -> No
 
     assert await _owned_counts(db_session, run_id) == (5, 5, 5)
     assert await _rollback_audit_rows(db_session, run_id) == []
+
+
+async def test_rollback_recovers_after_partial_failure(db_session, monkeypatch) -> None:
+    from sqlalchemy.ext.asyncio import AsyncConnection
+
+    from bot.services.import_rollback import rollback_ingestion_run
+
+    run_id = await _apply_small_import(db_session, source_hash="rollback_recovery_after_failure")
+    assert await _owned_counts(db_session, run_id) == (5, 5, 5)
+
+    original_execute = AsyncConnection.execute
+
+    async def _fail_on_update_delete(self, statement, *args, **kwargs):
+        if "DELETE FROM telegram_updates" in str(statement):
+            raise RuntimeError("simulated telegram_updates delete failure")
+        return await original_execute(self, statement, *args, **kwargs)
+
+    with monkeypatch.context() as patch_ctx:
+        patch_ctx.setattr(AsyncConnection, "execute", _fail_on_update_delete)
+
+        with pytest.raises(RuntimeError, match="simulated telegram_updates delete failure"):
+            await rollback_ingestion_run(db_session, run_id)
+
+    assert await _owned_counts(db_session, run_id) == (5, 5, 5)
+    assert await _rollback_audit_rows(db_session, run_id) == []
+
+    report = await rollback_ingestion_run(db_session, run_id)
+
+    assert report.idempotent_skip is False
+    assert report.chat_messages_deleted == 5
+    assert report.telegram_updates_deleted == 5
+    assert report.message_versions_cascade_deleted == 5
+    assert await _owned_counts(db_session, run_id) == (0, 0, 0)
+    audit_rows = await _rollback_audit_rows(db_session, run_id)
+    assert len(audit_rows) == 1
+    assert audit_rows[0][0] == report.audit_run_id
 
 
 async def test_message_versions_cascade_count(db_session) -> None:

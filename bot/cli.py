@@ -301,7 +301,7 @@ async def _cmd_rollback_ingestion_run_async(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 4
 
-    suffix = " (idempotent no-op)" if report.idempotent_skip else ""
+    suffix = " (idempotent no-op; prior audit counts shown)" if report.idempotent_skip else ""
     print(f"rollback_ingestion_run {report.original_run_id}{suffix}")
     print(f"chat_messages_deleted: {report.chat_messages_deleted}")
     print(f"telegram_updates_deleted: {report.telegram_updates_deleted}")

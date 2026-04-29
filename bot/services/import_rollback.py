@@ -14,9 +14,11 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from bot.services.import_chunking import acquire_advisory_lock
@@ -40,6 +42,12 @@ class DownstreamDependentsError(ValueError):
 
 @dataclass(frozen=True)
 class RollbackReport:
+    """Outcome of one rollback attempt.
+
+    When ``idempotent_skip`` is true, delete counts echo the prior rollback audit row
+    for operator visibility; this caller did not delete additional rows.
+    """
+
     original_run_id: int
     chat_messages_deleted: int
     telegram_updates_deleted: int
@@ -69,76 +77,115 @@ async def rollback_ingestion_run(
 
     async with acquire_advisory_lock(connection, ingestion_run_id):
         try:
-            existing_audit_id = await _find_existing_rollback_audit(
+            existing_audit = await _find_existing_rollback_audit(
                 connection,
                 ingestion_run_id,
             )
-            if existing_audit_id is not None:
+            if existing_audit is not None:
+                report = _build_idempotent_report(
+                    ingestion_run_id,
+                    audit_id=existing_audit[0],
+                    stats=existing_audit[1],
+                )
+                # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
                 await session.commit()
                 logger.info(
                     "import_rollback: idempotent no-op",
                     extra={
                         "original_run_id": ingestion_run_id,
-                        "audit_run_id": existing_audit_id,
+                        "audit_run_id": report.audit_run_id,
                     },
                 )
-                return RollbackReport(
-                    original_run_id=ingestion_run_id,
-                    chat_messages_deleted=0,
-                    telegram_updates_deleted=0,
-                    message_versions_cascade_deleted=0,
-                    audit_run_id=existing_audit_id,
-                    idempotent_skip=True,
+                return report
+
+            nested = connection.begin_nested()
+            await nested.start()
+            try:
+                await _check_no_downstream_dependents(connection, ingestion_run_id)
+
+                chat_messages_count = await _count_import_chat_messages(
+                    connection,
+                    ingestion_run_id,
+                )
+                message_versions_count = await _count_import_message_versions(
+                    connection,
+                    ingestion_run_id,
                 )
 
-            await _check_no_downstream_dependents(connection, ingestion_run_id)
+                chat_delete_result = await connection.execute(
+                    text(
+                        """
+                        DELETE FROM chat_messages cm
+                         WHERE EXISTS (
+                               SELECT 1
+                                 FROM telegram_updates tu
+                                WHERE tu.id = cm.raw_update_id
+                                  AND tu.ingestion_run_id = :id
+                                  AND tu.update_id IS NULL
+                         )
+                        """
+                    ),
+                    {"id": ingestion_run_id},
+                )
+                chat_messages_deleted = _require_rowcount(chat_delete_result)
 
-            chat_messages_count = await _count_import_chat_messages(
-                connection,
-                ingestion_run_id,
-            )
-            message_versions_count = await _count_import_message_versions(
-                connection,
-                ingestion_run_id,
-            )
+                update_delete_result = await connection.execute(
+                    text(
+                        """
+                        DELETE FROM telegram_updates
+                         WHERE ingestion_run_id = :id
+                           AND update_id IS NULL
+                        """
+                    ),
+                    {"id": ingestion_run_id},
+                )
+                telegram_updates_deleted = _require_rowcount(update_delete_result)
 
-            chat_delete_result = await connection.execute(
-                text(
-                    """
-                    DELETE FROM chat_messages cm
-                     WHERE EXISTS (
-                           SELECT 1
-                             FROM telegram_updates tu
-                            WHERE tu.id = cm.raw_update_id
-                              AND tu.ingestion_run_id = :id
-                              AND tu.update_id IS NULL
-                     )
-                    """
-                ),
-                {"id": ingestion_run_id},
-            )
-            chat_messages_deleted = _require_rowcount(chat_delete_result)
+                try:
+                    audit_run_id = await _insert_rollback_audit(
+                        connection,
+                        original_run_id=ingestion_run_id,
+                        chat_messages_deleted=chat_messages_deleted,
+                        telegram_updates_deleted=telegram_updates_deleted,
+                        message_versions_cascade_deleted=message_versions_count,
+                    )
+                except IntegrityError:
+                    await nested.rollback()
+                    race_audit = await _find_existing_rollback_audit(
+                        connection,
+                        ingestion_run_id,
+                    )
+                    if race_audit is None:
+                        raise
 
-            update_delete_result = await connection.execute(
-                text(
-                    """
-                    DELETE FROM telegram_updates
-                     WHERE ingestion_run_id = :id
-                       AND update_id IS NULL
-                    """
-                ),
-                {"id": ingestion_run_id},
-            )
-            telegram_updates_deleted = _require_rowcount(update_delete_result)
+                    report = _build_idempotent_report(
+                        ingestion_run_id,
+                        audit_id=race_audit[0],
+                        stats=race_audit[1],
+                    )
+                    # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
+                    await session.commit()
+                    logger.warning(
+                        "rollback race resolved via unique-index fallback",
+                        extra={
+                            "original_run_id": ingestion_run_id,
+                            "audit_run_id": report.audit_run_id,
+                            "chat_messages_deleted": report.chat_messages_deleted,
+                            "telegram_updates_deleted": report.telegram_updates_deleted,
+                            "message_versions_cascade_deleted": (
+                                report.message_versions_cascade_deleted
+                            ),
+                        },
+                    )
+                    return report
+            except BaseException:
+                if nested.is_active:
+                    await nested.rollback()
+                raise
+            else:
+                await nested.commit()
 
-            audit_run_id = await _insert_rollback_audit(
-                connection,
-                original_run_id=ingestion_run_id,
-                chat_messages_deleted=chat_messages_deleted,
-                telegram_updates_deleted=telegram_updates_deleted,
-                message_versions_cascade_deleted=message_versions_count,
-            )
-
+            # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
             await session.commit()
         except BaseException:
             await session.rollback()
@@ -212,11 +259,11 @@ def _validate_original_run(run: dict) -> None:
 async def _find_existing_rollback_audit(
     connection: AsyncConnection,
     ingestion_run_id: int,
-) -> int | None:
+) -> tuple[int, dict[str, Any]] | None:
     result = await connection.execute(
         text(
             """
-            SELECT id
+            SELECT id, stats_json
               FROM ingestion_runs
              WHERE run_type = 'rolled_back'
                AND stats_json::jsonb ->> 'original_run_id' = :original_run_id
@@ -226,8 +273,45 @@ async def _find_existing_rollback_audit(
         ),
         {"original_run_id": str(ingestion_run_id)},
     )
-    value = result.scalar_one_or_none()
-    return int(value) if value is not None else None
+    row = result.mappings().first()
+    if row is None:
+        return None
+    stats = row["stats_json"]
+    if isinstance(stats, str):
+        stats = json.loads(stats)
+    if not isinstance(stats, dict):
+        raise RuntimeError("rollback audit row stats_json is not an object")
+    return int(row["id"]), stats
+
+
+def _build_idempotent_report(
+    original_run_id: int,
+    *,
+    audit_id: int,
+    stats: dict[str, Any],
+) -> RollbackReport:
+    chat_messages_deleted, telegram_updates_deleted, message_versions_deleted = (
+        _extract_rollback_counts(stats)
+    )
+    return RollbackReport(
+        original_run_id=original_run_id,
+        chat_messages_deleted=chat_messages_deleted,
+        telegram_updates_deleted=telegram_updates_deleted,
+        message_versions_cascade_deleted=message_versions_deleted,
+        audit_run_id=audit_id,
+        idempotent_skip=True,
+    )
+
+
+def _extract_rollback_counts(stats: dict[str, Any]) -> tuple[int, int, int]:
+    try:
+        return (
+            int(stats["chat_messages_deleted"]),
+            int(stats["telegram_updates_deleted"]),
+            int(stats["message_versions_cascade_deleted"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("rollback audit row stats_json is missing rollback counts") from exc
 
 
 async def _count_import_chat_messages(
