@@ -98,92 +98,86 @@ async def rollback_ingestion_run(
                 )
                 return report
 
-            nested = connection.begin_nested()
-            await nested.start()
+            await _check_no_downstream_dependents(connection, ingestion_run_id)
+
+            chat_messages_count = await _count_import_chat_messages(
+                connection,
+                ingestion_run_id,
+            )
+            message_versions_count = await _count_import_message_versions(
+                connection,
+                ingestion_run_id,
+            )
+
+            chat_delete_result = await connection.execute(
+                text(
+                    """
+                    DELETE FROM chat_messages cm
+                     WHERE EXISTS (
+                           SELECT 1
+                             FROM telegram_updates tu
+                            WHERE tu.id = cm.raw_update_id
+                              AND tu.ingestion_run_id = :id
+                              AND tu.update_id IS NULL
+                     )
+                    """
+                ),
+                {"id": ingestion_run_id},
+            )
+            chat_messages_deleted = _require_rowcount(chat_delete_result)
+
+            update_delete_result = await connection.execute(
+                text(
+                    """
+                    DELETE FROM telegram_updates
+                     WHERE ingestion_run_id = :id
+                       AND update_id IS NULL
+                    """
+                ),
+                {"id": ingestion_run_id},
+            )
+            telegram_updates_deleted = _require_rowcount(update_delete_result)
+
+            audit_savepoint = await connection.begin_nested()
             try:
-                await _check_no_downstream_dependents(connection, ingestion_run_id)
-
-                chat_messages_count = await _count_import_chat_messages(
+                audit_run_id = await _insert_rollback_audit(
+                    connection,
+                    original_run_id=ingestion_run_id,
+                    chat_messages_deleted=chat_messages_deleted,
+                    telegram_updates_deleted=telegram_updates_deleted,
+                    message_versions_cascade_deleted=message_versions_count,
+                )
+            except IntegrityError:
+                await audit_savepoint.rollback()
+                race_audit = await _find_existing_rollback_audit(
                     connection,
                     ingestion_run_id,
                 )
-                message_versions_count = await _count_import_message_versions(
-                    connection,
+                if race_audit is None:
+                    raise
+
+                report = _build_idempotent_report(
                     ingestion_run_id,
+                    audit_id=race_audit[0],
+                    stats=race_audit[1],
                 )
-
-                chat_delete_result = await connection.execute(
-                    text(
-                        """
-                        DELETE FROM chat_messages cm
-                         WHERE EXISTS (
-                               SELECT 1
-                                 FROM telegram_updates tu
-                                WHERE tu.id = cm.raw_update_id
-                                  AND tu.ingestion_run_id = :id
-                                  AND tu.update_id IS NULL
-                         )
-                        """
-                    ),
-                    {"id": ingestion_run_id},
+                # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
+                await session.commit()
+                logger.warning(
+                    "rollback race resolved via unique-index fallback",
+                    extra={
+                        "original_run_id": ingestion_run_id,
+                        "audit_run_id": report.audit_run_id,
+                        "chat_messages_deleted": report.chat_messages_deleted,
+                        "telegram_updates_deleted": report.telegram_updates_deleted,
+                        "message_versions_cascade_deleted": (
+                            report.message_versions_cascade_deleted
+                        ),
+                    },
                 )
-                chat_messages_deleted = _require_rowcount(chat_delete_result)
-
-                update_delete_result = await connection.execute(
-                    text(
-                        """
-                        DELETE FROM telegram_updates
-                         WHERE ingestion_run_id = :id
-                           AND update_id IS NULL
-                        """
-                    ),
-                    {"id": ingestion_run_id},
-                )
-                telegram_updates_deleted = _require_rowcount(update_delete_result)
-
-                try:
-                    audit_run_id = await _insert_rollback_audit(
-                        connection,
-                        original_run_id=ingestion_run_id,
-                        chat_messages_deleted=chat_messages_deleted,
-                        telegram_updates_deleted=telegram_updates_deleted,
-                        message_versions_cascade_deleted=message_versions_count,
-                    )
-                except IntegrityError:
-                    await nested.rollback()
-                    race_audit = await _find_existing_rollback_audit(
-                        connection,
-                        ingestion_run_id,
-                    )
-                    if race_audit is None:
-                        raise
-
-                    report = _build_idempotent_report(
-                        ingestion_run_id,
-                        audit_id=race_audit[0],
-                        stats=race_audit[1],
-                    )
-                    # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
-                    await session.commit()
-                    logger.warning(
-                        "rollback race resolved via unique-index fallback",
-                        extra={
-                            "original_run_id": ingestion_run_id,
-                            "audit_run_id": report.audit_run_id,
-                            "chat_messages_deleted": report.chat_messages_deleted,
-                            "telegram_updates_deleted": report.telegram_updates_deleted,
-                            "message_versions_cascade_deleted": (
-                                report.message_versions_cascade_deleted
-                            ),
-                        },
-                    )
-                    return report
-            except BaseException:
-                if nested.is_active:
-                    await nested.rollback()
-                raise
+                return report
             else:
-                await nested.commit()
+                await audit_savepoint.commit()
 
             # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
             await session.commit()
