@@ -110,7 +110,7 @@ async def rollback_ingestion_run(
             )
 
             race_report: RollbackReport | None = None
-            async with connection.begin_nested():
+            async with session.begin_nested():
                 chat_delete_result = await connection.execute(
                     text(
                         """
@@ -140,7 +140,7 @@ async def rollback_ingestion_run(
                 )
                 telegram_updates_deleted = _require_rowcount(update_delete_result)
 
-                audit_savepoint = await connection.begin_nested()
+                audit_savepoint = await session.begin_nested()
                 try:
                     audit_run_id = await _insert_rollback_audit(
                         connection,
