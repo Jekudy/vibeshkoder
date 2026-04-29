@@ -804,8 +804,6 @@ async def test_per_event_db_error_isolation_via_savepoint(db_session, monkeypatc
     fail with PendingRollbackError — breaking the per-event isolation guarantee
     documented in the worker's docstring.
     """
-    from sqlalchemy.exc import ProgrammingError
-
     from bot.db.repos.forget_event import ForgetEventRepo
     from bot.services import forget_cascade
 
