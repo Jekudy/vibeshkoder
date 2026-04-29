@@ -66,7 +66,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from bot.db.models import ChatMessage, IngestionRun
+from bot.db.models import ChatMessage, IngestionRun, TelegramUpdate
 from bot.db.repos.message_version import MessageVersionRepo
 from bot.db.repos.telegram_update import TelegramUpdateRepo
 from bot.services.content_hash import compute_content_hash
@@ -477,6 +477,16 @@ async def _apply_one_message(
                 session,
                 resolution.chat_message_id,
             )
+        if resolved_reply_to_message_id is None:
+            # Cross-overlap guard: a live raw update can carry the export id while the
+            # linked chat_messages row has a different live-handler message_id.
+            resolved_reply_to_message_id = (
+                await _find_chat_message_message_id_by_raw_update_message_id(
+                    session,
+                    chat_id=chat_id,
+                    raw_update_message_id=reply_export_id,
+                )
+            )
 
     # 7. Synthetic raw row — written FIRST and ALWAYS (even for offrecord), tagged
     # with ingestion_run_id so #104 rollback can locate it. update_id MUST be NULL.
@@ -777,14 +787,32 @@ async def _find_existing_import_update_id(
     session: AsyncSession, chat_id: int, message_id: int
 ) -> int | None:
     """Return an existing import synthetic update id for offrecord idempotency."""
-    from bot.db.models import TelegramUpdate
-
     stmt = (
         select(TelegramUpdate.id)
         .where(
             TelegramUpdate.chat_id == chat_id,
             TelegramUpdate.message_id == message_id,
             TelegramUpdate.update_type == _IMPORT_UPDATE_TYPE,
+        )
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _find_chat_message_message_id_by_raw_update_message_id(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    raw_update_message_id: int,
+) -> int | None:
+    """Return cm.message_id for a row linked to telegram_updates.message_id."""
+    stmt = (
+        select(ChatMessage.message_id)
+        .join(TelegramUpdate, ChatMessage.raw_update_id == TelegramUpdate.id)
+        .where(
+            ChatMessage.chat_id == chat_id,
+            TelegramUpdate.message_id == raw_update_message_id,
         )
         .limit(1)
     )
