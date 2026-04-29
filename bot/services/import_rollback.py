@@ -109,79 +109,65 @@ async def rollback_ingestion_run(
                 ingestion_run_id,
             )
 
-            # Use explicit raw SAVEPOINT SQL because session.begin_nested() tracks
-            # connections through the ORM layer; connection.execute() calls bypass
-            # session tracking so session.begin_nested().__aexit__ would find an empty
-            # _connections dict and skip the ROLLBACK TO SAVEPOINT on asyncpg.
-            # Raw text SAVEPOINTs go through AsyncConnection.execute (async path) which
-            # works correctly with asyncpg.
-            await connection.execute(text("SAVEPOINT _rollback_outer"))
-            race_report: RollbackReport | None = None
-            try:
-                chat_delete_result = await connection.execute(
-                    text(
-                        """
-                        DELETE FROM chat_messages cm
-                         WHERE EXISTS (
-                               SELECT 1
-                                 FROM telegram_updates tu
-                                WHERE tu.id = cm.raw_update_id
-                                  AND tu.ingestion_run_id = :id
-                                  AND tu.update_id IS NULL
-                         )
-                        """
-                    ),
-                    {"id": ingestion_run_id},
-                )
-                chat_messages_deleted = _require_rowcount(chat_delete_result)
-
-                update_delete_result = await connection.execute(
-                    text(
-                        """
+            # Single CTE executes both DELETEs atomically in one server round-trip.
+            # Atomicity is guaranteed by PostgreSQL: if the statement errors or is
+            # interrupted before execution, neither table is touched. No client-side
+            # SAVEPOINT management is required.
+            atomic_result = await connection.execute(
+                text(
+                    """
+                    WITH deleted_updates AS (
                         DELETE FROM telegram_updates
                          WHERE ingestion_run_id = :id
                            AND update_id IS NULL
-                        """
+                        RETURNING id
                     ),
-                    {"id": ingestion_run_id},
-                )
-                telegram_updates_deleted = _require_rowcount(update_delete_result)
+                    deleted_messages AS (
+                        DELETE FROM chat_messages cm
+                         WHERE cm.raw_update_id IN (SELECT id FROM deleted_updates)
+                        RETURNING id
+                    )
+                    SELECT
+                        (SELECT COUNT(*) FROM deleted_updates)  AS tu_count,
+                        (SELECT COUNT(*) FROM deleted_messages) AS cm_count
+                    """
+                ),
+                {"id": ingestion_run_id},
+            )
+            row = atomic_result.one()
+            telegram_updates_deleted = int(row.tu_count)
+            chat_messages_deleted = int(row.cm_count)
 
-                # Inner SAVEPOINT for audit-insert race: if concurrent rollback already
-                # wrote the audit row (IntegrityError on unique partial index), we roll
-                # back only this inner savepoint and re-query the winning row.
-                await connection.execute(text("SAVEPOINT _rollback_audit"))
-                try:
-                    audit_run_id = await _insert_rollback_audit(
-                        connection,
-                        original_run_id=ingestion_run_id,
-                        chat_messages_deleted=chat_messages_deleted,
-                        telegram_updates_deleted=telegram_updates_deleted,
-                        message_versions_cascade_deleted=message_versions_count,
-                    )
-                except IntegrityError:
-                    await connection.execute(text("ROLLBACK TO SAVEPOINT _rollback_audit"))
-                    race_audit = await _find_existing_rollback_audit(
-                        connection,
-                        ingestion_run_id,
-                    )
-                    if race_audit is None:
-                        await connection.execute(text("ROLLBACK TO SAVEPOINT _rollback_outer"))
-                        raise
-                    race_report = _build_idempotent_report(
-                        ingestion_run_id,
-                        audit_id=race_audit[0],
-                        stats=race_audit[1],
-                    )
-                else:
-                    await connection.execute(text("RELEASE SAVEPOINT _rollback_audit"))
-            except BaseException:
-                # Any error inside outer savepoint (including RuntimeError from DELETE) →
-                # roll back the outer savepoint so all deletes are undone atomically.
-                await connection.execute(text("ROLLBACK TO SAVEPOINT _rollback_outer"))
-                raise
+            race_report: RollbackReport | None = None
+            # Inner SAVEPOINT for audit-insert race: if concurrent rollback already
+            # wrote the audit row (IntegrityError on unique partial index), we roll
+            # back only this inner savepoint and re-query the winning row.
+            # The deletes are already committed to the outer transaction at this point;
+            # only the audit INSERT is guarded here.
+            await connection.execute(text("SAVEPOINT _rollback_audit"))
+            try:
+                audit_run_id = await _insert_rollback_audit(
+                    connection,
+                    original_run_id=ingestion_run_id,
+                    chat_messages_deleted=chat_messages_deleted,
+                    telegram_updates_deleted=telegram_updates_deleted,
+                    message_versions_cascade_deleted=message_versions_count,
+                )
+            except IntegrityError:
+                await connection.execute(text("ROLLBACK TO SAVEPOINT _rollback_audit"))
+                race_audit = await _find_existing_rollback_audit(
+                    connection,
+                    ingestion_run_id,
+                )
+                if race_audit is None:
+                    raise
+                race_report = _build_idempotent_report(
+                    ingestion_run_id,
+                    audit_id=race_audit[0],
+                    stats=race_audit[1],
+                )
             else:
-                await connection.execute(text("RELEASE SAVEPOINT _rollback_outer"))
+                await connection.execute(text("RELEASE SAVEPOINT _rollback_audit"))
 
             # Commit inside acquire_advisory_lock(): pinned connection keeps the lock; see import_apply.py.
             await session.commit()
