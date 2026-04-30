@@ -1,4 +1,4 @@
-"""Migration 020 acceptance tests.
+"""Phase 4 FTS schema acceptance tests.
 
 These tests create an isolated temporary database, run Alembic against it, and
 drop the database afterwards. They do not mutate the shared pytest database.
@@ -75,7 +75,7 @@ async def _drop_database(admin_url: URL, database_name: str) -> None:
 @pytest_asyncio.fixture()
 async def temp_database_url() -> AsyncIterator[str]:
     base_url = _base_test_url()
-    database_name = f"shkoder_migration_020_{uuid.uuid4().hex[:12]}"
+    database_name = f"shkoder_fts_schema_{uuid.uuid4().hex[:12]}"
     try:
         await _create_database(base_url, database_name)
     except Exception as exc:  # pragma: no cover - environment guard
@@ -117,22 +117,37 @@ async def _fetch_value(database_url: str, query: str, *args: object) -> object:
         await conn.close()
 
 
-async def _insert_message_version(database_url: str) -> int:
+async def _insert_message_version(
+    database_url: str,
+    *,
+    text_value: str | None,
+    caption_value: str | None,
+    normalized_text: str | None,
+    content_hash: str,
+) -> int:
     conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(database_url)))
     try:
         async with conn.transaction():
             await conn.execute(
                 """
                 INSERT INTO users (id, username, first_name)
-                VALUES (910000000001, 'migration020', 'Migration')
+                VALUES (910000000001, 'fts_schema', 'FTS')
+                ON CONFLICT (id) DO NOTHING
                 """
             )
             chat_message_id = await conn.fetchval(
                 """
                 INSERT INTO chat_messages (message_id, chat_id, user_id, text, date)
-                VALUES (42001, -10042001, 910000000001, 'кошка сидит', now())
+                VALUES (
+                    (SELECT 42001 + count(*) FROM chat_messages),
+                    -10042001,
+                    910000000001,
+                    $1,
+                    now()
+                )
                 RETURNING id
-                """
+                """,
+                text_value,
             )
             return await conn.fetchval(
                 """
@@ -144,10 +159,14 @@ async def _insert_message_version(database_url: str) -> int:
                     normalized_text,
                     content_hash
                 )
-                VALUES ($1, 1, 'кошка сидит', 'рыжая кошка', 'кошка сидит', 'mig020-hash')
+                VALUES ($1, 1, $2, $3, $4, $5)
                 RETURNING id
                 """,
                 chat_message_id,
+                text_value,
+                caption_value,
+                normalized_text,
+                content_hash,
             )
     finally:
         await conn.close()
@@ -162,18 +181,27 @@ async def migrated_database_url(temp_database_url: str) -> AsyncIterator[str]:
 async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str) -> None:
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
 
-    assert current == "020"
+    assert current == "021"
 
 
-async def test_insert_message_versions_generates_tsv(migrated_database_url: str) -> None:
-    version_id = await _insert_message_version(migrated_database_url)
+async def test_insert_message_versions_generates_search_tsv_from_normalized_text(
+    migrated_database_url: str,
+) -> None:
+    version_id = await _insert_message_version(
+        migrated_database_url,
+        text_value="ORIGINAL TEXT SHOULD NOT DRIVE SEARCH",
+        caption_value=None,
+        normalized_text="тестовое сообщение",
+        content_hash="fts-schema-normalized",
+    )
 
     row = await _fetch_one(
         migrated_database_url,
         """
         SELECT
-            tsv::text AS tsv_text,
-            tsv @@ plainto_tsquery('russian', 'кошка') AS matches_query
+            search_tsv::text AS search_tsv_text,
+            search_tsv @@ plainto_tsquery('russian', 'сообщение') AS matches_query,
+            search_tsv @@ plainto_tsquery('russian', 'original') AS text_matches
         FROM message_versions
         WHERE id = $1
         """,
@@ -181,8 +209,62 @@ async def test_insert_message_versions_generates_tsv(migrated_database_url: str)
     )
 
     assert row is not None
-    assert row["tsv_text"]
+    assert row["search_tsv_text"]
     assert row["matches_query"] is True
+    assert row["text_matches"] is False
+
+
+async def test_insert_message_versions_generates_search_tsv_from_caption(
+    migrated_database_url: str,
+) -> None:
+    version_id = await _insert_message_version(
+        migrated_database_url,
+        text_value=None,
+        caption_value="русская подпись",
+        normalized_text=None,
+        content_hash="fts-schema-caption",
+    )
+
+    row = await _fetch_one(
+        migrated_database_url,
+        """
+        SELECT search_tsv @@ plainto_tsquery('russian', 'подпись') AS matches_query
+        FROM message_versions
+        WHERE id = $1
+        """,
+        version_id,
+    )
+
+    assert row is not None
+    assert row["matches_query"] is True
+
+
+async def test_insert_message_versions_null_content_generates_empty_search_tsv(
+    migrated_database_url: str,
+) -> None:
+    version_id = await _insert_message_version(
+        migrated_database_url,
+        text_value=None,
+        caption_value=None,
+        normalized_text=None,
+        content_hash="fts-schema-empty",
+    )
+
+    row = await _fetch_one(
+        migrated_database_url,
+        """
+        SELECT
+            search_tsv::text AS search_tsv_text,
+            search_tsv @@ plainto_tsquery('russian', 'anything') AS matches_query
+        FROM message_versions
+        WHERE id = $1
+        """,
+        version_id,
+    )
+
+    assert row is not None
+    assert row["search_tsv_text"] == ""
+    assert row["matches_query"] is False
 
 
 async def test_pg_indexes_contains_named_gin_index(migrated_database_url: str) -> None:
@@ -191,20 +273,30 @@ async def test_pg_indexes_contains_named_gin_index(migrated_database_url: str) -
         """
         SELECT indexdef
         FROM pg_indexes
-        WHERE schemaname = 'public'
-            AND tablename = 'message_versions'
-            AND indexname = 'idx_message_versions_tsv'
-        """,
+            WHERE schemaname = 'public'
+                AND tablename = 'message_versions'
+                AND indexname = 'ix_message_versions_search_tsv'
+            """,
     )
 
     assert indexdef is not None
     lowered = str(indexdef).lower()
     assert "using gin" in lowered
-    assert "(tsv)" in lowered
-    assert "where (is_redacted = false)" in lowered
+    assert "(search_tsv)" in lowered
+    assert "where" not in lowered
 
 
-async def test_alembic_downgrade_minus_one_drops_tsv(temp_database_url: str) -> None:
+def test_message_version_metadata_includes_search_tsv(app_env) -> None:
+    from tests.conftest import import_module
+
+    models = import_module("bot.db.models")
+    table = models.Base.metadata.tables["message_versions"]
+
+    assert "search_tsv" in table.columns
+    assert "ix_message_versions_search_tsv" in {ix.name for ix in table.indexes}
+
+
+async def test_alembic_downgrade_minus_one_drops_search_tsv(temp_database_url: str) -> None:
     _run_alembic(temp_database_url, "upgrade", "head")
     _run_alembic(temp_database_url, "downgrade", "-1")
 
@@ -214,11 +306,11 @@ async def test_alembic_downgrade_minus_one_drops_tsv(temp_database_url: str) -> 
         SELECT EXISTS (
             SELECT 1
             FROM information_schema.columns
-            WHERE table_schema = 'public'
-                AND table_name = 'message_versions'
-                AND column_name = 'tsv'
-        )
-        """,
+                WHERE table_schema = 'public'
+                    AND table_name = 'message_versions'
+                    AND column_name = 'search_tsv'
+            )
+            """,
     )
     index_exists = await _fetch_value(
         temp_database_url,
@@ -226,14 +318,14 @@ async def test_alembic_downgrade_minus_one_drops_tsv(temp_database_url: str) -> 
         SELECT EXISTS (
             SELECT 1
             FROM pg_indexes
-            WHERE schemaname = 'public'
-                AND tablename = 'message_versions'
-                AND indexname = 'idx_message_versions_tsv'
-        )
-        """,
+                WHERE schemaname = 'public'
+                    AND tablename = 'message_versions'
+                    AND indexname = 'ix_message_versions_search_tsv'
+            )
+            """,
     )
     current = await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version")
 
     assert column_exists is False
     assert index_exists is False
-    assert current == "019"
+    assert current == "020"

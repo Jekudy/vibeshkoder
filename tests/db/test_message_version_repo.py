@@ -280,6 +280,7 @@ def test_message_version_metadata_smoke(app_env) -> None:
         "raw_update_id",
         "is_redacted",
         "imported_final",
+        "search_tsv",
     } == cols
 
     constraint_names = {c.name for c in table.constraints if c.name}

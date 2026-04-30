@@ -6,6 +6,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
     DateTime,
     ForeignKey,
     Index,
@@ -18,8 +19,34 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.sql.expression import ColumnElement
+
+
+class MessageVersionSearchVectorExpression(ColumnElement[str]):
+    """Dialect-aware generated-column expression for ``message_versions.search_tsv``."""
+
+    inherit_cache = True
+
+
+@compiles(MessageVersionSearchVectorExpression, "postgresql")
+def _compile_search_vector_postgresql(
+    element: MessageVersionSearchVectorExpression,
+    compiler,
+    **kwargs,
+) -> str:
+    return "to_tsvector('russian', coalesce(normalized_text,'') || ' ' || coalesce(caption,''))"
+
+
+@compiles(MessageVersionSearchVectorExpression)
+def _compile_search_vector_default(
+    element: MessageVersionSearchVectorExpression,
+    compiler,
+    **kwargs,
+) -> str:
+    return "coalesce(normalized_text,'') || ' ' || coalesce(caption,'')"
 
 
 class Base(DeclarativeBase):
@@ -246,6 +273,11 @@ class MessageVersion(Base):
         Index("ix_message_versions_content_hash", "content_hash"),
         Index("ix_message_versions_captured_at", "captured_at"),
         Index("ix_message_versions_chat_message_id", "chat_message_id"),
+        Index(
+            "ix_message_versions_search_tsv",
+            "search_tsv",
+            postgresql_using="gin",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -287,6 +319,11 @@ class MessageVersion(Base):
     # FALSE for live ingestion. See docs/memory-system/import-edit-history.md.
     imported_final: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
+    )
+    search_tsv: Mapped[str | None] = mapped_column(
+        TSVECTOR().with_variant(Text(), "sqlite"),
+        Computed(MessageVersionSearchVectorExpression(), persisted=True),
+        nullable=True,
     )
 
 
