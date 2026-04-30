@@ -1,0 +1,194 @@
+name: Autonomous Healing
+
+on:
+  workflow_dispatch:
+    inputs:
+      signal_payload:
+        description: "JSON payload emitted by the composite healthcheck"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: healing-singleton
+  cancel-in-progress: false
+
+jobs:
+  healing:
+    runs-on: [self-hosted, shkoder-vps]
+    timeout-minutes: 45
+    env:
+      SIGNAL_PAYLOAD: ${{ inputs.signal_payload }}
+      COOLIFY_BASE_URL: ${{ vars.COOLIFY_BASE_URL }}
+      COOLIFY_APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
+      HEALING_BOT_CONTAINER: ${{ vars.HEALING_BOT_CONTAINER }}
+      COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      DATABASE_URL_RO: ${{ secrets.DATABASE_URL_RO }}
+      HEALING_ENV_KEY: ${{ secrets.HEALING_ENV_KEY }}
+      GH_TOKEN: ${{ secrets.HEALING_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,healing]"
+
+      - name: Pre-flight disabled flag
+        shell: bash
+        run: |
+          set -euo pipefail
+          disabled="$(python -m ops.healing.state_branch read-file .healing/disabled || true)"
+          if [ -n "$disabled" ]; then
+            printf '%s\n' "$SIGNAL_PAYLOAD" > signal.json
+            printf 'healing disabled flag is present\n' > session.log
+            printf '{"disabled":true}\n' > snapshot.json
+            python -m ops.healing.escalate \
+              --reason "healing disabled flag is present" \
+              --transcript-path session.log \
+              --snapshot-path snapshot.json \
+              --admin-id 149820031 \
+              --gh-repo "$GITHUB_REPOSITORY"
+            exit 0
+          fi
+
+      - name: Acquire healing lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing="$(python -m ops.healing.state_branch read-file .healing/in-progress || true)"
+          if [ -n "$existing" ]; then
+            printf 'existing healing lock: %s\n' "$existing" > session.log
+            printf '{"locked":true}\n' > snapshot.json
+            python -m ops.healing.escalate \
+              --reason "healing lock already exists" \
+              --transcript-path session.log \
+              --snapshot-path snapshot.json \
+              --admin-id 149820031 \
+              --gh-repo "$GITHUB_REPOSITORY"
+            exit 1
+          fi
+          printf 'run=%s attempt-start=%s\n' "$GITHUB_RUN_ID" "$(date -u +%FT%TZ)" \
+            | python -m ops.healing.state_branch write-file .healing/in-progress
+
+      - name: Healing attempts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p healing-work state-branch
+          printf '%s\n' "$SIGNAL_PAYLOAD" > healing-work/signal.json
+          reason="retry budget exhausted"
+          success="false"
+
+          cleanup_lock() {
+            printf '' | python -m ops.healing.state_branch write-file .healing/in-progress
+          }
+          trap cleanup_lock EXIT
+
+          for attempt in 1 2 3; do
+            printf 'attempt %s started at %s\n' "$attempt" "$(date -u +%FT%TZ)"
+            snapshot_path="healing-work/snapshot-${attempt}.json"
+            cp "$snapshot_path" healing-work/snapshot-current.json 2>/dev/null || true
+
+            python -m ops.healing.snapshot create --output "$snapshot_path"
+            cp "$snapshot_path" healing-work/snapshot-current.json
+            python -m ops.healing.state_branch write-file "snapshots/${GITHUB_RUN_ID}-${attempt}.json" \
+              < "$snapshot_path"
+            python -m ops.healing.state_branch write-file snapshots/latest.json < "$snapshot_path"
+
+            rm -rf state-branch
+            git worktree add state-branch healing-state
+            python -m ops.healing.context_bundle \
+              --signal-json "$SIGNAL_PAYLOAD" \
+              --state-branch-dir state-branch \
+              --output healing-work/context-bundle.md
+            git worktree remove --force state-branch
+
+            set +e
+            claude -p \
+              --model claude-opus-4-7 \
+              --append-system-prompt "$(cat ops/healing/INVARIANTS.md)" \
+              --max-turns 50 \
+              < healing-work/context-bundle.md > "healing-work/session-${attempt}.log"
+            claude_status=$?
+            set -e
+            cp "healing-work/session-${attempt}.log" session.log
+            if [ "$claude_status" -ne 0 ]; then
+              reason="claude session failed"
+              break
+            fi
+
+            pr_number="$(gh pr list --state open --base main --json number --jq '.[0].number // empty')"
+            if [ -z "$pr_number" ]; then
+              reason="claude did not open a pull request"
+              sleep 900
+              continue
+            fi
+
+            set +e
+            codex exec review --base main -m gpt-5.5 -c model_reasoning_effort=high --ephemeral \
+              > "healing-work/codex-${attempt}.log"
+            codex_status=$?
+            set -e
+            if [ "$codex_status" -ne 0 ] || ! rg -q "APPROVE" "healing-work/codex-${attempt}.log"; then
+              reason="codex review did not approve"
+              gh pr comment "$pr_number" --body-file "healing-work/codex-${attempt}.log"
+              sleep 900
+              continue
+            fi
+
+            gh pr merge "$pr_number" --rebase --delete-branch
+
+            poll_successes=0
+            for poll in 1 2 3 4 5; do
+              sleep 120
+              if python -m ops.healing.healthcheck > "healing-work/post-fix-${attempt}-${poll}.json"; then
+                poll_successes=$((poll_successes + 1))
+              else
+                reason="post-fix watch failed"
+                break
+              fi
+            done
+
+            if [ "$poll_successes" -eq 5 ]; then
+              success="true"
+              break
+            fi
+
+            python -m ops.healing.snapshot restore --input "$snapshot_path"
+            gh pr close "$pr_number" --comment "auto-reverted; root cause not resolved" || true
+            sleep 900
+          done
+
+          if [ "$success" = "true" ]; then
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "[healing] run ${GITHUB_RUN_ID} — succeeded" \
+              --body "Autonomous healing succeeded and passed the 10-minute watch." \
+              --label healing \
+              | tee healing-work/audit-issue.txt
+            issue_url="$(cat healing-work/audit-issue.txt)"
+            gh issue close "$issue_url" --comment "Closed automatically after green watch." || true
+            exit 0
+          fi
+
+          printf '%s\n' "$reason" > healing-work/escalation-reason.txt
+          python -m ops.healing.escalate \
+            --reason "$reason" \
+            --transcript-path session.log \
+            --snapshot-path healing-work/snapshot-current.json \
+            --admin-id 149820031 \
+            --gh-repo "$GITHUB_REPOSITORY"
+          printf 'disabled by run=%s reason=%s\n' "$GITHUB_RUN_ID" "$reason" \
+            | python -m ops.healing.state_branch write-file .healing/disabled
+          exit 1
