@@ -36,6 +36,9 @@ dev = [
 ops = [
     "telethon>=1.39",
 ]
+healing = [
+    "cryptography>=43",
+]
 
 [build-system]
 requires = ["setuptools>=75"]
