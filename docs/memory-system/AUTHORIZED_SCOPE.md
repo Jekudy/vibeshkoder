@@ -55,21 +55,90 @@ must wait for its phase gate.
 
 ---
 
+## Authorized: Phase 5 — LLM gateway + answer synthesis (2026-04-30)
+
+Phase 5 is authorized for implementation. Predecessor (Phase 4) closed 2026-04-30 with
+6/6 tickets shipped, FHR pending. Owned by Orchestrator A per `ORCHESTRATOR_REGISTRY.md`.
+
+Authorized scope:
+- `bot/services/llm_gateway.py` — single-entry LLM call interface; ALL provider calls
+  must go through this module.
+- `bot/services/llm_usage_ledger.py` + `bot/db/repos/llm_usage_ledger.py` — every call
+  audited (provider, model, input_tokens, output_tokens, cost_usd_cents, governance
+  filter result, ts).
+- alembic migration 022+ for `llm_usage_ledger`, 023+ for `qa_traces` LLM extension
+  fields (answer_text, citation_count, llm_call_id FK).
+- Governance source-filter pre-call: refuse to send any evidence whose source row has
+  `memory_policy IN ('offrecord','forgotten')` OR `is_redacted=TRUE`.
+- Budget guard (per-day USD ceiling, configurable env var; refuse when exceeded).
+- Cache layer (cite-stable input hash → cached answer; respects governance flips).
+- `/recall` upgrade: optional LLM-synthesized answer when ≥1 evidence + flag enabled.
+
+NOT in Phase 5 scope (defer to Phase 6+):
+- Knowledge cards, extraction pipelines, daily digests, observations, reflection runs.
+- Vector / semantic search beyond the FTS already shipped in Phase 4.
+- Cross-chat or public answer surfaces.
+
+---
+
+## Authorized: Phase 11 — Shkoderbench / evals harness (2026-04-30)
+
+Phase 11 is authorized for implementation in parallel with Phase 5. Owned by
+Orchestrator C. No production runtime impact; offline / CI-only.
+
+Authorized scope:
+- `tests/evals/` — new top-level test category with golden datasets, citation quality
+  assertions, leakage tests (no `#offrecord` / forgotten content in any answer),
+  no-evidence refusal correctness, citation precision/recall.
+- `bot/services/eval_*.py` — offline harness invoked by tests; no production wiring.
+- Golden recall fixtures (`tests/fixtures/golden_recall/`, `tests/fixtures/eval_seeds/`).
+- CI nightly job (`.github/workflows/evals.yml`) gated by env var (default OFF until
+  baseline established).
+- NO new alembic migrations. NO new production handlers.
+
+Phase 11 evals must run against the live `/recall` from Phase 4 first (baseline) and
+later against Phase 5 LLM-synthesized answers (regression suite for hallucination /
+leakage / citation drift).
+
+---
+
+## Authorized: Phase 12 — Butler design docs only (2026-04-30)
+
+Phase 12 is authorized **for documentation only**. NO implementation, NO execution
+code, NO database tables. Owned by Orchestrator B as a docs side-quest.
+
+Authorized scope:
+- `docs/memory-system/PHASE12_PLAN.md` (promoted from `_DRAFT`) — design contract for
+  the future butler action layer.
+- Permission model spec, action audit log spec, abort / dry-run spec.
+
+---
+
+## Conditionally authorized: Phase 9, Phase 10 (gated)
+
+Phase 9 (wiki) and Phase 10 (graph projection) are NOT yet authorized for runtime
+implementation. Orchestrator B may:
+- Refine `PHASE9_PLAN_DRAFT.md` and `PHASE10_PLAN_DRAFT.md` into `_PLAN.md` artifacts.
+- Sketch schema designs (no migrations until ratified).
+- Build read-only experiments in `.worktrees/orch-B-experiments/` (NOT pushed to main).
+
+Promotion to "authorized for implementation" requires:
+- Orchestrator A confirms Phase 6 (cards) closed (Phase 9 + 10 both depend on stable
+  cards / relations).
+- AUTHORIZED_SCOPE.md updated by human or Orchestrator A's closing PR.
+
+---
+
 ## NOT authorized (future phases — gates not passed)
 
 Do not start, design, or write speculative code for:
 
-- Import **apply** (Phase 2b) — needs T3-01 + policy detection minimum.
-- Q&A bot (Phase 4) — needs message_versions + governance filters.
-- LLM calls of any kind — needs `llm_gateway` + ledger (Phase 5).
-- LLM extraction — Phase 5.
-- Vector search / pgvector — Phase 4+ at earliest.
-- Catalog / knowledge cards — Phase 6.
-- Daily summaries — Phase 7.
-- Weekly digest — Phase 8.
-- Wiki (member or public) — Phase 9.
-- Graph projection (Neo4j / Graphiti) — Phase 10.
-- Butler / action execution — Phase 12 (postponed; design only).
+- Phase 6 catalog / cards — Orchestrator A unblocks after Phase 5 closure.
+- Phase 7 daily summaries — depends on Phase 5 + Phase 6.
+- Phase 8 reflection / observations — depends on Phase 7.
+- Wiki (member or public) implementation — Phase 9, conditionally above.
+- Graph projection (Neo4j / Graphiti) implementation — Phase 10, conditionally above.
+- Butler / action execution — Phase 12, design-only above.
 - Person expertise pages — Phase 6+.
 - Public surfaces of any kind — Phase 9 with explicit approval.
 
