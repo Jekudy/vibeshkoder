@@ -497,6 +497,37 @@ class ForgetEvent(Base):
     )
 
 
+class QaTrace(Base):
+    __tablename__ = "qa_traces"
+    __table_args__ = (
+        Index("ix_qa_traces_user_tg_id", "user_tg_id"),
+        Index("ix_qa_traces_chat_id_created_at", "chat_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_tg_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    query_redacted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    query_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_ids: Mapped[list[int]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
+    abstained: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=func.now(),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
 class IntroRefreshTracking(Base):
     __tablename__ = "intro_refresh_tracking"
 
