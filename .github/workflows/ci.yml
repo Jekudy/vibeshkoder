@@ -49,7 +49,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,healing]"
 
       - name: Run alembic migrations against the test postgres
         run: alembic upgrade head
