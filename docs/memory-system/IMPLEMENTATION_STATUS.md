@@ -167,7 +167,33 @@ ticket grid; will be picked up before or alongside Phase 4 work.
   hardening; current path is correct under aiogram contract but lacks an explicit None
   guard).
 
-## Phases 4–12
+## Phase 4 — Hybrid search + Q&A with citations (active 2026-04-30+)
+
+Authorized: see `AUTHORIZED_SCOPE.md`. Design + stream allocation: `PHASE4_PLAN.md` (PR #152, commit `5bd4888`). Audit + corrections: PR #154 (commit `276983a`).
+
+| Issue | Ticket | Status | Notes |
+|---|---|---|---|
+| [#145](https://github.com/Jekudy/vibeshkoder/issues/145) | T4-01 | ✅ closed | FTS schema (migration 020) shipped via PR #151 with deviations: column `tsv` (not `search_tsv`), index `idx_message_versions_tsv` (not `ix_*_search_tsv`), source uses `text` (not planned `normalized_text`), partial GIN index `WHERE is_redacted=false` (plan §5.A item 5 rejected partial-index strategy). `MessageVersion.tsv` ORM column not declared; SQL via `text()` works. Cosmetic deviations accepted; source switch + ORM column tracked in #153. |
+| [#146](https://github.com/Jekudy/vibeshkoder/issues/146) | T4-02 | ✅ closed | `bot/services/search.py::search_messages` shipped via PR #151. **Material gaps tracked in #153:** `SearchHit` ships 6 fields (planned 9); `current_version_id = mv.id` JOIN clause missing → returns historical message versions; tombstone NOT EXISTS uses single `target_type='message'` key, missing 3-key (`message:`/`message_hash:`/`user:`) pattern from plan §5.B → invariant #9 weakened for `message_hash`-targeted and `user`-targeted forget events. Test coverage gaps: russian stemmer, injection safety, current_version_id filtering, 100-row pagination. Cascade `fts_rows` layer remains `{status: 'skipped'}` but de-facto correctness preserved by existing `_cascade_message_versions` nulling content + partial index `WHERE is_redacted=false`. |
+| [#147](https://github.com/Jekudy/vibeshkoder/issues/147) | T4-03 | 🟡 open | Stream C — `bot/services/evidence.py` frozen `EvidenceBundle`/`EvidenceItem` dataclasses + JSON contract. Wave 1 parallel; unblocked. Prompt corrected (PR #154) — `search_types.py` stub dropped (canonical `SearchHit` ships in #151); 6-vs-9 field gap documented. |
+| [#148](https://github.com/Jekudy/vibeshkoder/issues/148) | T4-04 | 🟡 open | Stream D — `/recall` Telegram command + `memory.qa.enabled` feature flag (default OFF). Wave 3; depends on #147 + #149 + ideally #153 hardening (for full SearchHit fields). Prompt corrected (PR #154) — fixed 4 hallucinated APIs (`feature_flag.is_enabled` → `FeatureFlagRepo.get`, `UserRepo.get_by_id` → `UserRepo.get`, `detect_policy` tuple unpack, `process_forget_for_user` → `run_cascade_worker_once`), switched `parse_mode` to HTML, switched query parsing to `CommandObject.args`. |
+| [#149](https://github.com/Jekudy/vibeshkoder/issues/149) | T4-05 | 🟡 open | Stream E — `qa_traces` audit table + repo. Wave 1 parallel. Prompt corrected (PR #154) — `down_revision = "020"` literal (not `"020_add_message_version_fts_index"`); xfail cascade test rewritten to drive `run_cascade_worker_once` via `forget_events` row. Cascade `qa_traces` layer wiring deferred (xfail until added to `CASCADE_LAYER_ORDER`). |
+| [#150](https://github.com/Jekudy/vibeshkoder/issues/150) | T4-06 | 🟡 open | Eval seed cases (≥10), rolled into Stream D PR. |
+| [#153](https://github.com/Jekudy/vibeshkoder/issues/153) | T4-02H | 🟡 open | **Hardening follow-up.** Expand `SearchHit` to 9 fields (`chat_message_id`, `user_id`, `message_date`); add `current_version_id = mv.id` JOIN; add three-key tombstone NOT EXISTS; add russian stemmer + injection + current_version_id + 100-row pagination tests; add `MessageVersion.tsv` ORM column; optionally switch tsvector source from `text` to `normalized_text`. Material — Stream D rendering blocked on field expansion. |
+
+### Wave allocation (post-audit)
+
+- **Wave 1 (parallel, unblocked):** Stream C (#147), Stream E (#149).
+- **Wave 1.5 (hardening, parallel-safe with Wave 1):** #153 — coordinate so Stream D consumes the expanded `SearchHit`.
+- **Wave 3:** Stream D (#148 + #150) — after Wave 1 + #153.
+
+### Stream prompts (in repo root)
+
+`PHASE4_STREAM_C_PROMPT.md`, `PHASE4_STREAM_D_PROMPT.md`, `PHASE4_STREAM_E_PROMPT.md` — corrected and ready for autonomous execution. Stream A and Stream B prompts retained as historical reference (their work shipped via PR #151).
+
+---
+
+## Phases 5–12
 
 Not started. Not authorized. See `AUTHORIZED_SCOPE.md` for gating rules.
 
