@@ -38,6 +38,7 @@ ops = [
 ]
 healing = [
     "cryptography>=43",
+    "psycopg[binary]>=3.2",
 ]
 
 [build-system]
