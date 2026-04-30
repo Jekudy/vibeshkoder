@@ -1,0 +1,64 @@
+name: Healing Healthcheck
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    env:
+      COOLIFY_BASE_URL: ${{ vars.COOLIFY_BASE_URL }}
+      COOLIFY_APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
+      COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      DATABASE_URL_RO: ${{ secrets.DATABASE_URL_RO }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,healing]"
+
+      - name: Run composite healthcheck
+        id: check
+        shell: bash
+        run: |
+          set +e
+          python -m ops.healing.healthcheck > healthcheck-report.json
+          status=$?
+          cat healthcheck-report.json
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Append healthcheck history
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from ops.healing.state_branch import append_jsonl
+
+          report = json.loads(Path("healthcheck-report.json").read_text(encoding="utf-8"))
+          append_jsonl(Path("."), "healthcheck-log.jsonl", report)
+          PY
+
+      - name: Dispatch healing workflow on red
+        if: steps.check.outputs.status != '0'
+        shell: bash
+        run: |
+          gh workflow run healing.yml \
+            --ref main \
+            -f signal_payload="$(cat healthcheck-report.json)"
