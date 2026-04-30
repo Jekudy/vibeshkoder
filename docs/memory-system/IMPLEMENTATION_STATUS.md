@@ -175,11 +175,28 @@ Authorized: see `AUTHORIZED_SCOPE.md`. Design + stream allocation: `PHASE4_PLAN.
 |---|---|---|---|
 | [#145](https://github.com/Jekudy/vibeshkoder/issues/145) | T4-01 | ✅ closed | FTS schema (migration 020) shipped via PR #151 with deviations: column `tsv` (not `search_tsv`), index `idx_message_versions_tsv` (not `ix_*_search_tsv`), source uses `text` (not planned `normalized_text`), partial GIN index `WHERE is_redacted=false` (plan §5.A item 5 rejected partial-index strategy). `MessageVersion.tsv` ORM column not declared; SQL via `text()` works. Cosmetic deviations accepted; source switch + ORM column tracked in #153. |
 | [#146](https://github.com/Jekudy/vibeshkoder/issues/146) | T4-02 | ✅ closed | `bot/services/search.py::search_messages` shipped via PR #151. **Material gaps tracked in #153:** `SearchHit` ships 6 fields (planned 9); `current_version_id = mv.id` JOIN clause missing → returns historical message versions; tombstone NOT EXISTS uses single `target_type='message'` key, missing 3-key (`message:`/`message_hash:`/`user:`) pattern from plan §5.B → invariant #9 weakened for `message_hash`-targeted and `user`-targeted forget events. Test coverage gaps: russian stemmer, injection safety, current_version_id filtering, 100-row pagination. Cascade `fts_rows` layer remains `{status: 'skipped'}` but de-facto correctness preserved by existing `_cascade_message_versions` nulling content + partial index `WHERE is_redacted=false`. |
-| [#147](https://github.com/Jekudy/vibeshkoder/issues/147) | T4-03 | 🟡 open | Stream C — `bot/services/evidence.py` frozen `EvidenceBundle`/`EvidenceItem` dataclasses + JSON contract. Wave 1 parallel; unblocked. Prompt corrected (PR #154) — `search_types.py` stub dropped (canonical `SearchHit` ships in #151); 6-vs-9 field gap documented. |
-| [#148](https://github.com/Jekudy/vibeshkoder/issues/148) | T4-04 | 🟡 open | Stream D — `/recall` Telegram command + `memory.qa.enabled` feature flag (default OFF). Wave 3; depends on #147 + #149 + ideally #153 hardening (for full SearchHit fields). Prompt corrected (PR #154) — fixed 4 hallucinated APIs (`feature_flag.is_enabled` → `FeatureFlagRepo.get`, `UserRepo.get_by_id` → `UserRepo.get`, `detect_policy` tuple unpack, `process_forget_for_user` → `run_cascade_worker_once`), switched `parse_mode` to HTML, switched query parsing to `CommandObject.args`. |
-| [#149](https://github.com/Jekudy/vibeshkoder/issues/149) | T4-05 | 🟡 open | Stream E — `qa_traces` audit table + repo. Wave 1 parallel. Prompt corrected (PR #154) — `down_revision = "020"` literal (not `"020_add_message_version_fts_index"`); xfail cascade test rewritten to drive `run_cascade_worker_once` via `forget_events` row. Cascade `qa_traces` layer wiring deferred (xfail until added to `CASCADE_LAYER_ORDER`). |
-| [#150](https://github.com/Jekudy/vibeshkoder/issues/150) | T4-06 | 🟡 open | Eval seed cases (≥10), rolled into Stream D PR. |
-| [#153](https://github.com/Jekudy/vibeshkoder/issues/153) | T4-02H | 🟡 open | **Hardening follow-up.** Expand `SearchHit` to 9 fields (`chat_message_id`, `user_id`, `message_date`); add `current_version_id = mv.id` JOIN; add three-key tombstone NOT EXISTS; add russian stemmer + injection + current_version_id + 100-row pagination tests; add `MessageVersion.tsv` ORM column; optionally switch tsvector source from `text` to `normalized_text`. Material — Stream D rendering blocked on field expansion. |
+| [#147](https://github.com/Jekudy/vibeshkoder/issues/147) | T4-03 | ✅ closed | **Stream C MERGED via PR #157** (commit `8dda534`) on 2026-04-30. `bot/services/evidence.py` ships frozen `EvidenceBundle`/`EvidenceItem` dataclasses (slots, immutable, JSON-serializable, 9-field shape matching canonical `SearchHit`). `tests/services/test_evidence.py` — 6 tests passing. `tests/fixtures/evidence_bundle_v1.json` snapshot committed for Phase 5 contract stability. `from_hits()` performs no DB lookup. |
+| [#148](https://github.com/Jekudy/vibeshkoder/issues/148) | T4-04 | 🟡 in flight | Stream D — `/recall` handler + `memory.qa.enabled` feature flag. Wave 3 (Wave 1 fully merged 2026-04-30 via #157 + #158). Codex executor running with corrected APIs (FeatureFlagRepo.get, UserRepo.get, detect_policy tuple unpack, CommandObject.args, parse_mode=HTML). Implementation per `docs/memory-system/prompts/PHASE4_STREAM_D_PROMPT.md`. |
+| [#149](https://github.com/Jekudy/vibeshkoder/issues/149) | T4-05 | ✅ closed | **Stream E MERGED via PR #158** (commit `e952b81`) on 2026-04-30. Migration **022_add_qa_traces** (down_revision="021" because PR #156 took 021). `bot/db/repos/qa_trace.py::QaTraceRepo.create(...)` flushes; caller commits. `bot/db/models.py::QaTrace` model with 2 indexes. 3 tests passing + 1 xfail (forget_me cascade — qa_traces layer not yet wired in CASCADE_LAYER_ORDER; deferred follow-up). 2 fix-pushes resolved SQLite-incompat `'[]'::jsonb` server_default and test_fts_schema head assertion drift (021→022_add_qa_traces). |
+| [#150](https://github.com/Jekudy/vibeshkoder/issues/150) | T4-06 | 🟡 in flight | Eval seed cases ≥10 — rolled into Stream D PR. |
+| [#153](https://github.com/Jekudy/vibeshkoder/issues/153) | T4-02H | ✅ closed (duplicate) | **Closed as duplicate of PR #156** (commit `2b2a38a`, `fix(p4-fts): close FTS review findings`) which already shipped: SearchHit 9 fields, `current_version_id = mv.id` JOIN, three-key tombstone NOT EXISTS, `ts_rank_cd`, query length cap (256), column rename `tsv`→`search_tsv`, source `text`→`normalized_text`, ORM column `MessageVersion.search_tsv` via `MessageVersionSearchVectorExpression` compiler. Independent collision audit (PR #154 corrections cycle) confirmed redundancy. |
+
+### Phase 4 forward-looking design drafts (NOT AUTHORIZED — design only)
+
+Merged via PR #159 (commit `df7c016`) and PR #160 on 2026-04-30, all under `docs/memory-system/prompts/`:
+
+- `CODEX_DUAL_AGENT_PATTERN.md` — canonical executor+verifier orchestration pattern (Codex-based dual-agent default for Phase 4+).
+- `ORCHESTRATOR_PROMPT.md` — copy-paste meta-prompt for orchestrator session; paranoid-mode rules; collision watch; stale-state recovery.
+- `PHASE5_PLAN_DRAFT.md` — LLM synthesis gateway + usage ledger (T5-01..T5-05).
+- `PHASE6_PLAN_DRAFT.md` — knowledge cards / catalog (T6-01..T6-09).
+- `PHASE7_PLAN_DRAFT.md` — daily/weekly digests (T7-01..T7-08).
+- `PHASE8_PLAN_DRAFT.md` — reflection runs / observations / memory_events (T8-01..T8-09).
+- `PHASE9_PLAN_DRAFT.md` — wiki (member-only first; per-page public approval gate). Invariant #10 binding. T9-01..T9-08.
+- `PHASE10_PLAN_DRAFT.md` — graph projection. Invariant #6 binding. T10-01..T10-09. Includes cascade `graph_nodes` layer.
+- `PHASE11_PLAN_DRAFT.md` — person expertise pages. **NUMBERING CONFLICT:** HANDOFF currently has Phase 11 = Shkoderbench/evals; this draft repurposes Phase 11 = expertise. Stop signal flags conflict for human reconcile.
+- `PHASE12_PLAN_DRAFT.md` — butler / action execution (postponed per AUTHORIZED_SCOPE; design-only). Invariant #7 binding. T12-01..T12-10.
+
+All drafts open with 🚧 DRAFT — NOT AUTHORIZED banner; cite HANDOFF §1 invariants verbatim; defer LLM/vector implementation to phase boundary; list 5+ open design questions for human ratification.
 
 ### Wave allocation (post-audit)
 
@@ -195,7 +212,9 @@ Authorized: see `AUTHORIZED_SCOPE.md`. Design + stream allocation: `PHASE4_PLAN.
 
 ## Phases 5–12
 
-Not started. Not authorized. See `AUTHORIZED_SCOPE.md` for gating rules.
+**Implementation:** not started. Not authorized. See `AUTHORIZED_SCOPE.md` for gating rules.
+
+**Design drafts:** all 8 drafts (Phase 5/6/7/8/9/10/11/12) ratified as DRAFT-only docs in `docs/memory-system/prompts/` per PR #159 + #160. Each waits for: (a) Phase-N-1 closure; (b) AUTHORIZED_SCOPE.md update; (c) human design ratification. Phase 11 has a flagged numbering conflict (HANDOFF Phase 11 = Shkoderbench/evals; draft repurposes to expertise pages) — must reconcile before authorization.
 
 ---
 
