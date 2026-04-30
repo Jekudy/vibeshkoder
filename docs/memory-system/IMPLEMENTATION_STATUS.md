@@ -167,9 +167,23 @@ ticket grid; will be picked up before or alongside Phase 4 work.
   hardening; current path is correct under aiogram contract but lacks an explicit None
   guard).
 
-## Phase 4 — Hybrid search + Q&A with citations (active 2026-04-30+)
+## Phase 4 — Hybrid search + Q&A with citations — **CLOSED 2026-04-30**
 
-Authorized: see `AUTHORIZED_SCOPE.md`. Design + stream allocation: `PHASE4_PLAN.md` (PR #152, commit `5bd4888`). Audit + corrections: PR #154 (commit `276983a`).
+6/6 implementation tickets merged. FHR in flight (Codex deep-product + deep-spec reviewers running over the full Phase 4 diff).
+
+**Closed deliverables:**
+- T4-01 + T4-02 via PR #151 + PR #156 hardening
+- T4-03 via PR #157 (evidence bundle)
+- T4-04 via PR #162 (/recall handler + memory.qa.enabled flag, default OFF)
+- T4-05 via PR #158 (qa_traces audit, migration 022)
+- T4-06 via PR #162 (12 eval cases, all 5 categories)
+- T4-02H closed as duplicate of PR #156
+
+**Outstanding known follow-ups (deferred to next cycle):**
+- qa_traces cascade layer wiring on `/forget_me` — Stream E xfail test documents the gap. To be added to `bot/services/forget_cascade.py::CASCADE_LAYER_ORDER`.
+- Phase 11 numbering conflict: HANDOFF Phase 11 = Shkoderbench/evals, draft Phase 11 = expertise pages. Human reconcile required before Phase 11 authorization.
+
+Design + stream allocation: `PHASE4_PLAN.md` (PR #152, commit `5bd4888`). Audit + corrections: PR #154 (commit `276983a`). Wave 1 status update: PR #161.
 
 | Issue | Ticket | Status | Notes |
 |---|---|---|---|

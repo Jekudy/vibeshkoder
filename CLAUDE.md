@@ -37,8 +37,20 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 Phase 1 closed 2026-04-27. Phase 2 (importer + governance skeleton) **CLOSED 2026-04-29** —
 20/20 issues merged across 4 parallel stream worktrees (Alpha/Bravo/Charlie/Delta) +
 Final Holistic Review hotfix (PR #143). Phase 3 governance skeleton (T3-01..T3-05) merged
-as part of Phase 2 wave. Active phase: Phase 4 (hybrid search + Q&A with citations) —
-in planning.
+as part of Phase 2 wave.
+
+**Phase 4 (hybrid search + Q&A with citations) CLOSED 2026-04-30** — 6/6 implementation
+tickets merged: T4-01/T4-02 via PRs #151 + #156 (FTS schema + search service + hardening),
+T4-03 via #157 (evidence bundle), T4-04 via #162 (/recall handler), T4-05 via #158
+(qa_traces audit), T4-06 via #162 (12 eval cases). T4-02H (#153) closed as duplicate of
+#156. Forward-looking design drafts for Phase 5/6/7/8/9/10/11/12 ratified as docs-only
+artifacts in `docs/memory-system/prompts/` (PRs #159 + #160). FHR in flight.
+
+**Next active phase: Phase 5 (LLM gateway + answer synthesis)** — design ratified per
+`docs/memory-system/prompts/PHASE5_PLAN_DRAFT.md`, awaiting AUTHORIZED_SCOPE.md update
+before implementation kickoff. Open known follow-ups: qa_traces cascade layer wiring
+(deferred from Stream E xfail), Phase 11 numbering conflict (HANDOFF = Shkoderbench/evals
+vs draft = expertise pages).
 
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
