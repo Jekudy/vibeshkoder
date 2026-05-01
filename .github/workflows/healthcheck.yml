@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   healthcheck:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, shkoder-vps]
     env:
       COOLIFY_BASE_URL: ${{ vars.COOLIFY_BASE_URL }}
       COOLIFY_APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
@@ -30,6 +30,11 @@ jobs:
 
       - name: Install dependencies
         run: pip install -e ".[dev,healing]"
+
+      - name: Configure git identity for state branch
+        run: |
+          git config user.name "healing-bot[bot]"
+          git config user.email "healing-bot@users.noreply.github.com"
 
       - name: Run composite healthcheck
         id: check

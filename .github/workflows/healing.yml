@@ -44,5 +44,10 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev,healing]"
 
+      - name: Configure git identity for state branch
+        run: |
+          git config user.name "healing-bot[bot]"
+          git config user.email "healing-bot@users.noreply.github.com"
+
       - name: Run autonomous healing orchestrator
         run: python -m ops.healing.orchestrator --signal-payload "$SIGNAL_PAYLOAD"

@@ -22,7 +22,7 @@ export HEALING_GITHUB_TOKEN
 ## 2. Set GitHub Secrets
 
 ```bash
-REPO="Jekudy/vibe-gatekeeper"
+REPO="Jekudy/vibeshkoder"
 
 gh secret set HEALING_GITHUB_TOKEN --repo "$REPO" --body "$HEALING_GITHUB_TOKEN"
 gh secret set COOLIFY_API_TOKEN --repo "$REPO" --body "$COOLIFY_API_TOKEN"
@@ -44,7 +44,7 @@ PY
 ## 3. Set GitHub repository variables
 
 ```bash
-REPO="Jekudy/vibe-gatekeeper"
+REPO="Jekudy/vibeshkoder"
 
 gh variable set COOLIFY_BASE_URL --repo "$REPO" --body "$COOLIFY_BASE_URL"
 gh variable set COOLIFY_APP_UUID --repo "$REPO" --body "$COOLIFY_APP_UUID"
@@ -68,8 +68,8 @@ sudo chown -R runner:runner /home/runner/actions-runner
 ## 5. Install GitHub Actions runner on VPS
 
 ```bash
-REPO="Jekudy/vibe-gatekeeper"
-RUNNER_VERSION="2.328.0"
+REPO="Jekudy/vibeshkoder"
+RUNNER_VERSION="2.334.0"
 RUNNER_TOKEN="$(gh api -X POST "repos/$REPO/actions/runners/registration-token" --jq .token)"
 
 sudo -u runner bash -lc "
@@ -140,7 +140,7 @@ sudo -u runner -H tee /home/runner/.claude/settings.json >/dev/null <<'JSON'
         "hooks": [
           {
             "type": "command",
-            "command": "/home/runner/actions-runner/_work/vibe-gatekeeper/vibe-gatekeeper/ops/healing/preToolUse_hook.sh"
+            "command": "/home/runner/actions-runner/_work/vibeshkoder/vibeshkoder/ops/healing/preToolUse_hook.sh"
           }
         ]
       }
@@ -171,7 +171,7 @@ postgresql://healing_ro:${HEALING_RO_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}
 ## 11. Verify runner labels and auth
 
 ```bash
-REPO="Jekudy/vibe-gatekeeper"
+REPO="Jekudy/vibeshkoder"
 
 gh api "repos/$REPO/actions/runners" --jq '.runners[] | select(.labels[].name == "shkoder-vps") | .name'
 sudo -u runner -H bash -lc 'claude -p "echo OK"'
