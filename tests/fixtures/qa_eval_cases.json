@@ -273,5 +273,52 @@
     "expected_evidence_present": false,
     "expected_chat_message_ids": [],
     "notes": "Redacted rows are excluded from evidence"
+  },
+  {
+    "id": "imp_001_basic_text",
+    "category": "import_path",
+    "query": "импорт тест",
+    "chat_id": -1001888888001,
+    "messages": [
+      {
+        "id": 9001,
+        "type": "message",
+        "date": "2026-04-20T10:00:00",
+        "date_unixtime": "1745143200",
+        "from": "Import User One",
+        "from_id": "user9001001",
+        "text": "импорт тест основного сообщения",
+        "text_entities": [
+          {"type": "plain", "text": "импорт тест основного сообщения"}
+        ]
+      }
+    ],
+    "expected_evidence_present": true,
+    "expected_chat_message_ids": [9001],
+    "notes": "Single text message imported via run_apply → searchable via /recall"
+  },
+  {
+    "id": "imp_002_offrecord_abstain",
+    "category": "import_path",
+    "query": "приватно",
+    "chat_id": -1001888888002,
+    "messages": [
+      {
+        "id": 9002,
+        "type": "message",
+        "date": "2026-04-20T11:00:00",
+        "date_unixtime": "1745146800",
+        "from": "Import User Two",
+        "from_id": "user9002001",
+        "text": "#offrecord приватно обсуждаем",
+        "text_entities": [
+          {"type": "hashtag", "text": "#offrecord"},
+          {"type": "plain", "text": " приватно обсуждаем"}
+        ]
+      }
+    ],
+    "expected_evidence_present": false,
+    "expected_chat_message_ids": [],
+    "notes": "Import message with #offrecord → /recall abstains (H2 fix validation)"
   }
 ]
