@@ -235,12 +235,12 @@ All drafts open with 🚧 DRAFT — NOT AUTHORIZED banner; cite HANDOFF §1 inva
 
 | Ticket | Wave | Title | Status | Notes |
 |--------|------|-------|--------|-------|
-| T5-W0-01 | 0 | Phase 4 hotfix #164 — live v1 + import current_version_id + normalized_text + qa_traces cascade + router order | not started | Single PR (15 commits per design §6). Migration 023 backfills legacy `current_version_id IS NULL` cohort. Source: `prompts/PHASE5_WAVE0_HOTFIX164_DESIGN.md`. Blocks all Wave 1+ work. |
-| T5-01 | 1 | `bot/services/llm_gateway.py` core — `synthesize_answer`, provider abstraction, pre-call invariants, cache lookup | not started | Stream A. Parallel with T5-02. Mocks `LedgerRepo` until T5-03 lands. |
-| T5-02 | 1 | Alembic 024 — `llm_usage_ledger` + `llm_synthesis_cache` schema | not started | Stream B. Parallel with T5-01. ORM in `bot/db/models.py`. |
-| T5-03 | 2 | `LedgerRepo` + `SynthesisCacheRepo` async repos | not started | Sequential after T5-02. |
-| T5-04 | 2 | `/recall` LLM synthesis + `qa_traces` extension (alembic 025) + new cascade layers in `forget_cascade.py` | not started | Sequential after T5-03. May bundle with T5-03 in single PR per PHASE5_PLAN.md §6 / §9. Flag `memory.qa.llm_synthesis.enabled` default OFF — Phase 4 byte-for-byte preserved when OFF. |
-| T5-05 | 3 | Eval harness extension + integration fixtures | not started | Phase 11 coordination point with Orchestrator C. Real-gateway integration opt-in via `RUN_LLM_INTEGRATION=1`. |
+| T5-W0-01 | 0 | Phase 4 hotfix #164 — live v1 + import current_version_id + normalized_text + qa_traces cascade + router order | merged | Single PR (15 commits per design §6). Migration 023 backfills legacy `current_version_id IS NULL` cohort. Source: `prompts/PHASE5_WAVE0_HOTFIX164_DESIGN.md`. Blocks all Wave 1+ work. **Merged via PR #203** (issue #164 remains open until PR #204 closes it). |
+| T5-01 | 1 | `bot/services/llm_gateway.py` core — `synthesize_answer`, provider abstraction, pre-call invariants, cache lookup — GitHub: #197 | not started | Stream A. Parallel with T5-02. Mocks `LedgerRepo` until T5-03 lands. |
+| T5-02 | 1 | Alembic 024 — `llm_usage_ledger` + `llm_synthesis_cache` schema — GitHub: #198 | not started | Stream B. Parallel with T5-01. ORM in `bot/db/models.py`. |
+| T5-03 | 2 | `LedgerRepo` + `SynthesisCacheRepo` async repos — GitHub: #199 | not started | Sequential after T5-02. |
+| T5-04 | 2 | `/recall` LLM synthesis + `qa_traces` extension (alembic 025) + new cascade layers in `forget_cascade.py` — GitHub: #200 | not started | Sequential after T5-03. May bundle with T5-03 in single PR per PHASE5_PLAN.md §6 / §9. Flag `memory.qa.llm_synthesis.enabled` default OFF — Phase 4 byte-for-byte preserved when OFF. |
+| T5-05 | 3 | Eval harness extension + integration fixtures — GitHub: #201 | not started | Phase 11 coordination point with Orchestrator C. Real-gateway integration opt-in via `RUN_LLM_INTEGRATION=1`. |
 
 ## Phases 6–12
 
