@@ -1,7 +1,7 @@
 # Memory System — Implementation Status
 
-**Last updated:** 2026-04-29 (Phase 2 CLOSED — 20/20 issues + Final Holistic Review hotfix)
-**Active worktrees (Phase 2):** Phase 2 is complete after #104 + PR #143 hotfix. Historical worktrees: `.worktrees/p2-alpha` (`phase/p2-alpha`), `.worktrees/p2-bravo` (`phase/p2-bravo`), `.worktrees/p2-charlie` (`phase/p2-charlie`), `.worktrees/p2-delta` (Stream Delta). Phase 1 closed on `main` 2026-04-27.
+**Last updated:** 2026-05-02 (Phase 5 plan ratified by Orchestrator A; Wave 0 = #164 hotfix prerequisite).
+**Active worktrees:** `.worktrees/orch-A` (Phase 5 planning, branch `plan/p5-ratify`), `.worktrees/orch-B` (Phase 9/10/12 planning), `.worktrees/orch-C` (Phase 11 planning). Historical: `.worktrees/p2-alpha/bravo/charlie/delta` (Phase 2 closed 2026-04-29 — Phase 1 closed on `main` 2026-04-27); `.worktrees/p4-hotfix-164` (stale; design salvaged into `prompts/PHASE5_WAVE0_HOTFIX164_DESIGN.md`).
 **Source of truth:** this file is updated after every PR merge into `main`.
 
 ---
@@ -224,11 +224,35 @@ All drafts open with 🚧 DRAFT — NOT AUTHORIZED banner; cite HANDOFF §1 inva
 
 ---
 
-## Phases 5–12
+## Phase 5 — LLM gateway + answer synthesis (synthesis-first slice)
 
-**Implementation:** not started. Not authorized. See `AUTHORIZED_SCOPE.md` for gating rules.
+**Plan:** `docs/memory-system/PHASE5_PLAN.md` (ratified 2026-05-02 by Orchestrator A).
+**Authorization:** `AUTHORIZED_SCOPE.md` §"Authorized: Phase 5" (added 2026-04-30).
+**Predecessor blocker:** issue #164 (3 CRITICAL Phase 4 production gaps) absorbed as Wave 0 — single PR using design at `docs/memory-system/prompts/PHASE5_WAVE0_HOTFIX164_DESIGN.md` (1044-line v3 FINAL spec, Critic v2 + Risk v2 closed).
+**Worktrees:** `.worktrees/orch-A` (planning), future per-wave worktrees `.worktrees/p5-w0-hotfix-164`, `.worktrees/p5-w1-gateway`, `.worktrees/p5-w1-schema`, `.worktrees/p5-w2-repo-handler`, `.worktrees/p5-w3-evals`.
+**Owned alembic range:** 023–049. Wave 0 = 023, Wave 1 = 024, Wave 2 = 025, remainder reserved.
 
-**Design drafts:** all 8 drafts (Phase 5/6/7/8/9/10/11/12) ratified as DRAFT-only docs in `docs/memory-system/prompts/` per PR #159 + #160. Each waits for: (a) Phase-N-1 closure; (b) AUTHORIZED_SCOPE.md update; (c) human design ratification. Phase 11 has a flagged numbering conflict (HANDOFF Phase 11 = Shkoderbench/evals; draft repurposes to expertise pages) — must reconcile before authorization.
+| Ticket | Wave | Title | Status | Notes |
+|--------|------|-------|--------|-------|
+| T5-W0-01 | 0 | Phase 4 hotfix #164 — live v1 + import current_version_id + normalized_text + qa_traces cascade + router order | not started | Single PR (15 commits per design §6). Migration 023 backfills legacy `current_version_id IS NULL` cohort. Source: `prompts/PHASE5_WAVE0_HOTFIX164_DESIGN.md`. Blocks all Wave 1+ work. |
+| T5-01 | 1 | `bot/services/llm_gateway.py` core — `synthesize_answer`, provider abstraction, pre-call invariants, cache lookup | not started | Stream A. Parallel with T5-02. Mocks `LedgerRepo` until T5-03 lands. |
+| T5-02 | 1 | Alembic 024 — `llm_usage_ledger` + `llm_synthesis_cache` schema | not started | Stream B. Parallel with T5-01. ORM in `bot/db/models.py`. |
+| T5-03 | 2 | `LedgerRepo` + `SynthesisCacheRepo` async repos | not started | Sequential after T5-02. |
+| T5-04 | 2 | `/recall` LLM synthesis + `qa_traces` extension (alembic 025) + new cascade layers in `forget_cascade.py` | not started | Sequential after T5-03. May bundle with T5-03 in single PR per PHASE5_PLAN.md §6 / §9. Flag `memory.qa.llm_synthesis.enabled` default OFF — Phase 4 byte-for-byte preserved when OFF. |
+| T5-05 | 3 | Eval harness extension + integration fixtures | not started | Phase 11 coordination point with Orchestrator C. Real-gateway integration opt-in via `RUN_LLM_INTEGRATION=1`. |
+
+## Phases 6–12
+
+**Implementation:** not started.
+
+- **Phase 6 (cards) authorization:** gated on Phase 5 closure.
+- **Phase 7 (digests):** gated on Phase 6 closure.
+- **Phase 8 (reflection / observations / memory_events / memory_candidates / reflection_runs):** gated on Phase 7 closure. Note: HANDOFF originally placed extraction tables in Phase 5; PHASE5_PLAN.md §2 ratifies synthesis-first slice and defers extraction tables to Phase 8.
+- **Phase 9 (wiki) + Phase 10 (graph projection):** Orchestrator B owns; gated on Phase 6 cards closure.
+- **Phase 11 (Shkoderbench / evals):** Orchestrator C owns; runs in parallel with Phase 5 (per AUTHORIZED_SCOPE.md). Phase 11 numbering conflict (HANDOFF = evals vs. early DRAFT = expertise pages) — reconcile before kickoff.
+- **Phase 12 (butler design):** Orchestrator B; design-only, no implementation, authorized 2026-04-30.
+
+Design drafts for Phase 6/7/8/9/10/11/12 remain in `docs/memory-system/prompts/PHASE{6,7,8,9,10,11,12}_PLAN_DRAFT.md` until each phase's owning orchestrator promotes to `_PLAN.md` per the parallel pattern this Phase 5 plan establishes.
 
 ---
 
