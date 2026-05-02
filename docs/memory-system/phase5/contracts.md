@@ -925,6 +925,100 @@ After Phase 5 closure, this document transitions to historical reference. Phase 
 
 ---
 
+## §12 Orchestrator ratifications (2026-05-02 post-T5-01 + T5-02 implementation)
+
+The contracts.md analyst flagged 4 ratification asks. Orchestrator A resolves each below. T5-01 implementation (PR #209) closed empirical questions on ask #2. T5-02 implementation (PR #207) is unaffected by these decisions.
+
+### §12.1 Ratification: `prompt_hash` nullability
+
+**Original ask:** §5.B SQL says `prompt_hash CHAR(64) NOT NULL`; §5.E `_cascade_llm_usage_ledger` says NULL the column on user forget. Contradiction.
+
+**Decision (Orchestrator A):** **Defer to T5-04.** T5-02 ships `prompt_hash CHAR(64) NOT NULL` as currently specified (PR #207 already merged path). Migration 025 in T5-04 PR adds `ALTER TABLE llm_usage_ledger ALTER COLUMN prompt_hash DROP NOT NULL` AND `ALTER COLUMN response_hash DROP NOT NULL` AND adds matching `_cascade_llm_usage_ledger` layer that NULLs both hashes on `target_type='user'`.
+
+**Rationale:** T5-02 PR is in review; reopening for column-nullable change invalidates Codex round-2 review and resets merge gate. Cleaner to land T5-02 as-is and patch in T5-04 migration 025 alongside the cascade-layer addition. Cost: zero — `_cascade_llm_usage_ledger` is T5-04 scope anyway.
+
+**Carryover to T5-04 issue #200 (T5-04 acceptance criteria binding):**
+- T5-04 alembic 025 MUST include `ALTER COLUMN prompt_hash DROP NOT NULL` + `ALTER COLUMN response_hash DROP NOT NULL`.
+- T5-04 cascade layer test MUST verify ledger row survives forget with `prompt_hash IS NULL` AND `response_hash IS NULL`.
+
+### §12.2 Ratification: `LedgerRepo.update_placeholder` method
+
+**Original ask:** Atomic budget-guard pattern requires placeholder row insert + UPDATE with actual cost. Should `update_placeholder` be part of T5-03 LedgerRepo scope?
+
+**Decision (Orchestrator A):** **NOT REQUIRED.** T5-01 implementation (PR #209, commit `538c516`) demonstrated the placeholder pattern is unnecessary when:
+1. Gateway runs inside handler-owned transaction (single tx for `synthesize_answer` call lifetime).
+2. `pg_advisory_xact_lock(LLM_BUDGET_LOCK_ID)` held until tx commit.
+3. Ledger row inserted ONCE, post-dispatch, with actual cost.
+
+**Why this is equivalent to placeholder pattern:** The advisory lock serializes concurrent `synthesize_answer` calls at the budget-check critical section. Each tx reads the running `daily_cost_usd` AFTER the previous tx commits its ledger row (per Postgres MVCC + advisory lock semantics). No race window opens between read and write because both happen in the same locked tx.
+
+**T5-03 LedgerRepo scope (FROZEN):** ONLY the three methods in §5.1 — `record(...)`, `daily_cost_usd(day)`, `monthly_cost_usd(year, month)`. NO `update_placeholder`. NO `reserve(estimated_cost)`. NO `finalize(call_id, actual_cost)`.
+
+**Updates to §5.1 of this file:** the implicit "update_placeholder" method referenced in earlier draft is REMOVED. The §3.6 step 5 description in this document is updated by T5-04 PR if needed (current description is correct as written; T5-04 may simply reference the simpler pattern T5-01 established).
+
+### §12.3 Ratification: `QaTraceRepo.update_llm_fields` method
+
+**Original ask:** §6.1 step 3 needs an UPDATE on `qa_traces`; should `QaTraceRepo` ship a dedicated `update_llm_fields(...)` method or use raw `sqlalchemy.update()` in handler?
+
+**Decision (Orchestrator A):** **YES — add `update_llm_fields` to QaTraceRepo as part of T5-04 scope** (NOT T5-03; T5-03 ships ONLY new ledger + cache repos).
+
+**Method signature (BINDING):**
+```python
+@staticmethod
+async def update_llm_fields(
+    session: AsyncSession,
+    *,
+    qa_trace_id: int,
+    llm_call_id: int,
+    llm_response_summary: str | None,
+    llm_response_redacted: bool,
+    cost_usd: Decimal,
+) -> None:
+    """Update Phase 5 LLM-extension columns on an existing QaTrace.
+
+    Called by `bot/handlers/qa.py` step 3 of the binding 4-step order
+    (CREATE QaTrace → synthesize_answer → UPDATE QaTrace → render).
+
+    Flushes; does NOT commit. Caller owns commit.
+    """
+```
+
+**Rationale:** Encapsulates the column-set knowledge in the repo (consistent with existing `QaTraceRepo.create` pattern). Raw `update()` in handler couples handler to model column names — bad layering.
+
+**T5-04 acceptance criteria addition:** test `test_update_llm_fields_updates_only_phase5_columns` asserts other QaTrace columns (query, evidence_ids, abstained, redact_query) are NOT modified.
+
+### §12.4 Ratification: `GatewayDependencies` dependency-injection pattern
+
+**Original ask:** PHASE5_PLAN.md §5.A doesn't specify how T5-01 receives `LedgerRepo` + `SynthesisCacheRepo`. Contracts §10.3 proposed `GatewayDependencies` dataclass; orchestrator must ratify before T5-01 dispatch.
+
+**Decision (Orchestrator A):** **CONFIRMED — `GatewayDependencies` frozen dataclass.** T5-01 implementation (PR #209) used Protocol-injection via function kwargs (each repo injected as separate kwarg). This is COMPATIBLE with the eventual `GatewayDependencies` dataclass — T5-04 may either:
+
+- **Option A (preferred):** Pass repos as separate kwargs to `synthesize_answer(..., ledger_repo=..., cache_repo=...)`. Simpler. Matches current T5-01 signature.
+- **Option B:** Wrap repos in `GatewayDependencies(ledger_repo=..., cache_repo=...)` dataclass; pass as `synthesize_answer(..., deps=...)`. Cleaner if dependency count grows.
+
+**Decision:** Start with Option A (matching T5-01 implementation). Promote to Option B in a separate refactor PR when dependency count exceeds 3.
+
+**§10.3 of this file:** updated by NEXT contracts revision. For this PR, §10.3's `GatewayDependencies` proposal is FYI / future-pattern, not currently binding.
+
+### §12.5 Ratification: `prompt_template_version` initial value
+
+**Original ask (NOT in analyst's flag list — orchestrator-discovered during T5-01 review):** First semver-string for `prompt_template_version` field in `LLMGatewayConfig`?
+
+**Decision (Orchestrator A):** **`"v0.1.0"`** as Phase 5 initial value. Bumped when T5-04 ships the actual prompt template (then `"v1.0.0"`). T5-04 acceptance MUST include version bump assertion.
+
+### §12.6 Ratification: cost-pricing config location
+
+**Original ask (NOT in analyst's flag list — orchestrator-discovered during T5-01 review):** T5-01 `_estimate_cost` is a placeholder (`Decimal("0.000001") * total_tokens`). Where does real per-model pricing live?
+
+**Decision (Orchestrator A):** **T5-04 ships `bot/services/llm_pricing.py`** with a `MODEL_PRICING: dict[str, ModelPricing]` constant table containing per-million-token input/output rates. `synthesize_answer` looks up via `config.model`. Initial values:
+
+- `claude-haiku-4-5-20251001`: input $1.00, output $5.00 per 1M tokens (per Helicone calculator 2026-05-02).
+- `gpt-4o-mini` (OpenAI fallback if used): input $0.15, output $0.60 per 1M tokens.
+
+**T5-04 acceptance:** unit test asserting `_estimate_cost(model="claude-haiku-4-5-20251001", tokens_in=1_000_000, tokens_out=0) == Decimal("1.000000")`.
+
+---
+
 **Sealed by:** Orchestrator A — 2026-05-02.
 **Source of truth:** `docs/memory-system/PHASE5_PLAN.md` §5 + §7 + §11.
 **Cross-references:** `docs/memory-system/HANDOFF.md` §1 (invariants 2, 3, 9), `docs/memory-system/AUTHORIZED_SCOPE.md` §"Authorized: Phase 5".
