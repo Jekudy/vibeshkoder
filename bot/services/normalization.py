@@ -98,3 +98,41 @@ def extract_normalized_fields(message: Any) -> dict[str, Any]:
         "caption": extract_caption(message),
         "message_kind": classify_message_kind(message),
     }
+
+
+def extract_entities_unified(message: Any) -> list[dict] | None:
+    """Merge ``message.entities`` and ``message.caption_entities`` into one list.
+
+    Returns a deduplicated list of entity dicts (deduplicated by ``(offset, length,
+    type)``), or ``None`` when neither attribute yields any entities.
+
+    The legacy ``_build_entities_json`` in ``bot/handlers/edited_message.py`` only
+    looked at ``entities`` and silently ignored ``caption_entities``. This caused
+    caption-only photos with caption entities to produce empty entity lists, yielding
+    a different content_hash than the unified helper. This function fixes that
+    asymmetry — both the v1 creation path and the edit handler now use it.
+
+    Deduplication preserves the first occurrence (entities before caption_entities)
+    when both lists contain the same ``(offset, length, type)`` triple.
+    """
+    seen: set[tuple[int, int, str]] = set()
+    result: list[dict] = []
+
+    def _append_entities(attr_name: str) -> None:
+        entities = getattr(message, attr_name, None)
+        if entities is None:
+            return
+        for e in entities:
+            try:
+                d = e.model_dump(mode="json", exclude_none=True)
+            except Exception:
+                continue
+            key = (d.get("offset", 0), d.get("length", 0), d.get("type", ""))
+            if key not in seen:
+                seen.add(key)
+                result.append(d)
+
+    _append_entities("entities")
+    _append_entities("caption_entities")
+
+    return result if result else None

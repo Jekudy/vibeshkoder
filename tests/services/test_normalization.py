@@ -224,3 +224,103 @@ def test_extract_all_fields_minimal(app_env) -> None:
         "caption": None,
         "message_kind": "unknown",
     }
+
+
+# ─── _extract_entities_unified (commit 1 — hotfix #164) ──────────────────────
+
+
+def _make_entity(offset: int, length: int, entity_type: str) -> SimpleNamespace:
+    """Build a SimpleNamespace that mimics an aiogram MessageEntity."""
+    return SimpleNamespace(
+        offset=offset,
+        length=length,
+        type=entity_type,
+        model_dump=lambda mode="json", exclude_none=True: {
+            "offset": offset,
+            "length": length,
+            "type": entity_type,
+        },
+    )
+
+
+def test_extract_entities_unified_no_entities(app_env) -> None:
+    """Message with no entities and no caption_entities returns None."""
+    from bot.services.normalization import extract_entities_unified
+
+    msg = _msg(entities=None, caption_entities=None)
+    assert extract_entities_unified(msg) is None
+
+
+def test_extract_entities_unified_only_entities(app_env) -> None:
+    """Message with entities but no caption_entities returns entities list."""
+    from bot.services.normalization import extract_entities_unified
+
+    e = _make_entity(0, 5, "bold")
+    msg = _msg(entities=[e], caption_entities=None)
+    result = extract_entities_unified(msg)
+    assert result is not None
+    assert len(result) == 1
+    assert result[0]["type"] == "bold"
+
+
+def test_extract_entities_unified_only_caption_entities(app_env) -> None:
+    """Caption-only photo with caption_entities — unified returns the caption entities."""
+    from bot.services.normalization import extract_entities_unified
+
+    ce = _make_entity(0, 5, "bold")
+    msg = _msg(
+        photo=[SimpleNamespace(file_id="abc")],
+        entities=None,
+        caption_entities=[ce],
+    )
+    result = extract_entities_unified(msg)
+    assert result is not None
+    assert len(result) == 1
+    assert result[0]["type"] == "bold"
+
+
+def test_extract_entities_unified_merges_caption_entities(app_env) -> None:
+    """Both entities and caption_entities are merged and deduplicated by (offset, length, type)."""
+    from bot.services.normalization import extract_entities_unified
+
+    e1 = _make_entity(0, 5, "bold")
+    e2 = _make_entity(6, 3, "italic")
+    # caption_entity at same position as e1 (duplicate)
+    ce_dup = _make_entity(0, 5, "bold")
+    # caption_entity at new position
+    ce_new = _make_entity(10, 4, "code")
+
+    msg = _msg(
+        entities=[e1, e2],
+        caption_entities=[ce_dup, ce_new],
+    )
+    result = extract_entities_unified(msg)
+    assert result is not None
+    # After dedup: e1(bold 0-5), e2(italic 6-3), ce_new(code 10-4) — ce_dup is dropped
+    assert len(result) == 3
+    types = {r["type"] for r in result}
+    assert types == {"bold", "italic", "code"}
+
+
+def test_extract_entities_unified_old_build_entities_json_would_miss_caption(app_env) -> None:
+    """Counter-fixture: old _build_entities_json (entities only) returns [] for caption-only photo.
+
+    The unified helper returns the caption entities — proving the asymmetry is fixed.
+    """
+    from bot.services.normalization import extract_entities_unified
+
+    ce = _make_entity(0, 5, "bold")
+    # caption-only photo — no .entities attribute
+    msg = _msg(
+        photo=[SimpleNamespace(file_id="abc")],
+        entities=None,
+        caption_entities=[ce],
+    )
+    # Simulate old _build_entities_json behaviour (entities only, ignoring caption_entities)
+    old_result = getattr(msg, "entities", None)  # returns None
+    assert old_result is None  # old path would produce [] / None — missed caption entities
+
+    # Unified helper captures them
+    new_result = extract_entities_unified(msg)
+    assert new_result is not None
+    assert len(new_result) == 1

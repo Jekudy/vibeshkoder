@@ -39,6 +39,7 @@ the canonical record of the transition.
 
 from __future__ import annotations
 
+import json
 import logging
 
 from aiogram import Router
@@ -54,7 +55,7 @@ from bot.db.repos.offrecord_mark import OffrecordMarkRepo
 from bot.filters.chat_type import GroupChatFilter
 from bot.services.content_hash import compute_content_hash
 from bot.services.governance import detect_policy
-from bot.services.normalization import classify_message_kind, extract_caption
+from bot.services.normalization import classify_message_kind, extract_caption, extract_entities_unified
 
 logger = logging.getLogger(__name__)
 
@@ -67,30 +68,6 @@ router = Router(name="edited_message")
 # (chat_message_id, content_hash). See ``handle_edited_message`` Step 6 for the inline
 # logic.
 
-
-def _build_entities_json(message: Message) -> list[dict] | None:
-    """Extract entities from edited message for version storage."""
-    entities = getattr(message, "entities", None)
-    if entities is None:
-        return None
-    try:
-        return [e.model_dump(mode="json", exclude_none=True) for e in entities]
-    except Exception:
-        return None
-
-
-def _extract_entities_list(message: Message) -> list[dict] | None:
-    """Extract normalized entities for content hash computation."""
-    entities = getattr(message, "entities", None)
-    if entities is None:
-        # Also try caption_entities for media messages
-        entities = getattr(message, "caption_entities", None)
-    if entities is None:
-        return None
-    try:
-        return [e.model_dump(mode="json", exclude_none=True) for e in entities]
-    except Exception:
-        return None
 
 
 async def _find_chat_message(
@@ -259,7 +236,7 @@ async def handle_edited_message(
     text = getattr(message, "text", None)
     caption = extract_caption(message)
     message_kind = classify_message_kind(message)
-    entities = _extract_entities_list(message)
+    entities = extract_entities_unified(message)
     edit_date = getattr(message, "edit_date", None)
 
     # Step 3: detect policy on EDITED content BEFORE any DB mutation.
@@ -379,7 +356,8 @@ async def handle_edited_message(
 
     entities_json = None
     if not is_redacted_version:
-        entities_json = _build_entities_json(message)
+        entities_list = extract_entities_unified(message)
+        entities_json = json.dumps(entities_list) if entities_list else None
 
     new_version = await MessageVersionRepo.insert_version(
         session,
