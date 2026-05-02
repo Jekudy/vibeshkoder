@@ -97,24 +97,32 @@ Phase 5 MAY introduce extension hooks (e.g., a generic provider abstraction insi
               │   ↓ if memory.qa.llm_synthesis.enabled OFF:             │
               │       → render Phase 4 evidence list (unchanged)        │
               │   ↓ else:                                               │
-              │       → synthesize_answer(bundle, query, model_cfg) ──┐ │
-              │       → AnswerWithCitations | abstention             │ │
-              │       → render synthesized answer + citations        │ │
-              │       → write QaTrace(answer_text=…, llm_call_id=…) ─┤ │
-              │                                                       │ │
-              └───────────────────────────────────────────────────────┼─┘
-                                                                      ▼
+              │       → CREATE QaTrace FIRST (qa_trace_id required ──┐  │
+              │           by gateway; cascade FK populated upfront)  │  │
+              │       → synthesize_answer(bundle, query, cfg,        │  │
+              │                           qa_trace_id) ──────────────┤  │
+              │       → AnswerWithCitations | Abstention             │  │
+              │       → UPDATE QaTrace.{llm_call_id,                 │  │
+              │           llm_response_summary, cost_usd}            │  │
+              │       → render synthesized answer + citations        │  │
+              │                                                      │  │
+              └──────────────────────────────────────────────────────┼──┘
+                                                                     ▼
               ┌──────────────────────────────────────────────────────────┐
-              │ bot/services/llm_gateway.py                              │
-              │   • single entry: synthesize_answer(bundle, query, cfg)  │
-              │   • PRE-call source-filter (defense-in-depth)            │
-              │   • PRE-call budget guard (daily / monthly USD ceiling)  │
-              │   • cache lookup (cite-stable input hash)                │
+              │ bot/services/llm_gateway.py — pre-call order:            │
+              │   1. empty-bundle short-circuit                          │
+              │   2. PRE-call source-filter (defense-in-depth)           │
+              │   3. PRE-call forget-invalidation (3 tombstone keys:     │
+              │      message: / message_hash: / user:)                   │
+              │   4. cache lookup (AFTER forget gate so no stale         │
+              │      forgotten content can be served from cache)         │
               │     → cache hit: write ledger(cache_hit=True), return    │
-              │   • provider dispatch (anthropic | openai)               │
-              │   • write llm_usage_ledger row (success | error | cost)  │
-              │   • on cited message_version_id ∈ forget_events:         │
-              │       invalidate cache row + abstain                     │
+              │   5. PRE-call budget guard (atomic via                   │
+              │      pg_advisory_xact_lock + placeholder ledger row)     │
+              │   6. provider dispatch (anthropic | openai)              │
+              │   7. citation enforcement (citations ⊆ bundle ids)       │
+              │   • write/update llm_usage_ledger row (success | error)  │
+              │   • on forget event hit: invalidate cache row + abstain  │
               └──────────────────────────────────────────────────────────┘
                                   │              │
                                   ▼              ▼
@@ -168,7 +176,8 @@ async def synthesize_answer(
 ) -> SynthesisResult: ...
 ```
 
-**Query normalization** (for cache key + ledger `prompt_hash`): `query_normalized = query.strip()[:256]`. Mirrors `bot/services/search.py:43–55` (same `MAX_QUERY_LENGTH=256`, same `.strip()`). Symmetry is required so cache hit-rate matches search hit-rate. `prompt_template_version` lives on `LLMGatewayConfig` as `prompt_template_version: str` (semver-string; bumped on every prompt-template revision; cache rows with stale version are inert and aged out).
+**Query normalization** (for cache key + ledger `prompt_hash`): `query_normalized = query.strip()[:256].strip()` — exact byte-mirror of `bot/services/search.py:43,55` (which calls `.strip()` first, then if `len > MAX_QUERY_LENGTH=256` truncates and calls `.strip()` AGAIN to drop trailing whitespace from a mid-word truncation). The double-`.strip()` is load-bearing: if the original query has trailing whitespace AND length > 256, search.py's normalized form differs from a single-strip form. Cache hit-rate symmetry with search hit-rate requires byte equality, so the gateway uses the same recipe verbatim. Closes Codex LOW 1 (round 1 used `.strip()[:256]` which was off-by-one-strip vs search.py).
+`prompt_template_version` lives on `LLMGatewayConfig` as `prompt_template_version: str` (semver-string; bumped on every prompt-template revision; cache rows with stale version are inert and aged out).
 
 **Pre-call invariants enforced by gateway (REORDERED per Codex review HIGH 2 — cache lookup AFTER forget invalidation):**
 
@@ -184,6 +193,7 @@ async def synthesize_answer(
 6. **Provider dispatch + categorized error handling** — `config.provider` selects implementation; default `anthropic` with `claude-haiku-4-5-20251001`. Provider errors are categorized (closes Codex MEDIUM 2):
    - **Transient** (`rate_limit`, `timeout`, `5xx`, `connection_reset`) → caught, ledger row UPDATEs with `error='provider_transient:<subtype>'`, return `Abstention(reason='provider_error')`. NEVER raise. Same as previous behavior.
    - **Structural** (`auth`, `bad_request`, `contract_violation`, `model_not_found`) → caught, ledger row UPDATEs with `error='provider_structural:<subtype>'`, log at ERROR level with full exception, **emit stop signal** via `bot.services.observability.emit_stop_signal("llm_provider_structural")`, return `Abstention(reason='provider_error')`. Operator alerted; cycle keeps going (no raise into `/recall` handler — invariant #1 gatekeeper preservation), but a structural error means provider config is broken — must trip a human-visible alarm.
+   - **Unknown / catch-all** (any exception that does not match the Transient or Structural taxonomies — e.g., new SDK error subclass introduced by a provider library upgrade) → caught, ledger row UPDATEs with `error='provider_unknown:<exception_class_name>'`, log at ERROR level with full exception **and** `exc_info=True`, return `Abstention(reason='provider_error')`. Stop signal NOT emitted (avoid false-alarm on transient SDK quirks), but daily ledger query for `error LIKE 'provider_unknown:%'` should fire an operator review prompt. Closes Codex MEDIUM 2 catch-all gap. Future refactor MAY promote a recurring unknown-class to Transient or Structural after one cycle of observation.
 7. **Citation enforcement** — provider returns `ProviderResult.citation_ids: tuple[int, ...]` (explicit list — NOT post-parsed from answer text). Gateway validates `set(citation_ids) ⊆ set(bundle.evidence_ids)`. Hallucination → ledger row `error='citation_hallucination'`, `Abstention(reason='provider_error')`. Eval harness T5-05 verifies this property.
 
 **Provider abstraction:**
@@ -307,11 +317,16 @@ CREATE INDEX ix_qa_traces_llm_call_id ON qa_traces(llm_call_id);
 
 ### §5.E — `bot/handlers/qa.py` extension + `bot/services/forget_cascade.py` cascade layers
 
-**Handler extension:**
+**Handler extension (binding ORDER — closes Codex HIGH 4 on cascade FK direction):**
 - New flag check: `memory.qa.llm_synthesis.enabled` (per-chat scope, default FALSE).
 - If flag OFF → render Phase 4 evidence list verbatim (current behavior).
-- If flag ON AND `bundle.is_non_empty` → call `synthesize_answer(...)` → render `AnswerWithCitations` (new template) or fall back to Phase 4 list on `Abstention`.
-- `_write_trace` extended with `llm_call_id`, `llm_response_summary`, `llm_response_redacted`, `cost_usd` parameters.
+- If flag ON AND `bundle.is_non_empty`, the handler MUST execute the following steps **in this exact order**:
+  1. **Create `QaTrace` FIRST** via `QaTraceRepo.create(...)` with `evidence_ids=bundle.evidence_ids`, `abstained=False`, leaving the new LLM columns NULL initially. Capture `qa_trace_id`.
+  2. **Call `synthesize_answer(session, bundle=bundle, query=query, config=cfg, qa_trace_id=qa_trace_id)`**. The required `qa_trace_id` parameter is what guarantees `llm_usage_ledger.qa_trace_id` is populated on every ledger row written by the gateway, so `_cascade_qa_traces_llm` and `_cascade_llm_usage_ledger` can join via either FK direction.
+  3. **UPDATE `QaTrace`** with `llm_call_id` + `llm_response_summary` + `cost_usd` + `llm_response_redacted` from the `SynthesisResult`. On `Abstention`, set `llm_response_summary=None, llm_response_redacted=False, cost_usd=result.cost_usd`.
+  4. Render `AnswerWithCitations` template OR fall back to Phase 4 evidence list on `Abstention`.
+- This step ordering is enforced by tests in `tests/handlers/test_qa_llm_synthesis.py` — at least one regression test asserts that `QaTrace` row exists in DB BEFORE `synthesize_answer` is observed by the gateway spy (catches a future refactor that reverts to "create-trace-after-synthesis").
+- `_write_trace` is split into `_create_trace_pending(...)` (step 1) + `_finalize_trace(...)` (step 3) helpers.
 
 **Cascade layer additions (in `bot/services/forget_cascade.py`) — closes Codex CRITICAL 1 + HIGH 4:**
 
