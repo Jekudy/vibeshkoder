@@ -480,7 +480,7 @@ Deliberately NOT shipped in this PR:
 |---|--------|----------|--------------|--------|
 | A | Claude product review M1 | MEDIUM | Orch A — docs sweep before Phase 6 ratification | Add one-line cross-ref in `HANDOFF.md §Phase 5` pointing readers at `PHASE5_PLAN.md` as the authoritative slice (HANDOFF lists extraction tables under Phase 5; PHASE5_PLAN.md re-scopes them to Phase 8). Do as separate `docs/p5-handoff-crossref` PR. |
 | B | Claude product review M2 | MEDIUM | Orch A — T5-01 implementation kickoff | Verify Anthropic model ID `claude-haiku-4-5-20251001` against current Anthropic SDK / models catalog as the FIRST step of T5-01. Stop signal #10 enforces. |
-| C | Codex review LOW 1 | LOW | Resolved in §5.A | `query_normalized = query.strip()[:256]` defined explicitly; mirrors `bot/services/search.py:43–55`. |
+| C | Codex review LOW 1 | LOW | Resolved in §5.A | `query_normalized = query.strip()[:256].strip()` defined explicitly (double-strip, byte-mirrors `bot/services/search.py:43+55`). |
 
 ---
 
