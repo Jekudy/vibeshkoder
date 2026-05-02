@@ -27,7 +27,7 @@ def upgrade() -> None:
     op.create_table(
         "llm_usage_ledger",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
-        sa.Column("qa_trace_id", sa.Integer(), nullable=True),
+        sa.Column("qa_trace_id", sa.BigInteger(), nullable=True),
         sa.Column("provider", sa.String(64), nullable=False),
         sa.Column("model", sa.String(128), nullable=False),
         sa.Column("prompt_hash", sa.CHAR(64), nullable=False),
