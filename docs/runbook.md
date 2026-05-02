@@ -146,6 +146,70 @@ Canonical reference: `~/Vibe/knowledge/nocoders/docs/architecture/coolify-deploy
 - **Where secrets live:** Coolify env panel per app. On disk: `/data/coolify/...` (ACL 600 root:root). Never commit to git.
 - **Rollback to previous digest:** Coolify UI → app → Deployments → select previous deployment → Redeploy. CLI path: update image reference in app config to the prior `@sha256:` digest, redeploy.
 
+## Phase 4 Hotfix #164 — Post-Deploy Operator Notes
+
+### Audit chain activation (raw_updates flag)
+
+Hotfix #164 closes the live audit chain (`chat_messages.raw_update_id`,
+`telegram_updates.ingestion_run_id`) but the wiring is **dormant until ops flips the
+raw-archive feature flag**.
+
+Verify status after deploy:
+
+```sql
+-- Is the flag enabled?
+SELECT enabled FROM feature_flags WHERE key = 'memory.ingestion.raw_updates.enabled';
+
+-- With flag ON: new rows should appear within minutes of bot activity.
+SELECT count(*) FROM telegram_updates WHERE captured_at > now() - interval '1 day';
+
+-- Audit chain closed: new live rows should have raw_update_id set.
+SELECT count(*) FROM chat_messages
+WHERE raw_update_id IS NULL AND date > now() - interval '1 day';
+```
+
+To enable the raw-archive path:
+
+```sql
+-- In psql against prod DB:
+UPDATE feature_flags SET enabled = true, updated_at = now()
+WHERE key = 'memory.ingestion.raw_updates.enabled';
+-- (or via FeatureFlagRepo.set_enabled in a one-off script)
+```
+
+Pre-hotfix live rows (`telegram_updates.ingestion_run_id IS NULL` for rows with
+`update_id IS NOT NULL`) can be backfilled with a one-shot UPDATE if historical
+rollback / GDPR-export queries over pre-hotfix ranges become necessary — see §10
+deferred items in `docs/memory-system/HANDOFF.md`.
+
+### Migration 023 — backfill v1 for post-008 cohort
+
+Before running `alembic upgrade head`, measure the cohort size:
+
+```sql
+SELECT count(*) FROM chat_messages WHERE current_version_id IS NULL;
+```
+
+Realistic estimate (~1000 msg/day, 008 deployed 2026-04-27): ~2k–5k rows.
+Migration runs in <30 seconds for this range. If >10k rows → consider a maintenance
+window. If >1M → ops decision.
+
+Run the migration:
+
+```bash
+alembic upgrade head  # idempotent; re-runs safely
+```
+
+### Revert note
+
+If hotfix #164 is reverted:
+- New live messages between revert and re-deploy will have `current_version_id IS NULL`.
+- A migration **024** backfill will be required on re-deploy.
+- Feature flag `memory.qa.enabled=true` should be flipped OFF before code revert.
+- Migration 023 rows are harmless if left in place (forward-only migration).
+
+---
+
 ## Known Issues & Quirks
 
 _Filled incrementally as Coolify migration reveals issues. Each entry format:_
