@@ -393,7 +393,16 @@ async def _apply_one_message(
         _record_tombstone_skip(report, msg_id)
         return msg_id
 
-    # 2. Duplicate gate — chat_messages already has this (chat_id, message_id).
+    # 1b. Early live overlap check (§3.2 — must come BEFORE generic dup gate so live
+    # overlaps are classified correctly and skipped_overlap_count is bumped instead of
+    # skipped_duplicate_count).  No raw row yet — check without raw_update_id guard.
+    early_overlap = await _check_early_live_overlap(session, chat_id=chat_id, message_id=msg_id)
+    if early_overlap:
+        report.skipped_overlap_count += 1
+        return msg_id
+
+    # 2. Duplicate gate — chat_messages already has this (chat_id, message_id) from a
+    # prior import run (non-live row).
     existing_cm_id = await _find_existing_chat_message_id(session, chat_id, msg_id)
     if existing_cm_id is not None:
         report.skipped_duplicate_count += 1
@@ -588,6 +597,33 @@ async def _apply_one_message(
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
+
+
+async def _check_early_live_overlap(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    """Return True if a LIVE chat_messages row already exists for (chat_id, message_id).
+
+    Called BEFORE the generic duplicate gate and BEFORE the synthetic raw row is
+    created, so no ``current_import_raw_update_id`` exclusion is needed.  Live rows
+    are identified by: chat_messages.raw_update_id → telegram_updates row WHERE
+    update_id IS NOT NULL (live handler writes real Telegram update_id; import writes NULL).
+    """
+    stmt = (
+        select(ChatMessage.id)
+        .join(TelegramUpdate, TelegramUpdate.id == ChatMessage.raw_update_id)
+        .where(
+            ChatMessage.chat_id == chat_id,
+            ChatMessage.message_id == message_id,
+            TelegramUpdate.update_id.is_not(None),  # live, not synthetic-import
+        )
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
 
 
 async def _check_live_overlap_pre_persist(

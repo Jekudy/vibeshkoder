@@ -733,7 +733,14 @@ async def test_apply_skips_version_when_live_row_wins_overlap_race(db_session) -
             assert message_id_arg == 9001
             return None
 
-        with patch("bot.services.import_apply._find_existing_chat_message_id", new=_miss_duplicate_gate):
+        async def _miss_early_overlap(session, *, chat_id, message_id):
+            # Simulate that the live row appeared AFTER the early check (true race).
+            return False
+
+        with (
+            patch("bot.services.import_apply._find_existing_chat_message_id", new=_miss_duplicate_gate),
+            patch("bot.services.import_apply._check_early_live_overlap", new=_miss_early_overlap),
+        ):
             report = await run_apply(
                 db_session,
                 ingestion_run_id=run_id,
@@ -1497,6 +1504,99 @@ async def test_import_apply_offrecord_creates_chat_message_and_mark(db_session) 
         assert mv_row is not None, "H2: MessageVersion must be created for imported offrecord"
         assert mv_row[0] is True, "H2: MessageVersion must be redacted"
         assert mv_row[1] is None, "H2: MessageVersion.text must be NULL for offrecord"
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def test_import_apply_live_overlap_bumps_overlap_count_not_dup_count(db_session) -> None:
+    """HIGH 3 regression: live overlap must increment skipped_overlap_count, not
+    skipped_duplicate_count.  §3.2 acceptance criteria.
+
+    Scenario: live message ingested first (via persist_message_with_policy), then
+    same (chat_id, message_id) imported.  The live row is authoritative — import
+    is skipped and skipped_overlap_count == 1, skipped_duplicate_count == 0.
+    """
+    import tempfile
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from bot.db.repos.user import UserRepo
+    from bot.services.import_apply import run_apply
+    from bot.services.message_persistence import persist_message_with_policy
+
+    chat_id = -1_009_001_000_001
+    msg_id = 60_001
+    user_id = 99_001
+
+    # Pre-seed live chat_message via real path (creates live raw_update row with update_id NOT NULL).
+    await UserRepo.upsert(db_session, telegram_id=user_id, username="u99001", first_name="Overlap", last_name=None)
+    live_duck = SimpleNamespace(
+        message_id=msg_id,
+        chat=SimpleNamespace(id=chat_id, type="supergroup"),
+        from_user=SimpleNamespace(id=user_id, username="u99001", first_name="Overlap", last_name=None),
+        text="live message text",
+        caption=None,
+        date=datetime.now(timezone.utc),
+        model_dump=MagicMock(return_value={"text": "live message text"}),
+        reply_to_message=None, message_thread_id=None,
+        photo=None, video=None, voice=None, audio=None, document=None,
+        sticker=None, animation=None, video_note=None, location=None,
+        contact=None, poll=None, dice=None, forward_origin=None,
+        new_chat_members=None, left_chat_member=None, pinned_message=None,
+        entities=None, caption_entities=None,
+    )
+    # seed a live telegram_updates row (update_id IS NOT NULL) to satisfy overlap check
+    from bot.db.repos.telegram_update import TelegramUpdateRepo
+    live_raw = await TelegramUpdateRepo.insert(
+        db_session,
+        update_type="message",
+        update_id=12345,  # NOT NULL → marks as live
+        raw_json={"message_id": msg_id},
+        raw_hash=None,
+        chat_id=chat_id,
+        message_id=msg_id,
+        ingestion_run_id=None,
+        is_redacted=False,
+    )
+    live_result = await persist_message_with_policy(db_session, live_duck, raw_update_id=live_raw.id, source="live")
+    assert live_result.chat_message.current_version_id is not None
+
+    # Build a TD export for the same (chat_id, msg_id)
+    import json as _json
+    export_data = _json.dumps({
+        "id": chat_id,
+        "name": "Test",
+        "type": "public_supergroup",
+        "messages": [{
+            "id": msg_id,
+            "type": "message",
+            "date": "2024-01-15T10:00:00",
+            "date_unixtime": "1705312800",
+            "from": "Overlap User",
+            "from_id": f"user{user_id}",
+            "text": "live message text",
+            "text_entities": [{"type": "plain", "text": "live message text"}],
+        }],
+    })
+
+    tmp = Path(tempfile.mktemp(suffix=".json"))
+    try:
+        tmp.write_text(export_data)
+        run_id = await _create_apply_run(
+            db_session, source_path=str(tmp), chat_id=chat_id, source_hash="hash_live_overlap_h3"
+        )
+        report = await run_apply(
+            db_session, ingestion_run_id=run_id, resume_point=None, chunking_config=_default_chunking()
+        )
+
+        # §3.2: live overlap must bump skipped_overlap_count, NOT skipped_duplicate_count.
+        assert report.skipped_overlap_count == 1, (
+            f"Expected skipped_overlap_count=1 for live overlap; got {report}"
+        )
+        assert report.skipped_duplicate_count == 0, (
+            f"Expected skipped_duplicate_count=0 for live overlap; got {report}"
+        )
     finally:
         tmp.unlink(missing_ok=True)
 
