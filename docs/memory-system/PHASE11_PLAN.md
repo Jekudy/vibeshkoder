@@ -206,7 +206,7 @@ This category is wired in Wave 1 (T11-W1-05) so it is green BEFORE Phase 5 start
 
 ### Wave 1 — Harness skeleton (no LLM)
 
-Tickets T11-W1-01 .. T11-W1-06. Goal: produce a green CI run on Phase 4 baseline.
+Tickets T11-W1-01 .. T11-W1-07. Goal: produce a green CI run on Phase 4 baseline.
 
 | Ticket | Title | Owns |
 |--------|-------|------|
@@ -214,8 +214,9 @@ Tickets T11-W1-01 .. T11-W1-06. Goal: produce a green CI run on Phase 4 baseline
 | T11-W1-02 | `bot/services/eval_seeds.py` + seed loader | loads JSONL seed; computes seed_hash; resolves message_version_ids post-fixture-apply |
 | T11-W1-03 | `bot/services/eval_metrics.py` | deterministic recall@K / precision@K |
 | T11-W1-04 | `tests/evals/conftest.py` + golden_recall/seed_v1 fixture | 20+ messages, 8+ queries with expected ids |
-| T11-W1-05 | `tests/evals/test_determinism.py` + smoke `test_recall_precision.py` | establishes Phase 4 baseline metrics |
-| T11-W1-06 | `.github/workflows/evals.yml` (gated default OFF) | nightly cron + workflow_dispatch |
+| T11-W1-05 | `tests/evals/test_determinism.py` + smoke `test_recall_precision.py` + `tests/evals/test_no_llm_imports.py` (§5.6 I1-I3) | Phase 4 baseline metrics + invariant 2 binding test |
+| T11-W1-06 | `.github/workflows/evals.yml` (gated default OFF) + `eval_results.jsonl` artifact schema | nightly cron + workflow_dispatch + structured verdict output |
+| T11-W1-07 | Privacy-allowlist CI gate + local pre-commit hook proposal (per §7 #5) | mechanical enforcement of `tests/fixtures/eval_seeds/leakage_*` allowlist |
 
 ### Wave 2 — Privacy + correctness binding (Phase 4 baseline)
 
