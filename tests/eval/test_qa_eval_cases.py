@@ -193,19 +193,89 @@ async def _seed_case_via_import_path(db_session, case: dict) -> None:
         )
 
 
+async def _seed_case_via_real_path(db_session, case: dict) -> None:
+    """Seed a rec_* case through persist_message_with_policy (real path).
+
+    Builds a SimpleNamespace duck from fixture_messages and calls the unified
+    persist helper. Inline assertion: current_version_id must be set after persist
+    (§3.9 CRITICAL 1 inverse-test for live path).
+    """
+    from types import SimpleNamespace
+    from datetime import timezone
+
+    from bot.db.repos.user import UserRepo
+    from bot.services.message_persistence import persist_message_with_policy
+
+    for message in case["fixture_messages"]:
+        user_id = int(message["user_id"])
+        chat_id = int(message["chat_id"])
+        msg_id = int(message["message_id"])
+        captured_at = _parse_dt(message.get("captured_at"))
+
+        await UserRepo.upsert(
+            db_session,
+            telegram_id=user_id,
+            username=f"qa_eval_{user_id}",
+            first_name=f"Eval {user_id}",
+            last_name=None,
+        )
+
+        text = message.get("text", message.get("normalized_text"))
+        caption = message.get("caption")
+
+        duck = SimpleNamespace(
+            message_id=msg_id,
+            chat=SimpleNamespace(id=chat_id, type="supergroup"),
+            from_user=SimpleNamespace(
+                id=user_id,
+                username=f"qa_eval_{user_id}",
+                first_name=f"Eval {user_id}",
+                last_name=None,
+            ),
+            text=text,
+            caption=caption,
+            date=captured_at if captured_at.tzinfo is not None else captured_at.replace(tzinfo=timezone.utc),
+            model_dump=lambda **_: {},
+            reply_to_message=None,
+            message_thread_id=None,
+            photo=None, video=None, voice=None, audio=None, document=None,
+            sticker=None, animation=None, video_note=None, location=None,
+            contact=None, poll=None, dice=None, forward_origin=None,
+            new_chat_members=None, left_chat_member=None, pinned_message=None,
+            entities=None, caption_entities=None,
+        )
+
+        result = await persist_message_with_policy(
+            db_session, duck, source="live", captured_at=captured_at
+        )
+        # §3.9 inline assertion: current_version_id must be set (CRITICAL 1 inverse-test).
+        assert result.chat_message.current_version_id is not None, (
+            f"{case['id']}: message_id={msg_id} current_version_id is None after real-path seed"
+        )
+
+
 async def _populate_case(db_session, case: dict) -> int:
     case_id = case["id"]
+    fixture_source = case.get("fixture_source")
 
-    if case_id.startswith("imp_"):
+    if fixture_source == "import_path" or case_id.startswith("imp_"):
         # Import-path cases: seed via run_apply, return chat_id from case.
         await _seed_case_via_import_path(db_session, case)
         for event in case.get("fixture_forget_events", []):
             await _create_forget_event(db_session, event)
         return int(case["chat_id"])
 
-    # Legacy rec_* cases: seed via manual ORM rows.
-    for message in case["fixture_messages"]:
-        await _create_message(db_session, case_id, message)
+    if fixture_source == "legacy_orm":
+        # Edge cases that require explicit ORM control (e.g. custom content_hash,
+        # explicit is_redacted) — not expressible through the governance real path.
+        for message in case["fixture_messages"]:
+            await _create_message(db_session, case_id, message)
+        for event in case.get("fixture_forget_events", []):
+            await _create_forget_event(db_session, event)
+        return int(case["fixture_messages"][0]["chat_id"])
+
+    # Default: rec_* cases seed via persist_message_with_policy real path (§3.9).
+    await _seed_case_via_real_path(db_session, case)
     for event in case.get("fixture_forget_events", []):
         await _create_forget_event(db_session, event)
     return int(case["fixture_messages"][0]["chat_id"])
