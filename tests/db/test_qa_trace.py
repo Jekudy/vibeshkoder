@@ -171,14 +171,13 @@ async def test_qa_trace_cascade_idempotent(db_session) -> None:
     stats2 = await run_cascade_worker_once(db_session)
     # Second run processes the event but qa_traces has 0 un-redacted rows → rows=0
     # (the layer ran but found nothing to update).
-    from bot.services.forget_cascade import CASCADE_LAYER_ORDER
     # No error, just 0 more rows.
     assert stats2["failed"] == 0
 
 
 async def test_qa_trace_cascade_message_target_skips(db_session) -> None:
     """target_type='message' event → qa_traces layer reports not_applicable (pre-filter)."""
-    from bot.db.models import ForgetEvent, ChatMessage, TelegramUpdate
+    from bot.db.models import ForgetEvent
     from bot.services.forget_cascade import run_cascade_worker_once
 
     # Create a minimal chat_messages row to have a valid target_id.

@@ -363,7 +363,6 @@ async def test_recall_with_flag_off_still_persists_message(monkeypatch) -> None:
     message = _message(chat_id=COMMUNITY_CHAT_ID)
     session = AsyncMock()
     fake_cm = SimpleNamespace(id=1, current_version_id=None)
-    fake_v1 = SimpleNamespace(id=10)
 
     persist_mock = AsyncMock()
     from bot.services.message_persistence import PersistResult
