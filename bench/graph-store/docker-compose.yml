@@ -1,0 +1,83 @@
+# Benchmark overlay for graph store candidates.
+# Each service is a standalone store. Bring up ONLY the service you are benchmarking;
+# they all expose different ports so they can coexist on the same host if needed.
+#
+# Usage:
+#   docker compose -f bench/graph-store/docker-compose.yml up age-bench -d
+#   python bench/graph-store/harness.py --store age
+#
+#   docker compose -f bench/graph-store/docker-compose.yml up neo4j-bench -d
+#   python bench/graph-store/harness.py --store neo4j
+#
+#   docker compose -f bench/graph-store/docker-compose.yml down
+
+services:
+
+  # --------------------------------------------------------------------------
+  # Apache AGE — PostgreSQL 16 with the AGE extension pre-installed.
+  # Image: apache/age (PG16 tag), official community image.
+  # https://hub.docker.com/r/apache/age
+  # Port: 5440 (avoids clash with dev postgres on 5433 and prod on 5432)
+  # --------------------------------------------------------------------------
+  age-bench:
+    image: apache/age:PG16
+    container_name: bench-age
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench_age
+    ports:
+      - "127.0.0.1:5440:5432"
+    volumes:
+      - bench-age-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "bench", "-d", "bench_age"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --------------------------------------------------------------------------
+  # Neo4j 5 Community Edition.
+  # https://hub.docker.com/_/neo4j
+  # Ports:
+  #   7477 → 7474 (HTTP browser UI)
+  #   7688 → 7687 (bolt protocol — used by Python driver)
+  # Auth disabled for simplicity in the isolated benchmark environment.
+  # --------------------------------------------------------------------------
+  neo4j-bench:
+    image: neo4j:5-community
+    container_name: bench-neo4j
+    environment:
+      NEO4J_AUTH: none
+      # Reduce JVM heap for benchmark host (adjust if OOM)
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+    ports:
+      - "127.0.0.1:7477:7474"
+      - "127.0.0.1:7688:7687"
+    volumes:
+      - bench-neo4j-data:/data
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # --------------------------------------------------------------------------
+  # Graphiti benchmark note:
+  # Graphiti uses Neo4j as its storage backend. For this benchmark we measure
+  # the raw Neo4j write/read path directly (LLM extraction is bypassed).
+  # Use the neo4j-bench service above. The harness --store graphiti target
+  # connects to the same neo4j-bench container but uses a separate graph
+  # database (neo4j:bench_graphiti) to isolate results.
+  # No additional service needed.
+  # --------------------------------------------------------------------------
+
+  # --------------------------------------------------------------------------
+  # NetworkX runs entirely in-process — no Docker service required.
+  # The harness --store networkx target loads triples into Python memory.
+  # --------------------------------------------------------------------------
+
+volumes:
+  bench-age-data:
+  bench-neo4j-data:
