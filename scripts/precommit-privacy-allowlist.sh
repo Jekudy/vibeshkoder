@@ -12,6 +12,10 @@ is_allowed_path() {
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_redacted.*\.jsonl$ ]] && return 0
   [[ "$path" =~ ^docs/.*\.md$ ]] && return 0
   [[ "$path" =~ ^bot/services/governance\.py$ ]] && return 0
+  [[ "$path" =~ ^bot/services/message_persistence\.py$ ]] && return 0
+  [[ "$path" =~ ^bot/services/forget_cascade\.py$ ]] && return 0
+  [[ "$path" =~ ^bot/handlers/edited_message\.py$ ]] && return 0
+  [[ "$path" =~ ^bot/db/models\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_governance\.py$ ]] && return 0
   [[ "$path" =~ ^tests/handlers/.*test_chat_messages.*\.py$ ]] && return 0
   [[ "$path" =~ ^tests/handlers/test_qa\.py$ ]] && return 0
