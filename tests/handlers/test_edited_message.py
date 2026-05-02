@@ -996,3 +996,55 @@ def test_edit_on_legacy_v1_recomputes_chv1(app_env, monkeypatch) -> None:
 
     # No new version because chv1("old text") == chv1("old text") — same content
     mock_insert_version.assert_not_awaited()
+
+
+# ─── §3.10: handle_edited_message threads raw_update_id ──────────────────────
+
+
+def test_handle_edited_message_threads_raw_update_id(app_env, monkeypatch) -> None:
+    """§3.10: handle_edited_message passes raw_update_id from raw_update param to insert_version."""
+    handler = import_module("bot.handlers.edited_message")
+
+    from bot.services.content_hash import compute_content_hash
+
+    msg_id = _random_message_id()
+    chat_id = -1001234567890
+    message = _make_message(message_id=msg_id, chat_id=chat_id, text="new edit text")
+
+    existing_row = _make_chat_message_row(
+        id=50,
+        message_id=msg_id,
+        chat_id=chat_id,
+        text="original text",
+        message_kind="text",
+        memory_policy="normal",
+        current_version_id=1,
+    )
+
+    new_hash = compute_content_hash("new edit text", None, "text", None)
+    new_version = _make_version_row(id=2, version_seq=2, content_hash=new_hash)
+
+    mock_find = AsyncMock(return_value=existing_row)
+    mock_get_by_hash = AsyncMock(return_value=None)
+    mock_insert_version = AsyncMock(return_value=new_version)
+
+    session = AsyncMock()
+    session.execute = AsyncMock(
+        return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=existing_row))
+    )
+    session.flush = AsyncMock()
+    session.refresh = AsyncMock()
+
+    monkeypatch.setattr(handler, "_find_chat_message", mock_find)
+    monkeypatch.setattr(handler.MessageVersionRepo, "get_by_hash", mock_get_by_hash)
+    monkeypatch.setattr(handler.MessageVersionRepo, "insert_version", mock_insert_version)
+
+    # Simulate a raw_update row surfaced by RawUpdatePersistenceMiddleware.
+    from types import SimpleNamespace as NS
+    raw_update = NS(id=777)
+
+    asyncio.run(handler.handle_edited_message(message, session, raw_update=raw_update))
+
+    mock_insert_version.assert_awaited_once()
+    call_kwargs = mock_insert_version.call_args.kwargs
+    assert call_kwargs.get("raw_update_id") == 777

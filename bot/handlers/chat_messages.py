@@ -7,6 +7,7 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
+from bot.db.models import TelegramUpdate
 from bot.db.repos.user import UserRepo
 from bot.filters.chat_type import GroupChatFilter
 from bot.services.message_persistence import persist_message_with_policy
@@ -20,6 +21,7 @@ router = Router(name="chat_messages")
 async def save_chat_message(
     message: Message,
     session: AsyncSession,
+    raw_update: TelegramUpdate | None = None,
 ) -> None:
     """Save every message in the community group chat."""
     # Handler-only guards (community chat filter, group filter, anonymous sender).
@@ -41,7 +43,11 @@ async def save_chat_message(
     # Persist with policy detection (advisory lock + governance + mark creation).
     # The helper mirrors the former inline logic from this handler body so DB state
     # is byte-identical regardless of call site (live handler or importer).
-    result = await persist_message_with_policy(session, message)
+    result = await persist_message_with_policy(
+        session,
+        message,
+        raw_update_id=raw_update.id if raw_update is not None else None,
+    )
 
     logger.debug(
         "chat_message saved: chat_id=%s message_id=%s policy=%s mark_created=%s",

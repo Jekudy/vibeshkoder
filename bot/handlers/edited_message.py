@@ -49,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
 from bot.db.locks import advisory_lock_chat_message
-from bot.db.models import ChatMessage, MessageVersion
+from bot.db.models import ChatMessage, MessageVersion, TelegramUpdate
 from bot.db.repos.message_version import MessageVersionRepo
 from bot.db.repos.offrecord_mark import OffrecordMarkRepo
 from bot.filters.chat_type import GroupChatFilter
@@ -201,6 +201,7 @@ async def _update_memory_policy(
 async def handle_edited_message(
     message: Message,
     session: AsyncSession,
+    raw_update: TelegramUpdate | None = None,
 ) -> None:
     """Handle Telegram ``edited_message`` updates for community group chat.
 
@@ -368,6 +369,7 @@ async def handle_edited_message(
         normalized_text=version_text,
         entities_json=entities_json,
         edit_date=edit_date,
+        raw_update_id=raw_update.id if raw_update is not None else None,
         is_redacted=is_redacted_version,
     )
 
