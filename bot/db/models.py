@@ -4,6 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -781,7 +782,7 @@ class LlmUsageLedger(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     qa_trace_id: Mapped[int | None] = mapped_column(
-        Integer,
+        BigInteger,
         ForeignKey(
             "qa_traces.id",
             name="fk_llm_usage_ledger_qa_trace_id",
@@ -791,8 +792,8 @@ class LlmUsageLedger(Base):
     )
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
-    prompt_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    response_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    prompt_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    response_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
     tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False, server_default=text("0"))
@@ -830,10 +831,11 @@ class LlmSynthesisCache(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
     answer_text: Mapped[str] = mapped_column(Text, nullable=False)
-    citation_ids: Mapped[list] = mapped_column(
-        JSONB(),
+    citation_ids: Mapped[list[int]] = mapped_column(
+        # JSONB on postgres (enables @> containment ops); JSON elsewhere for sqlite test compat.
+        JSON().with_variant(JSONB(), "postgresql"),
         nullable=False,
     )
     model: Mapped[str] = mapped_column(String(128), nullable=False)

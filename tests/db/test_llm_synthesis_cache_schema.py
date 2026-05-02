@@ -123,27 +123,31 @@ async def migrated_database_url(temp_database_url: str) -> AsyncIterator[str]:
     yield temp_database_url
 
 
-# ─── Test 1: Table exists with all 8 columns ────────────────────────────────
+# ─── Test 1: Table exists with all 8 columns + correct types/lengths ────────
 
 
 async def test_llm_synthesis_cache_all_columns_exist(migrated_database_url: str) -> None:
-    """All 8 columns exist in llm_synthesis_cache with correct data types."""
-    expected_columns = {
-        "id": "bigint",
-        "input_hash": "character",
-        "answer_text": "text",
-        "citation_ids": "jsonb",
-        "model": "character varying",
-        "created_at": "timestamp with time zone",
-        "last_hit_at": "timestamp with time zone",
-        "hit_count": "integer",
+    """All 8 columns exist in llm_synthesis_cache with correct types and lengths.
+
+    Tuple: (data_type, character_maximum_length, numeric_precision, numeric_scale).
+    None means 'not applicable / not reported by information_schema' for that slot.
+    """
+    expected_columns: dict[str, tuple[str, int | None, int | None, int | None]] = {
+        "id":           ("bigint",                   None, 64,   0),
+        "input_hash":   ("character",                64,   None, None),
+        "answer_text":  ("text",                     None, None, None),
+        "citation_ids": ("jsonb",                    None, None, None),
+        "model":        ("character varying",        128,  None, None),
+        "created_at":   ("timestamp with time zone", None, None, None),
+        "last_hit_at":  ("timestamp with time zone", None, None, None),
+        "hit_count":    ("integer",                  None, 32,   0),
     }
 
-    for col_name, expected_type in expected_columns.items():
-        actual_type = await _fetch_value(
+    for col_name, (exp_type, exp_char_len, exp_num_prec, exp_num_scale) in expected_columns.items():
+        row = await _fetch_row(
             migrated_database_url,
             """
-            SELECT data_type
+            SELECT data_type, character_maximum_length, numeric_precision, numeric_scale
             FROM information_schema.columns
             WHERE table_schema = 'public'
               AND table_name = 'llm_synthesis_cache'
@@ -151,8 +155,21 @@ async def test_llm_synthesis_cache_all_columns_exist(migrated_database_url: str)
             """,
             col_name,
         )
-        assert actual_type == expected_type, (
-            f"Column '{col_name}': expected type '{expected_type}', got '{actual_type}'"
+        assert row is not None, f"Column '{col_name}' not found in llm_synthesis_cache"
+        assert row["data_type"] == exp_type, (
+            f"Column '{col_name}': expected data_type '{exp_type}', got '{row['data_type']}'"
+        )
+        assert row["character_maximum_length"] == exp_char_len, (
+            f"Column '{col_name}': expected character_maximum_length {exp_char_len!r},"
+            f" got {row['character_maximum_length']!r}"
+        )
+        assert row["numeric_precision"] == exp_num_prec, (
+            f"Column '{col_name}': expected numeric_precision {exp_num_prec!r},"
+            f" got {row['numeric_precision']!r}"
+        )
+        assert row["numeric_scale"] == exp_num_scale, (
+            f"Column '{col_name}': expected numeric_scale {exp_num_scale!r},"
+            f" got {row['numeric_scale']!r}"
         )
 
 
@@ -322,3 +339,32 @@ def test_llm_synthesis_cache_tablename_registered(app_env) -> None:
     models = import_module("bot.db.models")
     assert models.LlmSynthesisCache.__tablename__ == "llm_synthesis_cache"
     assert "llm_synthesis_cache" in models.Base.metadata.tables
+
+
+# ─── Test 8: CHAR(64) boundary on input_hash ────────────────────────────────
+
+
+async def test_llm_synthesis_cache_input_hash_char_64_boundary(migrated_database_url: str) -> None:
+    """input_hash CHAR(64): exactly 64 chars succeeds; 65 chars raises DataError."""
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        # Exactly 64 chars — must succeed
+        await conn.execute(
+            """
+            INSERT INTO llm_synthesis_cache (input_hash, answer_text, citation_ids, model)
+            VALUES ($1, 'boundary test', '[]'::jsonb, 'claude-haiku')
+            """,
+            "i" * 64,
+        )
+
+        # 65 chars — must fail with a truncation error
+        with pytest.raises(asyncpg.exceptions.StringDataRightTruncationError):
+            await conn.execute(
+                """
+                INSERT INTO llm_synthesis_cache (input_hash, answer_text, citation_ids, model)
+                VALUES ($1, 'over boundary', '[]'::jsonb, 'claude-haiku')
+                """,
+                "j" * 65,
+            )
+    finally:
+        await conn.close()
