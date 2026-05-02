@@ -1,0 +1,49 @@
+{
+  "description": "5 sources: 1 nomem + 4 visible → NOMEM",
+  "card": {
+    "title": "Multi-source card with one nomem",
+    "body_markdown": "This card cites five messages, one of which has nomem policy.",
+    "card_status": "approved"
+  },
+  "sources": [
+    {
+      "local_id": 1,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-multi-05-aaa",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 2,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-multi-05-bbb",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 3,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-multi-05-ccc",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 4,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-multi-05-ddd",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 5,
+      "memory_policy": "nomem",
+      "is_redacted": false,
+      "content_hash": "hash-multi-05-eee",
+      "tombstone_key": null
+    }
+  ],
+  "expected": {
+    "visibility": "nomem",
+    "note": "Source 5 has memory_policy='nomem'. 4 visible sources. NOMEM beats VISIBLE."
+  }
+}

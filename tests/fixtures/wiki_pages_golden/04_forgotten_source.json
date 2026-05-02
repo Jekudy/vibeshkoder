@@ -1,0 +1,28 @@
+{
+  "description": "One source has a forget_events tombstone matching its content_hash → FORGOTTEN",
+  "card": {
+    "title": "Card with forgotten source",
+    "body_markdown": "This card cites a message that was later forgotten.",
+    "card_status": "approved"
+  },
+  "sources": [
+    {
+      "local_id": 1,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-forgotten-04-aaa",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 2,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-forgotten-04-bbb",
+      "tombstone_key": "message_hash:hash-forgotten-04-bbb"
+    }
+  ],
+  "expected": {
+    "visibility": "forgotten",
+    "note": "Source 2 has tombstone_key='message_hash:hash-forgotten-04-bbb'. FORGOTTEN."
+  }
+}

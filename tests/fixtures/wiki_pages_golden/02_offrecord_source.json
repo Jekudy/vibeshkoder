@@ -1,0 +1,28 @@
+{
+  "description": "One source has memory_policy='offrecord' → REDACTED",
+  "card": {
+    "title": "Card with offrecord source",
+    "body_markdown": "This card cites one offrecord message.",
+    "card_status": "approved"
+  },
+  "sources": [
+    {
+      "local_id": 1,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-offrecord-02-aaa",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 2,
+      "memory_policy": "offrecord",
+      "is_redacted": false,
+      "content_hash": "hash-offrecord-02-bbb",
+      "tombstone_key": null
+    }
+  ],
+  "expected": {
+    "visibility": "redacted",
+    "note": "Source 2 has memory_policy='offrecord'. REDACTED beats all others."
+  }
+}

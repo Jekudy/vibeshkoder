@@ -1,0 +1,28 @@
+{
+  "description": "One source has is_redacted=True → REDACTED",
+  "card": {
+    "title": "Card with redacted source",
+    "body_markdown": "This card cites one message that has been redacted in place.",
+    "card_status": "approved"
+  },
+  "sources": [
+    {
+      "local_id": 1,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-redacted-03-aaa",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 2,
+      "memory_policy": "normal",
+      "is_redacted": true,
+      "content_hash": "hash-redacted-03-bbb",
+      "tombstone_key": null
+    }
+  ],
+  "expected": {
+    "visibility": "redacted",
+    "note": "Source 2 has is_redacted=True (content nulled by cascade or manual redaction). REDACTED."
+  }
+}

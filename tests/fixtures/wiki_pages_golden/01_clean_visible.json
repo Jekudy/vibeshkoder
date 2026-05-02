@@ -1,0 +1,35 @@
+{
+  "description": "All sources are normal, not redacted, no tombstone → VISIBLE",
+  "card": {
+    "title": "Clean visible card",
+    "body_markdown": "This card cites three clean messages.",
+    "card_status": "approved"
+  },
+  "sources": [
+    {
+      "local_id": 1,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-clean-01-aaa",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 2,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-clean-01-bbb",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 3,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-clean-01-ccc",
+      "tombstone_key": null
+    }
+  ],
+  "expected": {
+    "visibility": "visible",
+    "note": "All three sources have memory_policy='normal', not redacted, no tombstone."
+  }
+}
