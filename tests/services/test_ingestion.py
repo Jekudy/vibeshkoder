@@ -133,6 +133,26 @@ async def test_get_or_create_live_run_attaches_when_exists(db_session) -> None:
     assert first.id == second.id
 
 
+async def test_live_ingestion_run_created_on_startup(db_session) -> None:
+    """§3.8: startup logic creates exactly one live run with run_type='live', status='running'.
+
+    Models the dp['live_ingestion_run_id'] wiring in bot/__main__.py::on_startup.
+    """
+    from bot.services.ingestion import get_or_create_live_run
+
+    # Simulate what on_startup does: call get_or_create_live_run and cache its id.
+    live_run = await get_or_create_live_run(db_session)
+    cached_id = live_run.id
+
+    assert cached_id is not None
+    assert live_run.run_type == "live"
+    assert live_run.status == "running"
+
+    # Idempotent: second call (e.g. bot restart) returns same id, no duplicate rows.
+    second_run = await get_or_create_live_run(db_session)
+    assert second_run.id == cached_id
+
+
 # ─── stub detector wired ────────────────────────────────────────────────────────────────
 
 

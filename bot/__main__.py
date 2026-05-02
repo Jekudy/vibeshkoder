@@ -119,7 +119,17 @@ async def main() -> None:
 
     # Startup / shutdown hooks
     async def on_startup() -> None:
+        from bot.db.engine import async_session
         from bot.services.health import report, startup_log_lines
+        from bot.services.ingestion import get_or_create_live_run
+
+        # Cache the live ingestion run id so the RawUpdatePersistenceMiddleware can pass
+        # it to record_update without a per-update DB query.  Accessible via data dict in
+        # all middlewares/handlers through aiogram's dp workflow-data mechanism.
+        async with async_session() as session:
+            live_run = await get_or_create_live_run(session)
+            await session.commit()
+        dp["live_ingestion_run_id"] = live_run.id
 
         start_scheduler(bot)
         bot_info = await bot.me()

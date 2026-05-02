@@ -52,7 +52,8 @@ class RawUpdatePersistenceMiddleware(BaseMiddleware):
             if session is not None:
                 try:
                     async with session.begin_nested():
-                        raw_row = await record_update(session, event)
+                        live_run_id = data.get("live_ingestion_run_id")
+                        raw_row = await record_update(session, event, ingestion_run_id=live_run_id)
                         if raw_row is not None:
                             data["raw_update"] = raw_row
                 except SQLAlchemyError as exc:
