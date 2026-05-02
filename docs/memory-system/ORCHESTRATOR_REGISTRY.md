@@ -123,7 +123,7 @@ Update this section at sprint start (in your sprint-kickoff PR) and at sprint cl
 | Orch A (Phase 6) | `knowledge_cards` + `card_sources` stable | Orch B (Phase 9) wiki content; Orch B (Phase 10) graph entity nodes | Phase 6 closure |
 | Orch A (Phase 8) | `observations` table | Orch B (Phase 10) graph projection of observations | Phase 8 closure |
 | Orch A (any phase) | New content table | Orch A self: must add to `forget_cascade.CASCADE_LAYER_ORDER` in same sprint | Privacy invariant 9 |
-| Orch C | Phase 4 baseline evals (Wave 2 — leakage / citations / refusal) | Orch A (Phase 5) regression baseline before LLM enables | **BINDING:** Phase 5 closure requires Wave 2 PASS. Run: `EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 tests/evals/ -k "leakage or citations or refusal"`. See `PHASE11_PLAN.md §8.1`. |
+| Orch C | Phase 4 baseline evals (Wave 2 — leakage / citations / refusal + Wave 1 §5.6 no-LLM-imports) | Orch A (Phase 5) regression baseline before LLM enables | **BINDING ACTIVATES at T11-W2-04 closure** (Wave 2 baseline freeze). Until activation, contract is intent-only — `tests/evals/` is empty in this Sprint 0 ratification PR. Run command (post-activation, explicit file paths — never `-k`): `EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 tests/evals/test_leakage.py tests/evals/test_citations.py tests/evals/test_refusal.py tests/evals/test_no_llm_imports.py`. Verdict source: `eval_results.jsonl`. See `PHASE11_PLAN.md §8.1`. |
 | Orch C (Wave 3) | LLM-synthesis hallucination + citation-drift evals | Orch A (Phase 5) post-merge regression suite | After Phase 5 close; Orch A may not declare Phase 5 stable until Wave 3 green. |
 
 ---
