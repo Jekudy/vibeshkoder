@@ -1,31 +1,60 @@
-# Phase 12 — Butler / Action Execution for Shkoderbot Memory System: Design Draft
+# Phase 12 — Butler / Action Execution for Shkoderbot Memory System: Ratified Design
 
 ## §0. Banner
 
-🚧 DRAFT — NOT AUTHORIZED
+✅ RATIFIED — DESIGN ONLY
 
-🚧 DESIGN-ONLY (per AUTHORIZED_SCOPE.md: Butler / action execution — Phase 12 (postponed; design only))
+🚫 NO IMPLEMENTATION AUTHORIZED (per `AUTHORIZED_SCOPE.md` §"Phase 12 — Butler design docs only (2026-04-30)" and §"NOT authorized")
 
-**Status:** design draft only; no implementation authorized.
+**Status:** ratified design contract; future butler implementation requires explicit AUTHORIZED_SCOPE.md update AND human team-lead approval.
 **Cycle:** Memory system Phase 12.
-**Date:** 2026-04-30.
-**Predecessors:** Phase 4 evidence / Q&A, Phase 5 LLM gateway + ledger, Phase 6 cards as suggestions, Phase 8 observations / digest context.
-**Critical invariant for this phase:** Future butler cannot read raw DB directly; it must use governance-filtered evidence context.
+**Date:** 2026-04-30 (drafted) → 2026-05-02 (ratified, Orchestrator B sprint 0a).
+**Owner:** Orchestrator B per `docs/memory-system/ORCHESTRATOR_REGISTRY.md §1`.
+**Predecessors (gates that must close before any §6 implementation work begins):**
+Phase 4 evidence / Q&A (CLOSED 2026-04-30), Phase 5 LLM gateway + ledger (Orchestrator A active), Phase 6 cards as suggestions (Orchestrator A blocked), Phase 8 observations / digest context (Orchestrator A blocked).
+**Critical invariant for this phase:** Future butler cannot read raw DB directly; it must use governance-filtered evidence context (HANDOFF.md §1 invariant 7).
 
-### Source Reading Notes
+### Ratification Note (2026-05-02, Orchestrator B)
 
-Required source files read:
+This document was promoted from `docs/memory-system/prompts/PHASE12_PLAN_DRAFT.md`
+(merged via PR #160 as a docs-only artifact) to its canonical location
+`docs/memory-system/PHASE12_PLAN.md` per `AUTHORIZED_SCOPE.md` line 111 and
+`ORCHESTRATOR_REGISTRY.md §2 Orchestrator B exclusive write`. The substance of §1–§10
+was preserved verbatim from the ratified draft. The following changes were applied
+during ratification:
 
-- `docs/memory-system/HANDOFF.md` — invariants, roadmap, Phase 12 design-only spec, service boundaries.
-- `docs/memory-system/AUTHORIZED_SCOPE.md` — confirms Butler / action execution is Phase 12, postponed, design only.
-- `docs/memory-system/ROADMAP.md` — confirms Phase 12 exit gate is docs only / no execution code.
-- `docs/memory-system/ARCHITECTURE.md`, `docs/memory-system/GLOSSARY.md`, ADR-0003, ADR-0004, ADR-0005 — used for governance, LLM gateway, graph / butler boundary.
-- `.worktrees/p4-stream-e/docs/memory-system/PHASE4_PLAN.md` — used as structural model because `docs/memory-system/PHASE4_PLAN.md` was not present in the main worktree.
+- §0 banner switched from "DRAFT — NOT AUTHORIZED" to "RATIFIED — DESIGN ONLY".
+- §0 source-reading-notes pruned: gaps about a missing `PHASE4_PLAN.md` and missing
+  `prompts/` directory are obsolete (Phase 4 closed 2026-04-30; `prompts/` exists).
+- §11 "Compliance Recap" added — explicit cross-reference index for permission model,
+  action audit, abort / dry-run, and the future butler boundary as required by the
+  Orchestrator B charter directive.
+- §Final Report Block updated: `DRAFT_PATH` → `CANONICAL_PATH`, `STATUS: RATIFIED`,
+  ratification date stamped.
+- §6 Wave / §7 Tickets / §9 PR Workflow remain authored as **future** implementation
+  contracts. They MUST NOT be picked up until `AUTHORIZED_SCOPE.md` is updated by
+  human or by Orchestrator A's Phase 6+ closing PR.
 
-Required source gaps:
+### Source Reading Notes (verified 2026-05-02)
 
-- `docs/memory-system/PHASE4_PLAN.md` is not present in the main worktree.
-- `docs/memory-system/prompts/` is not present in the main worktree, so there were no prior phase prompt drafts to read from that path.
+Required source files read during draft authoring AND verified at ratification time:
+
+- `docs/memory-system/HANDOFF.md` — invariants (§1), roadmap, Phase 12 design-only spec
+  (§ "Phase 12 — future butler action layer (design only / postponed)"), service
+  boundaries, risk register entry "Butler bypassing governance". Verified present and
+  consistent at HEAD on 2026-05-02.
+- `docs/memory-system/AUTHORIZED_SCOPE.md` — confirms Butler / action execution is
+  Phase 12, postponed, design only. Verified at HEAD on 2026-05-02.
+- `docs/memory-system/ROADMAP.md` — confirms Phase 12 exit gate is docs only / no
+  execution code.
+- `docs/memory-system/ARCHITECTURE.md`, `docs/memory-system/GLOSSARY.md`, ADR-0003,
+  ADR-0004, ADR-0005 — used for governance, LLM gateway, graph / butler boundary.
+- `docs/memory-system/PHASE4_PLAN.md` — present at HEAD post Phase 4 closure; structural
+  model alignment confirmed.
+
+The historical `prompts/PHASE4_PLAN.md` reference (used by the original draft author
+because the canonical Phase 4 plan was not yet in the main worktree) is now obsolete
+and intentionally not preserved.
 
 ---
 
@@ -1019,15 +1048,144 @@ PR checklist:
 
 ---
 
+## §11. Compliance Recap (added at ratification, 2026-05-02)
+
+This section is a cross-reference index, not new substance. It exists because the
+Orchestrator B charter directive at sprint 0a explicitly required the ratified plan to
+"complete the spec on permission model, action audit, abort/dry-run, future butler
+boundary per HANDOFF §Phase 12". Each topic below points to where the binding contract
+already lives in §1–§10, so future readers (and Phase 12 implementers, when authorized)
+can audit invariant coverage in one pass.
+
+### §11.1 Permission model — where it is specified
+
+Butler authorization is enforced at four layers, fail-closed:
+
+1. **Invocation gate (who can call `/butler`).** §2 "Abuse Prevention" + §5.D "Telegram
+   `/butler` Command + Interactive Confirmation UI": baseline limits to community
+   members and admins; non-members rejected without evidence lookup; DM usage allowed
+   only for personal preview unless target chat is explicit and user is authorized.
+2. **Per-action confirmation gate.** §2 "User Confirmation Default" + §5.D + §5.A
+   `butler_action_confirmations`: every action carries a `requires_confirmation` flag
+   defaulting to TRUE; the confirmer's role is recorded as `requester | affected_user |
+   admin | rollback_requester` in `butler_action_confirmations.confirmation_role`.
+3. **Cross-user consent gate.** §2 "Cross-User Butler Actions" + §5.D "affected-user
+   prompts" + Stop Signal "Cross-user action lacks affected-user consent → REJECT".
+4. **Visibility-scoped preview gate.** §5.D "No confirmation preview may reveal
+   evidence the confirmer is not authorized to see" + §5.F EvidenceContext
+   `visibility_scope: member | admin | self`.
+
+Future butler implementation MUST NOT introduce a fifth bypass (e.g. session-wide
+opt-in) without an explicit re-ratification of this plan and an `AUTHORIZED_SCOPE.md`
+amendment.
+
+### §11.2 Action audit — where it is specified
+
+Every planned, confirmed, executed, rejected, expired, or undone Butler action writes
+audit rows. Audit is never optional and never best-effort — failure to write audit is a
+Stop Signal that aborts the action before execution (§8 "Action audit cannot be
+written → REJECT and do not execute").
+
+The three audit tables and their roles:
+
+| Table | Purpose | Section |
+|-------|---------|---------|
+| `butler_actions` | one row per planned / executed / rejected / expired / undo action; carries `evidence_context_hash`, `action_args_hash`, `result_payload_hash`, `inverse_op_payload`, `llm_usage_ledger_id` | §5.A |
+| `butler_tool_invocations` | one row per actual tool call attempt; `idempotency_key UNIQUE`; no hidden retries | §5.A |
+| `butler_action_confirmations` | one row per confirmation / rejection event; preserves `preview_payload_hash` and `confirmation_role` | §5.A |
+
+Cross-table linkage rules:
+
+- Every executed `butler_actions` row MUST link to at least one
+  `butler_action_confirmations` row (default per-action confirmation policy).
+- Every Butler LLM call MUST link to `llm_usage_ledger` via
+  `butler_actions.llm_usage_ledger_id` (Phase 5 ledger).
+- Every undo action MUST set `butler_actions.parent_action_id` to the original action;
+  the original's audit is immutable.
+
+Operator inspection surface (admin-only, read-only) is out of scope for the baseline
+schema but the columns above MUST be queryable for later read-only admin tooling
+(§5.G observability).
+
+### §11.3 Abort and dry-run — where it is specified
+
+The Butler lifecycle exposes three distinct "stop the action" paths:
+
+1. **Reject before execution (validation abort).** §2 "Strict validation happens before
+   user confirmation" + §5.B "Fail-closed validation": unknown tool, schema violation,
+   hallucinated args, missing evidence, governance breach, expired TTL, unauthorized
+   actor — all REJECT before any Telegram side effect.
+2. **Cancel after planning, before / during pending confirmation.** §5.D `/butler_cancel
+   <action_id>` + lifecycle state `cancelled`. The action transitions to `cancelled`
+   without any tool invocation.
+3. **TTL expiry (silent abort).** §2 "Action TTL" + §5.A `butler_actions.expires_at` +
+   §5.D inline keyboard hash check. After expiry, the inline keyboard cannot trigger
+   execution; the action transitions to `expired`.
+
+Dry-run semantics — Phase 12 baseline does NOT ship a separately-named "dry-run" mode
+because every action already enforces a mandatory dry-pass before any Telegram side
+effect:
+
+- The plan is validated (§5.B) before user confirmation.
+- The user confirmation preview (§5.D) shows exact outgoing text, target chat / users,
+  evidence citations, expiry, undo availability — that preview IS the dry-run output.
+- `recall_evidence` (§5.C tool list) is the only memory-read tool and has no Telegram
+  side effect; it is intrinsically dry by construction.
+
+If a future iteration wants an explicit `/butler --dry-run` flag (e.g. for evals or
+operator testing), it MUST reuse the existing planning + validation path and stop
+before `butler_action_confirmations` is created. It MUST still write a
+`llm_usage_ledger` entry (so dry-run cost is metered) and a lightweight `butler_actions`
+row in status `rejected` with `rejection_reason='dry_run_inspection'` (so dry-run audit
+exists). This is a hardening note, not an authorization to ship the flag.
+
+### §11.4 Future butler boundary — where it is specified
+
+The boundary recap consolidates the binding interpretations of HANDOFF.md §1
+invariant 7 into a single audit-friendly list. Each row is a fail-closed contract any
+Phase 12 implementer (when authorized) MUST satisfy:
+
+| # | Contract | Where enforced |
+|---|----------|----------------|
+| 1 | Butler service receives `EvidenceContext`, never raw `telegram_updates`, raw `chat_messages`, raw SQL rows, or raw graph rows. | §1 invariant 7 binding interpretation; §4 architecture chain; §5.C "every tool receives `EvidenceContext`, not DB session access for memory reads"; §5.F EvidenceContext contract. |
+| 2 | All LLM calls go through `bot/services/llm_gateway.py`. No provider SDK import inside `bot/services/butler.py` or `bot/services/butler_tools/`. | §1 invariant 2 binding interpretation; §2 LLM Gateway Contract; §5.C "no tool calls LLM"; §8 Stop Signal "LLM called outside `llm_gateway` → REJECT". |
+| 3 | EvidenceContext excludes `#nomem`, `#offrecord`, redacted, forgotten, tombstoned, unauthorized content BEFORE the gateway call. | §1 invariant 3 binding interpretation; §5.F contract bullet "service never returns `#nomem`, `#offrecord`, forgotten, or unauthorized content"; T12-02 acceptance criteria. |
+| 4 | Citations resolve to `message_version_id` or approved `card_sources` ids only. No raw `chat_messages.id` citations. | §1 invariant 4 binding interpretation; §5.F shape; §5.A `butler_actions.evidence_ids` constraint. |
+| 5 | Tool whitelist is closed-list (5 tools at baseline). LLM-emitted tool names not in whitelist REJECT before confirmation. | §2 "Tool whitelist scope" decision; §5.C `ALLOWED_BUTLER_TOOLS`; §8 Stop Signal "Tool not in whitelist → REJECT". |
+| 6 | No external API beyond the explicit Telegram bot wrapper methods required by the five tools. | §3 Out-of-Scope; §8 Stop Signal "Tool tries external API beyond whitelisted Telegram methods → REJECT". |
+| 7 | Rollback path (`inverse_op_payload`) MUST exist before status transitions to `succeeded`, OR `rollback_kind = 'not_reversible'` is set with explicit user warning in preview. | §5.E rollback categories; §8 Stop Signal "`inverse_op_payload` missing for executable action → REJECT". |
+| 8 | Feature flag default OFF. Flipping default ON requires explicit team-lead approval + invariant re-audit. | §5.D acceptance criteria "feature flag defaults OFF"; §8 Stop Signal "Feature flag default ON → REJECT". |
+| 9 | Forget cascade: any new Phase 12 content table (`butler_actions`, `butler_tool_invocations`, `butler_action_confirmations`) MUST be wired into `bot/services/forget_cascade.CASCADE_LAYER_ORDER` in the same migration sprint. (Cross-orchestrator binding from `ORCHESTRATOR_REGISTRY.md §2 Shared` and HANDOFF.md §1 invariant 9.) | T12-01 acceptance criteria — added at ratification; cross-ref `forget_cascade._LAYER_FUNCS`. |
+
+Boundary contract #9 was made explicit at ratification (it was implicit in the original
+draft but is the most common silent-violation footgun for new content tables). The
+T12-01 acceptance criteria already lean on it; this row makes the cross-orchestrator
+expectation visible to any future Phase 12 implementer.
+
+---
+
 ## Final Report Block
 
-DRAFT_PATH: /tmp/PHASE12_PLAN_DRAFT.md
+CANONICAL_PATH: docs/memory-system/PHASE12_PLAN.md
+STATUS: RATIFIED — DESIGN ONLY (no implementation authorized)
+RATIFIED_AT: 2026-05-02
+RATIFIED_BY: Orchestrator B (sprint 0a, branch `plan/p12-ratify`)
+ORIGINAL_DRAFT_PATH: docs/memory-system/prompts/PHASE12_PLAN_DRAFT.md (renamed via `git mv`)
 COMPONENTS: 5+
-TICKETS: T12-01..T12-NN (8+)
+TICKETS: T12-01..T12-10 (10 tickets, all design-only contracts — not authorized for implementation until AUTHORIZED_SCOPE.md update)
 INVARIANT_7_BINDING: yes (butler reads only evidence context)
 INVARIANT_2_BINDING: yes (LLM only via gateway)
-USER_CONFIRMATION_FLOW_DESIGNED: yes
-TOOL_WHITELIST_DESIGNED: yes (start small)
-ROLLBACK_PATH_DESIGNED: yes
+INVARIANT_9_BINDING: yes (forget cascade integration noted in §11.4 row 9 + T12-01 acceptance)
+USER_CONFIRMATION_FLOW_DESIGNED: yes (per-action default; cross-user consent required)
+TOOL_WHITELIST_DESIGNED: yes (start small, 5 tools)
+ROLLBACK_PATH_DESIGNED: yes (best-effort, audited; `not_reversible` allowed when honest)
 DEPS_NOTED: Phase 5 (gateway), Phase 6 (cards as suggestions), Phase 8 (observations as context)
-OPEN_DESIGN_QUESTIONS: 1. User confirmation default — per-action vs session-wide opt-in; 2. Tool whitelist scope — start tiny vs full from day one; 3. Action TTL — auto-expire pending butler actions after N minutes; 4. Rollback semantics — best-effort vs guaranteed; 5. Cross-user butler actions — A asks Butler to introduce A to B; what is B's confirmation flow; 6. Cost ceiling — separate from /recall; per-user daily limit; 7. Abuse prevention — rate-limit per user; who can invoke butler
+OPEN_DESIGN_QUESTIONS_RESOLVED_AT_RATIFICATION:
+  1. User confirmation default → per-action (§2, §5.D);
+  2. Tool whitelist scope → start tiny with 5 tools (§5.C);
+  3. Action TTL → 15min low-risk / 5min cross-user / 30min admin-suggestion (§2);
+  4. Rollback semantics → best-effort, not guaranteed (§5.E);
+  5. Cross-user actions → affected-user confirmation required by default (§2);
+  6. Cost ceiling → separate per-user / per-chat Butler budget, stricter than Q&A (§2);
+  7. Abuse prevention → members/admins only, per-user/per-chat/per-tool rate limits, cooldown (§2).
+OPEN_QUESTIONS_DEFERRED: dry-run flag (§11.3); admin override of cross-user consent (§2 "Admin override is out of scope for baseline Phase 12 unless separately authorized"); operator dashboard surface (§5.G "out of scope for baseline implementation").
