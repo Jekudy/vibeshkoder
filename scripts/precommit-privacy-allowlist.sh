@@ -14,7 +14,14 @@ is_allowed_path() {
   [[ "$path" =~ ^bot/services/governance\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_governance\.py$ ]] && return 0
   [[ "$path" =~ ^tests/handlers/.*test_chat_messages.*\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/handlers/test_qa\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_ingestion.*\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/services/test_import_apply\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/services/test_message_persistence\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/db/test_qa_trace\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/eval/test_qa_eval_cases\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/fixtures/qa_eval_cases\.json$ ]] && return 0
+  [[ "$path" =~ ^tests/integration/.*\.py$ ]] && return 0
   [[ "$path" =~ ^\.github/workflows/lint-privacy\.yml$ ]] && return 0
 
   return 1
