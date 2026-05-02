@@ -124,33 +124,37 @@ async def migrated_database_url(temp_database_url: str) -> AsyncIterator[str]:
     yield temp_database_url
 
 
-# ─── Test 1: Table exists with all 14 columns + correct types ───────────────
+# ─── Test 1: Table exists with all 14 columns + correct types/lengths ───────
 
 
 async def test_llm_usage_ledger_all_columns_exist(migrated_database_url: str) -> None:
-    """All 14 columns exist in llm_usage_ledger with correct data types."""
-    expected_columns = {
-        "id": "bigint",
-        "qa_trace_id": "integer",
-        "provider": "character varying",
-        "model": "character varying",
-        "prompt_hash": "character",
-        "response_hash": "character",
-        "tokens_in": "integer",
-        "tokens_out": "integer",
-        "cost_usd": "numeric",
-        "latency_ms": "integer",
-        "request_id": "character varying",
-        "cache_hit": "boolean",
-        "error": "character varying",
-        "created_at": "timestamp with time zone",
+    """All 14 columns exist in llm_usage_ledger with correct types and lengths.
+
+    Tuple: (data_type, character_maximum_length, numeric_precision, numeric_scale).
+    None means 'not applicable / not reported by information_schema' for that slot.
+    """
+    expected_columns: dict[str, tuple[str, int | None, int | None, int | None]] = {
+        "id":         ("bigint",                   None, 64,  0),
+        "qa_trace_id": ("bigint",                  None, 64,  0),
+        "provider":   ("character varying",        64,   None, None),
+        "model":      ("character varying",        128,  None, None),
+        "prompt_hash": ("character",               64,   None, None),
+        "response_hash": ("character",             64,   None, None),
+        "tokens_in":  ("integer",                  None, 32,  0),
+        "tokens_out": ("integer",                  None, 32,  0),
+        "cost_usd":   ("numeric",                  None, 10,  6),
+        "latency_ms": ("integer",                  None, 32,  0),
+        "request_id": ("character varying",        128,  None, None),
+        "cache_hit":  ("boolean",                  None, None, None),
+        "error":      ("character varying",        255,  None, None),
+        "created_at": ("timestamp with time zone", None, None, None),
     }
 
-    for col_name, expected_type in expected_columns.items():
-        actual_type = await _fetch_value(
+    for col_name, (exp_type, exp_char_len, exp_num_prec, exp_num_scale) in expected_columns.items():
+        row = await _fetch_row(
             migrated_database_url,
             """
-            SELECT data_type
+            SELECT data_type, character_maximum_length, numeric_precision, numeric_scale
             FROM information_schema.columns
             WHERE table_schema = 'public'
               AND table_name = 'llm_usage_ledger'
@@ -158,8 +162,21 @@ async def test_llm_usage_ledger_all_columns_exist(migrated_database_url: str) ->
             """,
             col_name,
         )
-        assert actual_type == expected_type, (
-            f"Column '{col_name}': expected type '{expected_type}', got '{actual_type}'"
+        assert row is not None, f"Column '{col_name}' not found in llm_usage_ledger"
+        assert row["data_type"] == exp_type, (
+            f"Column '{col_name}': expected data_type '{exp_type}', got '{row['data_type']}'"
+        )
+        assert row["character_maximum_length"] == exp_char_len, (
+            f"Column '{col_name}': expected character_maximum_length {exp_char_len!r},"
+            f" got {row['character_maximum_length']!r}"
+        )
+        assert row["numeric_precision"] == exp_num_prec, (
+            f"Column '{col_name}': expected numeric_precision {exp_num_prec!r},"
+            f" got {row['numeric_precision']!r}"
+        )
+        assert row["numeric_scale"] == exp_num_scale, (
+            f"Column '{col_name}': expected numeric_scale {exp_num_scale!r},"
+            f" got {row['numeric_scale']!r}"
         )
 
 
@@ -349,3 +366,181 @@ async def test_llm_usage_ledger_downgrade_drops_table(temp_database_url: str) ->
         """,
     )
     assert exists_after is False
+
+
+# ─── Test 8: migration roundtrip (downgrade -1 + upgrade head) ──────────────
+
+
+async def test_migration_024_upgrade_downgrade_roundtrip(migrated_database_url: str) -> None:
+    """Downgrade -1 drops both tables; upgrade head restores them + accepts rows."""
+    # Step 1: downgrade -1 — both tables must vanish
+    _run_alembic(migrated_database_url, "downgrade", "-1")
+
+    for table_name in ("llm_usage_ledger", "llm_synthesis_cache"):
+        exists = await _fetch_value(
+            migrated_database_url,
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = $1
+            )
+            """,
+            table_name,
+        )
+        assert exists is False, f"Expected '{table_name}' to be absent after downgrade -1"
+
+    # Step 2: upgrade head — both tables must reappear
+    _run_alembic(migrated_database_url, "upgrade", "head")
+
+    for table_name in ("llm_usage_ledger", "llm_synthesis_cache"):
+        exists = await _fetch_value(
+            migrated_database_url,
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = $1
+            )
+            """,
+            table_name,
+        )
+        assert exists is True, f"Expected '{table_name}' to be present after upgrade head"
+
+    # Step 3: minimal row inserts into each table succeed
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        await conn.execute(
+            """
+            INSERT INTO llm_usage_ledger (provider, model, prompt_hash)
+            VALUES ('anthropic', 'claude-haiku', $1)
+            """,
+            "a" * 64,
+        )
+        await conn.execute(
+            """
+            INSERT INTO llm_synthesis_cache (input_hash, answer_text, citation_ids, model)
+            VALUES ($1, 'roundtrip answer', '[]'::jsonb, 'claude-haiku')
+            """,
+            "b" * 64,
+        )
+    finally:
+        await conn.close()
+
+
+# ─── Test 9: CHAR(64) boundary on prompt_hash ───────────────────────────────
+
+
+async def test_llm_usage_ledger_char_64_boundary(migrated_database_url: str) -> None:
+    """prompt_hash CHAR(64): exactly 64 chars succeeds; 65 chars raises DataError."""
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        # Exactly 64 chars — must succeed
+        await conn.execute(
+            """
+            INSERT INTO llm_usage_ledger (provider, model, prompt_hash)
+            VALUES ('anthropic', 'claude-haiku', $1)
+            """,
+            "c" * 64,
+        )
+
+        # 65 chars — must fail with a truncation / string data error
+        with pytest.raises(asyncpg.exceptions.StringDataRightTruncationError):
+            await conn.execute(
+                """
+                INSERT INTO llm_usage_ledger (provider, model, prompt_hash)
+                VALUES ('anthropic', 'claude-haiku', $1)
+                """,
+                "d" * 65,
+            )
+    finally:
+        await conn.close()
+
+
+# ─── Test 10: NUMERIC(10,6) boundary on cost_usd ────────────────────────────
+
+
+async def test_llm_usage_ledger_cost_usd_numeric_boundary(migrated_database_url: str) -> None:
+    """cost_usd NUMERIC(10,6): 9999.999999 round-trips exact; 99999.999999 overflows."""
+    from decimal import Decimal
+
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        # 9999.999999 = 10 total digits, 6 after decimal — fits NUMERIC(10,6)
+        row_id = await conn.fetchval(
+            """
+            INSERT INTO llm_usage_ledger (provider, model, prompt_hash, cost_usd)
+            VALUES ('anthropic', 'claude-haiku', $1, $2::numeric)
+            RETURNING id
+            """,
+            "e" * 64,
+            "9999.999999",
+        )
+        cost_back = await conn.fetchval(
+            "SELECT cost_usd FROM llm_usage_ledger WHERE id = $1",
+            row_id,
+        )
+        assert Decimal(str(cost_back)) == Decimal("9999.999999")
+
+        # 99999.999999 = 11 total digits — must overflow NUMERIC(10,6)
+        with pytest.raises(asyncpg.exceptions.NumericValueOutOfRangeError):
+            await conn.execute(
+                """
+                INSERT INTO llm_usage_ledger (provider, model, prompt_hash, cost_usd)
+                VALUES ('anthropic', 'claude-haiku', $1, $2::numeric)
+                """,
+                "f" * 64,
+                "99999.999999",
+            )
+    finally:
+        await conn.close()
+
+
+# ─── Test 11: FK ON DELETE SET NULL real behavior ───────────────────────────
+
+
+async def test_llm_usage_ledger_fk_on_delete_set_null_real_behavior(
+    migrated_database_url: str,
+) -> None:
+    """DELETE parent qa_traces row → ledger row survives with qa_trace_id = NULL."""
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        # Insert a qa_traces row (raw SQL — no ORM/session available in this fixture)
+        qa_trace_id = await conn.fetchval(
+            """
+            INSERT INTO qa_traces (user_tg_id, chat_id, query_text, evidence_ids, abstained)
+            VALUES (9000000001, -1000000000001, 'test query', '[]'::jsonb, false)
+            RETURNING id
+            """,
+        )
+
+        # Insert a ledger row referencing it
+        ledger_id = await conn.fetchval(
+            """
+            INSERT INTO llm_usage_ledger (provider, model, prompt_hash, qa_trace_id)
+            VALUES ('anthropic', 'claude-haiku', $1, $2)
+            RETURNING id
+            """,
+            "g" * 64,
+            qa_trace_id,
+        )
+
+        # Confirm the FK is set
+        linked = await conn.fetchval(
+            "SELECT qa_trace_id FROM llm_usage_ledger WHERE id = $1",
+            ledger_id,
+        )
+        assert linked == qa_trace_id
+
+        # Delete the parent qa_traces row
+        await conn.execute("DELETE FROM qa_traces WHERE id = $1", qa_trace_id)
+
+        # Ledger row must still exist, qa_trace_id must be NULL
+        row = await conn.fetchrow(
+            "SELECT id, qa_trace_id FROM llm_usage_ledger WHERE id = $1",
+            ledger_id,
+        )
+        assert row is not None, "Ledger row was deleted — expected SET NULL, not CASCADE"
+        assert row["qa_trace_id"] is None, (
+            f"Expected qa_trace_id=NULL after parent delete, got {row['qa_trace_id']!r}"
+        )
+    finally:
+        await conn.close()
