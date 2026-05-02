@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import html
+import logging
 from datetime import datetime
 
 from aiogram import Router
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +17,8 @@ from bot.db.repos.user import UserRepo
 from bot.services.evidence import EvidenceBundle
 from bot.services.governance import detect_policy
 from bot.services.qa import run_qa
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="qa")
 
@@ -122,8 +126,18 @@ async def recall_handler(
         )
 
     if message.chat.id != settings.COMMUNITY_CHAT_ID:
-        if message.chat.type == "private":
+        try:
             await message.reply("Команда /recall работает только в community чате.")
+        except TelegramForbiddenError:
+            # Bot lacks can_send_messages in this chat (e.g. kicked, restricted).
+            # Audit-only path: still record the abstain trace, do not raise.
+            logger.info(
+                "recall refused: bot lacks send permission",
+                extra={
+                    "chat_id": message.chat.id,
+                    "user_id": getattr(message.from_user, "id", None),
+                },
+            )
         await audit_empty()
         return
 

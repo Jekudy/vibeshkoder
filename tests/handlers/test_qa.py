@@ -262,3 +262,52 @@ async def test_audit_row_written_once_for_processed_invocation(monkeypatch) -> N
         "abstained": True,
         "redact_query": False,
     }
+
+
+# ─── §3.4 asymmetric /recall refusal tests ────────────────────────────────
+
+
+async def test_recall_in_non_community_group_replies_and_audits(monkeypatch) -> None:
+    """§3.4: supergroup with chat.id != COMMUNITY_CHAT_ID → reply sent + qa_traces abstain."""
+    handler = import_module("bot.handlers.qa")
+    # Non-community supergroup (not private, not community)
+    message = _message(chat_id=-9999999999, chat_type="supergroup")
+    session = AsyncMock()
+    trace_create = AsyncMock()
+
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.QaTraceRepo, "create", trace_create)
+    monkeypatch.setattr(handler, "run_qa", AsyncMock())
+
+    await handler.recall_handler(message, _command("что-то"), session)
+
+    # New behavior: reply is always sent for non-community chats (not just private).
+    message.reply.assert_awaited_once_with(
+        "Команда /recall работает только в community чате."
+    )
+    trace_create.assert_awaited_once()
+    assert trace_create.call_args.kwargs["abstained"] is True
+
+
+async def test_recall_in_non_community_group_handles_forbidden(monkeypatch) -> None:
+    """§3.4: if bot lacks send_messages permission, TelegramForbiddenError is caught;
+    qa_traces audit row still created, no exception escapes."""
+    from aiogram.exceptions import TelegramForbiddenError
+
+    handler = import_module("bot.handlers.qa")
+    message = _message(chat_id=-9999999998, chat_type="supergroup")
+    # Simulate bot lacking can_send_messages.
+    message.reply = AsyncMock(side_effect=TelegramForbiddenError(method=None, message="Forbidden: bot was kicked"))
+    session = AsyncMock()
+    trace_create = AsyncMock()
+
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.QaTraceRepo, "create", trace_create)
+    monkeypatch.setattr(handler, "run_qa", AsyncMock())
+
+    # Must NOT raise — TelegramForbiddenError is caught internally.
+    await handler.recall_handler(message, _command("тест"), session)
+
+    # Audit row still created.
+    trace_create.assert_awaited_once()
+    assert trace_create.call_args.kwargs["abstained"] is True
