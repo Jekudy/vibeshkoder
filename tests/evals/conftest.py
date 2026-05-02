@@ -288,3 +288,8 @@ async def golden_recall_seed(eval_db_session: Any) -> Seed:
 @pytest.fixture(scope="class")
 def seed(golden_recall_seed: Seed) -> Seed:
     return golden_recall_seed
+
+
+@pytest.fixture(scope="class")
+def seed_local_id_map(golden_recall_seed: Seed) -> dict[str, int]:
+    return dict(golden_recall_seed.expected_id_map)
