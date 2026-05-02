@@ -423,6 +423,8 @@ Cannot parallelize without gate:
 
 ### Phase 5 — events + observations + extraction candidates
 
+> **Note (2026-05-02):** This section describes the original full Phase 5 scope. Phase 5 implementation is a **synthesis-first slice** per `docs/memory-system/PHASE5_PLAN.md` §2 — `llm_gateway` + `llm_usage_ledger` + `/recall` LLM extension only. Extraction tables (`memory_events`, `observations`, `memory_candidates`, `reflection_runs`) are deferred to Phase 8. See PHASE5_PLAN.md for the authoritative scope.
+
 - **Objective:** create structured pre-catalog memory.
 - **Scope:** `llm_usage_ledger`, `extraction_runs`, `memory_events`, `observations`,
   `reflection_runs`, `memory_candidates`.
