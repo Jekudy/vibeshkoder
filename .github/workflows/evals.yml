@@ -1,0 +1,86 @@
+name: Evals
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 3 * * *"
+
+jobs:
+  evals-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - name: Check eval harness gate
+        id: gate
+        shell: bash
+        env:
+          EVAL_HARNESS_ENABLED_SECRET: ${{ secrets.EVAL_HARNESS_ENABLED }}
+        run: |
+          if [ "$EVAL_HARNESS_ENABLED_SECRET" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  evals:
+    needs: evals-gate
+    if: ${{ needs.evals-gate.outputs.enabled == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vibe
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: vibe_gatekeeper
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vibe -d vibe_gatekeeper"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      BOT_TOKEN: 123456:test-token
+      COMMUNITY_CHAT_ID: -1001234567890
+      ADMIN_IDS: '[149820031]'
+      DATABASE_URL: postgresql+asyncpg://vibe:changeme@localhost:5432/vibe_gatekeeper
+      REDIS_URL: redis://redis:6379/0
+      GOOGLE_SHEETS_CREDS_FILE: ""
+      GOOGLE_SHEET_ID: ""
+      WEB_BASE_URL: http://localhost:8080
+      WEB_BOT_USERNAME: vibeshkoder_dev_bot
+      DB_PASSWORD: changeme
+      WEB_PASSWORD: test-pass
+      WEB_SESSION_SECRET: test-session-secret
+      DEV_MODE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,healing]"
+
+      - name: Run evals
+        shell: bash
+        run: |
+          : > eval_results.jsonl
+          if [ -d tests/evals ] && [ -n "$(find tests/evals -name 'test_*.py' -print -quit)" ]; then
+            EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 tests/evals/ --jsonl-report=eval_results.jsonl || true
+          else
+            echo "tests/evals/ not yet populated - skipping eval run"
+          fi
+
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: eval_results.jsonl
+          if-no-files-found: error
