@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    Numeric,
     SmallInteger,
     String,
     Text,
@@ -752,4 +754,101 @@ class TelegramUpdate(Base):
     redaction_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=func.now(), server_default=func.now()
+    )
+
+
+class LlmUsageLedger(Base):
+    """Per-call audit log for every LLM gateway invocation (T5-02 / alembic 024).
+
+    Written by ``bot/services/llm_gateway.py`` for every call outcome, including
+    cache hits, abstentions, budget refusals, and errors. Never committed by the
+    gateway itself — the caller (handler) owns the transaction.
+
+    All numeric fields (tokens, cost, latency) use server defaults of 0 so that
+    partial rows created for budget-guard placeholders are self-consistent.
+
+    ``prompt_hash`` and ``response_hash`` are SHA-256 hex digests (64 chars each).
+    The Phase 5 cascade layer ``_cascade_llm_usage_ledger`` NULLs both on a
+    forget-me event while preserving the row for budget reconciliation.
+    """
+
+    __tablename__ = "llm_usage_ledger"
+    __table_args__ = (
+        Index("ix_llm_usage_ledger_qa_trace_id", "qa_trace_id"),
+        Index("ix_llm_usage_ledger_model_created_at", "model", "created_at"),
+        Index("ix_llm_usage_ledger_created_at", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    qa_trace_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey(
+            "qa_traces.id",
+            name="fk_llm_usage_ledger_qa_trace_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    response_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False, server_default=text("0"))
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    qa_trace: Mapped[QaTrace | None] = relationship(
+        "QaTrace",
+        foreign_keys=[qa_trace_id],
+    )
+
+
+class LlmSynthesisCache(Base):
+    """DB-backed answer cache for LLM synthesis results (T5-02 / alembic 024).
+
+    Keyed by ``input_hash`` = sha256(query_normalized || sorted(citation_ids)
+    || model_id || prompt_template_version). Cache rows are invalidated (deleted)
+    by ``SynthesisCacheRepo.invalidate_by_citation`` when a forget event covers any
+    cited ``message_version_id`` in ``citation_ids``.
+
+    ``citation_ids`` is a JSONB array of ``message_version_id`` integers — the same
+    ids returned by ``EvidenceBundle.evidence_ids``.
+    """
+
+    __tablename__ = "llm_synthesis_cache"
+    __table_args__ = (
+        UniqueConstraint("input_hash", name="uq_llm_synthesis_cache_input_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    answer_text: Mapped[str] = mapped_column(Text, nullable=False)
+    citation_ids: Mapped[list] = mapped_column(
+        JSONB(),
+        nullable=False,
+    )
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    last_hit_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    hit_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("1"),
     )
