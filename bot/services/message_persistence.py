@@ -12,23 +12,30 @@ Sprint #80 invariants preserved:
 - Advisory lock acquired BEFORE any DB operation.
 - Sticky offrecord CASE in MessageRepo.save (server-side monotonic ratchet).
 
-Sprint #81 invariant preserved:
-- MessageVersionRepo.insert_version is NOT called here (follow-up sprint).
+Hotfix #164 (CRITICAL 1 fix):
+- MessageVersionRepo.insert_version IS NOW called here. This helper is the SOLE writer
+  for (chat_messages, message_versions, current_version_id) triples. Previously deferred
+  per Sprint #81 comment; relocation closes CRITICAL 1, CRITICAL 2, CRITICAL 3, Risk H2.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.locks import advisory_lock_chat_message
 from bot.db.models import ChatMessage
 from bot.db.repos.message import MessageRepo
+from bot.db.repos.message_version import MessageVersionRepo
 from bot.db.repos.offrecord_mark import OffrecordMarkRepo
+from bot.services.content_hash import compute_content_hash
 from bot.services.governance import detect_policy
-from bot.services.normalization import extract_normalized_fields
+from bot.services.normalization import extract_entities_unified, extract_normalized_fields
 
 
 @dataclass(frozen=True)
@@ -44,19 +51,24 @@ async def persist_message_with_policy(
     *,
     raw_update_id: int | None = None,
     source: Literal["live", "import"] = "live",
+    captured_at: datetime | None = None,
 ) -> PersistResult:
-    """Save a message with policy detection and mark creation.
+    """Save a message with policy detection, mark creation, and v1 MessageVersion.
 
-    Internal flow (mirrors chat_messages.py:38-109):
+    Internal flow (hotfix #164 extended from chat_messages.py:38-109):
     1. Acquire advisory lock for (chat_id, message_id) — Sprint #80 invariant.
     2. Extract normalized fields (reply/thread/caption/kind).
     3. Detect policy (offrecord > nomem > normal).
     4. Build persist-content fields per policy:
        - offrecord → text=None, caption=None, raw_json=None, is_redacted=True
        - else       → preserve message fields; raw_json only when message.text truthy
-    5. MessageRepo.save with sticky CASE preserved.
+    5. MessageRepo.save with sticky CASE preserved, optional captured_at override.
     6. If policy != "normal" and mark_payload is not None → OffrecordMarkRepo.create_for_message.
-    7. Return PersistResult.
+    7. Build v1 content fields per redaction policy.
+    8. Compute content_hash (chv1 recipe).
+    9. Insert v1 row (idempotent on (chat_message_id, content_hash)).
+    10. Close FK loop: UPDATE chat_messages SET current_version_id = v1.id.
+    11. Return PersistResult.
     """
     # 1. Advisory lock before any DB op (Sprint #80).
     await advisory_lock_chat_message(session, message.chat.id, message.message_id)
@@ -110,13 +122,15 @@ async def persist_message_with_policy(
     user_id = message.from_user.id if message.from_user is not None else None
 
     # 5. Save — sticky CASE in MessageRepo.save handles offrecord monotonic ratchet.
+    # When captured_at is provided (e.g. import preserving export timestamp), override date.
+    save_date = captured_at if captured_at is not None else message.date
     saved = await MessageRepo.save(
         session,
         message_id=message.message_id,
         chat_id=message.chat.id,
         user_id=user_id,
         text=persist_text,
-        date=message.date,
+        date=save_date,
         raw_json=persist_raw_json,
         reply_to_message_id=normalized["reply_to_message_id"],
         message_thread_id=normalized["message_thread_id"],
@@ -140,5 +154,53 @@ async def persist_message_with_policy(
         )
         mark_created = True
 
-    # 7. Return result.
+    # 7. Build v1 content fields per redaction policy (hotfix #164 CRITICAL 1 fix).
+    if is_redacted_flag:
+        v1_text = None
+        v1_caption = None
+        v1_normalized_text = None
+        v1_entities_list = None
+        v1_entities_json = None
+    else:
+        v1_text = persist_text
+        v1_caption = persist_caption
+        v1_normalized_text = persist_text  # raw text; canonicalization deferred to #153
+        v1_entities_list = extract_entities_unified(message)
+        v1_entities_json = json.dumps(v1_entities_list) if v1_entities_list else None
+
+    # 8. Compute content_hash (chv1 recipe: text, caption, message_kind, entities).
+    v1_content_hash = compute_content_hash(
+        text=v1_text,
+        caption=v1_caption,
+        message_kind=normalized["message_kind"],
+        entities=v1_entities_list,
+    )
+
+    # 9. Insert v1 (idempotent on (chat_message_id, content_hash)).
+    v1 = await MessageVersionRepo.insert_version(
+        session,
+        chat_message_id=saved.id,
+        content_hash=v1_content_hash,
+        text=v1_text,
+        caption=v1_caption,
+        normalized_text=v1_normalized_text,
+        entities_json=v1_entities_json,
+        edit_date=None,  # v1 is NOT an edit
+        raw_update_id=raw_update_id,
+        is_redacted=is_redacted_flag,
+        imported_final=(source == "import"),
+        captured_at=captured_at,  # None → server_default now(); override for imports/eval
+    )
+
+    # 10. Close FK loop on chat_messages (idempotent guard for retry-races).
+    if saved.current_version_id != v1.id:
+        await session.execute(
+            update(ChatMessage)
+            .where(ChatMessage.id == saved.id)
+            .values(current_version_id=v1.id)
+        )
+        await session.flush()
+        saved.current_version_id = v1.id
+
+    # 11. Return result.
     return PersistResult(saved, policy, mark_created)
