@@ -793,3 +793,64 @@ async def test_persist_threads_captured_at_to_v1(db_session) -> None:
     )).scalar_one()
 
     assert v1.captured_at.replace(microsecond=0) == override_ts.replace(microsecond=0)
+
+
+async def test_persist_does_not_overwrite_existing_current_version_id(db_session) -> None:
+    """Regression: if current_version_id already points to v2, re-delivering original
+    message must NOT overwrite it back to v1.
+
+    Scenario:
+      1. original message delivered → v1 created, current_version_id = v1.id
+      2. edit delivered → v2 created by edited_message handler, current_version_id = v2.id
+      3. Telegram re-delivers original (retry) → helper called again with same duck
+         → must NOT set current_version_id = v1.id (that would be a regression)
+    """
+    from bot.db.models import ChatMessage, MessageVersion
+    from bot.db.repos.user import UserRepo
+    from bot.services.message_persistence import persist_message_with_policy
+    from sqlalchemy import select, update as sa_update
+
+    user_id = 77_012
+    chat_id = -1_002_000_000_012
+    msg_id = 10_012
+
+    await UserRepo.upsert(db_session, telegram_id=user_id, username="u77012", first_name="T", last_name=None)
+    message = _make_text_message(message_id=msg_id, chat_id=chat_id, user_id=user_id, text="original text")
+
+    # First delivery: v1 is created.
+    r1 = await persist_message_with_policy(db_session, message)
+    cm_id = r1.chat_message.id
+    v1_id = r1.chat_message.current_version_id
+    assert v1_id is not None
+
+    # Simulate edit handler writing v2 and updating current_version_id to v2.
+    v2 = MessageVersion(
+        chat_message_id=cm_id,
+        version_seq=2,
+        text="edited text",
+        caption=None,
+        normalized_text="edited text",
+        content_hash="hash-v2-fake",
+        edit_date=datetime.now(timezone.utc),
+        raw_update_id=None,
+        is_redacted=False,
+        imported_final=False,
+    )
+    db_session.add(v2)
+    await db_session.flush()
+
+    # Update current_version_id to v2 (mirrors edited_message handler).
+    await db_session.execute(
+        sa_update(ChatMessage).where(ChatMessage.id == cm_id).values(current_version_id=v2.id)
+    )
+    await db_session.flush()
+    await db_session.refresh(r1.chat_message)
+    assert r1.chat_message.current_version_id == v2.id
+
+    # Telegram retry: original message delivered again (identical duck).
+    r2 = await persist_message_with_policy(db_session, message)
+
+    # CRITICAL: current_version_id must still point to v2, not regressed to v1.
+    assert r2.chat_message.current_version_id == v2.id, (
+        "current_version_id was overwritten back to v1 — edit→v1 regression detected"
+    )

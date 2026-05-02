@@ -193,7 +193,9 @@ async def persist_message_with_policy(
     )
 
     # 10. Close FK loop on chat_messages (idempotent guard for retry-races).
-    if saved.current_version_id != v1.id:
+    # Only set current_version_id when it is NULL — never overwrite a newer edit
+    # version pointer back to v1 (which would regress an already-edited message).
+    if saved.current_version_id is None:
         await session.execute(
             update(ChatMessage)
             .where(ChatMessage.id == saved.id)
