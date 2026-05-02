@@ -1,0 +1,9 @@
+{"query_id":"q_01","query":"Когда будет воркшоп по Postgres FTS?","expected_message_version_ids":["msg_03"],"expected_abstain":false}
+{"query_id":"q_02","query":"Что решили принести на субботний завтрак?","expected_message_version_ids":["msg_07","msg_08"],"expected_abstain":false}
+{"query_id":"q_03","query":"Какие правила дизайна зафиксировали для интерфейса?","expected_message_version_ids":["msg_05"],"expected_abstain":false}
+{"query_id":"q_04","query":"Где пройдет офлайн-встреча и какой нужен переходник?","expected_message_version_ids":["msg_15","msg_16"],"expected_abstain":false}
+{"query_id":"q_05","query":"Что должен показывать дневной дайджест для админов?","expected_message_version_ids":["msg_13","msg_14"],"expected_abstain":false}
+{"query_id":"q_06","query":"Какие темы оставили для следующего доклада?","expected_message_version_ids":["msg_17"],"expected_abstain":false}
+{"query_id":"q_07","query":"Как новичку правильно представиться в сообществе?","expected_message_version_ids":["msg_19","msg_20"],"expected_abstain":false}
+{"query_id":"q_08","query":"Кто оформляет визы для поездки в Японию?","expected_message_version_ids":[],"expected_abstain":true}
+{"query_id":"q_09","query":"Когда участники доступны для менторских созвонов?","expected_message_version_ids":["msg_23","msg_24"],"expected_abstain":false}
