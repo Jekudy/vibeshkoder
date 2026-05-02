@@ -67,7 +67,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from bot.db.models import ChatMessage, IngestionRun, TelegramUpdate
-from bot.db.repos.message_version import MessageVersionRepo
 from bot.db.repos.telegram_update import TelegramUpdateRepo
 from bot.services.content_hash import compute_content_hash
 from bot.services.governance import detect_policy

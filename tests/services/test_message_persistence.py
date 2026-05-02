@@ -461,7 +461,7 @@ async def test_persist_passes_raw_update_id(app_env) -> None:
 
 async def test_persist_creates_v1_with_current_version_fk(db_session) -> None:
     """Normal text → v1 row with correct fields; current_version_id IS NOT NULL."""
-    from bot.db.models import ChatMessage, MessageVersion
+    from bot.db.models import MessageVersion
     from bot.db.repos.user import UserRepo
     from bot.services.message_persistence import persist_message_with_policy
     from sqlalchemy import select
@@ -808,7 +808,7 @@ async def test_persist_does_not_overwrite_existing_current_version_id(db_session
     from bot.db.models import ChatMessage, MessageVersion
     from bot.db.repos.user import UserRepo
     from bot.services.message_persistence import persist_message_with_policy
-    from sqlalchemy import select, update as sa_update
+    from sqlalchemy import update as sa_update
 
     user_id = 77_012
     chat_id = -1_002_000_000_012

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import itertools
 import json
-import random
 import tempfile
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -145,10 +144,8 @@ def _default_chunking():
 
 async def test_live_message_then_recall_returns_hit(db_session) -> None:
     """Scenario 1: group message persisted via real path → /recall returns hit citing v1."""
-    from bot.db.models import ChatMessage
     from bot.services.message_persistence import persist_message_with_policy
     from bot.services.qa import run_qa
-    from sqlalchemy import select
 
     user_id = _next_user_id()
     chat_id = _next_chat_id()
@@ -232,7 +229,6 @@ async def test_import_message_then_recall_returns_hit(db_session) -> None:
 
 async def test_forget_message_then_recall_abstains(db_session) -> None:
     """Scenario 3: persist → create tombstone → /recall abstains."""
-    from bot.db.models import ForgetEvent
     from bot.services.message_persistence import persist_message_with_policy
     from bot.services.qa import run_qa
 

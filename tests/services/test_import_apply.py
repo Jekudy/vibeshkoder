@@ -1356,9 +1356,9 @@ async def test_import_apply_overlap_with_live_v1_skips_via_pre_check(db_session)
     the live v1 (imported_final=False) must remain.
     """
     import json as _json
-    import tempfile, os
+    import tempfile
 
-    from bot.db.models import ChatMessage, MessageVersion
+    from bot.db.models import MessageVersion
     from bot.db.repos.user import UserRepo
     from bot.services.import_apply import run_apply
     from bot.services.message_persistence import persist_message_with_policy
@@ -1441,9 +1441,7 @@ async def test_import_apply_offrecord_creates_chat_message_and_mark(db_session) 
     """
     import tempfile
 
-    from bot.db.models import OffrecordMark, MessageVersion
     from bot.services.import_apply import run_apply
-    from sqlalchemy import select
 
     chat_id = -1_009_000_000_002
     msg_id = 50_002
