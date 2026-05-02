@@ -58,11 +58,17 @@ def test_save_chat_message_does_not_auto_mark_member(app_env, monkeypatch) -> No
     message_save = AsyncMock()
     fake_row = Mock()
     fake_row.id = 1
+    fake_row.current_version_id = None
     message_save.return_value = fake_row
+
+    fake_v1 = Mock()
+    fake_v1.id = 10
+    version_insert = AsyncMock(return_value=fake_v1)
 
     monkeypatch.setattr(handler.UserRepo, "upsert", user_upsert)
     monkeypatch.setattr(handler.UserRepo, "set_member", user_set_member)
     monkeypatch.setattr(persistence_module.MessageRepo, "save", message_save)
+    monkeypatch.setattr(persistence_module.MessageVersionRepo, "insert_version", version_insert)
     # Also patch advisory_lock so no real postgres is needed.
     monkeypatch.setattr(persistence_module, "advisory_lock_chat_message", AsyncMock())
 

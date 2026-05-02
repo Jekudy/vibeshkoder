@@ -131,12 +131,21 @@ def test_save_chat_message_advisory_lock_before_db_ops(app_env, monkeypatch) -> 
         text="normal message",
     )
 
-    # Patch MessageRepo.save to avoid actual DB interaction after the lock.
+    # Patch MessageRepo.save and MessageVersionRepo.insert_version to avoid actual
+    # DB interaction after the lock. insert_version must return an obj with .id to
+    # allow persist_message_with_policy to close the FK loop.
     saved_row = MagicMock()
     saved_row.id = 1
+    saved_row.current_version_id = None
+    v1_row = MagicMock()
+    v1_row.id = 10
     monkeypatch.setattr(
         "bot.db.repos.message.MessageRepo.save",
         AsyncMock(return_value=saved_row),
+    )
+    monkeypatch.setattr(
+        "bot.db.repos.message_version.MessageVersionRepo.insert_version",
+        AsyncMock(return_value=v1_row),
     )
     monkeypatch.setattr(
         "bot.db.repos.user.UserRepo.upsert",
@@ -190,9 +199,16 @@ def test_save_chat_message_offrecord_advisory_lock_before_db_ops(app_env, monkey
 
     saved_row = MagicMock()
     saved_row.id = 2
+    saved_row.current_version_id = None
+    v1_row = MagicMock()
+    v1_row.id = 20
     monkeypatch.setattr(
         "bot.db.repos.message.MessageRepo.save",
         AsyncMock(return_value=saved_row),
+    )
+    monkeypatch.setattr(
+        "bot.db.repos.message_version.MessageVersionRepo.insert_version",
+        AsyncMock(return_value=v1_row),
     )
     monkeypatch.setattr(
         "bot.db.repos.user.UserRepo.upsert",

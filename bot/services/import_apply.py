@@ -532,16 +532,18 @@ async def _apply_one_message(
         poll_question=poll_question,
         contact_name=contact_name,
     )
+    # 8b. Hotfix #164 H2 fix: do NOT short-circuit on offrecord. The helper handles
+    # offrecord internally (writes chat_messages with memory_policy='offrecord', creates
+    # OffrecordMark, creates redacted v1) — restoring import↔live audit symmetry per
+    # invariant #8 and closing risk-audit H2. Counter is retained for operator dashboards.
     if policy == "offrecord":
         raw_row.is_redacted = True
         raw_row.redaction_reason = "offrecord"
         await session.flush()
         report.skipped_governance_count += 1
-        return msg_id
+        # IMPORTANT: do NOT return here. Continue to step 9.
 
-    # 9. Build the message duck and call persist_message_with_policy. The helper
-    # remains the sole writer for non-offrecord chat_messages rows and re-runs
-    # deterministic governance inside the write path, matching the live route.
+    # 9. Build the message duck.
     duck = _build_message_duck(
         msg=msg,
         chat_id=chat_id,
@@ -552,47 +554,72 @@ async def _apply_one_message(
         reply_to_msg_id=resolved_reply_to_message_id,
         message_kind=kind,
     )
+
+    # 10. Explicit overlap pre-check BEFORE persist (hotfix #164 §3.2).
+    # If a LIVE chat_messages row already exists for (chat_id, message_id), the live
+    # row is authoritative — skip the helper entirely.
+    is_overlap = await _check_live_overlap_pre_persist(
+        session,
+        chat_id=chat_id,
+        message_id=msg_id,
+        current_import_raw_update_id=raw_row.id,
+    )
+    if is_overlap:
+        report.skipped_overlap_count += 1
+        return msg_id
+
+    # 11. Single helper call — handles both normal AND offrecord paths uniformly.
+    # The helper is now the SOLE writer for (chat_messages, message_versions,
+    # current_version_id) triples — this closes CRITICAL 2, CRITICAL 3, and H2.
     persist_result = await persist_message_with_policy(
         session,
         duck,
         raw_update_id=raw_row.id,
         source="import",
+        captured_at=duck.date,  # preserve export captured_at
     )
 
-    # 10. message_versions row for live-or-import overlap rule (#106 §5).
-    # If a live row already exists for the same (chat_id, message_id), we
-    # skip the version insert: the live row is authoritative. The duplicate
-    # gate above already covers this for the current ingestion run, but a row
-    # could have been written between the dup-check and persist (live ingestion
-    # racing with import). Re-check using raw_update_id of the parent row.
-    persisted_cm = persist_result.chat_message
-    if _is_live_chat_message(persisted_cm, synthetic_raw_update_id=raw_row.id):
-        # TODO: when #89 grows a created: bool return, switch to that.
-        # Live row pre-existed → skip imported version per overlap rule.
-        report.skipped_overlap_count += 1
-    else:
-        # Determine edit_date from TD export (last-edit timestamp, if any).
-        edit_dt = _parse_edited_at(msg)
-        # Insert the imported_final version row. is_redacted mirrors the chat_messages
-        # redaction state so downstream consumers see consistent flags.
-        await MessageVersionRepo.insert_version(
-            session,
-            chat_message_id=persisted_cm.id,
-            content_hash=content_hash,
-            text=None if persist_result.policy == "offrecord" else text_value,
-            caption=None if persist_result.policy == "offrecord" else caption_value,
-            entities_json=None,
-            edit_date=edit_dt,
-            raw_update_id=raw_row.id,
-            is_redacted=persist_result.policy == "offrecord",
-            imported_final=True,
-        )
+    # 12. Counter branching.
+    if persist_result.policy != "offrecord":
         report.applied_count += 1
+    # offrecord case: skipped_governance_count was already bumped in step 8b.
 
     return msg_id
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
+
+
+async def _check_live_overlap_pre_persist(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    message_id: int,
+    current_import_raw_update_id: int,
+) -> bool:
+    """Return True if a LIVE chat_messages row already exists for (chat_id, message_id).
+
+    Live rows are identified by:
+      chat_messages.raw_update_id → telegram_updates row WHERE update_id IS NOT NULL.
+    Synthetic import raw rows (telegram_updates.update_id IS NULL) are NOT treated
+    as live overlaps; they are prior import runs and handled by the dup-check earlier.
+
+    Called BEFORE persist_message_with_policy so the live row is authoritative and
+    the import is skipped cleanly without creating a duplicate.
+    """
+    stmt = (
+        select(ChatMessage.id)
+        .join(TelegramUpdate, TelegramUpdate.id == ChatMessage.raw_update_id)
+        .where(
+            ChatMessage.chat_id == chat_id,
+            ChatMessage.message_id == message_id,
+            TelegramUpdate.update_id.is_not(None),  # live, not synthetic-import
+            ChatMessage.raw_update_id != current_import_raw_update_id,  # not us
+        )
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
 
 
 def _iter_export_messages(path: Path) -> Iterable[dict[str, Any]]:

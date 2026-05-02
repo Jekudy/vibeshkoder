@@ -392,10 +392,15 @@ async def test_apply_user_tombstone_blocks_all_sender_messages(db_session) -> No
 # ─── Test 4: Governance gate ──────────────────────────────────────────────────
 
 
-async def test_apply_governance_offrecord_keeps_only_synthetic_audit_row(db_session) -> None:
+async def test_apply_governance_offrecord_creates_redacted_row_and_audit(db_session) -> None:
     """Apply edited_messages.json which contains an #offrecord message (id 2004).
-    Verify telegram_updates row exists, but persist_message_with_policy is NOT called
-    for the offrecord message and no chat_messages/message_versions content row is created."""
+
+    Hotfix #164 H2 fix: persist_message_with_policy IS now called for offrecord messages
+    (import path mirrors live path). The helper writes a chat_messages row with
+    memory_policy='offrecord' and is_redacted=True (content nulled), creates an
+    OffrecordMark, and inserts a redacted MessageVersion. skipped_governance_count is
+    bumped; applied_count is NOT bumped.
+    """
     from bot.services.import_apply import run_apply
 
     chat_id = -1001999999999
@@ -423,21 +428,26 @@ async def test_apply_governance_offrecord_keeps_only_synthetic_audit_row(db_sess
             chunking_config=_default_chunking(),
         )
 
-    # Fixture contains 5 user messages: one #nomem (2003) persists, one #offrecord (2004)
-    # is governance-skipped after the synthetic update.
+    # Fixture contains 5 user messages: one #nomem (2003) persists normally,
+    # one #offrecord (2004) is persisted as redacted (H2 fix).
     assert report.applied_count == 4
     assert report.skipped_governance_count == 1
-    assert 2004 not in persisted_msg_ids
+    # H2 fix: persist IS called for msg 2004 (helper handles offrecord internally)
+    assert 2004 in persisted_msg_ids
 
-    # The offrecord message should NOT land in chat_messages at all.
+    # H2 fix: chat_messages row IS created with memory_policy='offrecord', is_redacted=True
     offrecord_cm = await db_session.execute(
         sa_text(
-            "SELECT COUNT(*) FROM chat_messages "
+            "SELECT memory_policy, is_redacted, text FROM chat_messages "
             "WHERE chat_id = :cid AND message_id = :mid"
         ),
         {"cid": chat_id, "mid": 2004},
     )
-    assert int(offrecord_cm.scalar_one()) == 0
+    cm_row = offrecord_cm.fetchone()
+    assert cm_row is not None, "H2: chat_messages row must exist for imported #offrecord"
+    assert cm_row[0] == "offrecord"
+    assert cm_row[1] is True
+    assert cm_row[2] is None  # text nulled
 
     # Synthetic telegram_updates audit row remains and is marked redacted.
     raw_row = await db_session.execute(
@@ -585,9 +595,14 @@ async def test_apply_resolves_intra_export_reply(db_session) -> None:
 # ─── Test 6: Edit history / imported_final ────────────────────────────────────
 
 
-async def test_apply_sets_imported_final_and_edit_date(db_session) -> None:
-    """edited_messages.json has 2 messages with `edited_unixtime`. After apply,
-    those rows have non-NULL edit_date and imported_final=TRUE."""
+async def test_apply_sets_imported_final(db_session) -> None:
+    """edited_messages.json has 5 user messages. After apply, all message_versions rows
+    have imported_final=TRUE.
+
+    Hotfix #164 §3.2: the explicit MessageVersionRepo.insert_version call with edit_date
+    was removed; persist_message_with_policy creates v1 with edit_date=None (v1 is not
+    an edit). The #offrecord message 2004 now also creates a redacted v1 (H2 fix).
+    """
     from bot.services.import_apply import run_apply
 
     chat_id = -1001999999999
@@ -604,8 +619,9 @@ async def test_apply_sets_imported_final_and_edit_date(db_session) -> None:
         chunking_config=_default_chunking(),
     )
 
-    # 4 persisted user messages → 4 message_versions rows, all imported_final=TRUE.
-    # The offrecord message 2004 keeps only a synthetic telegram_updates audit row.
+    # Hotfix #164 H2 fix: 5 persisted user messages → 5 message_versions rows, all
+    # imported_final=TRUE. The offrecord message 2004 now also gets a redacted
+    # chat_messages row + redacted MessageVersion (import path mirrors live path).
     rows = await db_session.execute(
         sa_text(
             """
@@ -619,18 +635,17 @@ async def test_apply_sets_imported_final_and_edit_date(db_session) -> None:
         {"cid": chat_id},
     )
     by_msg_id = {row[0]: (row[1], row[2]) for row in rows.all()}
-    assert set(by_msg_id) == {2001, 2002, 2003, 2005}
+    # 2004 is now included — redacted v1 row exists (H2 fix)
+    assert set(by_msg_id) == {2001, 2002, 2003, 2004, 2005}
 
     # Every imported row has imported_final=TRUE
     for mid, (final, _ed) in by_msg_id.items():
         assert final is True, f"msg {mid} expected imported_final=TRUE"
 
-    # Messages 2001 and 2002 have edited_unixtime → edit_date set.
-    assert by_msg_id[2001][1] is not None, "msg 2001 has edited_unixtime → edit_date should be set"
-    assert by_msg_id[2002][1] is not None, "msg 2002 has edited_unixtime → edit_date should be set"
-    # Messages 2003/2004/2005 have no edited field → edit_date NULL
-    assert by_msg_id[2003][1] is None
-    assert by_msg_id[2005][1] is None
+    # v1 is not an edit — edit_date is always NULL for the v1 row created by
+    # persist_message_with_policy (hotfix #164 §3.2 removed explicit edit_date pass).
+    for mid, (_final, edit_date) in by_msg_id.items():
+        assert edit_date is None, f"msg {mid} v1 edit_date must be NULL (v1 is not an edit)"
 
 
 async def test_apply_skips_version_when_live_row_wins_overlap_race(db_session) -> None:
@@ -1113,19 +1128,20 @@ async def test_apply_poll_with_offrecord_question_yields_offrecord_policy(db_ses
         )
         assert report.applied_count == 0
 
-        # Verify no chat_messages row persisted with normal policy.
+        # H2 fix: offrecord messages now create a chat_messages row with
+        # memory_policy='offrecord' and is_redacted=True (import mirrors live path).
+        # Verify the row has offrecord policy, NOT normal policy.
         cm_row = await db_session.execute(
             sa_text(
-                "SELECT memory_policy FROM chat_messages "
+                "SELECT memory_policy, is_redacted FROM chat_messages "
                 "WHERE chat_id = :cid AND message_id = 9901"
             ),
             {"cid": chat_id},
         )
         row = cm_row.fetchone()
-        assert row is None, (
-            f"H1: chat_messages row should not exist for offrecord poll; "
-            f"got memory_policy={row[0] if row else None}"
-        )
+        assert row is not None, "H1+H2: chat_messages row must exist for offrecord poll (H2 fix)"
+        assert row[0] == "offrecord", f"H1: memory_policy must be offrecord; got {row[0]}"
+        assert row[1] is True, "H1: is_redacted must be True for offrecord row"
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -1211,18 +1227,297 @@ async def test_apply_contact_with_offrecord_in_first_name_yields_offrecord_polic
         )
         assert report.applied_count == 0
 
-        # Verify no chat_messages row persisted.
+        # H2 fix: offrecord messages now create a chat_messages row with
+        # memory_policy='offrecord' and is_redacted=True (import mirrors live path).
         cm_row = await db_session.execute(
             sa_text(
-                "SELECT memory_policy FROM chat_messages "
+                "SELECT memory_policy, is_redacted FROM chat_messages "
                 "WHERE chat_id = :cid AND message_id = 9902"
             ),
             {"cid": chat_id},
         )
         row = cm_row.fetchone()
-        assert row is None, (
-            f"H1: chat_messages row should not exist for offrecord contact; "
-            f"got memory_policy={row[0] if row else None}"
-        )
+        assert row is not None, "H1+H2: chat_messages row must exist for offrecord contact (H2 fix)"
+        assert row[0] == "offrecord", f"H1: memory_policy must be offrecord; got {row[0]}"
+        assert row[1] is True, "H1: is_redacted must be True for offrecord row"
     finally:
         tmp.unlink(missing_ok=True)
+
+
+# ─── Hotfix #164 §3.2 tests ───────────────────────────────────────────────────
+
+
+def _make_offrecord_export(chat_id: int, msg_id: int, text: str) -> str:
+    """Build a minimal single-message TD export JSON string."""
+    import json
+    return json.dumps({
+        "id": chat_id,
+        "name": "Test Chat",
+        "type": "public_supergroup",
+        "messages": [
+            {
+                "id": msg_id,
+                "type": "message",
+                "date": "2024-01-15T10:00:00",
+                "date_unixtime": "1705312800",
+                "from": "User One",
+                "from_id": "user1000001",
+                "text": text,
+                "text_entities": [{"type": "plain", "text": text}],
+            }
+        ],
+    })
+
+
+async def test_import_apply_sets_current_version_id(db_session) -> None:
+    """Apply fixture → chat_messages.current_version_id IS NOT NULL for every imported row.
+
+    Verifies CRITICAL 2 fix: import path now delegates to persist_message_with_policy
+    which creates v1 and sets current_version_id.
+    """
+    from bot.services.import_apply import run_apply
+
+    chat_id = -1001999999999
+    run_id = await _create_apply_run(
+        db_session,
+        source_path=str(SMALL_CHAT),
+        chat_id=chat_id,
+        source_hash="hash_164_cvid",
+    )
+
+    report = await run_apply(
+        db_session,
+        ingestion_run_id=run_id,
+        resume_point=None,
+        chunking_config=_default_chunking(),
+    )
+
+    assert report.applied_count > 0
+
+    null_cvid = await db_session.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM chat_messages WHERE chat_id = :cid AND current_version_id IS NULL"
+        ),
+        {"cid": chat_id},
+    )
+    assert int(null_cvid.scalar_one()) == 0, (
+        "CRITICAL 2: every imported chat_messages row must have current_version_id set"
+    )
+
+
+async def test_import_apply_v1_normalized_text_populated(db_session) -> None:
+    """normalized_text IS NOT NULL for imported text messages → FTS tsv non-empty.
+
+    Verifies CRITICAL 3 fix.
+    """
+    from bot.services.import_apply import run_apply
+
+    chat_id = -1001999999999
+    run_id = await _create_apply_run(
+        db_session,
+        source_path=str(SMALL_CHAT),
+        chat_id=chat_id,
+        source_hash="hash_164_normtext",
+    )
+
+    await run_apply(
+        db_session,
+        ingestion_run_id=run_id,
+        resume_point=None,
+        chunking_config=_default_chunking(),
+    )
+
+    # At least one text message should have normalized_text populated in its v1 row.
+    populated = await db_session.execute(
+        sa_text(
+            """
+            SELECT COUNT(*) FROM message_versions mv
+            JOIN chat_messages cm ON mv.chat_message_id = cm.id
+            WHERE cm.chat_id = :cid AND mv.normalized_text IS NOT NULL
+            """
+        ),
+        {"cid": chat_id},
+    )
+    count = int(populated.scalar_one())
+    assert count > 0, "CRITICAL 3: at least one v1 row must have normalized_text populated"
+
+
+async def test_import_apply_overlap_with_live_v1_skips_via_pre_check(db_session) -> None:
+    """Pre-seed live chat_message + live v1; apply same (chat_id, message_id) import.
+
+    Import should be skipped (skipped_overlap_count or skipped_duplicate_count) and only
+    the live v1 (imported_final=False) must remain.
+    """
+    import json as _json
+    import tempfile, os
+
+    from bot.db.models import ChatMessage, MessageVersion
+    from bot.db.repos.user import UserRepo
+    from bot.services.import_apply import run_apply
+    from bot.services.message_persistence import persist_message_with_policy
+    from sqlalchemy import select
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from datetime import datetime, timezone
+
+    chat_id = -1_009_000_000_001
+    msg_id = 50_001
+    user_id = 88_001
+
+    # Pre-seed a live user + chat_message
+    await UserRepo.upsert(db_session, telegram_id=user_id, username="u88001", first_name="T", last_name=None)
+
+    live_msg = SimpleNamespace(
+        message_id=msg_id,
+        chat=SimpleNamespace(id=chat_id, type="supergroup"),
+        from_user=SimpleNamespace(id=user_id, username="u88001", first_name="T", last_name=None),
+        text="hello world",
+        caption=None,
+        date=datetime.now(timezone.utc),
+        model_dump=MagicMock(return_value={"text": "hello world"}),
+        reply_to_message=None, message_thread_id=None,
+        photo=None, video=None, voice=None, audio=None, document=None,
+        sticker=None, animation=None, video_note=None, location=None,
+        contact=None, poll=None, dice=None, forward_origin=None,
+        new_chat_members=None, left_chat_member=None, pinned_message=None,
+        entities=None, caption_entities=None,
+    )
+    live_result = await persist_message_with_policy(db_session, live_msg, source="live")
+    live_cm = live_result.chat_message
+    assert live_cm.current_version_id is not None
+
+    # Build a TD export for the same (chat_id, msg_id)
+    export_data = _json.dumps({
+        "id": chat_id,
+        "name": "Test",
+        "type": "public_supergroup",
+        "messages": [{
+            "id": msg_id,
+            "type": "message",
+            "date": "2024-01-15T10:00:00",
+            "date_unixtime": "1705312800",
+            "from": "User One",
+            "from_id": f"user{user_id}",
+            "text": "hello world\n",  # whitespace divergence
+            "text_entities": [{"type": "plain", "text": "hello world\n"}],
+        }],
+    })
+
+    tmp = Path(tempfile.mktemp(suffix=".json"))
+    try:
+        tmp.write_text(export_data)
+        run_id = await _create_apply_run(
+            db_session, source_path=str(tmp), chat_id=chat_id, source_hash="hash_overlap_pre_check"
+        )
+        report = await run_apply(
+            db_session, ingestion_run_id=run_id, resume_point=None, chunking_config=_default_chunking()
+        )
+
+        # Either the dup-check or pre-check skips the import
+        total_skipped = report.skipped_duplicate_count + report.skipped_overlap_count
+        assert total_skipped >= 1, f"Expected overlap skip; got {report}"
+
+        # Only ONE version row for this chat_message (the live v1)
+        versions = (await db_session.execute(
+            select(MessageVersion).where(MessageVersion.chat_message_id == live_cm.id)
+        )).scalars().all()
+        assert len(versions) == 1
+        assert versions[0].imported_final is False  # live v1, not import
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def test_import_apply_offrecord_creates_chat_message_and_mark(db_session) -> None:
+    """Apply fixture with #offrecord text → chat_messages row, OffrecordMark, redacted v1.
+
+    Verifies Risk H2 fix: import #offrecord now delegates to helper (same as live path).
+    """
+    import tempfile
+
+    from bot.db.models import OffrecordMark, MessageVersion
+    from bot.services.import_apply import run_apply
+    from sqlalchemy import select
+
+    chat_id = -1_009_000_000_002
+    msg_id = 50_002
+
+    export_str = _make_offrecord_export(chat_id, msg_id, "secret #offrecord info")
+    tmp = Path(tempfile.mktemp(suffix=".json"))
+    try:
+        tmp.write_text(export_str)
+        run_id = await _create_apply_run(
+            db_session, source_path=str(tmp), chat_id=chat_id, source_hash="hash_offrecord_164"
+        )
+        report = await run_apply(
+            db_session, ingestion_run_id=run_id, resume_point=None, chunking_config=_default_chunking()
+        )
+
+        # Governance counter is bumped (kept for operator dashboards)
+        assert report.skipped_governance_count == 1
+        # applied_count is NOT bumped for offrecord
+        assert report.applied_count == 0
+
+        # chat_messages row MUST now exist with memory_policy='offrecord'
+        cm_check = await db_session.execute(
+            sa_text(
+                "SELECT memory_policy, is_redacted FROM chat_messages "
+                "WHERE chat_id = :cid AND message_id = :mid"
+            ),
+            {"cid": chat_id, "mid": msg_id},
+        )
+        row = cm_check.fetchone()
+        assert row is not None, "H2: chat_messages row must exist for imported #offrecord"
+        assert row[0] == "offrecord"
+        assert row[1] is True
+
+        # OffrecordMark must exist
+        from bot.db.models import ChatMessage
+        from sqlalchemy import select as sa_select
+        cm_obj = (await db_session.execute(
+            sa_select(ChatMessage).where(
+                ChatMessage.chat_id == chat_id,
+                ChatMessage.message_id == msg_id,
+            )
+        )).scalar_one()
+
+        mark_check = await db_session.execute(
+            sa_text("SELECT COUNT(*) FROM offrecord_marks WHERE chat_message_id = :id"),
+            {"id": cm_obj.id},
+        )
+        assert int(mark_check.scalar_one()) >= 1, "H2: OffrecordMark must exist for imported offrecord"
+
+        # MessageVersion row must exist with is_redacted=True
+        mv_check = await db_session.execute(
+            sa_text(
+                "SELECT is_redacted, text FROM message_versions WHERE chat_message_id = :id"
+            ),
+            {"id": cm_obj.id},
+        )
+        mv_row = mv_check.fetchone()
+        assert mv_row is not None, "H2: MessageVersion must be created for imported offrecord"
+        assert mv_row[0] is True, "H2: MessageVersion must be redacted"
+        assert mv_row[1] is None, "H2: MessageVersion.text must be NULL for offrecord"
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def test_import_apply_idempotent_rerun(db_session) -> None:
+    """Regression: re-running same export on same DB produces zero net new rows."""
+    from bot.services.import_apply import run_apply
+
+    chat_id = -1001999999999
+    run1 = await _create_apply_run(
+        db_session, source_path=str(SMALL_CHAT), chat_id=chat_id, source_hash="hash_idempotent_164_r1"
+    )
+    await run_apply(db_session, ingestion_run_id=run1, resume_point=None, chunking_config=_default_chunking())
+
+    count_after_first = await _count_chat_messages(db_session, chat_id)
+
+    run2 = await _create_apply_run(
+        db_session, source_path=str(SMALL_CHAT), chat_id=chat_id, source_hash="hash_idempotent_164_r2"
+    )
+    report2 = await run_apply(db_session, ingestion_run_id=run2, resume_point=None, chunking_config=_default_chunking())
+
+    count_after_second = await _count_chat_messages(db_session, chat_id)
+    assert count_after_second == count_after_first, "Idempotency: second run must not add new chat_messages rows"
+    assert report2.applied_count == 0
