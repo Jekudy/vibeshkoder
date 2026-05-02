@@ -111,6 +111,7 @@ Update this section at sprint start (in your sprint-kickoff PR) and at sprint cl
 | Orch | Sprint label | Tickets | Started (UTC) | Status | PRs | Notes |
 |------|--------------|---------|---------------|--------|-----|-------|
 | C | sprint-0 plan ratification | T11 plan + draft reconciliation | 2026-05-02 | open | (this PR) | Promotes `PHASE11_PLAN.md` (canonical evals scope); marks `prompts/PHASE11_PLAN_DRAFT.md` (expertise pages) as deferred. No code, no schema. |
+| B | sprint-0a — Phase 12 ratification (docs only) | n/a — promotes `prompts/PHASE12_PLAN_DRAFT.md` → canonical `docs/memory-system/PHASE12_PLAN.md` | 2026-05-02 | OPEN — both PAR reviewers PASSED (Claude product ACCEPTED + fallback Claude technical APPROVE; Codex stuck after reconnects, cancelled per Rule 7) | #171 | Branch `plan/p12-ratify`, worktree `.worktrees/orch-B`. Touches `docs/memory-system/PHASE12_PLAN.md` (created via `git mv`), `docs/memory-system/IMPLEMENTATION_STATUS.md`, `docs/memory-system/ORCHESTRATOR_REGISTRY.md`. NO source code, NO migrations, NO `models.py` / `forget_cascade.py` / `governance.py` edits. REGISTRY §3.1 step 4 collision scan at kickoff: clear; rebased on origin/main 2026-05-02 to absorb Orch C's 3 merged PRs (`970842f`, `d48de41`, `8e1e716`) — no semantic collision (C touched `PHASE11_PLAN.md` + REGISTRY §1 + §4; B touches `PHASE12_PLAN.md` + REGISTRY §4 + IMPLEMENTATION_STATUS row 211). |
 
 ---
 

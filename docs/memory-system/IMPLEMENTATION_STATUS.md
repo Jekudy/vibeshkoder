@@ -208,7 +208,7 @@ Merged via PR #159 (commit `df7c016`) and PR #160 on 2026-04-30, all under `docs
 - `PHASE9_PLAN_DRAFT.md` — wiki (member-only first; per-page public approval gate). Invariant #10 binding. T9-01..T9-08.
 - `PHASE10_PLAN_DRAFT.md` — graph projection. Invariant #6 binding. T10-01..T10-09. Includes cascade `graph_nodes` layer.
 - `PHASE11_PLAN_DRAFT.md` — person expertise pages. **NUMBERING CONFLICT:** HANDOFF currently has Phase 11 = Shkoderbench/evals; this draft repurposes Phase 11 = expertise. Stop signal flags conflict for human reconcile.
-- `PHASE12_PLAN_DRAFT.md` — butler / action execution (postponed per AUTHORIZED_SCOPE; design-only). Invariant #7 binding. T12-01..T12-10.
+- `PHASE12_PLAN.md` — butler / action execution (postponed per AUTHORIZED_SCOPE; design-only). **RATIFIED 2026-05-02** by Orchestrator B (sprint 0a, branch `plan/p12-ratify`); promoted from `prompts/PHASE12_PLAN_DRAFT.md` to canonical path via `git mv`; §11 Compliance Recap added; Final Report Block updated. Invariant #7 + #2 + #9 binding. T12-01..T12-10 remain design-only contracts; implementation requires AUTHORIZED_SCOPE.md update.
 
 All drafts open with 🚧 DRAFT — NOT AUTHORIZED banner; cite HANDOFF §1 invariants verbatim; defer LLM/vector implementation to phase boundary; list 5+ open design questions for human ratification.
 
