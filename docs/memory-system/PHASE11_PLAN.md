@@ -12,6 +12,8 @@
 
 This is the canonical Phase 11 plan. The earlier file `prompts/PHASE11_PLAN_DRAFT.md` is a **deferred draft for person expertise pages** (a future Phase 6+ feature) and is NOT this plan. See §11 for the reconciliation note.
 
+**Supersede note (2026-05-02).** This plan **supersedes the original Phase 11 scope sketched in `HANDOFF.md §Phase 11` (lines ~476-480) and the `add_eval_tables` migration row in `HANDOFF.md §5` (line ~715).** Per `AUTHORIZED_SCOPE.md §Phase 11` (ratified 2026-04-30, narrowed to offline / CI-only), Phase 11 ships **no DB tables** (`eval_cases` / `eval_runs` / `eval_results`), **no migrations**, and **no admin eval view** in this iteration. If durable eval persistence is later required, it lands in a successor phase (e.g., a future Phase 11.x or 13) under separate authorization. HANDOFF.md will be reconciled in a follow-up shared-file PR (Sprint 0 keeps shared-file edits minimal per `ORCHESTRATOR_REGISTRY.md §3.3`).
+
 **No production runtime impact.** Phase 11 ships:
 
 - a new top-level test category `tests/evals/`
@@ -34,9 +36,16 @@ This is the canonical Phase 11 plan. The earlier file `prompts/PHASE11_PLAN_DRAF
 7. Future butler cannot read raw DB directly; must use governance-filtered evidence context.
 8. Import apply must go through the same normalization / governance path as live updates.
 9. Tombstones are durable and not casually rolled back.
-10. Public wiki remains disabled until review / source trace / governance proven.
+10. Public wiki remains disabled until review / source trace / governance are proven.
 
-**Phase 11 is the binding compliance gate for invariants 2, 3, 4, 9** when downstream phases (5, 6, 7, 9, 10) come online. Every Phase 11 test category exists to detect a violation of one of these invariants.
+**Phase 11 is the binding compliance gate for invariants 2, 3, 4, 9** when downstream phases (5, 6, 7, 9, 10) come online. Every Phase 11 test category exists to detect a violation of one of these invariants:
+
+| Invariant | Binding category | Failure mode caught |
+|-----------|------------------|---------------------|
+| 2 — no LLM outside `llm_gateway` | §5.6 Import-graph guard | a service module silently imports `anthropic`/`openai`/etc. |
+| 3 — no q&a over offrecord/nomem/forgotten | §5.1 Leakage tests (L1-L5) | a redacted/tombstoned mv_id surfaces in `bundle.items` |
+| 4 — citations point to `message_version_id` | §5.2 Citation tests (C1-C4) | non-abstaining answer with empty/invalid mv_id |
+| 9 — tombstones durable | §5.1 L3 (forgotten) | tombstone present but mv_id still returned by search |
 
 ---
 
@@ -177,6 +186,20 @@ For each query in `golden_recall/seed_v1/queries.jsonl` with `expected_message_v
 
 Same seed + same query run twice in the same process MUST produce byte-identical `bundle.evidence_ids`. Catches non-deterministic orderings before they corrupt baseline.
 
+### §5.6 Import-graph guard (`tests/evals/test_no_llm_imports.py` — Wave 1)
+
+**Binds invariant 2** (no LLM calls outside `llm_gateway`). This is a static / AST-level test that does not depend on any runtime fixture.
+
+| Sub-case | Assertion |
+|----------|-----------|
+| I1 | walking the AST of every file under `bot/` (excluding `bot/services/llm_gateway.py` once Phase 5 introduces it), no `Import` / `ImportFrom` node references modules in `{anthropic, openai, langchain, langchain_*, transformers, huggingface_hub, ollama, cohere, mistral, replicate}` |
+| I2 | `pyproject.toml` `[project.dependencies]` does not list any of the above as a direct runtime dep (Phase 5 will add them under a clearly-named section limited to the gateway path) |
+| I3 | Once `llm_gateway.py` exists (Phase 5+), it is the **only** Python file allowed to do those imports — assertion compares observed import sites set against the allow-list `{"bot/services/llm_gateway.py"}` |
+
+**Failure semantics:** any non-allow-listed import site = test FAIL with the offending file path + import statement quoted. No retries.
+
+This category is wired in Wave 1 (T11-W1-05) so it is green BEFORE Phase 5 starts merging LLM code, and provides a definitive automated gate for invariant 2 — replacing the prior "reviewer vigilance" enforcement.
+
 ---
 
 ## §6. Wave allocation
@@ -228,7 +251,13 @@ If any of these triggers in implementation, STOP and escalate:
 2. Subagent proposes an alembic migration → outside scope (Phase 11 is no-schema-change).
 3. Subagent proposes importing `anthropic`, `openai`, `langchain`, `transformers`, `ollama`, `huggingface` anywhere in `bot/` → invariant 2 violation.
 4. Eval reports 100% pass on first run → suspect false-negative; verify the assertion path is wired before celebrating.
-5. New seed file contains the literal strings `#offrecord`, `#nomem`, `forgotten`, `nomem` in a positive-example position → privacy disaster; pre-commit grep gate.
+5. New seed file contains the literal strings `#offrecord`, `#nomem`, `forgotten`, `nomem` in a position OTHER than a leakage-test fixture explicitly designed to verify exclusion. **Formal allowlist (binding):** these literals are permitted ONLY in files matching exactly one of these glob patterns:
+   - `tests/fixtures/eval_seeds/leakage_offrecord*.jsonl`
+   - `tests/fixtures/eval_seeds/leakage_nomem*.jsonl`
+   - `tests/fixtures/eval_seeds/leakage_forgotten*.jsonl`
+   - `tests/fixtures/eval_seeds/leakage_redacted*.jsonl`
+
+   Any other path containing these literals = pre-commit gate FAIL. Implemented as a CI check in T11-W1-06 (`evals.yml`) AND a local pre-commit hook proposal in T11-W1-07 (new ticket added per PAR feedback). The allowlist exists because §5.1 requires these literals to verify exclusion semantics — they are intentionally present in a tightly-scoped fixture set, never in source code, plan docs, or other test fixtures. Even within allow-listed seed files, the harness MUST treat the seed as durable storage of marker text and never write its content to logs / qa_traces / Telegram messages.
 6. Orch A claims Phase 5 closed but Wave 3 has not run / has failures → Orch C blocks closure with explicit failing-seed dump.
 7. CI workflow `evals.yml` is enabled (env var = true) before Wave 2 baseline frozen → revert immediately.
 8. Eval baseline metric jumps upward by >10% without an explainable seed change → assume regression in Phase 4 surface, not improvement; investigate before re-baselining.
@@ -242,14 +271,21 @@ If any of these triggers in implementation, STOP and escalate:
 - **Producer:** Orch C, Wave 2 baseline (Phase 4 evals green).
 - **Consumer:** Orch A, Phase 5 closure precondition.
 - **Mechanism:** `ORCHESTRATOR_REGISTRY.md §5` cross-dep table updated by Sprint 0 PR. Comment on Orch A's Phase 5 closing PR with run command + verdict.
-- **Run command (canonical):**
+- **Activation gate.** The contract is **NOT YET BINDING** at Sprint 0 ratification time, because `tests/evals/` is empty and the listed test files do not exist. The contract activates **at T11-W2-04 closure** (Wave 2 baseline freeze), at which point `tests/evals/test_leakage.py`, `tests/evals/test_citations.py`, `tests/evals/test_refusal.py`, and `tests/evals/test_no_llm_imports.py` MUST exist and MUST be green on `main`. Orch C announces activation via a comment on this PR's tracking thread + a dedicated row update in `ORCHESTRATOR_REGISTRY.md §5`.
+- **Run command (canonical, activates at T11-W2-04 closure).** Use **explicit file paths**, never `pytest -k` — `-k` matches against test item names and silently runs zero tests if a future test rename drops the keyword:
 
   ```bash
   cd /Users/eekudryavtsev/Vibe/products/shkoderbot
-  EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 tests/evals/ -k "leakage or citations or refusal"
+  EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 \
+      tests/evals/test_leakage.py \
+      tests/evals/test_citations.py \
+      tests/evals/test_refusal.py \
+      tests/evals/test_no_llm_imports.py
   ```
 
-- **Verdict format:** `PASS` (Orch C ACKs Phase 5 closure) | `FAIL: <category> <case_id> <evidence>` (Orch A must fix before merge).
+  The harness MUST also write a structured `eval_results.jsonl` artifact (one line per failing case + a final summary line) so Orch A can consume the verdict programmatically rather than scraping comment text. Schema (minimal): `{"verdict": "PASS"|"FAIL", "category": "leakage"|"citations"|"refusal"|"no_llm_imports", "case_id": "L1"|"L2"|...|"I1"|..., "seed_hash": "<sha256>", "harness_version": "<git-sha>", "evidence": <object>}`. The schema is finalized in T11-W1-06.
+
+- **Verdict format (machine-readable, comment-mirrored):** `PASS` (Orch C ACKs Phase 5 closure) | `FAIL: <category> <case_id> — see eval_results.jsonl line N` (Orch A must fix before merge). The `eval_results.jsonl` artifact is the source of truth; the PR comment is the human echo.
 
 ### §8.2 Contract with Orch B (Phase 9 wiki + Phase 10 graph + Phase 12 docs)
 
@@ -291,16 +327,19 @@ Created as GitHub issues with label `phase:11` in Sprint 0 PR follow-up.
 | T11-W1-02 | 1 | `bot/services/eval_seeds.py` + JSONL loader | yes (after W1-01 import surface stable) |
 | T11-W1-03 | 1 | `bot/services/eval_metrics.py` recall@K / precision@K | yes |
 | T11-W1-04 | 1 | `tests/fixtures/golden_recall/seed_v1` + `conftest.py` | yes |
-| T11-W1-05 | 1 | `test_determinism.py` + smoke `test_recall_precision.py` | sequential after W1-01..W1-04 |
-| T11-W1-06 | 1 | `.github/workflows/evals.yml` gated nightly | yes |
-| T11-W2-01 | 2 | `test_leakage.py` (L1–L5) | yes |
+| T11-W1-05 | 1 | `test_determinism.py` + smoke `test_recall_precision.py` + `test_no_llm_imports.py` (§5.6 I1-I3) | sequential after W1-01..W1-04 |
+| T11-W1-06 | 1 | `.github/workflows/evals.yml` gated nightly + `eval_results.jsonl` schema | yes |
+| T11-W1-07 | 1 | Privacy-allowlist CI gate + local pre-commit hook proposal (per §7 #5) | yes |
+| T11-W2-01 | 2 | `test_leakage.py` (L1–L5). **Split rule:** if implementer estimate >2 days, split into T11-W2-01a (L1+L2+L4) and T11-W2-01b (L3+L5). | yes |
 | T11-W2-02 | 2 | `test_citations.py` (C1–C4) | yes |
 | T11-W2-03 | 2 | `test_refusal.py` (R1–R4) | yes |
-| T11-W2-04 | 2 | Baseline freeze + flip workflow ON | sequential, last |
+| T11-W2-04 | 2 | Baseline freeze + flip workflow ON + activate §8.1 Phase 5 binding | sequential, last |
 | T11-W3-01 | 3 | LLM-synthesis hallucination test | after Orch A Phase 5 merged |
 | T11-W3-02 | 3 | Citation drift test | after Orch A Phase 5 merged |
 | T11-W3-03 | 3 | Cost / latency benchmark | after Orch A Phase 5 merged |
 | T11-W3-04 | 3 | Phase 11 FHR | end of phase |
+| T11-CHORE-01 | — | Follow-up: rename `prompts/PHASE11_PLAN_DRAFT.md` → `prompts/EXPERTISE_PAGES_DRAFT.md` (deferrable; per PAR §7 finding) | low priority |
+| T11-CHORE-02 | — | Follow-up: reconcile HANDOFF.md §Phase 11 + §5 stale rows in a separate shared-file PR | low priority |
 
 ---
 
