@@ -54,7 +54,7 @@ Without Wave 0 hotfix landed, `/recall` returns abstention for every production 
 **Phase 5 amplifies invariant #2 and invariant #3.** Every gateway call MUST:
 - Refuse to dispatch if any cited source has `memory_policy IN ('offrecord','forgotten')` OR `is_redacted=TRUE` (defense-in-depth — `search.py` already filters at SQL level, but the gateway re-validates).
 - Write a `llm_usage_ledger` row regardless of outcome (success, error, abstain, cache hit, cost-refusal).
-- Never log raw prompt / response content above DEBUG; production runs at INFO, so prompt and response only appear in DB in HASHED form.
+- Never log raw prompt / response BODIES above DEBUG; production runs at INFO. Provider request/response BODIES never logged. Provider request/response IDs only stored in `llm_usage_ledger`. Raw answer text DOES persist in two places — `llm_synthesis_cache.answer_text` and `qa_traces.llm_response_summary` — and BOTH are protected by cascade layers per §5.E (`_cascade_llm_synthesis_cache` runs synchronously per `forget_event`; `_cascade_qa_traces_llm` covers user-level forgets). No raw text is durable beyond a forget event.
 
 ---
 
@@ -162,19 +162,29 @@ async def synthesize_answer(
     bundle: EvidenceBundle,
     query: str,
     config: LLMGatewayConfig,
-    qa_trace_id: int | None = None,
+    qa_trace_id: int,                    # REQUIRED — handler MUST create QaTrace BEFORE
+                                          # calling gateway so cascade FK is always populated
+                                          # (closes Codex review HIGH 4: cascade direction)
 ) -> SynthesisResult: ...
 ```
 
-**Pre-call invariants enforced by gateway (in this order):**
+**Query normalization** (for cache key + ledger `prompt_hash`): `query_normalized = query.strip()[:256]`. Mirrors `bot/services/search.py:43–55` (same `MAX_QUERY_LENGTH=256`, same `.strip()`). Symmetry is required so cache hit-rate matches search hit-rate. `prompt_template_version` lives on `LLMGatewayConfig` as `prompt_template_version: str` (semver-string; bumped on every prompt-template revision; cache rows with stale version are inert and aged out).
+
+**Pre-call invariants enforced by gateway (REORDERED per Codex review HIGH 2 — cache lookup AFTER forget invalidation):**
 
 1. **Empty bundle short-circuit** — `len(bundle.evidence_ids) == 0` → write ledger row with `error='empty_bundle'`, return `Abstention(reason='empty_bundle', cost_usd=Decimal(0), llm_call_id=...)`. NO provider call.
-2. **Source filter (defense-in-depth)** — re-validate every cited row: `chat_messages.memory_policy NOT IN ('offrecord','forgotten') AND chat_messages.is_redacted=FALSE`. If any cited source fails the filter → `reason='all_filtered'` (or per-source filter; if 0 surviving citations, abstain). Defends against race between Phase 4 search-time filter and gateway-time call.
-3. **Cache lookup** — input hash = `sha256(query_normalized || sorted(citation_ids) || model_id || prompt_template_version)`. Hit → write ledger row with `cache_hit=True`, return cached `AnswerWithCitations` with new `llm_call_id`. NO provider call. NO cost.
-4. **Forget-invalidation gate** — for every `citation_id IN bundle.evidence_ids`, JOIN against `forget_events` on `tombstone_key = 'message:{chat_id}:{message_id}'`. If any tombstone exists → invalidate cache + return `Abstention(reason='forget_invalidated')`. Belt-and-braces against forget_cascade race.
-5. **Budget guard** — `LedgerRepo.daily_cost_usd(today) < config.daily_ceiling_usd` AND monthly equivalent. Failure → `Abstention(reason='budget_exceeded')`. NO provider call. Ledger row written with `error='budget_exceeded'`.
-6. **Provider dispatch** — `config.provider` selects implementation; default `anthropic` with `claude-haiku-4-5-20251001`. Provider errors → caught, ledger row written with `error=str(e)`, `Abstention(reason='provider_error')`. NEVER raise.
-7. **Citation enforcement** — provider must return `(answer_text, citation_ids)` where `citation_ids ⊆ bundle.evidence_ids`. If provider hallucinates a citation outside the bundle → reject, treat as `provider_error`. Eval harness in T5-05 verifies this property.
+2. **Source filter (defense-in-depth)** — re-validate every cited row: `chat_messages.memory_policy NOT IN ('offrecord','forgotten') AND chat_messages.is_redacted=FALSE`. If 0 surviving citations → `Abstention(reason='all_filtered')`. Defends against race between Phase 4 search-time filter and gateway-time call.
+3. **Forget-invalidation gate (THREE-KEY check; mirrors `bot/services/search.py:99/102/106`)** — for every `citation_id IN bundle.evidence_ids` resolve `(chat_id, message_id, content_hash, user_id)` and JOIN against `forget_events` on ANY of:
+   - `tombstone_key = 'message:' || chat_id || ':' || message_id`
+   - `tombstone_key = 'message_hash:' || content_hash`
+   - `tombstone_key = 'user:' || user_id`
+   If any tombstone matches → `SynthesisCacheRepo.invalidate_by_citation(message_version_id)` for affected rows + `Abstention(reason='forget_invalidated')`. Closes Codex HIGH 3 (was previously checking only `message:` keys).
+4. **Cache lookup** — input hash = `sha256(query_normalized || sorted(citation_ids) || model_id || prompt_template_version)`. Lookup runs AFTER step 3 so a cached row cannot serve forgotten content. Cache hit → write ledger row with `cache_hit=True`, `qa_trace_id` set, return cached `AnswerWithCitations` with new `llm_call_id`. NO provider call. NO cost.
+5. **Budget guard (atomic)** — wrap the read-and-decide in a single transaction: `SELECT pg_advisory_xact_lock(LLM_BUDGET_LOCK_ID); SELECT daily_cost_usd, monthly_cost_usd FROM llm_usage_ledger ...`. Cost-row reservation: write ledger row with `error='budget_exceeded'` IF over ceiling, else write a *placeholder* row with `cost_usd=0, error=NULL` BEFORE provider dispatch. Provider-return path UPDATEs the placeholder with actual cost. Closes Codex MEDIUM 1 (was non-atomic; concurrent calls could all pass the read before any commit). `LLM_BUDGET_LOCK_ID` = deterministic int64 derived from `sha256("llm_budget_guard")`.
+6. **Provider dispatch + categorized error handling** — `config.provider` selects implementation; default `anthropic` with `claude-haiku-4-5-20251001`. Provider errors are categorized (closes Codex MEDIUM 2):
+   - **Transient** (`rate_limit`, `timeout`, `5xx`, `connection_reset`) → caught, ledger row UPDATEs with `error='provider_transient:<subtype>'`, return `Abstention(reason='provider_error')`. NEVER raise. Same as previous behavior.
+   - **Structural** (`auth`, `bad_request`, `contract_violation`, `model_not_found`) → caught, ledger row UPDATEs with `error='provider_structural:<subtype>'`, log at ERROR level with full exception, **emit stop signal** via `bot.services.observability.emit_stop_signal("llm_provider_structural")`, return `Abstention(reason='provider_error')`. Operator alerted; cycle keeps going (no raise into `/recall` handler — invariant #1 gatekeeper preservation), but a structural error means provider config is broken — must trip a human-visible alarm.
+7. **Citation enforcement** — provider returns `ProviderResult.citation_ids: tuple[int, ...]` (explicit list — NOT post-parsed from answer text). Gateway validates `set(citation_ids) ⊆ set(bundle.evidence_ids)`. Hallucination → ledger row `error='citation_hallucination'`, `Abstention(reason='provider_error')`. Eval harness T5-05 verifies this property.
 
 **Provider abstraction:**
 
@@ -194,6 +204,8 @@ class ProviderResult(NamedTuple):
 Anthropic implementation default; OpenAI implementation behind `SYNTHESIS_PROVIDER=openai` env / config. **No stub provider in production code** — tests use `pytest`-injected fakes.
 
 **Cache backing storage** — DB-backed table `llm_synthesis_cache` (alembic 024 migration ships it alongside `llm_usage_ledger`). Schema: `id PK, input_hash CHAR(64) UNIQUE, answer_text TEXT, citation_ids JSONB, model VARCHAR, created_at TIMESTAMPTZ, last_hit_at TIMESTAMPTZ, hit_count INT DEFAULT 1`. Multi-instance correct, GDPR-cascadable, simple. **Decision ratified by this plan** — supersedes DRAFT §5.A "minimal internal cache table OR deterministic in-memory test double". In-memory variants stay test-only.
+
+**Cache lifecycle and forget-cascade integration (closes Codex CRITICAL 1).** Raw answer text in `llm_synthesis_cache.answer_text` is durable across requests but NOT durable across forget events. The cascade layer `_cascade_llm_synthesis_cache` (added in §5.E) runs FIRST in the Phase 5 cascade chain and invokes `SynthesisCacheRepo.invalidate_by_citation(message_version_id)` for every forgotten citation BEFORE `forget_events.cascade_status` for that layer is marked complete. Equivalently: a cache row whose `citation_ids JSONB` array intersects any forgotten `message_version_id` is deleted (or `answer_text` nulled) before the forget event is finalised. This guarantees no synthesised answer survives a forget; pairs with the gateway's pre-call THREE-KEY tombstone check (step 3 above) for defense-in-depth.
 
 **Cost ceiling defaults:**
 - `LLM_DAILY_USD_CEILING` env / `feature_flags.config_json["daily_usd_ceiling"]`. Default **5.00 USD/day**.
@@ -240,7 +252,7 @@ CREATE TABLE llm_synthesis_cache (
 );
 ```
 
-Forward-only `down_revision = "022_add_qa_traces"` after Wave 0 lands 023. Migration 024 builds on 023 (which exists as backfill, no schema). `down()` drops both tables.
+Forward-only `down_revision = "023"` (linear chain after Wave 0 backfill — closes Codex HIGH 1; do NOT set to `"022_add_qa_traces"` or you create sibling alembic heads). Migration 024 builds on 023 (which exists as data-only backfill with no schema delta). `down()` drops both tables. Wave 0's 023 migration must use `revision = "023"` exactly (string match) so this `down_revision` resolves; verify by `alembic heads` after Wave 0 merge.
 
 ### §5.C — `bot/db/repos/llm_usage_ledger.py` and `bot/db/repos/llm_synthesis_cache.py`
 
@@ -301,10 +313,21 @@ CREATE INDEX ix_qa_traces_llm_call_id ON qa_traces(llm_call_id);
 - If flag ON AND `bundle.is_non_empty` → call `synthesize_answer(...)` → render `AnswerWithCitations` (new template) or fall back to Phase 4 list on `Abstention`.
 - `_write_trace` extended with `llm_call_id`, `llm_response_summary`, `llm_response_redacted`, `cost_usd` parameters.
 
-**Cascade layer additions (in `bot/services/forget_cascade.py`):**
-- New layer `_cascade_qa_traces_llm` — for `target_type='message'`: NULL `llm_response_summary` on rows where `llm_call_id IN (SELECT id FROM llm_usage_ledger WHERE qa_trace_id IN (target_qa_traces))`. For `target_type='user'`: NULL `query_text` (already covered by Wave 0) AND `llm_response_summary` for that user's traces.
-- New layer `_cascade_llm_usage_ledger` — for `target_type='user'`: NULL `prompt_hash` and `response_hash` (the only PII surface; ledger keeps cost/token rows for audit).
-- Both layers append to `CASCADE_LAYER_ORDER` after `_cascade_qa_traces` (which Wave 0 introduces).
+**Cascade layer additions (in `bot/services/forget_cascade.py`) — closes Codex CRITICAL 1 + HIGH 4:**
+
+Layer ORDER inside Phase 5 chain (FIRST → LAST):
+1. **`_cascade_llm_synthesis_cache`** (NEW; runs FIRST so no forgotten-content cache row outlives a forget event):
+   - For `target_type='message'`: `SynthesisCacheRepo.invalidate_by_citation(message_version_id)` where `message_version_id` is the `current_version_id` of the forgotten `chat_message`.
+   - For `target_type='message_hash'`: resolve `message_version_id`s by `chat_messages.content_hash` join, then per-id `invalidate_by_citation`.
+   - For `target_type='user'`: bulk DELETE every cache row whose `citation_ids JSONB` array contains any of the user's `message_version_id`s (`citation_ids @> ANY (...)` JSONB containment).
+2. **`_cascade_qa_traces_llm`** (NEW): NULLs `qa_traces.llm_response_summary` for affected traces. Uses BOTH FK directions because handler-side trace creation (per §5.A `qa_trace_id` REQUIRED) populates `qa_traces.llm_call_id` AND `llm_usage_ledger.qa_trace_id` symmetrically:
+   - For `target_type='message'`: NULL `llm_response_summary` on traces whose `evidence_ids` JSONB array contains any of the target message's `message_version_id`s.
+   - For `target_type='user'`: NULL `query_text` (already covered by Wave 0) AND `llm_response_summary` for that user's traces (`qa_traces.user_tg_id = target_user_id`).
+3. **`_cascade_llm_usage_ledger`** (NEW; runs LAST among Phase 5 layers — only PII fields touched, never the cost/token aggregates required for budget audit):
+   - For `target_type='user'`: NULL `prompt_hash` and `response_hash` for ledger rows where `qa_trace_id IN (user's traces)`. Ledger row itself preserved for budget reconciliation.
+   - For `target_type='message'` / `'message_hash'`: no-op (ledger rows are not per-message; they aggregate per call).
+
+All three layers append to `CASCADE_LAYER_ORDER` AFTER `_cascade_qa_traces` (which Wave 0 introduces) in the order: cache → traces-llm → ledger. Append order is binding because traces-llm depends on cache having been invalidated first (otherwise a parallel `synthesize_answer` could re-populate cache from a half-redacted trace). Migration 025 (Phase 5 Wave 2) lands the schema for `qa_traces.llm_response_summary` AND adds these three layers in `forget_cascade._LAYER_FUNCS` AND extends `CASCADE_LAYER_ORDER`.
 
 ---
 
@@ -341,7 +364,7 @@ CREATE INDEX ix_qa_traces_llm_call_id ON qa_traces(llm_call_id);
 | ID | Title | Files | Migration | Dep | Acceptance summary |
 |----|-------|-------|-----------|-----|--------------------|
 | **T5-03** | `LedgerRepo` + `SynthesisCacheRepo` async repositories | `bot/db/repos/llm_usage_ledger.py`, `bot/db/repos/llm_synthesis_cache.py`, `tests/db/test_llm_usage_ledger_repo.py`, `tests/db/test_llm_synthesis_cache_repo.py` | none | T5-02 | All methods per §5.C. `record(...)` flushes without commit. `daily_cost_usd` / `monthly_cost_usd` UTC bounded; zero rows = `Decimal("0")`. `invalidate_by_citation` returns `int` count of invalidated rows. ≥15 tests including rollback safety. |
-| **T5-04** | `/recall` LLM synthesis integration + `qa_traces` LLM extension + cascade layers | `bot/handlers/qa.py`, `bot/services/qa.py`, `alembic/versions/025_extend_qa_traces_for_llm.py`, `bot/db/models.py` (QaTrace extension), `bot/db/repos/qa_trace.py`, `bot/services/forget_cascade.py` (new cascade layers per §5.E), `tests/handlers/test_qa_llm_synthesis.py`, `tests/services/test_forget_cascade.py` (+layers) | **025** | T5-01, T5-02, T5-03 | Flag `memory.qa.llm_synthesis.enabled` default OFF preserves Phase 4 output **byte-for-byte**. ON + non-empty bundle → calls `synthesize_answer`; rendered with template `qa_synthesized.html`. Abstention falls back to Phase 4 list. Gateway error → log + Phase 4 fallback. New `qa_traces` columns populated. Cascade layers green for `target_type IN ('message','user')`. ≥20 tests. |
+| **T5-04** | `/recall` LLM synthesis integration + `qa_traces` LLM extension + cascade layers | `bot/handlers/qa.py`, `bot/services/qa.py`, `alembic/versions/025_extend_qa_traces_for_llm.py`, `bot/db/models.py` (QaTrace extension), `bot/db/repos/qa_trace.py`, `bot/services/forget_cascade.py` (new cascade layers per §5.E), `tests/handlers/test_qa_llm_synthesis.py`, `tests/services/test_forget_cascade.py` (+layers) | **025** | T5-01, T5-02, T5-03 | Flag `memory.qa.llm_synthesis.enabled` default OFF preserves Phase 4 output **byte-for-byte**. ON + non-empty bundle → handler creates `QaTrace` FIRST, passes `qa_trace_id` to `synthesize_answer`, then UPDATEs trace with `llm_call_id` + `llm_response_summary` + `cost_usd` (closes Codex HIGH 4: cascade FK direction). Rendered with template `qa_synthesized.html`. Abstention falls back to Phase 4 list. Gateway error → log + Phase 4 fallback. New `qa_traces` columns populated. **Three** new cascade layers in `forget_cascade.CASCADE_LAYER_ORDER`: `_cascade_llm_synthesis_cache` (FIRST), `_cascade_qa_traces_llm`, `_cascade_llm_usage_ledger`. Cascade layers green for `target_type IN ('message','message_hash','user')`. ≥20 tests including (a) cache invalidation on forget, (b) trace-creation-before-synthesis ordering, (c) three-key tombstone forget gate at gateway, (d) budget atomic check under concurrent calls. |
 
 ### Wave 3 — evals + FHR
 
@@ -362,8 +385,10 @@ Pause work, comment on tracking issue, escalate if any:
 5. CI on `main` red for an unrelated reason — block all pushes until resolved.
 6. Provider call returns content not in `bundle.evidence_ids` — citation hallucination — gateway must reject AND eval suite must capture this regression.
 7. Budget guard accidentally bypassed — every gateway call MUST write ledger row, including refusals.
-8. Cascade layer for `qa_traces.llm_response_summary` or `llm_usage_ledger` missing when shipping T5-04 → invariant #9 violation (tombstones durable).
+8. Cascade layer for `llm_synthesis_cache.answer_text` OR `qa_traces.llm_response_summary` OR `llm_usage_ledger.prompt_hash`/`response_hash` missing when shipping T5-04 → invariant #9 violation (tombstones durable). All three layers MUST land in the same migration 025 PR.
 9. Phase 6/7/8 work attempts to start before Phase 5 closes (out of scope per §3 + AUTHORIZED_SCOPE.md).
+10. Anthropic model ID `claude-haiku-4-5-20251001` rejected by SDK at T5-01 implementation time → STOP, re-verify against current Anthropic models catalog, update `LLMGatewayConfig` default before resuming. (Carried over from Sprint 0 Claude review M2.)
+11. Forget-cascade test discovers a cache row, qa_trace, or ledger row containing forgotten content AFTER the forget event finalises → invariant #9 violation; halt, root-cause, fix layer ordering.
 
 ---
 
@@ -434,6 +459,16 @@ Deliberately NOT shipped in this PR:
 
 ---
 
+## §13. Outstanding asks carried into Wave 0/1 (from Sprint 0 PAR review)
+
+| # | Source | Severity | Action owner | Action |
+|---|--------|----------|--------------|--------|
+| A | Claude product review M1 | MEDIUM | Orch A — docs sweep before Phase 6 ratification | Add one-line cross-ref in `HANDOFF.md §Phase 5` pointing readers at `PHASE5_PLAN.md` as the authoritative slice (HANDOFF lists extraction tables under Phase 5; PHASE5_PLAN.md re-scopes them to Phase 8). Do as separate `docs/p5-handoff-crossref` PR. |
+| B | Claude product review M2 | MEDIUM | Orch A — T5-01 implementation kickoff | Verify Anthropic model ID `claude-haiku-4-5-20251001` against current Anthropic SDK / models catalog as the FIRST step of T5-01. Stop signal #10 enforces. |
+| C | Codex review LOW 1 | LOW | Resolved in §5.A | `query_normalized = query.strip()[:256]` defined explicitly; mirrors `bot/services/search.py:43–55`. |
+
+---
+
 **Ratified by:** Orchestrator A.
-**Date:** 2026-05-02.
+**Date:** 2026-05-02 (initial); patched same day to incorporate Codex technical REQUEST_CHANGES (closes 1 CRITICAL + 4 HIGH + 2 MEDIUM + 1 LOW).
 **Predecessor:** `prompts/PHASE5_PLAN_DRAFT.md` (kept in repo as historical record).
