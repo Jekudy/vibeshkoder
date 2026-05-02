@@ -40,7 +40,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.engine import async_session
-from bot.db.models import ChatMessage, MessageVersion
+from bot.db.models import ChatMessage, MessageVersion, QaTrace
 from bot.db.repos.feature_flag import FeatureFlagRepo
 from bot.db.repos.forget_event import ForgetEventRepo
 
@@ -57,11 +57,18 @@ CASCADE_WORKER_FLAG = "memory.forget.cascade_worker.enabled"
 CASCADE_LAYER_ORDER: tuple[str, ...] = (
     "chat_messages",
     "message_versions",
+    "qa_traces",
     "message_entities",
     "message_links",
     "attachments",
     "fts_rows",
 )
+
+# Layers that apply only to specific target_types. Layers absent from this dict
+# apply to all target_types (preserves existing behavior).
+_LAYER_APPLICABLE_TARGET_TYPES: dict[str, frozenset[str]] = {
+    "qa_traces": frozenset({"user"}),  # user-targeted forgets only
+}
 
 
 async def _cascade_chat_messages(session: AsyncSession, event) -> int:
@@ -229,12 +236,47 @@ async def _cascade_message_versions(session: AsyncSession, event) -> int:
     )
 
 
-# Map layer name → cascade function. Only Phase 1 layers have functions here;
-# the rest are recorded as skipped. When a future phase adds a layer's table,
-# add its function to this map and remove it from the implicit "skipped" set.
+async def _cascade_qa_traces(session: AsyncSession, event) -> int:
+    """Redact qa_traces.query_text for the forget_event's user.
+
+    Per ADR-0003, preserves the row (audit) but nulls query content and flips
+    query_redacted=True. Idempotent: re-runs find no un-redacted rows for the user.
+
+    Pre-condition: dispatcher has verified event.target_type == 'user' via
+    _LAYER_APPLICABLE_TARGET_TYPES. This function does not re-validate.
+    """
+    if event.target_id is None:
+        raise ValueError("forget_event target_type='user' requires non-None target_id")
+
+    try:
+        telegram_id = int(event.target_id)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"target_id must be integer telegram_id; got {event.target_id!r}"
+        )
+
+    stmt = (
+        update(QaTrace)
+        .where(
+            QaTrace.user_tg_id == telegram_id,
+            QaTrace.query_redacted == False,  # idempotency guard  # noqa: E712
+        )
+        .values(
+            query_text=None,
+            query_redacted=True,
+        )
+    )
+    result = await session.execute(stmt)
+    await session.flush()
+    return result.rowcount or 0
+
+
+# Map layer name → cascade function. Layers absent from this map are recorded as
+# skipped. When a future phase adds a layer's table, add its function here.
 _LAYER_FUNCS: dict[str, Any] = {
     "chat_messages": _cascade_chat_messages,
     "message_versions": _cascade_message_versions,
+    "qa_traces": _cascade_qa_traces,
 }
 
 
@@ -290,15 +332,25 @@ async def _process_one_event(session: AsyncSession, event) -> None:
                         "reason": "target_type_not_supported_yet",
                     }
             elif layer in _LAYER_FUNCS:
-                # H4 fix (p2-hotfix): wrap each active layer call in a SAVEPOINT so
-                # that a real PostgreSQL-level DB error in one layer aborts only that
-                # layer's sub-transaction, leaving the outer transaction valid. Without
-                # per-layer savepoints, a DB error would abort the outer transaction and
-                # subsequent events in the batch would fail with InFailedSQLTransactionError,
-                # breaking the per-event isolation guarantee.
-                async with session.begin_nested():
-                    rows = await _LAYER_FUNCS[layer](session, event)
-                cascade_state[layer] = {"status": "completed", "rows": rows}
+                # Check per-layer target_type applicability before invoking.
+                applicable = _LAYER_APPLICABLE_TARGET_TYPES.get(layer)
+                if applicable is not None and event.target_type not in applicable:
+                    # Layer is present but does not apply to this target_type.
+                    cascade_state[layer] = {
+                        "status": "completed",
+                        "rows": 0,
+                        "reason": "not_applicable",
+                    }
+                else:
+                    # H4 fix (p2-hotfix): wrap each active layer call in a SAVEPOINT so
+                    # that a real PostgreSQL-level DB error in one layer aborts only that
+                    # layer's sub-transaction, leaving the outer transaction valid. Without
+                    # per-layer savepoints, a DB error would abort the outer transaction and
+                    # subsequent events in the batch would fail with InFailedSQLTransactionError,
+                    # breaking the per-event isolation guarantee.
+                    async with session.begin_nested():
+                        rows = await _LAYER_FUNCS[layer](session, event)
+                    cascade_state[layer] = {"status": "completed", "rows": rows}
             else:
                 # Phase 4+ layers — table not yet present in this codebase.
                 cascade_state[layer] = {
