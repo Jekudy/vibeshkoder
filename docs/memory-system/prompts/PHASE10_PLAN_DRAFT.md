@@ -70,6 +70,94 @@ The following decisions are intentionally left open:
 
 ---
 
+## §0a. Refinement Status (Orchestrator B sprint-0b, 2026-05-02)
+
+**RATIFIED PENDING PHASE 6 + PHASE 8 CLOSURE** — design contract approved by
+Orchestrator B sprint-0b on 2026-05-02; **implementation deferred** until ALL of:
+
+1. Orchestrator A confirms Phase 6 (cards) AND Phase 8 (observations) BOTH CLOSED
+   per `ORCHESTRATOR_REGISTRY.md §5` cross-orch dependency table:
+   - "Orch A (Phase 6) → `knowledge_cards` + `card_sources` stable → Orch B (Phase
+     10) graph entity nodes" (Phase 6 closure gate)
+   - "Orch A (Phase 8) → `observations` table → Orch B (Phase 10) graph projection
+     of observations" (Phase 8 closure gate)
+2. `AUTHORIZED_SCOPE.md` updated to add Phase 10 implementation authorization block
+   (currently lists Phase 10 in §"Conditionally authorized: Phase 9, Phase 10
+   (gated)").
+3. This draft promoted from `prompts/PHASE10_PLAN_DRAFT.md` to canonical
+   `docs/memory-system/PHASE10_PLAN.md` per REGISTRY §2 Orch B exclusive write.
+
+### Refinement deltas applied 2026-05-02
+
+- Output-path artifact at line 6 (`/tmp/PHASE10_PLAN_DRAFT.md`) is from the
+  original draft author's tooling; the canonical path on ratification will be
+  `docs/memory-system/PHASE10_PLAN.md`. Not corrected in this refinement — intentional
+  preservation of draft history; will be replaced at promotion time.
+- Required-reading-status §0 lists three "not present" requested files
+  (`PHASE4_PLAN.md`, `prompts/PHASE6_PLAN_DRAFT.md`, `prompts/PHASE8_PLAN_DRAFT.md`).
+  As of 2026-05-02 ratification: `PHASE4_PLAN.md` exists at HEAD (Phase 4 closed
+  2026-04-30); `prompts/PHASE6_PLAN_DRAFT.md` and `prompts/PHASE8_PLAN_DRAFT.md`
+  exist at HEAD (ratified docs-only via PR #160). The "not present" notes are
+  stale historical context preserved as draft provenance.
+- Migration window: §6 / §7 reference T10-* tickets without a hard alembic number
+  range. **Binding constraint:** alembic versions for graph schema MUST be in
+  **050–069** per `ORCHESTRATOR_REGISTRY.md §2 Orch B exclusive write`
+  (specifically scoped after Phase 9 wiki migrations consume the lower end of the
+  range). Implementation-time decision: tentatively **060+** for graph tables to
+  leave headroom for Phase 9 wiki schema migrations in 050–059.
+- Ratification of "Open for ratification" §0.6 list — these 6 decisions are
+  intentionally **left open** at refinement time. Each will be resolved at
+  promotion time (when Phase 6/8 close) and recorded in the canonical PHASE10_PLAN.md
+  Final Report Block:
+  - Decision 1 (graph store): provisionally **Apache AGE** as default (postgres
+    extension; same DB; no new operational service; native cascade integration with
+    `forget_cascade.CASCADE_LAYER_ORDER`). Neo4j / Graphiti remain implementable
+    alternatives but require new ops surface and separate forget-cascade wiring.
+    Final choice deferred to promotion sprint.
+  - Decision 2 (hosting): if AGE → same compose stack (free); if Neo4j/Graphiti →
+    separate service. Coupled to decision 1.
+  - Decision 3 (triple extraction prompts): blocked on Phase 5 LLM gateway
+    closure (Orch A); the prompt template MUST flow through `llm_gateway` per
+    invariant 2.
+  - Decision 4 (update cadence): provisionally **scheduled batch projection** to
+    avoid coupling graph rebuild to live ingestion latency. Real-time hooks
+    deferred to a later optimization phase.
+  - Decision 5 (privacy model): **forget cascade is canonical** — every `forget`
+    event MUST purge graph_nodes / graph_edges in the same transaction layer
+    (per invariant 9 + REGISTRY §2 Shared cascade discipline). Visibility
+    propagates by edge filtering at query time (graph stores raw cards/observations,
+    query layer filters by viewer scope).
+  - Decision 6 (Phase 8 source contract): now resolvable from
+    `prompts/PHASE8_PLAN_DRAFT.md` (present at HEAD); to be reconciled at promotion
+    time with whatever Orch A actually ships.
+
+### Phase 6 + Phase 8 dependency contract (what cards / observations must expose)
+
+When Phase 6 + Phase 8 close, the graph projection service (T10-* in §6) consumes
+these fields. Binding contract for the Phase 6/8 → Phase 10 handoff:
+
+| Field needed by graph | Source (Phase 6/8 owned) | Why graph needs it |
+|----------------------|--------------------------|--------------------|
+| `card.id` + `card.entity_type` | `knowledge_cards` | Node creation: `(card_id, entity_type)` becomes a `graph_node` row |
+| `card_relations.from_card_id`, `to_card_id`, `relation_type` | `card_relations` (Orch A Phase 6) | Edge creation: typed `graph_edge` rows |
+| `card.visibility_scope`, `card.status` | `knowledge_cards` | Visibility filter at projection time + query time; never project `pending` / `rejected` |
+| `card_sources.message_version_id` (for citation back-trace) | `card_sources` | Edge metadata: every projected edge carries source-trace pointer |
+| `observations.subject_card_id`, `predicate`, `object_card_id` | `observations` (Orch A Phase 8) | Triple-shaped observation rows project to graph triples (the original Phase 10 design rationale) |
+| `observations.confidence`, `observations.source_evidence_ids[]` | `observations` | Edge weight + citation backing |
+| `forget_events.tombstone_key` | `forget_events` (existing) | Cascade input: every forget MUST purge derived graph rows |
+
+If Phase 6 / Phase 8 ship with renamed/missing fields, Orch B re-opens this draft
+and adjusts §5 / §7 before promoting to canonical path.
+
+### Implementation gate explicitly deferred
+
+Phase 10 implementation tickets in §6 / §7 (T10-01 through T10-09) MUST NOT be
+picked up until the three pre-conditions above are satisfied. §6 / §7 / §8
+substance remains the binding design contract. Orchestrator B will not open
+implementation PRs on this draft until ratified via promotion to canonical path.
+
+---
+
 ## §1. Invariants verbatim
 
 From `docs/memory-system/HANDOFF.md §1`:

@@ -6,7 +6,7 @@
 **Cycle:** Memory system Phase 9
 **Date:** 2026-04-30
 **Predecessor:** Phase 8 must be closed before Phase 9 begins.
-**Migration window:** tentative 040+; reconcile with actual Phase 4-8 revisions before implementation.
+**Migration window:** **050+** per `ORCHESTRATOR_REGISTRY.md §2 Orchestrator B exclusive write` (corrected from original draft's "040+" by Orch B sprint-0b refinement 2026-05-02; 040–049 belong to Orch A's Phase 5/6/7/8 chain).
 **Critical invariant for this phase:** Public wiki remains disabled until review/source trace/governance are proven.
 
 ---
@@ -34,6 +34,68 @@ TBD — not started.
 - `web/static/style.css`
 
 **Grounding:** HANDOFF §1 says catalog must precede digest/wiki and digest/wiki must reference approved cards/sources. HANDOFF §2 Phase 9 defines the wiki/community catalog scope. ROADMAP phase 9 says public stays disabled. AUTHORIZED_SCOPE marks wiki and public surfaces as not authorized future scope.
+
+---
+
+## §0a. Refinement Status (Orchestrator B sprint-0b, 2026-05-02)
+
+**RATIFIED PENDING PHASE 6 CLOSURE** — design contract approved by Orchestrator B
+sprint-0b on 2026-05-02; **implementation deferred** until ALL of the following:
+
+1. Orchestrator A confirms Phase 6 (knowledge cards + admin review) CLOSED — every
+   T6-* ticket merged, IMPLEMENTATION_STATUS.md reflects, post-merge `pytest -x` on
+   fresh main green, FHR reviewers ACCEPTED. (Per `ORCHESTRATOR_REGISTRY.md §5`,
+   Phase 6 closure is the cross-orch dependency that gates Phase 9 wiki content.)
+2. `AUTHORIZED_SCOPE.md` is updated by human or by Orchestrator A's Phase 6 closing
+   PR to add a "Phase 9 — wiki" authorization block (currently §"Conditionally
+   authorized: Phase 9, Phase 10 (gated)" lists three pre-conditions; this status
+   block satisfies the design refinement pre-condition).
+3. This draft is promoted from `prompts/PHASE9_PLAN_DRAFT.md` to canonical
+   `docs/memory-system/PHASE9_PLAN.md` per `ORCHESTRATOR_REGISTRY.md §2 Orchestrator
+   B exclusive write` (mirrors the Phase 12 promotion pattern from sprint-0a /
+   PR #171).
+
+### Refinement deltas applied 2026-05-02
+
+- Migration window in front-matter corrected: original "040+" → **050+** to match
+  `ORCHESTRATOR_REGISTRY.md §2` (Orch A owns 022–049, Orch B owns 050–069).
+- Web layout discrepancy explicitly logged: spec uses `web/routers/wiki.py`; the
+  existing repo layout uses `web/routes/`. Implementation-time decision; do NOT
+  rewrite the spec ahead of Phase 6 closure since the route module path is a
+  trivial rename. **Resolution:** Wave 1 implementer reconciles this in their first
+  commit (rename `routers` → `routes` if going with existing layout, or vice versa).
+  The §5.A spec carries this as a known discrepancy.
+- Phase 11 numbering conflict — **resolved upstream by Orchestrator C** in commit
+  `8e1e716` (`docs(p11): ratify Phase 11 evals plan + reconcile draft numbering
+  conflict`). Phase 11 = Shkoderbench/evals (canonical); the "expertise pages"
+  draft was deferred. No Phase 9 spec changes required for that reconciliation.
+
+### Phase 6 dependency contract (what cards must expose for wiki)
+
+When Phase 6 closes, the wiki render pipeline (T9-04 / T9-05 in §7) consumes these
+fields from the cards layer. This list is the binding contract Orchestrator B will
+hold Orchestrator A to at the Phase 6 closure handoff:
+
+| Field needed by wiki | Source (Phase 6 owned) | Why wiki needs it |
+|---------------------|------------------------|-------------------|
+| `card.id` (BIGINT) | `knowledge_cards.id` | Page anchor, page-source FK |
+| `card.title` (TEXT) | `knowledge_cards.title` | Page heading + sidebar link text |
+| `card.body` (TEXT) | `knowledge_cards.body` | Page body section |
+| `card.visibility_scope` ENUM(`member`, `admin`) | `knowledge_cards.visibility_scope` | Phase 9 first-gate filter — invariant #3 / #10 binding |
+| `card.status` ENUM (`approved`, `pending`, `rejected`) | `knowledge_cards.status` | Wiki MUST render only `approved`; never `pending` |
+| `card.source_ids[]` → `card_sources.id[]` | `card_sources` table | Citation rendering — citations point to `message_version_id` per invariant #4 |
+| `card.updated_at` (TIMESTAMPTZ) | `knowledge_cards.updated_at` | Page freshness sort + last-updated stamp |
+| `card.created_by_tg_id` (BIGINT) | `knowledge_cards.created_by_tg_id` | Page author attribution |
+
+If Phase 6 ships with field renames or omissions, Orch B re-opens this draft and
+adjusts §5 / §7 before promoting to canonical.
+
+### Implementation gate explicitly deferred
+
+Phase 9 implementation tickets in §6 / §7 (T9-01 through T9-08) MUST NOT be picked
+up until the three pre-conditions above are satisfied. The §6 / §7 / §8 substance
+remains the binding design contract. Orchestrator B will not open implementation
+PRs on this draft until ratified via promotion to canonical path.
 
 ---
 
