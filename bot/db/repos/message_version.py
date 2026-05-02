@@ -57,6 +57,7 @@ class MessageVersionRepo:
         raw_update_id: int | None = None,
         is_redacted: bool = False,
         imported_final: bool = False,
+        captured_at: datetime | None = None,
     ) -> MessageVersion:
         """Idempotent version insert.
 
@@ -68,6 +69,10 @@ class MessageVersionRepo:
         path. Live ingestion leaves it False. The column is denormalised provenance — the
         FK chain ``raw_update_id → telegram_updates.ingestion_run_id → run_type`` remains
         the audit trail. See ``docs/memory-system/import-edit-history.md``.
+
+        ``captured_at`` (hotfix #164): when provided, overrides the PG server_default
+        ``now()``. Required for import paths that preserve the original export timestamp
+        and for eval fixtures that need recency-sensitive ordering.
 
         Concurrency safety: the INSERT is wrapped in a savepoint (``session.begin_nested``).
         If two concurrent callers both pass the ``get_by_hash`` check (TOCTOU window) and
@@ -88,7 +93,7 @@ class MessageVersionRepo:
                     await MessageVersionRepo.get_max_version_seq(session, chat_message_id)
                 ) + 1
 
-                row = MessageVersion(
+                row_kwargs: dict = dict(
                     chat_message_id=chat_message_id,
                     version_seq=next_seq,
                     text=text,
@@ -101,6 +106,10 @@ class MessageVersionRepo:
                     is_redacted=is_redacted,
                     imported_final=imported_final,
                 )
+                if captured_at is not None:
+                    row_kwargs["captured_at"] = captured_at
+
+                row = MessageVersion(**row_kwargs)
                 session.add(row)
                 await session.flush()
         except IntegrityError:

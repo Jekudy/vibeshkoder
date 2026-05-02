@@ -417,3 +417,32 @@ async def test_insert_version_savepoint_branch_reselects_on_integrity_error(
     assert result.id == v1.id
     assert result.version_seq == v1.version_seq
     assert call_count["n"] == 2  # one lie + one real reselect inside except branch
+
+
+# ─── captured_at kwarg (hotfix #164 commit 2) ─────────────────────────────────
+
+
+async def test_insert_version_with_explicit_captured_at_overrides_default(db_session) -> None:
+    """Pass captured_at explicitly → row's captured_at matches the override (not now())."""
+    from bot.db.repos.message_version import MessageVersionRepo
+    from sqlalchemy import select
+    from bot.db.models import MessageVersion
+
+    msg_id = await _make_chat_message(db_session, text="ts override test")
+    override_ts = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    v = await MessageVersionRepo.insert_version(
+        db_session,
+        chat_message_id=msg_id,
+        content_hash="ts-hash",
+        text="ts override test",
+        captured_at=override_ts,
+    )
+
+    # Reload from DB to confirm PG persisted our override (not server_default now())
+    row = (
+        await db_session.execute(select(MessageVersion).where(MessageVersion.id == v.id))
+    ).scalar_one()
+
+    # Compare truncated to seconds to avoid microsecond drift in PG vs Python
+    assert row.captured_at.replace(microsecond=0) == override_ts.replace(microsecond=0)
