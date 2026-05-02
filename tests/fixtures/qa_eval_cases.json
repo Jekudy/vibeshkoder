@@ -14,7 +14,9 @@
       }
     ],
     "expected_evidence_present": true,
-    "expected_chat_message_ids": [1],
+    "expected_chat_message_ids": [
+      1
+    ],
     "notes": "Russian declension match via russian stemmer"
   },
   {
@@ -40,7 +42,10 @@
       }
     ],
     "expected_evidence_present": true,
-    "expected_chat_message_ids": [3, 2],
+    "expected_chat_message_ids": [
+      3,
+      2
+    ],
     "notes": "Equal-rank hits should prefer newer captured_at"
   },
   {
@@ -84,7 +89,9 @@
       }
     ],
     "expected_evidence_present": true,
-    "expected_chat_message_ids": [6],
+    "expected_chat_message_ids": [
+      6
+    ],
     "notes": "Offrecord row excluded; normal row returned"
   },
   {
@@ -129,7 +136,9 @@
       }
     ],
     "expected_evidence_present": true,
-    "expected_chat_message_ids": [8],
+    "expected_chat_message_ids": [
+      8
+    ],
     "notes": "Caption-only messages are searchable evidence"
   },
   {
@@ -147,7 +156,9 @@
       }
     ],
     "expected_evidence_present": true,
-    "expected_chat_message_ids": [9],
+    "expected_chat_message_ids": [
+      9
+    ],
     "notes": "Multi-token query returns the message containing both terms"
   },
   {
@@ -173,7 +184,9 @@
       }
     ],
     "expected_evidence_present": true,
-    "expected_chat_message_ids": [10],
+    "expected_chat_message_ids": [
+      10
+    ],
     "notes": "Search stays scoped to the invocation chat_id"
   },
   {
@@ -227,7 +240,8 @@
     ],
     "expected_evidence_present": false,
     "expected_chat_message_ids": [],
-    "notes": "Message-hash tombstone excludes matching content hash"
+    "notes": "Message-hash tombstone excludes matching content hash",
+    "fixture_source": "legacy_orm"
   },
   {
     "id": "rec_011",
@@ -252,7 +266,9 @@
       }
     ],
     "expected_evidence_present": true,
-    "expected_chat_message_ids": [15],
+    "expected_chat_message_ids": [
+      15
+    ],
     "notes": "Nomem row excluded; normal row returned"
   },
   {
@@ -272,7 +288,8 @@
     ],
     "expected_evidence_present": false,
     "expected_chat_message_ids": [],
-    "notes": "Redacted rows are excluded from evidence"
+    "notes": "Redacted rows are excluded from evidence",
+    "fixture_source": "legacy_orm"
   },
   {
     "id": "imp_001_basic_text",
@@ -289,12 +306,17 @@
         "from_id": "user9001001",
         "text": "импорт тест основного сообщения",
         "text_entities": [
-          {"type": "plain", "text": "импорт тест основного сообщения"}
+          {
+            "type": "plain",
+            "text": "импорт тест основного сообщения"
+          }
         ]
       }
     ],
     "expected_evidence_present": true,
-    "expected_chat_message_ids": [9001],
+    "expected_chat_message_ids": [
+      9001
+    ],
     "notes": "Single text message imported via run_apply → searchable via /recall"
   },
   {
@@ -312,8 +334,14 @@
         "from_id": "user9002001",
         "text": "#offrecord приватно обсуждаем",
         "text_entities": [
-          {"type": "hashtag", "text": "#offrecord"},
-          {"type": "plain", "text": " приватно обсуждаем"}
+          {
+            "type": "hashtag",
+            "text": "#offrecord"
+          },
+          {
+            "type": "plain",
+            "text": " приватно обсуждаем"
+          }
         ]
       }
     ],
