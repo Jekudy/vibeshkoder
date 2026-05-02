@@ -69,26 +69,65 @@ sprint-0b on 2026-05-02; **implementation deferred** until ALL of the following:
   `8e1e716` (`docs(p11): ratify Phase 11 evals plan + reconcile draft numbering
   conflict`). Phase 11 = Shkoderbench/evals (canonical); the "expertise pages"
   draft was deferred. No Phase 9 spec changes required for that reconciliation.
+- **Phase 6 dependency contract corrected** (mid-sprint, before any review): the
+  initial draft of the table cited fictional field names (`card.body`,
+  `card.status` with `pending` value, `card.visibility_scope`, `card.source_ids[]`
+  via a separate `card_sources` table, `card.created_by_tg_id`, `card.id BIGINT`).
+  Reconciled against the actual Phase 6 schema in
+  `prompts/PHASE6_PLAN_DRAFT.md §"032_add_knowledge_cards"`: actual fields are
+  `body_markdown`, `card_status` (`draft`/`approved`/`archived`/`deprecated`),
+  `source_message_version_ids jsonb` (no separate table), `approved_by_user_id`,
+  `id uuid`. Visibility column does NOT exist in Phase 6 — gap explicitly
+  documented below with three resolution options. This correction landed inside
+  the same sprint-0b PR — no separate hotfix; reviewers see only the corrected
+  table.
 
 ### Phase 6 dependency contract (what cards must expose for wiki)
 
 When Phase 6 closes, the wiki render pipeline (T9-04 / T9-05 in §7) consumes these
-fields from the cards layer. This list is the binding contract Orchestrator B will
-hold Orchestrator A to at the Phase 6 closure handoff:
+fields from the cards layer. **Field names in this table are reconciled against the
+actual Phase 6 schema in `prompts/PHASE6_PLAN_DRAFT.md` §"032_add_knowledge_cards"**
+(verified 2026-05-02 during sprint-0b refinement; the original sprint-0b draft of
+this table cited fictional names — see §0a "Refinement deltas applied"):
 
-| Field needed by wiki | Source (Phase 6 owned) | Why wiki needs it |
+| Field needed by wiki | Actual Phase 6 source | Why wiki needs it |
 |---------------------|------------------------|-------------------|
-| `card.id` (BIGINT) | `knowledge_cards.id` | Page anchor, page-source FK |
-| `card.title` (TEXT) | `knowledge_cards.title` | Page heading + sidebar link text |
-| `card.body` (TEXT) | `knowledge_cards.body` | Page body section |
-| `card.visibility_scope` ENUM(`member`, `admin`) | `knowledge_cards.visibility_scope` | Phase 9 first-gate filter — invariant #3 / #10 binding |
-| `card.status` ENUM (`approved`, `pending`, `rejected`) | `knowledge_cards.status` | Wiki MUST render only `approved`; never `pending` |
-| `card.source_ids[]` → `card_sources.id[]` | `card_sources` table | Citation rendering — citations point to `message_version_id` per invariant #4 |
-| `card.updated_at` (TIMESTAMPTZ) | `knowledge_cards.updated_at` | Page freshness sort + last-updated stamp |
-| `card.created_by_tg_id` (BIGINT) | `knowledge_cards.created_by_tg_id` | Page author attribution |
+| `knowledge_cards.id` (uuid) | Phase 6 §"032" L182 | Page anchor + page-source FK in `wiki_pages` |
+| `knowledge_cards.title` (text) | Phase 6 §"032" L183 | Page heading + sidebar link text |
+| `knowledge_cards.body_markdown` (text) | Phase 6 §"032" L184 | Page body content (already markdown — wiki renderer uses directly) |
+| `knowledge_cards.card_status` (`draft`/`approved`/`archived`/`deprecated`) | Phase 6 §"032" L187 | Wiki MUST render only `card_status='approved'`. Phase 6 binding constraint: `card_status!='approved'` rows are not citation-eligible (line 197). |
+| `knowledge_cards.source_message_version_ids` (jsonb) | Phase 6 §"032" L186 | Citation rendering — wiki resolves each `message_version_id` to citation block per invariant #4. **Note:** Phase 6 draft does NOT ship a separate `card_sources` table; sources live inline in this jsonb column. Phase 9 wiki adapts accordingly. |
+| `knowledge_cards.updated_at` (timestamptz) | Phase 6 §"032" L191 | Page freshness sort + last-updated stamp |
+| `knowledge_cards.approved_by_user_id` (bigint, FK `users.id`) | Phase 6 §"032" L188 | Page author/approver attribution. **Note:** Phase 6 ships only `approved_by_user_id`, not a separate `created_by_*` field. If Phase 9 needs author distinct from approver, that requires a Phase 9 schema migration on `knowledge_cards` (additive; within 050–059 window). |
+| `knowledge_cards.approved_at` (timestamptz) | Phase 6 §"032" L189 | Approval timestamp for page metadata |
 
-If Phase 6 ships with field renames or omissions, Orch B re-opens this draft and
-adjusts §5 / §7 before promoting to canonical.
+**GAP — `visibility_scope` not in Phase 6 schema.** Phase 6 §"032" does NOT add a
+`visibility_scope` column to `knowledge_cards`. This is a real design gap relative
+to invariant #3 ("no extraction/search/q&a over `#nomem` / `#offrecord` /
+forgotten") which §1–§10 of this plan repeatedly relies on.
+
+Resolution options for Phase 9 implementation sprint:
+
+1. **Inherit from messages.** Phase 9 wiki visibility derives from
+   `chat_messages.memory_policy` + `chat_messages.is_redacted` of every
+   `message_version_id` listed in `source_message_version_ids`. If ANY source row
+   is redacted/offrecord/forgotten, the card is excluded from wiki rendering. This
+   is the strictest interpretation of invariant #3 and requires no Phase 6 schema
+   change.
+2. **Phase 9 owned migration.** Add `knowledge_cards.visibility_scope` enum
+   (`member` / `admin`) in a Phase 9 migration (050–059). Phase 9 sets default at
+   render time based on source-row visibility (option 1 logic) but allows admin
+   override via review UI (T9-03 in §7).
+3. **Wait on a Phase 6.x amendment.** Defer Phase 9 implementation until Phase 6
+   adds `visibility_scope` natively. Costly — blocks Phase 9 indefinitely on
+   work that is not on Orch A's near-term plan.
+
+Provisional choice: **option 1 at first ratification + option 2 at promotion** —
+implementation-time decision recorded at §0a refinement so future implementer
+doesn't re-litigate. Final choice deferred to promotion sprint.
+
+If Phase 6 ships with further field renames or omissions beyond what is enumerated
+here, Orch B re-opens this draft and adjusts §5 / §7 before promoting to canonical.
 
 ### Implementation gate explicitly deferred
 

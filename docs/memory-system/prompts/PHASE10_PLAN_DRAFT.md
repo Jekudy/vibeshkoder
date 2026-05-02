@@ -93,6 +93,30 @@ Orchestrator B sprint-0b on 2026-05-02; **implementation deferred** until ALL of
   original draft author's tooling; the canonical path on ratification will be
   `docs/memory-system/PHASE10_PLAN.md`. Not corrected in this refinement — intentional
   preservation of draft history; will be replaced at promotion time.
+- **Phase 6 + Phase 8 dependency contract corrected** (mid-sprint, before any
+  external review): the initial sprint-0b draft of the table cited fictional
+  fields and a fictional `card_relations` table. Reconciled:
+  - `card.id BIGINT` → `knowledge_cards.id uuid` (Phase 6 §"032" L182).
+  - `card.entity_type` REMOVED (no such column in Phase 6 schema; if needed,
+    Phase 10 derives entity tagging from `topic_tags` or extraction-time labels).
+  - `card_relations.{from_card_id, to_card_id, relation_type}` REMOVED — Phase 6
+    actual scope (L50 + L326) does NOT ship this table; gap documented as
+    Resolution Option 3 (Phase 10 ships its own `graph_edges` table) — see GAP A.
+  - `card.visibility_scope`, `card.status` → `knowledge_cards.card_status`
+    ('draft','approved','archived','deprecated'); visibility column does NOT exist
+    in Phase 6 — gap documented as GAP C with derivation from
+    `chat_messages.memory_policy` of cited message versions.
+  - `card_sources.message_version_id` (separate table) →
+    `knowledge_cards.source_message_version_ids jsonb` (inline, no separate table).
+  - `observations.subject_card_id, predicate, object_card_id` REMOVED — Phase 8
+    observations are NOT triple-shaped (Phase 8 §"5.A" L198–L218 confirms only
+    `confidence_score`, `topic_tags`, `cited_message_version_ids`, `policy`).
+    Triple derivation deferred to projection-time LLM extraction — see GAP B.
+  - `observations.source_evidence_ids[]` → `observations.cited_message_version_ids
+    jsonb` (Phase 8 §"5.A" L216, line 245 binding constraint).
+  - `forget_events.tombstone_key` → confirmed correct against `bot/db/models.py`
+    L472; also added `target_type` + `target_id` per the actual schema
+    (L460-L461).
 - Required-reading-status §0 lists three "not present" requested files
   (`PHASE4_PLAN.md`, `prompts/PHASE6_PLAN_DRAFT.md`, `prompts/PHASE8_PLAN_DRAFT.md`).
   As of 2026-05-02 ratification: `PHASE4_PLAN.md` exists at HEAD (Phase 4 closed
@@ -134,20 +158,76 @@ Orchestrator B sprint-0b on 2026-05-02; **implementation deferred** until ALL of
 ### Phase 6 + Phase 8 dependency contract (what cards / observations must expose)
 
 When Phase 6 + Phase 8 close, the graph projection service (T10-* in §6) consumes
-these fields. Binding contract for the Phase 6/8 → Phase 10 handoff:
+these fields. **Field names in this table are reconciled against the actual Phase
+6 schema in `prompts/PHASE6_PLAN_DRAFT.md §"032_add_knowledge_cards"` and the
+actual Phase 8 schema in `prompts/PHASE8_PLAN_DRAFT.md §"5.A"`** (verified
+2026-05-02 during sprint-0b refinement; the original sprint-0b draft of this table
+cited fictional triple-shape fields and a `card_relations` table that Phase 6 does
+not ship — see §0a "Refinement deltas applied"):
 
-| Field needed by graph | Source (Phase 6/8 owned) | Why graph needs it |
-|----------------------|--------------------------|--------------------|
-| `card.id` + `card.entity_type` | `knowledge_cards` | Node creation: `(card_id, entity_type)` becomes a `graph_node` row |
-| `card_relations.from_card_id`, `to_card_id`, `relation_type` | `card_relations` (Orch A Phase 6) | Edge creation: typed `graph_edge` rows |
-| `card.visibility_scope`, `card.status` | `knowledge_cards` | Visibility filter at projection time + query time; never project `pending` / `rejected` |
-| `card_sources.message_version_id` (for citation back-trace) | `card_sources` | Edge metadata: every projected edge carries source-trace pointer |
-| `observations.subject_card_id`, `predicate`, `object_card_id` | `observations` (Orch A Phase 8) | Triple-shaped observation rows project to graph triples (the original Phase 10 design rationale) |
-| `observations.confidence`, `observations.source_evidence_ids[]` | `observations` | Edge weight + citation backing |
-| `forget_events.tombstone_key` | `forget_events` (existing) | Cascade input: every forget MUST purge derived graph rows |
+| Field needed by graph | Actual source | Why graph needs it |
+|----------------------|---------------|--------------------|
+| `knowledge_cards.id` (uuid) | Phase 6 §"032" L182 | Node creation: each approved card becomes a `graph_node` row |
+| `knowledge_cards.title`, `body_markdown` | Phase 6 §"032" L183-L184 | Node label + preview; body for triple extraction at projection time |
+| `knowledge_cards.card_status` | Phase 6 §"032" L187 | Visibility filter: project ONLY `card_status='approved'` per Phase 6 binding constraint L197 |
+| `knowledge_cards.source_message_version_ids` (jsonb) | Phase 6 §"032" L186 | Citation back-trace edge metadata — every projected edge carries the originating message_version_id list |
+| `observations.id` (bigint) | Phase 8 §"5.A" L198 | Node creation: each observation becomes an `observation_node` (or projected as edge metadata, decision deferred to promotion sprint) |
+| `observations.cited_message_version_ids` (jsonb) | Phase 8 §"5.A" L216 | Citation back-trace per observation-derived edge |
+| `observations.confidence_score` (numeric 3,2) | Phase 8 §"5.A" L212 | Edge weight + filtering threshold |
+| `observations.topic_tags` (text[]) | Phase 8 §"5.A" L218 | Tag-based clustering / filter |
+| `observations.policy` ('advisory') | Phase 8 §"5.A" L241 | Hard filter: graph projects only `policy='advisory'` (the schema-allowed value). |
+| `forget_events.target_type`, `target_id`, `tombstone_key` | `bot/db/models.py` L460-L472 | Cascade input: every forget event MUST purge derived `graph_nodes` / `graph_edges` rows in the same cascade transaction layer per invariant 9 + REGISTRY §2 Shared `CASCADE_LAYER_ORDER` discipline |
 
-If Phase 6 / Phase 8 ship with renamed/missing fields, Orch B re-opens this draft
-and adjusts §5 / §7 before promoting to canonical path.
+**GAP A — `card_relations` table NOT in Phase 6 actual scope.** HANDOFF.md
+aspirational text references `card_relations` (quoted at Phase 6 draft L50), but
+the actual Phase 6 ratified schema in `prompts/PHASE6_PLAN_DRAFT.md §"5.A
+Migrations 030-033"` ships only `extraction_runs`, `memory_candidates`,
+`knowledge_cards`, `extraction_decisions`. There is no `card_relations` table at
+Phase 6 closure. This is a real gap relative to the original Phase 10 design
+ambition of "typed edges between cards".
+
+Resolution options for Phase 10 implementation sprint:
+
+1. **Derive triples from card body via LLM extraction.** When Phase 5 LLM gateway
+   is closed (Orch A), graph projection runs an LLM extraction pass over each
+   `card.body_markdown` to produce structured `(subject, predicate, object)`
+   triples. Citations stay anchored to the source `message_version_id` list. This
+   is what original Phase 10 §6 "triple extraction" stream actually plans
+   regardless of `card_relations` existence.
+2. **Phase 6.x amendment.** Wait for a future Phase 6 amendment (or a separate
+   Phase 6.5 ticket) to add `card_relations` natively. Costly — blocks Phase 10
+   on work not on Orch A's roadmap.
+3. **Phase 10 owned migration.** Phase 10 ships a `card_relations`-equivalent
+   table inside its own 060–069 migration window, populated by extraction-pass
+   output (option 1). Avoids cross-orch coupling.
+
+Provisional choice (recorded at §0a refinement): **option 1 + option 3 combined**
+— Phase 10 ships its own `graph_edges` table (within 060+) populated by triple
+extraction over `card.body_markdown` via Phase 5 gateway. This is consistent with
+ADR-0005 (graph as projection, not truth) and avoids waiting on a Phase 6
+amendment.
+
+**GAP B — `observations` are NOT triple-shaped.** The original sprint-0b draft of
+this table claimed `observations.subject_card_id`, `predicate`, `object_card_id`
+fields. These fields DO NOT EXIST in `prompts/PHASE8_PLAN_DRAFT.md §"5.A"`. Real
+observations are free-form narrative (no fixed subject/predicate/object schema)
+with `confidence_score`, `topic_tags`, and `cited_message_version_ids`.
+
+Resolution: Phase 10 graph projection of observations uses the same LLM extraction
+pattern as cards (Gap A option 1) — extract triples from observation narratives at
+projection time, attach citations from `observations.cited_message_version_ids`.
+The free-form text remains the canonical observation; graph triples are derived
+projection artifacts (consistent with ADR-0005).
+
+**GAP C — `visibility_scope` not in Phase 6 schema.** Same gap as Phase 9 §0a
+documents. Phase 10 graph follows the same resolution: derive visibility from
+source-row `chat_messages.memory_policy` + `is_redacted` of every cited
+`message_version_id`. If any source is redacted/offrecord/forgotten, the derived
+graph node/edge is excluded.
+
+If Phase 6 / Phase 8 ship with further field renames or omissions beyond what is
+enumerated here, Orch B re-opens this draft and adjusts §5 / §7 / §8 before
+promoting to canonical path.
 
 ### Implementation gate explicitly deferred
 
