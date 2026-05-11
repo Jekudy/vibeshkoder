@@ -18,7 +18,6 @@ import pytest_asyncio
 from sqlalchemy import select
 
 from bot.db.models import ChatMessage, ForgetEvent, MessageVersion, QaTrace
-from bot.db.repos.qa_trace import QaTraceRepo
 from bot.services.eval_runner import run_eval_recall
 from tests.evals.conftest import SEED_CHAT_ID, Seed
 
@@ -156,8 +155,15 @@ class TestCitationInvariants:
     ) -> None:
         assert mv_ids, "Pre-condition: bundle must have at least one evidence item"
 
-        # Write a qa_trace the same way the production handler does.
-        trace = await QaTraceRepo.create(
+        # Call the SAME `_write_trace` helper the production handler uses
+        # (bot/handlers/qa.py::_write_trace) — guarantees C4 catches a future
+        # divergence between handler trace-write and bundle.evidence_ids.
+        # If a refactor changes the helper signature or the persisted shape,
+        # this test fails immediately rather than silently letting the
+        # synthetic duplication drift.
+        from bot.handlers.qa import _write_trace
+
+        await _write_trace(
             eval_db_session,
             user_tg_id=_CITATION_USER_TG_ID,
             chat_id=SEED_CHAT_ID,
@@ -170,9 +176,13 @@ class TestCitationInvariants:
 
         # Reload from DB to verify persistence (not just ORM cache).
         persisted = await eval_db_session.scalar(
-            select(QaTrace).where(QaTrace.id == trace.id)
+            select(QaTrace)
+            .where(QaTrace.user_tg_id == _CITATION_USER_TG_ID)
+            .where(QaTrace.chat_id == SEED_CHAT_ID)
+            .order_by(QaTrace.id.desc())
+            .limit(1)
         )
-        assert persisted is not None, "QaTrace row was not persisted"
+        assert persisted is not None, "QaTrace row was not persisted via handler helper"
         assert sorted(persisted.evidence_ids) == sorted(mv_ids), (
             f"qa_traces.evidence_ids={persisted.evidence_ids!r} does not match "
             f"bundle.evidence_ids={mv_ids!r}"
