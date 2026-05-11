@@ -53,6 +53,7 @@ from decimal import Decimal
 from typing import Any, Literal, Protocol
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.evidence import EvidenceBundle
@@ -688,13 +689,53 @@ async def synthesize_answer(
         tokens_in=provider_result.tokens_in,
         tokens_out=provider_result.tokens_out,
     )
-    await cache_repo.store(
-        session,
-        input_hash=cache_input_hash,
-        answer_text=provider_result.answer_text,
-        citation_ids=list(provider_result.citation_ids),
-        model=config.model,
-    )
+    # F4-RACE-FIX (Codex round-2 HIGH-2): cache store may race with a
+    # concurrent winner that also dispatched between unlock and store. The
+    # ``input_hash`` UNIQUE constraint catches the duplicate; we treat it as
+    # an effective cache hit and surface the existing row's answer. Wasteful
+    # extra provider call (rare under flag-default-OFF), but no crash and
+    # cache row remains canonical. Real Postgres exercises this; unit tests
+    # validate the code shape via FakeCacheRepo's IntegrityError-on-duplicate
+    # behaviour.
+    try:
+        await cache_repo.store(
+            session,
+            input_hash=cache_input_hash,
+            answer_text=provider_result.answer_text,
+            citation_ids=list(provider_result.citation_ids),
+            model=config.model,
+        )
+    except IntegrityError:
+        # Another concurrent call beat us to STORE. Re-fetch and return that
+        # row as the canonical answer; record this call's ledger row as a
+        # cache_hit so cost accounting reflects we DID make a provider call
+        # but lost the cache-store race.
+        existing = await cache_repo.get_or_none(
+            session, input_hash=cache_input_hash
+        )
+        if existing is not None:
+            latency = int((time.monotonic() - started) * 1000)
+            await ledger_repo.update_placeholder(
+                session,
+                llm_call_id=placeholder_row.id,
+                cost_usd=cost_usd,
+                response_hash=_response_hash(existing.answer_text),
+                tokens_in=provider_result.tokens_in,
+                tokens_out=provider_result.tokens_out,
+                request_id=provider_result.request_id,
+                latency_ms=latency,
+                error="cache_store_race_loser",
+            )
+            return AnswerWithCitations(
+                answer_text=existing.answer_text,
+                citation_ids=tuple(existing.citation_ids),
+                cost_usd=cost_usd,
+                cache_hit=False,  # provider was called; we just lost the store race
+                llm_call_id=placeholder_row.id,
+            )
+        # Race-recovery itself failed: re-raise so the outer handler can
+        # surface an Abstention via the unknown-error path.
+        raise
     latency = int((time.monotonic() - started) * 1000)
     await ledger_repo.update_placeholder(
         session,
