@@ -119,11 +119,19 @@ tests/fixtures/golden_recall/
     queries.jsonl                       ← {query, expected_message_version_ids[], expected_abstain: bool}
     seed_meta.yaml                      ← seed_id, version, hash, governance markers manifest
 
-tests/fixtures/eval_seeds/
-  leakage_offrecord.jsonl               ← messages with #offrecord; queries that would surface them
-  leakage_nomem.jsonl                   ← #nomem markers
-  leakage_forgotten.jsonl               ← forget_events tombstone fixtures
-  refusal_no_evidence.jsonl             ← queries with no ground-truth in seed
+tests/fixtures/eval_seeds/  (RESERVED — see note below)
+  leakage_offrecord.jsonl               ← (planned) messages with #offrecord
+  leakage_nomem.jsonl                   ← (planned) #nomem markers
+  leakage_forgotten.jsonl               ← (planned) forget_events tombstone fixtures
+  refusal_no_evidence.jsonl             ← (planned) queries with no ground-truth
+
+# NOTE 2026-05-11: leakage / refusal negative fixtures shipped as INLINE
+# Python helpers (see tests/evals/test_leakage.py::_create_case and
+# tests/evals/test_refusal.py::CONTENT_TRUNCATE_SQL) rather than as separate
+# JSONL files. The eval_seeds/ directory is RESERVED for the externalised
+# fixture migration (follow-up); the privacy-allowlist globs in
+# scripts/lint_privacy_check.sh already cover these paths so the move is
+# friction-free when needed.
 
 .github/workflows/evals.yml             ← nightly cron + manual dispatch; gate: secrets.EVAL_HARNESS_ENABLED == 'true'
 ```
@@ -180,7 +188,7 @@ For each query in `golden_recall/seed_v1/queries.jsonl` with `expected_message_v
 - `recall@K = |returned[:K] ∩ expected| / |expected|`
 - `precision@K = |returned[:K] ∩ expected| / K`
 
-**K ∈ {1, 3, 5}.** Baseline thresholds **set after first run** (no fictional thresholds — establish empirically). Test fails if metric drops below baseline minus a tolerance band (defined in `seed_meta.yaml`).
+**K ∈ {1, 3, 5}.** Baseline thresholds frozen in `seed_meta.yaml::baseline_thresholds` (recall@K_min, precision@K_min, abstain_rate_max). `test_recall_precision.py::TestRecallPrecision` parses the YAML and **fails** the test if any per-K mean drops below floor or the abstain rate exceeds ceiling (T11-W2-04 closer wired this enforcement; cleanup PR #222 added the actual assertions — initial implementation in PR #205 had a smoke-only `assert >= 0.0` placeholder).
 
 ### §5.5 Determinism (`tests/evals/test_determinism.py` — Wave 1)
 

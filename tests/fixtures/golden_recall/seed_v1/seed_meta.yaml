@@ -22,4 +22,7 @@ baseline_thresholds:
   precision_at_3_min: 0.03
   precision_at_5_min: 0.02
   # Observed: 0.125 / 0.125 / 0.125 / 0.125 / 0.042 / 0.025.
-  abstain_rate_max: 1.0  # effectively no upper bound on abstain — seed needs quality work
+  # abstain ceiling = observed (7/8 = 0.875) + 5% buffer. Tighter than 1.0 so a
+  # regression that pushes abstain to 8/8 fails immediately; loose enough to
+  # absorb normal Phase 4 FTS noise within seed_v1 (known seed-quality, #219).
+  abstain_rate_max: 0.92
