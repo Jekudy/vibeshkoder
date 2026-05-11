@@ -31,7 +31,7 @@ class PersistedMessage:
     user_id: int
 
 
-@pytest_asyncio.fixture()
+@pytest_asyncio.fixture(loop_scope="class")
 async def leakage_session(eval_db_session: AsyncSession) -> AsyncIterator[AsyncSession]:
     await _clear_leakage_tables(eval_db_session)
     yield eval_db_session
