@@ -286,7 +286,7 @@ async def _create_case(
         await session.flush()
         event = await forget_event_repo.ForgetEventRepo.create(
             session,
-            target_type="content_hash",
+            target_type="message_hash",
             target_id=version.content_hash,
             actor_user_id=None,
             authorized_by="system",
