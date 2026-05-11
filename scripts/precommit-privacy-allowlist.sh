@@ -19,6 +19,10 @@ is_allowed_path() {
   [[ "$path" =~ ^tests/services/test_governance\.py$ ]] && return 0
   [[ "$path" =~ ^tests/handlers/.*test_chat_messages.*\.py$ ]] && return 0
   [[ "$path" =~ ^tests/handlers/test_qa\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/handlers/test_qa_llm_synthesis\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/handlers/test_qa_recall_phase4_preserved\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/services/test_forget_cascade\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/services/test_llm_gateway\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_ingestion.*\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_import_apply\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_message_persistence\.py$ ]] && return 0
