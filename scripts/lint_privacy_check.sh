@@ -12,6 +12,8 @@ is_allowed_path() {
   [[ "$path" =~ ^bot/services/governance\.py$ ]] && return 0
   [[ "$path" =~ ^bot/services/message_persistence\.py$ ]] && return 0
   [[ "$path" =~ ^bot/services/forget_cascade\.py$ ]] && return 0
+  [[ "$path" =~ ^bot/services/llm_gateway\.py$ ]] && return 0
+  [[ "$path" =~ ^bot/services/llm_providers/.*\.py$ ]] && return 0
   [[ "$path" =~ ^bot/handlers/edited_message\.py$ ]] && return 0
   [[ "$path" =~ ^bot/db/models\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_governance\.py$ ]] && return 0
