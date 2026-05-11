@@ -263,8 +263,12 @@ async def _create_case(
     if case_id == "L3b":
         # L3b — tombstone by `message_hash:<content_hash>` key.
         # Production search.py uses this branch when forget targets a content
-        # fingerprint rather than a specific (chat, message_id) tuple. Persist
-        # via the handler path (same as L1/L2) so content_hash is populated.
+        # fingerprint rather than a specific (chat, message_id) tuple.
+        # Note: ChatMessage.content_hash is nullable and not auto-populated by
+        # the current ingestion pipeline (message_persistence only stores it on
+        # MessageVersion). We mirror what tests/evals/conftest.py does and copy
+        # the v1 hash onto the chat_message row so the search.py
+        # `c.content_hash IS NOT NULL` branch is exercised.
         forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
         created = await _persist_via_handler(
             session,
@@ -273,16 +277,20 @@ async def _create_case(
             text_value="забываемая тау люкс",
         )
         chat_message = await session.get(ChatMessage, created.chat_message_id)
-        assert chat_message is not None and chat_message.content_hash, (
-            "L3b precondition: chat_message must have a populated content_hash"
+        assert chat_message is not None, "L3b: chat_message must persist"
+        version = await session.get(MessageVersion, created.version_id)
+        assert version is not None and version.content_hash, (
+            "L3b precondition: message_version must have a populated content_hash"
         )
+        chat_message.content_hash = version.content_hash
+        await session.flush()
         event = await forget_event_repo.ForgetEventRepo.create(
             session,
             target_type="content_hash",
-            target_id=chat_message.content_hash,
+            target_id=version.content_hash,
             actor_user_id=None,
             authorized_by="system",
-            tombstone_key=f"message_hash:{chat_message.content_hash}",
+            tombstone_key=f"message_hash:{version.content_hash}",
         )
         await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="processing")
         await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="completed")
