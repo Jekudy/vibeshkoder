@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import yaml
+
 from bot.services.eval_metrics import precision_at_k, recall_at_k
 from bot.services.eval_runner import run_eval_recall
 from bot.services.eval_seeds import (
@@ -31,12 +33,23 @@ pytestmark = [
 ]
 
 SEED_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "golden_recall" / "seed_v1"
+SEED_META = SEED_DIR / "seed_meta.yaml"
 SEED_CHAT_ID = -1001234567890
 
 
 @pytest.fixture(scope="module")
 def seed_spec() -> SeedSpec:
     return load_seed_spec(SEED_DIR, seed_id="golden_recall_v1", version=1)
+
+
+@pytest.fixture(scope="module")
+def baseline_thresholds() -> dict[str, float]:
+    with SEED_META.open("r", encoding="utf-8") as fh:
+        meta = yaml.safe_load(fh) or {}
+    thresholds = meta.get("baseline_thresholds")
+    if not isinstance(thresholds, dict):
+        pytest.fail(f"{SEED_META}: missing or invalid baseline_thresholds map")
+    return {k: float(v) for k, v in thresholds.items()}
 
 
 async def _measure_query(
@@ -61,6 +74,7 @@ class TestRecallPrecision:
         eval_db_session: AsyncSession,
         seed_spec: SeedSpec,
         seed_local_id_map: dict[str, int],
+        baseline_thresholds: dict[str, float],
         k: int,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -100,9 +114,22 @@ class TestRecallPrecision:
             for qid, r, p in per_query:
                 print(f"  {qid}: recall={r:.3f} precision={p:.3f}")
 
-        # Smoke-only floors — kept loose until T11-W2-04 freezes baseline.
-        assert mean_recall >= 0.0
-        assert mean_precision >= 0.0
+        # Enforce frozen baseline_thresholds from seed_meta.yaml (per T11-W2-04).
+        # If a regression in Phase 4 FTS drops mean_recall below the floor, fail
+        # immediately rather than silently passing.
+        recall_floor = baseline_thresholds[f"recall_at_{k}_min"]
+        precision_floor = baseline_thresholds[f"precision_at_{k}_min"]
+        abstain_max = baseline_thresholds.get("abstain_rate_max", 1.0)
+        observed_abstain_rate = abstain_count / len(answerable) if answerable else 0.0
+        assert mean_recall >= recall_floor, (
+            f"mean_recall@{k}={mean_recall:.3f} below frozen floor {recall_floor:.3f}"
+        )
+        assert mean_precision >= precision_floor, (
+            f"mean_precision@{k}={mean_precision:.3f} below frozen floor {precision_floor:.3f}"
+        )
+        assert observed_abstain_rate <= abstain_max, (
+            f"abstain rate {observed_abstain_rate:.3f} above ceiling {abstain_max:.3f}"
+        )
 
     async def test_abstain_queries_actually_abstain(
         self,

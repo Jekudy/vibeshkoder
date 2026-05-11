@@ -67,15 +67,22 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev,healing]"
 
+      - name: Run database migrations
+        run: alembic upgrade head
+
       - name: Run evals
         shell: bash
         run: |
           : > eval_results.jsonl
-          if [ -d tests/evals ] && [ -n "$(find tests/evals -name 'test_*.py' -print -quit)" ]; then
-            EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 tests/evals/ --jsonl-report=eval_results.jsonl || true
-          else
-            echo "tests/evals/ not yet populated - skipping eval run"
+          if [ ! -d tests/evals ] || [ -z "$(find tests/evals -name 'test_*.py' -print -quit)" ]; then
+            echo "tests/evals/ not yet populated — skipping eval run"
+            exit 0
           fi
+          # NOTE: structured eval_results.jsonl emitter is a follow-up (see
+          # docs/memory-system/eval-results-schema.md). For now we run the
+          # privacy binding suite and fail the job on real pytest failure —
+          # NO `|| true` masking. CI green = privacy invariants hold.
+          EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 tests/evals/
 
       - name: Upload eval results
         if: always()
