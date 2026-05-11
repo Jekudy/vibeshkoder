@@ -31,7 +31,7 @@ phase 0 safety
 | 2b| Telegram Desktop import — apply            | Authorized: DONE 2026-04-29 | gate passed: tombstones + policy detection + apply + rollback net (#104) + Final Holistic Review hotfix (PR #143) |
 | 3 | Governance (`#nomem` / `#offrecord` / `/forget` / tombstones) | SKELETON DONE 2026-04-29 (T3-01..T3-05 merged in Phase 2 wave Charlie) | forbidden content excluded from future search/extraction/import           |
 | 4 | Hybrid search + Q&A with citations         | NO          | bot answers from evidence only or refuses; no LLM general knowledge       |
-| 5 | LLM gateway + extraction (events / observations / candidates) | NO  | every LLM call logged in ledger; no forbidden source sent to LLM          |
+| 5 | LLM gateway + answer synthesis (synthesis-first slice)        | **DONE 2026-05-11** (Orch A; canonical plan: `PHASE5_PLAN.md`; closure PR pending) | every LLM call logged in ledger; no forbidden source sent to LLM; flag-OFF Phase 4 byte-for-byte preserved (T5-W0-01..T5-05 merged; FHR ACCEPTED; extraction tables deferred to Phase 8 per §2 ratification) |
 | 6 | Knowledge cards + admin review             | NO          | active card requires source + admin approval                              |
 | 7 | Daily summaries                            | NO          | every bullet has source; forgotten source redacts bullet                  |
 | 8 | Weekly digest                              | NO          | reviewed sourced sections; no auto-publish                                |

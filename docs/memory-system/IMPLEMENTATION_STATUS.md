@@ -306,7 +306,41 @@ All drafts open with 🚧 DRAFT — NOT AUTHORIZED banner; cite HANDOFF §1 inva
 | T5-02 | 1 | Alembic 024 — `llm_usage_ledger` + `llm_synthesis_cache` schema — GitHub: #198 | merged | Stream B. Shipped via **PR #207** (commit `5fcd99b`). ORM in `bot/db/models.py::LlmUsageLedger` (line 761) + `LlmSynthesisCache` (line 816). 19 schema tests. |
 | T5-03 | 2 | `LedgerRepo` + `SynthesisCacheRepo` async repos — GitHub: #199 | merged | Shipped via **PR #223** (commit `18c98893`). 4 methods on each repo (incl. `update_placeholder` per §12.2 REVISED + `invalidate_by_citation` JSONB `@>` with SQLite portable fallback). 17 tests. PAR: Claude critic ACCEPTED + Codex round-2 APPROVE (after fix `e5bc5ea` for rollback proof + SQLite hydration hygiene + bump_hit ts advance). |
 | T5-04 | 2 | `/recall` LLM synthesis + `qa_traces` extension (alembic 025) + new cascade layers in `forget_cascade.py` — GitHub: #200 | merged | Shipped via **PR #226** (commit `43f21ee`). 7 commits: alembic 025 + QaTrace ORM ext + LlmUsageLedger.prompt_hash nullable + QaTraceRepo.update_llm_fields + llm_pricing.py + gateway `_estimate_cost` wired + `prompt_template_version` v0.1.0→v1.0.0 + qa.py 4-step ORDER + flag `memory.qa.llm_synthesis.enabled` (default FALSE; Phase 4 byte-for-byte preserved when OFF) + forget_cascade 3 new layers (synthesis_cache FIRST → qa_traces_llm → llm_usage_ledger). 27 new tests + 4 byte-identity + 1 integration. PAR: Claude critic ACCEPTED (4 stop signals clear); Codex 2 rounds REQUEST_CHANGES → fixes `c5b5c38` + `33248e2` + `d6b2c51` (lint-privacy allowlist). Stall recovery executed: prior deep-implementer dispatch stalled 100min; orchestrator salvaged partial work into 3 atomic commits + narrower handler dispatch succeeded. |
-| T5-05 | 3 | Eval harness extension + integration fixtures — GitHub: #201 | not started | Phase 11 coordination point with Orchestrator C. Real-gateway integration opt-in via `RUN_LLM_INTEGRATION=1`. Wave 3 next; FHR required before Phase 5 CLOSED per superflow Rule 9. |
+| T5-05 | 3 | Eval harness extension + integration fixtures — GitHub: #201 | merged | Shipped via **PR #229** (commit `5faea1d`). 8 fixture cases per contracts.md §9 + mocked unit evals (9 in-CI + 1 opt-in real-gateway smoke). Stabilized PKs 7005/7008 for cache-hit + happy-path. Phase 11 (Orch C) consumes fixture VERBATIM (cross-orch contract per REGISTRY §5). PAR: Claude `deep-code-reviewer` ACCEPTED + Codex round-2 APPROVE (after fix `3a11f1f` for fixture-verbatim consumption + prompt_template_version v1.0.0 alignment). Carryover M-1: `qa_trace_id=None` type drift — gateway robust per ledger FK nullable; tighten in Phase 6 kickoff. |
+
+## Phase 5 — **CLOSED 2026-05-11**
+
+All 6 implementation tickets merged. **FHR Claude `deep-product-reviewer` (Opus) ACCEPTED** with 0 CRITICAL / 0 HIGH / 4 MEDIUM carryovers (documented below).
+
+Phase 5 ships the **synthesis-first slice** of LLM gateway per ratified PHASE5_PLAN.md §2:
+- `bot/services/llm_gateway.py` (885 LOC) — `synthesize_answer` + 7 pre-call invariants + provider abstraction (Anthropic + OpenAI) + DB-backed cache + budget guard with lock-released-before-HTTP placeholder pattern + categorized error handling + citation enforcement
+- `bot/services/llm_providers/{anthropic,openai}.py` + `bot/services/observability.py::emit_stop_signal`
+- `bot/services/llm_pricing.py` — MODEL_PRICING (Haiku 4.5 $1/$5 + gpt-4o-mini $0.15/$0.60)
+- `bot/db/models.py::LlmUsageLedger / LlmSynthesisCache / QaTrace` (extended)
+- `bot/db/repos/llm_*.py` — 4 methods each (flush-only)
+- `alembic 023/024/025` — backfill + ledger/cache + qa_traces LLM ext
+- `bot/handlers/qa.py` — 4-step ORDER (CREATE trace → synthesize → UPDATE fields → render) + flag `memory.qa.llm_synthesis.enabled` default OFF + flag-OFF Phase 4 byte-for-byte preservation
+- `bot/services/forget_cascade.py` — 3 new layers in BINDING ORDER (`_cascade_llm_synthesis_cache` FIRST → `_cascade_qa_traces_llm` → `_cascade_llm_usage_ledger`)
+- `tests/eval/test_qa_llm_eval_cases.py` + `tests/fixtures/qa_llm_eval_cases.json` (8 cases for Phase 11 handoff)
+
+**Privacy invariants verified end-to-end:**
+- #2 (no LLM outside gateway) — `tests/evals/test_no_llm_imports.py` 4-test suite green on main
+- #3 (no offrecord/forgotten through) — gateway STEP_SOURCE_FILTER + STEP_FORGET_INVALIDATION_GATE (3-key tombstone) + cache-FIRST cascade layer
+- #9 (tombstones durable) — `_cascade_llm_usage_ledger` NULLs PII (`prompt_hash`/`response_hash`) while preserving budget aggregates (`cost_usd`/`tokens`/`latency_ms`)
+
+**Phase 11 (Orch C) cross-orch binding ACTIVE**: T11-W2-04 baseline frozen 2026-05-11; nightly `evals.yml` runs leakage/citations/refusal/no_llm_imports tests.
+
+**FHR carryovers (documented):**
+- **M-1** (Phase 6 kickoff): tighten `bot/services/llm_gateway.py::synthesize_answer` annotation `qa_trace_id: int` → `int | None` OR add runtime `assert qa_trace_id is not None` at function entry. Gateway is currently robust to None (ledger FK nullable) but contracts.md §3.1 says REQUIRED.
+- **M-2** (closure PR — this commit): contracts.md §3.4 + §3.6 + §5.1 field-name drift `daily_usd_ceiling` → `daily_ceiling_usd` (impl shipped `daily_ceiling_usd`).
+- **M-3** (closure PR — this commit): `tests/fixtures/qa_llm_eval_cases.json` — runtime-seeded convention documented for cases with `evidence_message_version_ids=[]` (eval-002/003/004/006/007).
+- **M-4** (Phase 6 kickoff): add direct `_cascade_qa_traces_llm` + `_cascade_llm_synthesis_cache` `message_hash` sub-case tests with `llm_response_summary` NULL assertions.
+
+Plus L-1..L-4 cosmetic carryovers (N+1 perf, alembic 025 `import hashlib` placement, etc.).
+
+**Carryovers from per-PR PAR reviews (documented in `.par-evidence.json`):**
+- contracts.md §5.1+§10.1+§12.2 update_placeholder return type drift (-> None vs -> int rowcount).
+- contracts.md §12.3 update_llm_fields return type drift (-> None vs -> rowcount + LookupError note).
 
 ## Phases 6–12
 
