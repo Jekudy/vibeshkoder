@@ -37,7 +37,7 @@ phase 0 safety
 | 8 | Weekly digest                              | NO          | reviewed sourced sections; no auto-publish                                |
 | 9 | Wiki (member / internal)                   | NO          | visibility filter + governance + source trace; public stays disabled      |
 | 10| Graph projection (Neo4j / Graphiti)        | NO          | derived only; rebuildable from postgres; forget purges graph              |
-| 11| Shkoderbench / evals                       | Authorized: in progress 2026-05-02 (Orch C; canonical plan: `PHASE11_PLAN.md`) | leakage / citation / no-answer / no-LLM-imports tests in CI nightly        |
+| 11| Shkoderbench / evals                       | **DONE 2026-05-11** (Orch C; canonical plan: `PHASE11_PLAN.md`; baseline frozen at T11-W2-04) | leakage / citation / no-answer / no-LLM-imports tests in CI nightly (`evals.yml` + `lint-privacy.yml`) |
 | 12| Future butler — design-only                | NO          | docs only; no execution code                                              |
 
 ## Phase gates (must be true to advance)

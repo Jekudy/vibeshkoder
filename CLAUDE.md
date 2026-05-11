@@ -34,6 +34,20 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 
 ## Memory System Cycle (active 2026-04-26+)
 
+**Phase 11 (Shkoderbench / evaluation harness) CLOSED 2026-05-11** — Wave 1
+(eval harness skeleton: runner, seeds module, metrics, fixture, gated CI
+workflow, privacy allowlist gate, determinism + smoke + AST no-LLM-imports
+tests) + Wave 2 round 1 (leakage L1-L5, citations C1-C4, refusal R1-R4)
+merged as 10 PRs. Baseline thresholds frozen at T11-W2-04 (commit `bc98bbd`)
+in `tests/fixtures/golden_recall/seed_v1/seed_meta.yaml`. `EVAL_HARNESS_ENABLED`
+secret flipped ON; nightly `evals.yml` workflow runs the privacy binding suite
+(`tests/evals/test_leakage.py` / `test_citations.py` / `test_refusal.py` /
+`test_no_llm_imports.py`). Binding **ACTIVE** for Orch A's Phase 5 closure —
+see `ORCHESTRATOR_REGISTRY.md §5` and `PHASE11_PLAN.md §8.1`.
+
+Known follow-up: seed_v1 produces 7/8 abstain rate on Phase 4 FTS — separate
+seed-quality issue. Privacy invariant gates work regardless.
+
 Phase 1 closed 2026-04-27. Phase 2 (importer + governance skeleton) **CLOSED 2026-04-29** —
 20/20 issues merged across 4 parallel stream worktrees (Alpha/Bravo/Charlie/Delta) +
 Final Holistic Review hotfix (PR #143). Phase 3 governance skeleton (T3-01..T3-05) merged
