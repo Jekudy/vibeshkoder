@@ -181,7 +181,7 @@ async def migrated_database_url(temp_database_url: str) -> AsyncIterator[str]:
 async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str) -> None:
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
 
-    assert current == "023"
+    assert current == "024"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(
