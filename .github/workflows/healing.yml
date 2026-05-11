@@ -37,9 +37,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Set up Python venv (system python; setup-python@v5 has no prebuilt for Ubuntu 25.10)
+        run: |
+          python3 --version
+          python3 -m venv /tmp/healing-venv
+          /tmp/healing-venv/bin/pip install --upgrade pip
+          echo "/tmp/healing-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install dependencies
         run: pip install -e ".[dev,healing]"
