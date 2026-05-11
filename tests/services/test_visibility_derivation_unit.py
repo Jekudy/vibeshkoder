@@ -396,3 +396,151 @@ def test_visibility_derivation_blocking_ids_is_tuple():
         reason="test",
     )
     assert isinstance(result.blocking_source_ids, tuple)
+
+
+# ─── 5. classify_visibility pure function tests ───────────────────────────────
+
+
+def _make_version_row(
+    version_id: int,
+    memory_policy: str = "normal",
+    is_redacted: bool = False,
+    content_hash: str | None = "abc",
+    chat_id: int | None = -100,
+    message_id: int | None = 1,
+    user_id: int | None = 42,
+):
+    """Helper to create a _VersionRow for use in classify_visibility tests."""
+    from bot.services.visibility_derivation import _VersionRow
+
+    return _VersionRow(
+        version_id=version_id,
+        content_hash=content_hash,
+        chat_id=chat_id,
+        message_id=message_id,
+        user_id=user_id,
+        memory_policy=memory_policy,
+        is_redacted=is_redacted,
+    )
+
+
+def test_classify_visibility_all_visible():
+    """All VersionRows with normal policy, not redacted, no tombstones → VISIBLE."""
+    from bot.services.visibility_derivation import CardVisibility, classify_visibility
+
+    versions = [
+        _make_version_row(1, memory_policy="normal"),
+        _make_version_row(2, memory_policy="normal"),
+    ]
+    result = classify_visibility(versions, matched_tombstone_keys=set())
+    assert result.visibility == CardVisibility.VISIBLE
+    assert result.blocking_source_ids == ()
+    assert "visible" in result.reason
+
+
+def test_classify_visibility_offrecord_blocks():
+    """One VersionRow with memory_policy='offrecord' → REDACTED, blocking_ids contains that id."""
+    from bot.services.visibility_derivation import CardVisibility, classify_visibility
+
+    versions = [
+        _make_version_row(10, memory_policy="offrecord"),
+        _make_version_row(11, memory_policy="normal"),
+    ]
+    result = classify_visibility(versions, matched_tombstone_keys=set())
+    assert result.visibility == CardVisibility.REDACTED
+    assert 10 in result.blocking_source_ids
+    assert 11 not in result.blocking_source_ids
+    assert "offrecord" in result.reason
+
+
+def test_classify_visibility_redacted_flag_blocks():
+    """One VersionRow with is_redacted=True → REDACTED."""
+    from bot.services.visibility_derivation import CardVisibility, classify_visibility
+
+    versions = [_make_version_row(20, is_redacted=True)]
+    result = classify_visibility(versions, matched_tombstone_keys=set())
+    assert result.visibility == CardVisibility.REDACTED
+    assert 20 in result.blocking_source_ids
+
+
+def test_classify_visibility_nomem_blocks():
+    """One VersionRow with memory_policy='nomem', none redacted → NOMEM."""
+    from bot.services.visibility_derivation import CardVisibility, classify_visibility
+
+    versions = [
+        _make_version_row(30, memory_policy="nomem"),
+        _make_version_row(31, memory_policy="normal"),
+    ]
+    result = classify_visibility(versions, matched_tombstone_keys=set())
+    assert result.visibility == CardVisibility.NOMEM
+    assert 30 in result.blocking_source_ids
+    assert 31 not in result.blocking_source_ids
+
+
+def test_classify_visibility_tombstone_blocks():
+    """matched_tombstone_keys non-empty and matches a version → FORGOTTEN."""
+    from bot.services.visibility_derivation import CardVisibility, classify_visibility
+
+    # version_id=40 has content_hash="deadbeef" → key "message_hash:deadbeef" matches
+    versions = [
+        _make_version_row(40, memory_policy="normal", content_hash="deadbeef"),
+    ]
+    result = classify_visibility(versions, matched_tombstone_keys={"message_hash:deadbeef"})
+    assert result.visibility == CardVisibility.FORGOTTEN
+    assert 40 in result.blocking_source_ids
+    # reason should name one of the matched tombstone key formats
+    assert "message_hash" in result.reason
+
+
+def test_classify_visibility_precedence_redacted_over_nomem():
+    """One version REDACTED + another NOMEM → result is REDACTED (not NOMEM)."""
+    from bot.services.visibility_derivation import CardVisibility, classify_visibility
+
+    versions = [
+        _make_version_row(50, memory_policy="offrecord"),  # → REDACTED
+        _make_version_row(51, memory_policy="nomem"),       # → NOMEM
+    ]
+    result = classify_visibility(versions, matched_tombstone_keys=set())
+    assert result.visibility == CardVisibility.REDACTED
+
+
+def test_classify_visibility_precedence_nomem_over_forgotten():
+    """One NOMEM version + a matched tombstone → result is NOMEM (NOMEM > FORGOTTEN)."""
+    from bot.services.visibility_derivation import CardVisibility, classify_visibility
+
+    # version 60: nomem (no tombstone keys for it)
+    # version 61: normal, but matched tombstone → FORGOTTEN
+    versions = [
+        _make_version_row(60, memory_policy="nomem", content_hash=None, chat_id=None,
+                          message_id=None, user_id=None),
+        _make_version_row(61, memory_policy="normal", content_hash="abc61",
+                          chat_id=-100, message_id=61, user_id=None),
+    ]
+    result = classify_visibility(versions, matched_tombstone_keys={"message_hash:abc61"})
+    assert result.visibility == CardVisibility.NOMEM
+
+
+def test_classify_visibility_blocking_ids_multiple():
+    """5 versions, 3 REDACTED → blocking_source_ids tuple has all 3 ids in sorted order."""
+    from bot.services.visibility_derivation import CardVisibility, classify_visibility
+
+    versions = [
+        _make_version_row(70, memory_policy="offrecord"),  # blocking
+        _make_version_row(71, memory_policy="normal"),
+        _make_version_row(72, memory_policy="offrecord"),  # blocking
+        _make_version_row(73, memory_policy="normal"),
+        _make_version_row(74, memory_policy="forgotten"),  # → REDACTED (forgotten policy)
+    ]
+    result = classify_visibility(versions, matched_tombstone_keys=set())
+    assert result.visibility == CardVisibility.REDACTED
+    assert result.blocking_source_ids == (70, 72, 74)
+
+
+def test_classify_visibility_empty_versions():
+    """Empty versions list → VISIBLE, empty blocking_ids, reason mentions 'no cited sources'."""
+    from bot.services.visibility_derivation import CardVisibility, classify_visibility
+
+    result = classify_visibility([], matched_tombstone_keys=set())
+    assert result.visibility == CardVisibility.VISIBLE
+    assert result.blocking_source_ids == ()
+    assert "no cited sources" in result.reason

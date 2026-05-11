@@ -58,6 +58,7 @@ def _build_tombstone_keys(
         keys.append(f"user:{from_user_id}")
     return keys
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,6 +120,149 @@ def _classify_version(
     return CardVisibility.VISIBLE
 
 
+@dataclass(frozen=True)
+class _VersionRow:
+    """Pure-data row representing a fetched message_version + joined chat_messages fields.
+
+    Internal carrier: converts SQLAlchemy Row objects into a plain frozen dataclass
+    so that classify_visibility() can be called without a session.
+
+    Both ver_is_redacted and parent_is_redacted are preserved separately to allow
+    classify_visibility to pass them independently to _classify_version (matching the
+    original derive_card_visibility inline logic exactly).
+    """
+
+    version_id: int
+    content_hash: str | None
+    chat_id: int | None
+    message_id: int | None
+    user_id: int | None
+    memory_policy: str  # 'normal' | 'nomem' | 'offrecord' | 'forgotten' | etc.
+    # is_redacted is the version-level flag (message_versions.is_redacted)
+    is_redacted: bool
+    # parent_is_redacted is the chat_messages-level flag (chat_messages.is_redacted)
+    parent_is_redacted: bool = False
+
+
+async def _fetch_versions(
+    session: AsyncSession,
+    cited_message_version_ids: list[int],
+) -> list[_VersionRow]:
+    """Fetch message_versions JOIN chat_messages for the given version IDs.
+
+    Returns a list of _VersionRow with all fields needed for classify_visibility().
+    Single SQL query; no N+1.
+    """
+    stmt = (
+        select(
+            MessageVersion.id.label("ver_id"),
+            MessageVersion.content_hash.label("ver_content_hash"),
+            MessageVersion.is_redacted.label("ver_is_redacted"),
+            ChatMessage.memory_policy.label("parent_policy"),
+            ChatMessage.is_redacted.label("parent_is_redacted"),
+            ChatMessage.chat_id.label("parent_chat_id"),
+            ChatMessage.message_id.label("parent_message_id"),
+            ChatMessage.user_id.label("parent_user_id"),
+        )
+        .join(ChatMessage, MessageVersion.chat_message_id == ChatMessage.id)
+        .where(MessageVersion.id.in_(cited_message_version_ids))
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        _VersionRow(
+            version_id=row.ver_id,
+            content_hash=row.ver_content_hash,
+            chat_id=row.parent_chat_id,
+            message_id=row.parent_message_id,
+            user_id=row.parent_user_id,
+            memory_policy=row.parent_policy,
+            is_redacted=row.ver_is_redacted,
+            parent_is_redacted=row.parent_is_redacted,
+        )
+        for row in rows
+    ]
+
+
+async def _fetch_matched_tombstones(
+    session: AsyncSession,
+    all_keys: list[str],
+) -> set[str]:
+    """Return the subset of all_keys that exist in forget_events.tombstone_key.
+
+    Single IN query regardless of key count. Returns empty set when all_keys is empty.
+    """
+    if not all_keys:
+        return set()
+    tomb_stmt = select(ForgetEvent.tombstone_key).where(
+        ForgetEvent.tombstone_key.in_(all_keys)
+    )
+    tomb_rows = (await session.execute(tomb_stmt)).scalars().all()
+    return set(tomb_rows)
+
+
+def classify_visibility(
+    versions: list[_VersionRow],
+    matched_tombstone_keys: set[str],
+) -> VisibilityDerivation:
+    """Pure function: given fetched version rows + matched tombstone keys, compute
+    precedence-resolved visibility + blocking_ids + reason.
+
+    NO session access. Fully unit-testable with synthetic inputs.
+
+    Args:
+        versions: List of _VersionRow from _fetch_versions() (or synthetic in tests).
+        matched_tombstone_keys: Set of tombstone keys active in forget_events
+                                (from _fetch_matched_tombstones() or synthetic in tests).
+
+    Returns:
+        VisibilityDerivation with the strictest visibility found across all sources.
+    """
+    if not versions:
+        return VisibilityDerivation(
+            visibility=CardVisibility.VISIBLE,
+            blocking_source_ids=(),
+            reason="no cited sources",
+        )
+
+    worst: CardVisibility = CardVisibility.VISIBLE
+    blocking: list[int] = []
+    # Track which tombstone keys actually matched for audit reason string.
+    matched_keys_found: set[str] = set()
+
+    for v in versions:
+        row_keys = _build_tombstone_keys(
+            content_hash=v.content_hash,
+            chat_id=v.chat_id,
+            message_id=v.message_id,
+            from_user_id=v.user_id,
+        )
+        row_matches = matched_tombstone_keys & set(row_keys)
+        has_tombstone = bool(row_matches)
+        if has_tombstone:
+            matched_keys_found.update(row_matches)
+
+        classification = _classify_version(
+            ver_is_redacted=v.is_redacted,
+            parent_memory_policy=v.memory_policy,
+            parent_is_redacted=v.parent_is_redacted,
+            has_tombstone=has_tombstone,
+        )
+
+        if _POLICY_RANK[classification] > _POLICY_RANK[CardVisibility.VISIBLE]:
+            blocking.append(v.version_id)
+
+        if _POLICY_RANK[classification] > _POLICY_RANK[worst]:
+            worst = classification
+
+    matched_keys_list = sorted(matched_keys_found)
+    reason = _build_reason(worst, blocking, len(versions), len(versions), matched_keys_list)
+    return VisibilityDerivation(
+        visibility=worst,
+        blocking_source_ids=tuple(sorted(blocking)),
+        reason=reason,
+    )
+
+
 async def derive_card_visibility(
     session: AsyncSession,
     cited_message_version_ids: list[int],
@@ -142,87 +286,30 @@ async def derive_card_visibility(
             reason="no cited sources; artifact is unconstrained",
         )
 
-    # Step 1: Fetch versions + parent chat_messages data in one query.
-    # We join chat_messages to get memory_policy, is_redacted, and the fields
-    # needed to build all three tombstone key formats (chat_id, message_id, user_id).
-    stmt = (
-        select(
-            MessageVersion.id.label("ver_id"),
-            MessageVersion.content_hash.label("ver_content_hash"),
-            MessageVersion.is_redacted.label("ver_is_redacted"),
-            ChatMessage.memory_policy.label("parent_policy"),
-            ChatMessage.is_redacted.label("parent_is_redacted"),
-            ChatMessage.chat_id.label("parent_chat_id"),
-            ChatMessage.message_id.label("parent_message_id"),
-            ChatMessage.user_id.label("parent_user_id"),
-        )
-        .join(ChatMessage, MessageVersion.chat_message_id == ChatMessage.id)
-        .where(MessageVersion.id.in_(cited_message_version_ids))
-    )
-    rows = (await session.execute(stmt)).all()
+    # Step 1: Fetch versions + parent chat_messages data.
+    versions = await _fetch_versions(session, cited_message_version_ids)
 
-    # Step 2: Build all tombstone keys for all rows (3 formats per message_version),
+    # Step 2: Build all tombstone keys for all versions (3 formats per message_version),
     # then do a SINGLE forget_events lookup covering all key formats in one IN query.
     # Production formats (HANDOFF §10, forget_cascade.py, forget_reply.py, forget_me.py):
     #   message_hash:{sha256}         — content-level redact
     #   message:{chat_id}:{message_id} — /forget_reply handler
     #   user:{tg_id}                  — /forget_me handler
     all_tombstone_keys: list[str] = []
-    for row in rows:
+    for v in versions:
         all_tombstone_keys.extend(
             _build_tombstone_keys(
-                content_hash=row.ver_content_hash,
-                chat_id=row.parent_chat_id,
-                message_id=row.parent_message_id,
-                from_user_id=row.parent_user_id,
+                content_hash=v.content_hash,
+                chat_id=v.chat_id,
+                message_id=v.message_id,
+                from_user_id=v.user_id,
             )
         )
 
-    active_tombstones: set[str] = set()
-    if all_tombstone_keys:
-        tomb_stmt = select(ForgetEvent.tombstone_key).where(
-            ForgetEvent.tombstone_key.in_(all_tombstone_keys)
-        )
-        tomb_rows = (await session.execute(tomb_stmt)).scalars().all()
-        active_tombstones = set(tomb_rows)
+    matched = await _fetch_matched_tombstones(session, all_tombstone_keys)
 
-    # Step 3: Classify each version and track blocking sources.
-    worst: CardVisibility = CardVisibility.VISIBLE
-    blocking: list[int] = []
-
-    for row in rows:
-        row_keys = _build_tombstone_keys(
-            content_hash=row.ver_content_hash,
-            chat_id=row.parent_chat_id,
-            message_id=row.parent_message_id,
-            from_user_id=row.parent_user_id,
-        )
-        has_tombstone = bool(active_tombstones & set(row_keys))
-        classification = _classify_version(
-            ver_is_redacted=row.ver_is_redacted,
-            parent_memory_policy=row.parent_policy,
-            parent_is_redacted=row.parent_is_redacted,
-            has_tombstone=has_tombstone,
-        )
-
-        if _POLICY_RANK[classification] > _POLICY_RANK[CardVisibility.VISIBLE]:
-            blocking.append(row.ver_id)
-
-        if _POLICY_RANK[classification] > _POLICY_RANK[worst]:
-            worst = classification
-
-    # Step 4: Build reason string for audit log.
-    # Collect matched tombstone keys for audit trail specificity.
-    matched_keys = sorted(active_tombstones & set(all_tombstone_keys))
-    reason = _build_reason(
-        worst, blocking, len(rows), len(cited_message_version_ids), matched_keys
-    )
-
-    return VisibilityDerivation(
-        visibility=worst,
-        blocking_source_ids=tuple(sorted(blocking)),
-        reason=reason,
-    )
+    # Step 3: Delegate all classification + precedence + reason logic to classify_visibility().
+    return classify_visibility(versions, matched)
 
 
 def _build_reason(
