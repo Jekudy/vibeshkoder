@@ -117,10 +117,12 @@ Phase 5 MAY introduce extension hooks (e.g., a generic provider abstraction insi
               │   4. cache lookup (AFTER forget gate so no stale         │
               │      forgotten content can be served from cache)         │
               │     → cache hit: write ledger(cache_hit=True), return    │
-              │   5. PRE-call budget guard (atomic via                   │
-              │      pg_advisory_xact_lock + placeholder ledger row)     │
+              │   5. PRE-call budget guard via                           │
+              │      pg_advisory_lock/unlock (session-scoped) +          │
+              │      placeholder ledger row INSERT; unlock BEFORE HTTP   │
               │   6. provider dispatch (anthropic | openai)              │
-              │   7. citation enforcement (citations ⊆ bundle ids)       │
+              │   7. citation enforcement (citations ⊆ surviving_ids,    │
+              │      i.e. post-source-filter set)                        │
               │   • write/update llm_usage_ledger row (success | error)  │
               │   • on forget event hit: invalidate cache row + abstain  │
               └──────────────────────────────────────────────────────────┘
@@ -194,7 +196,7 @@ async def synthesize_answer(
    - `tombstone_key = 'user:' || user_id`
    If any tombstone matches → `SynthesisCacheRepo.invalidate_by_citation(message_version_id)` for affected rows + `Abstention(reason='forget_invalidated')`. Closes Codex HIGH 3 (was previously checking only `message:` keys).
 4. **Cache lookup** — input hash = `sha256(query_normalized || sorted(citation_ids) || model_id || prompt_template_version)`. Lookup runs AFTER step 3 so a cached row cannot serve forgotten content. Cache hit → write ledger row with `cache_hit=True`, `qa_trace_id` set, return cached `AnswerWithCitations` with new `llm_call_id`. NO provider call. NO cost.
-5. **Budget guard (atomic)** — wrap the read-and-decide in a single transaction: `SELECT pg_advisory_xact_lock(LLM_BUDGET_LOCK_ID); SELECT daily_cost_usd, monthly_cost_usd FROM llm_usage_ledger ...`. Cost-row reservation: write ledger row with `error='budget_exceeded'` IF over ceiling, else write a *placeholder* row with `cost_usd=0, error=NULL` BEFORE provider dispatch. Provider-return path UPDATEs the placeholder with actual cost. Closes Codex MEDIUM 1 (was non-atomic; concurrent calls could all pass the read before any commit). `LLM_BUDGET_LOCK_ID` = deterministic int64 derived from `sha256("llm_budget_guard")`.
+5. **Budget guard (session-scoped lock; unlock BEFORE HTTP)** — wrap the read-and-decide in a session-scoped advisory-lock window so the lock is RELEASED before the 5-15s provider HTTP call (otherwise bursts globally serialize on the same lock id): `SELECT pg_advisory_lock(LLM_BUDGET_LOCK_ID); SELECT daily_cost_usd, monthly_cost_usd FROM llm_usage_ledger ...; INSERT INTO llm_usage_ledger (placeholder row, cost_usd=0, error=NULL) RETURNING id; SELECT pg_advisory_unlock(LLM_BUDGET_LOCK_ID);`. Cost-row reservation: if cost-check exceeds ceiling write ledger row with `error='budget_exceeded'` and abstain (still under lock); else write placeholder row BEFORE unlock. Provider-return path UPDATEs the placeholder via `LedgerRepo.update_placeholder(id, cost_usd, response_hash, tokens_in, tokens_out, request_id, latency_ms, error)` with actual values. `LLM_BUDGET_LOCK_ID` = deterministic int64 derived from `sha256("llm_budget_guard")`. **Known Wave 1 limitation:** placeholder INSERT may not be visible to concurrent readers between unlock and outer-tx commit (Postgres read-committed isolation); T5-04 integration test MUST exercise burst load and either savepoint-commit inside the lock window OR move placeholder INSERT to a dedicated short-lived connection. Closes Codex round-1 MED-1 + Claude critic round-2 CRITICAL-1 (round-1 `pg_advisory_xact_lock` pattern held the lock through HTTP).
 6. **Provider dispatch + categorized error handling** — `config.provider` selects implementation; default `anthropic` with `claude-haiku-4-5-20251001`. Provider errors are categorized (closes Codex MEDIUM 2):
    - **Transient** (`rate_limit`, `timeout`, `5xx`, `connection_reset`) → caught, ledger row UPDATEs with `error='provider_transient:<subtype>'`, return `Abstention(reason='provider_error')`. NEVER raise. Same as previous behavior.
    - **Structural** (`auth`, `bad_request`, `contract_violation`, `model_not_found`) → caught, ledger row UPDATEs with `error='provider_structural:<subtype>'`, log at ERROR level with full exception, **emit stop signal** via `bot.services.observability.emit_stop_signal("llm_provider_structural")`, return `Abstention(reason='provider_error')`. Operator alerted; cycle keeps going (no raise into `/recall` handler — invariant #1 gatekeeper preservation), but a structural error means provider config is broken — must trip a human-visible alarm.
