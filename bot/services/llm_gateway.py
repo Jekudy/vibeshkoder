@@ -854,19 +854,37 @@ async def _budget_check(
 def _estimate_cost(
     *, config: LLMGatewayConfig, tokens_in: int, tokens_out: int
 ) -> Decimal:
-    """Pricing stub. T5-04 wires real per-model pricing tables.
+    """Real per-model pricing via ``bot.services.llm_pricing.MODEL_PRICING``.
 
-    For T5-01, we charge a deterministic non-zero amount so the budget
-    guard tests can verify cost accumulation. Production cost computation
-    lands with the per-model table in T5-04. ``config`` is accepted so the
-    T5-04 swap (which will read a per-model rate keyed on
-    ``config.model``) is a pure-signature-compatible replacement; for the
-    stub the parameter is intentionally unused. F8 closure — kept on the
-    signature rather than removed because the T5-04 model-rate lookup
-    needs the same shape.
+    T5-04 wires this up — the previous placeholder ``Decimal("0.000001") *
+    total_tokens`` is gone. Pricing table per contracts.md §12.6:
+
+    * ``claude-haiku-4-5-20251001`` — input $1.00, output $5.00 per 1M tokens
+    * ``gpt-4o-mini`` — input $0.15, output $0.60 per 1M tokens
+
+    On unknown ``config.model``: log a structural error, emit the
+    ``llm_provider_structural`` stop signal so an operator notices the
+    misconfiguration, and return ``Decimal("0")`` so the call doesn't crash.
+    The gateway already categorises the abstention at the outer error layer.
+    Adding a stop signal here (rather than raising) preserves the
+    gatekeeper-immune invariant (#1 HANDOFF §1).
     """
-    _ = config  # F8: documented unused — T5-04 reads config.model.
-    return Decimal("0.000001") * (tokens_in + tokens_out)
+    from bot.services.llm_pricing import estimate_cost
+
+    try:
+        return estimate_cost(
+            model=config.model, tokens_in=tokens_in, tokens_out=tokens_out
+        )
+    except KeyError:
+        logger.error(
+            "llm_gateway: model not in MODEL_PRICING table model=%s",
+            config.model,
+        )
+        # Lazy import — observability stays optional at module load time.
+        from bot.services import observability
+
+        observability.emit_stop_signal("llm_provider_structural")
+        return Decimal("0")
 
 
 __all__ = [
