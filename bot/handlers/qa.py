@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from aiogram import Router
@@ -14,10 +16,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import settings
 from bot.db.models import TelegramUpdate
 from bot.db.repos.feature_flag import FeatureFlagRepo
+from bot.db.repos.llm_synthesis_cache import SynthesisCacheRepo
+from bot.db.repos.llm_usage_ledger import LedgerRepo
 from bot.db.repos.qa_trace import QaTraceRepo
 from bot.db.repos.user import UserRepo
 from bot.services.evidence import EvidenceBundle
 from bot.services.governance import detect_policy
+from bot.services.llm_gateway import (
+    AnswerWithCitations,
+    LLMGatewayConfig,
+    synthesize_answer,
+)
+from bot.services.llm_providers import LLMProvider
+from bot.services.llm_providers.anthropic import (
+    DEFAULT_ANTHROPIC_MODEL,
+    AnthropicProvider,
+)
+from bot.services.llm_providers.openai import DEFAULT_OPENAI_MODEL, OpenAIProvider
 from bot.services.message_persistence import persist_message_with_policy
 from bot.services.qa import run_qa
 
@@ -26,6 +41,11 @@ logger = logging.getLogger(__name__)
 router = Router(name="qa")
 
 QA_FEATURE_FLAG = "memory.qa.enabled"
+LLM_SYNTHESIS_FEATURE_FLAG = "memory.qa.llm_synthesis.enabled"
+
+# Default prompt template version per contracts.md §12.5 ratification.
+# Stays in sync with whatever ``_build_prompt`` ships in the gateway today.
+DEFAULT_PROMPT_TEMPLATE_VERSION = "v1.0.0"
 
 
 def _short_chat_id(chat_id: int) -> str:
@@ -78,6 +98,89 @@ def _format_response(bundle: EvidenceBundle, users_by_id: dict[int, object]) -> 
             f"<code>message_version_id:{item.message_version_id}</code>"
         )
     return "\n\n".join(parts)
+
+
+def _load_gateway_config() -> LLMGatewayConfig:
+    """Resolve LLM gateway config from env vars with sane defaults.
+
+    Reads:
+      * ``LLM_PROVIDER`` (default ``"anthropic"``) — gateway provider tag.
+      * ``LLM_MODEL`` (provider-specific default) — model id passed to
+        ``MODEL_PRICING`` and the provider SDK.
+      * ``LLM_DAILY_USD_CEILING`` (default ``Decimal("5.00")``).
+      * ``LLM_MONTHLY_USD_CEILING`` (default ``Decimal("50.00")``).
+
+    ``prompt_template_version`` is the ``v1.0.0`` baseline introduced
+    with T5-04b — see ``bot/services/llm_pricing.py`` + contracts.md §12.5.
+    """
+    provider = os.environ.get("LLM_PROVIDER", "anthropic")
+    if provider not in ("anthropic", "openai"):
+        # Reject typos early; the gateway expects a Literal["anthropic","openai"].
+        raise ValueError(f"unknown provider: {provider}")
+
+    default_model = (
+        DEFAULT_OPENAI_MODEL if provider == "openai" else DEFAULT_ANTHROPIC_MODEL
+    )
+    model = os.environ.get("LLM_MODEL", default_model)
+    daily = Decimal(os.environ.get("LLM_DAILY_USD_CEILING", "5.00"))
+    monthly = Decimal(os.environ.get("LLM_MONTHLY_USD_CEILING", "50.00"))
+    return LLMGatewayConfig(
+        provider=provider,  # type: ignore[arg-type]  # validated above
+        model=model,
+        daily_ceiling_usd=daily,
+        monthly_ceiling_usd=monthly,
+        prompt_template_version=DEFAULT_PROMPT_TEMPLATE_VERSION,
+    )
+
+
+def _resolve_provider(provider_name: str) -> LLMProvider:
+    """Instantiate Anthropic or OpenAI provider per config.
+
+    Raises ``ValueError`` on unknown ``provider_name``. The handler catches
+    every exception from the LLM-synthesis branch and falls back to the
+    Phase 4 rendering path, so a misconfigured provider never crashes the
+    bot — but it does abstain from synthesis.
+    """
+    if provider_name == "anthropic":
+        return AnthropicProvider()
+    if provider_name == "openai":
+        return OpenAIProvider()
+    raise ValueError(f"unknown provider: {provider_name}")
+
+
+def _format_synthesized_response(
+    answer: AnswerWithCitations,
+    bundle: EvidenceBundle,
+    users_by_id: dict[int, object],
+) -> str:
+    """HTML reply for a synthesized answer with citation footer.
+
+    Layout::
+
+        <synthesized answer — HTML-escaped>
+
+        <b>Источники:</b>
+        [1] {date} — {author}: {snippet}
+        [2] ...
+
+    The footer enumerates ``bundle.items`` in bundle order so citation
+    markers ``[N]`` in the synthesized text deterministically resolve to
+    the same evidence row. ``answer.citation_ids`` is NOT used to drive
+    the footer because the v1.0.0 prompt template does not yet emit
+    structured citation markers — F5 (gateway) keeps citation_ids tied to
+    surviving evidence so the cascade can invalidate them, but the
+    user-facing layout reuses the Phase 4 evidence list verbatim.
+    """
+    answer_text = html.escape(answer.answer_text, quote=False)
+    parts = [answer_text, "", "<b>Источники:</b>"]
+    for idx, item in enumerate(bundle.items, start=1):
+        author_name = _author_name(
+            users_by_id.get(item.user_id) if item.user_id else None
+        )
+        date_text = _format_date(item.message_date)
+        snippet = _safe_headline(item.snippet)
+        parts.append(f"[{idx}] {date_text} — {author_name}: {snippet}")
+    return "\n".join(parts)
 
 
 async def _write_trace(
@@ -193,6 +296,93 @@ async def recall_handler(
         if author is not None:
             users_by_id[item.user_id] = author
 
+    # Phase 5 LLM synthesis branch — only when flag ON AND bundle non-empty.
+    # When the flag is OFF (or bundle empty), execution falls through to the
+    # byte-for-byte Phase 4 path below (contracts.md §6.2).
+    if (
+        await FeatureFlagRepo.get(session, LLM_SYNTHESIS_FEATURE_FLAG)
+        and not result.bundle.abstained
+        and len(result.bundle.evidence_ids) > 0
+    ):
+        # BINDING 4-step ORDER per contracts.md §6.1. Tested in
+        # tests/handlers/test_qa_llm_synthesis.py.
+        #
+        # Step 1: Create QaTrace FIRST so the gateway can populate
+        # llm_usage_ledger.qa_trace_id from the start of the call. This
+        # makes the §8 cascade layers join correctly via either FK
+        # direction.
+        trace = await QaTraceRepo.create(
+            session,
+            user_tg_id=message.from_user.id,
+            chat_id=message.chat.id,
+            query=query,
+            evidence_ids=result.bundle.evidence_ids,
+            abstained=False,
+            redact_query=result.query_redacted,
+        )
+
+        # Step 2: dispatch synthesize_answer with required qa_trace_id +
+        # DI deps. Any exception (provider misconfig, transport bug,
+        # gateway invariant breach) is caught here so the handler NEVER
+        # crashes the bot — the fallback path renders the Phase 4 reply.
+        # The qa_traces row remains intact with LLM columns NULL so the
+        # audit log shows "tried synthesis, dispatch failed". No
+        # update_llm_fields call is issued (no ledger row to point at).
+        try:
+            cfg = _load_gateway_config()
+            provider = _resolve_provider(cfg.provider)
+            synth_result = await synthesize_answer(
+                session,
+                bundle=result.bundle,
+                query=query,
+                config=cfg,
+                qa_trace_id=trace.id,
+                ledger_repo=LedgerRepo(),
+                cache_repo=SynthesisCacheRepo(),
+                provider=provider,
+            )
+        except Exception:
+            logger.exception(
+                "llm_synthesis_dispatch_failed; falling back to Phase 4 path",
+                extra={"qa_trace_id": trace.id, "chat_id": message.chat.id},
+            )
+            await message.reply(
+                _format_response(result.bundle, users_by_id),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+
+        # Step 3: UPDATE QaTrace with LLM fields. Touches ONLY the 4
+        # Phase 5 columns (query_text / evidence_ids / abstained /
+        # query_redacted stay untouched per contracts.md §6.1 + §12.3).
+        await QaTraceRepo.update_llm_fields(
+            session,
+            qa_trace_id=trace.id,
+            llm_call_id=synth_result.llm_call_id,
+            llm_response_summary=getattr(synth_result, "answer_text", None),
+            llm_response_redacted=False,
+            cost_usd=synth_result.cost_usd,
+        )
+
+        # Step 4: render the AnswerWithCitations template OR fall back to
+        # the Phase 4 evidence list on Abstention.
+        if isinstance(synth_result, AnswerWithCitations):
+            reply_text = _format_synthesized_response(
+                synth_result, result.bundle, users_by_id
+            )
+        else:
+            reply_text = _format_response(result.bundle, users_by_id)
+        await message.reply(
+            reply_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    # Flag OFF (or bundle empty) → Phase 4 byte-for-byte path (UNCHANGED).
+    # Do NOT refactor or reformat this block — tested by
+    # tests/handlers/test_qa_recall_phase4_preserved.py.
     await message.reply(
         _format_response(result.bundle, users_by_id),
         parse_mode="HTML",
