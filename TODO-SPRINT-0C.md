@@ -42,12 +42,15 @@ code creates THREE tombstone formats:
 
 ### Self-reported 38-passing claim is unverifiable without Postgres
 
-**Status: RESOLVED** — commit `6123e33` (2026-05-02).
+**Status: RESOLVED** — commit `6123e33` (2026-05-02). Fix iterated — coverage now ≥70%
+in unit mode via `classify_visibility` extraction. Commit: `5e4983e`.
 
 **Problem was:** All tests depended on `db_session` fixture (real Postgres). In CI
 without Postgres, 37/38 tests silently skipped — coverage dropped to 34%.
+Second iteration: unit coverage was still only 50% because classification logic was
+inline inside the async orchestration body of `derive_card_visibility`.
 
-**Fix applied:**
+**Fix applied (iteration 1 — commit `6123e33`):**
 1. Split into `test_visibility_derivation_unit.py` (26 pure-function tests, no Postgres)
    and existing `test_visibility_derivation.py` with all DB-backed tests marked
    `@pytest.mark.integration` (31 integration tests + 1 enum test that stays unmarked).
@@ -55,11 +58,22 @@ without Postgres, 37/38 tests silently skipped — coverage dropped to 34%.
 3. `pytest tests/services/ -m "not integration"` → **27 passed, 0 skipped** (no DB needed).
 4. `pytest tests/services/ -m integration` → requires Postgres; all 37 integration tests run.
 
+**Fix applied (iteration 2 — commit `5e4983e`, coverage ≥70%):**
+1. Extracted `_VersionRow` frozen dataclass — pure-data carrier for fetched rows.
+2. Extracted `classify_visibility(versions, matched_tombstone_keys) -> VisibilityDerivation`
+   — pure function with no session. All precedence resolution, blocking_ids, reason logic.
+3. Extracted `_fetch_versions()` and `_fetch_matched_tombstones()` — thin async SQL helpers.
+4. `derive_card_visibility` now delegates to all three: fetch → classify.
+5. Added 9 new unit tests in `test_visibility_derivation_unit.py` covering classify_visibility
+   directly: all-visible, offrecord/nomem/tombstone blocks, precedence matrix, multiple blocking
+   ids, empty versions.
+6. Unit coverage: **83%** (was 50%). Async fetchers + derive_card_visibility stay uncovered
+   in unit mode (expected — require real Postgres).
+
 **Verification:**
 ```
-pytest tests/services/test_visibility_derivation.py tests/services/test_visibility_derivation_unit.py \
-  -m "not integration" -v
-# → 27 passed, 37 deselected in 0.81s
+pytest tests/services/test_visibility_derivation_unit.py --cov=bot.services.visibility_derivation --cov-report=term-missing
+# → 35 passed, 83% coverage
 ```
 
 ---
