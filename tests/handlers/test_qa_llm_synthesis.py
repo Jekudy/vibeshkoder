@@ -618,5 +618,77 @@ async def test_end_to_end_happy_path_with_fake_provider(monkeypatch) -> None:
     assert message.reply.call_args.kwargs["disable_web_page_preview"] is True
 
 
+async def test_step_ordering_with_real_db_session_proves_trace_flushed_before_synth(
+    db_session, monkeypatch
+) -> None:
+    """Integration-level proof: QaTrace row is fetchable via SELECT against the
+    real DB session at the moment synthesize_answer is invoked. This complements
+    the mock-level call_order recorder by hitting the actual DB, closing Codex
+    round-2 MEDIUM (mock-only proof was insufficient).
+
+    QaTraceRepo.create is NOT monkeypatched — it runs against the real db_session
+    and flushes a real row. The synthesize_answer replacement does a live SELECT
+    via the same session and asserts the row is present. db_session fixture rolls
+    back the outer transaction at teardown so no data leaks between tests.
+    """
+    from bot.db.models import QaTrace
+    from bot.services.llm_gateway import AnswerWithCitations
+    from sqlalchemy import select
+
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+
+    captured: dict[str, Any] = {}
+
+    async def real_db_synth(
+        session,
+        *,
+        bundle,
+        query,
+        config,
+        qa_trace_id,
+        ledger_repo,
+        cache_repo,
+        provider,
+    ):
+        result = await session.execute(
+            select(QaTrace).where(QaTrace.id == qa_trace_id)
+        )
+        row = result.scalar_one_or_none()
+        captured["trace_in_db_at_synth"] = row is not None
+        captured["trace_id_received"] = qa_trace_id
+        captured["trace_evidence_ids"] = list(row.evidence_ids) if row else None
+        return AnswerWithCitations(
+            answer_text="ok",
+            citation_ids=tuple(bundle.evidence_ids),
+            cost_usd=Decimal("0.01"),
+            cache_hit=False,
+            llm_call_id=1,
+        )
+
+    _patch_persist(handler, monkeypatch)
+    monkeypatch.setattr(
+        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
+    )
+    monkeypatch.setattr(
+        handler.UserRepo,
+        "get",
+        AsyncMock(side_effect=[_user(), _user(user_id=2002, first_name="Author")]),
+    )
+    # Do NOT patch QaTraceRepo.create — let it write to the real db_session.
+    monkeypatch.setattr(handler.QaTraceRepo, "update_llm_fields", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler, "run_qa", AsyncMock(return_value=_qa_result(abstained=False)))
+    monkeypatch.setattr(handler, "synthesize_answer", real_db_synth)
+
+    await handler.recall_handler(message, _command("память"), db_session)
+
+    assert captured["trace_in_db_at_synth"] is True, (
+        "QaTrace row was NOT found in the real DB when synthesize_answer was invoked — "
+        "step 1 flush is missing or occurs after step 2"
+    )
+    assert captured["trace_id_received"] is not None and captured["trace_id_received"] > 0
+    assert captured["trace_evidence_ids"] is not None
+
+
 # Unused import guard — silence ruff for the helper we kept for symmetry with test_qa.py
 _ = replace
