@@ -33,9 +33,15 @@ class PersistedMessage:
 
 @pytest_asyncio.fixture(loop_scope="class")
 async def leakage_session(eval_db_session: AsyncSession) -> AsyncIterator[AsyncSession]:
+    # Per-case isolation: TRUNCATE before AND after each test invocation so
+    # L1-L5 (parametrized cases) do not see each other's content. Fixture
+    # itself stays class-scoped so the asyncpg connection / loop stays
+    # aligned with the conftest class-scope session.
     await _clear_leakage_tables(eval_db_session)
-    yield eval_db_session
-    await _clear_leakage_tables(eval_db_session)
+    try:
+        yield eval_db_session
+    finally:
+        await _clear_leakage_tables(eval_db_session)
 
 
 async def _clear_leakage_tables(session: AsyncSession) -> None:
@@ -232,9 +238,9 @@ async def _create_case(
         assert chat_message.is_redacted is False
         return SEED_CHAT_ID, "дельта", {created.version_id}
 
-    if case_id == "L3":
+    if case_id == "L3a":
+        # L3a — tombstone by `message:<chat_id>:<message_id>` key.
         forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
-
         created = await _persist_via_service(
             session,
             chat_id=SEED_CHAT_ID,
@@ -253,6 +259,57 @@ async def _create_case(
         await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="processing")
         await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="completed")
         return SEED_CHAT_ID, "сигма", {created.version_id}
+
+    if case_id == "L3b":
+        # L3b — tombstone by `message_hash:<content_hash>` key.
+        # Production search.py uses this branch when forget targets a content
+        # fingerprint rather than a specific (chat, message_id) tuple.
+        forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
+        created = await _persist_via_service(
+            session,
+            chat_id=SEED_CHAT_ID,
+            message_id=11_007,
+            user_id=91_007,
+            text_value="забываемая тау люкс",
+        )
+        chat_message = await session.get(ChatMessage, created.chat_message_id)
+        assert chat_message is not None and chat_message.content_hash, (
+            "L3b precondition: chat_message must have a populated content_hash"
+        )
+        event = await forget_event_repo.ForgetEventRepo.create(
+            session,
+            target_type="content_hash",
+            target_id=chat_message.content_hash,
+            actor_user_id=None,
+            authorized_by="system",
+            tombstone_key=f"message_hash:{chat_message.content_hash}",
+        )
+        await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="processing")
+        await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="completed")
+        return SEED_CHAT_ID, "тау", {created.version_id}
+
+    if case_id == "L3c":
+        # L3c — tombstone by `user:<user_id>` key (full user-level forget).
+        forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
+        user_id = 91_008
+        created = await _persist_via_service(
+            session,
+            chat_id=SEED_CHAT_ID,
+            message_id=11_008,
+            user_id=user_id,
+            text_value="заброшенная ро люкс",
+        )
+        event = await forget_event_repo.ForgetEventRepo.create(
+            session,
+            target_type="user",
+            target_id=str(user_id),
+            actor_user_id=None,
+            authorized_by="system",
+            tombstone_key=f"user:{user_id}",
+        )
+        await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="processing")
+        await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="completed")
+        return SEED_CHAT_ID, "ро", {created.version_id}
 
     if case_id == "L4":
         created = await _persist_via_service(
@@ -293,7 +350,10 @@ pytestmark = pytest.mark.asyncio(loop_scope="class")
 
 
 class TestRecallGovernanceLeakage:
-    @pytest.mark.parametrize("case_id", ["L1", "L2", "L3", "L4", "L5"])
+    @pytest.mark.parametrize(
+        "case_id",
+        ["L1", "L2", "L3a", "L3b", "L3c", "L4", "L5"],
+    )
     async def test_recall_governance_leakage(
         self,
         eval_app_env: None,

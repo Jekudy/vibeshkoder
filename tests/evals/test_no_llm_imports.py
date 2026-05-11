@@ -45,6 +45,21 @@ ALLOWED_LLM_IMPORT_FILES: frozenset[str] = frozenset(
     ]
 )
 
+# I4 — URL-level guard. The provider SDK imports above (anthropic / openai)
+# are not the only way to call an LLM endpoint: a direct httpx / requests /
+# aiohttp call to a provider hostname would bypass the invariant-#2 contract
+# while passing the import-graph check. This domain list catches that.
+LLM_PROVIDER_HOSTNAMES: tuple[str, ...] = (
+    "api.anthropic.com",
+    "api.openai.com",
+    "api.cohere.ai",
+    "api.cohere.com",
+    "api.mistral.ai",
+    "generativelanguage.googleapis.com",
+    "api.replicate.com",
+    "api-inference.huggingface.co",
+)
+
 
 def _relative_to_repo(path: Path) -> str:
     return str(path.relative_to(REPO_ROOT))
@@ -144,6 +159,43 @@ def test_i2_no_llm_provider_in_runtime_dependencies() -> None:
     # Note: optional_section_name tracked above so future ALLOWED groups can be
     # asserted; current state forbids any provider anywhere in runtime deps.
     del optional_section_name
+
+
+def _llm_hostname_sites(path: Path) -> list[tuple[int, str]]:
+    """Find lines that mention an LLM provider hostname as a string literal."""
+    sites: list[tuple[int, str]] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return sites
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for host in LLM_PROVIDER_HOSTNAMES:
+            if host in line:
+                sites.append((line_no, host))
+                break
+    return sites
+
+
+def test_i4_no_llm_provider_url_outside_gateway() -> None:
+    """I4: a direct httpx/aiohttp/requests call to an LLM provider hostname
+    must not exist outside the allow-listed gateway files. AST imports (I1)
+    catch SDK import; this check catches the raw-URL escape hatch.
+    """
+    if not BOT_ROOT.is_dir():
+        pytest.skip(f"{BOT_ROOT} not found; harness assumes monorepo layout")
+
+    violations: list[str] = []
+    for path in _collect_python_files(BOT_ROOT):
+        rel = _relative_to_repo(path)
+        if rel in ALLOWED_LLM_IMPORT_FILES:
+            continue
+        for line_no, host in _llm_hostname_sites(path):
+            violations.append(f"{rel}:{line_no}: hostname {host!r}")
+
+    assert not violations, (
+        "invariant 2 URL-level violation — LLM provider hostname referenced "
+        "outside the allow-list:\n" + "\n".join(violations)
+    )
 
 
 def test_i3_allow_list_contract_documented() -> None:

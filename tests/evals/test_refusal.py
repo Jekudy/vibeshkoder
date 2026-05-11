@@ -26,11 +26,12 @@ CONTENT_TRUNCATE_SQL = text(
 def _message(
     *,
     chat_id: int = SEED_CHAT_ID,
+    chat_type: str = "supergroup",
     user_id: int = 1001,
     message_id: int = 700,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        chat=SimpleNamespace(id=chat_id, type="supergroup"),
+        chat=SimpleNamespace(id=chat_id, type=chat_type),
         from_user=SimpleNamespace(
             id=user_id,
             username="refusal_user",
@@ -258,7 +259,10 @@ class TestRefusal:
         assert bundle.abstained is True
         assert bundle.items == ()
 
-    async def test_r3_wrong_chat_non_member_refuses_at_handler(self) -> None:
+    async def test_r3a_non_member_refuses_at_handler(self) -> None:
+        """R3a (non-community-membership branch): user in community chat without
+        is_member/is_admin → handler replies access-denied, never runs run_qa,
+        writes an abstained qa_trace."""
         handler = import_module("bot.handlers.qa")
         trace_create, run_qa, _persist = _patch_handler_db_edges(handler)
         handler.FeatureFlagRepo.get = AsyncMock(return_value=True)
@@ -270,6 +274,57 @@ class TestRefusal:
         await handler.recall_handler(message, _command("память"), AsyncMock())
 
         message.reply.assert_awaited_once_with("Доступ только участникам сообщества.")
+        run_qa.assert_not_awaited()
+        trace_create.assert_awaited_once()
+        assert trace_create.call_args.kwargs["abstained"] is True
+
+    async def test_r3b_wrong_chat_private_replies_usage_hint(self) -> None:
+        """R3b (wrong-chat private branch): /recall invoked from a 1:1 private
+        chat with the bot → handler replies the community-only usage hint,
+        never runs run_qa, writes an abstained qa_trace."""
+        handler = import_module("bot.handlers.qa")
+        trace_create, run_qa, _persist = _patch_handler_db_edges(handler)
+        handler.FeatureFlagRepo.get = AsyncMock(return_value=True)
+        # UserRepo.get must NOT be called on the wrong-chat branch (returns early).
+        handler.UserRepo.get = AsyncMock(side_effect=AssertionError(
+            "UserRepo.get must not be reached on wrong-chat branch"
+        ))
+        message = _message(
+            chat_id=SEED_CHAT_ID + 7777,  # non-community
+            chat_type="private",
+            user_id=1001,
+            message_id=902,
+        )
+
+        await handler.recall_handler(message, _command("память"), AsyncMock())
+
+        message.reply.assert_awaited_once_with(
+            "Команда /recall работает только в community чате."
+        )
+        run_qa.assert_not_awaited()
+        trace_create.assert_awaited_once()
+        assert trace_create.call_args.kwargs["abstained"] is True
+
+    async def test_r3c_wrong_chat_group_silent_audit_no_reply(self) -> None:
+        """R3c (wrong-chat non-private branch): /recall invoked from a
+        third-party group → handler does NOT reply (silent), does NOT run
+        run_qa, but DOES write an abstained qa_trace for audit."""
+        handler = import_module("bot.handlers.qa")
+        trace_create, run_qa, _persist = _patch_handler_db_edges(handler)
+        handler.FeatureFlagRepo.get = AsyncMock(return_value=True)
+        handler.UserRepo.get = AsyncMock(side_effect=AssertionError(
+            "UserRepo.get must not be reached on wrong-chat branch"
+        ))
+        message = _message(
+            chat_id=SEED_CHAT_ID + 8888,
+            chat_type="supergroup",
+            user_id=1001,
+            message_id=903,
+        )
+
+        await handler.recall_handler(message, _command("память"), AsyncMock())
+
+        message.reply.assert_not_awaited()
         run_qa.assert_not_awaited()
         trace_create.assert_awaited_once()
         assert trace_create.call_args.kwargs["abstained"] is True
