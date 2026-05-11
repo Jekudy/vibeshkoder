@@ -945,16 +945,44 @@ The contracts.md analyst flagged 4 ratification asks. Orchestrator A resolves ea
 
 **Original ask:** Atomic budget-guard pattern requires placeholder row insert + UPDATE with actual cost. Should `update_placeholder` be part of T5-03 LedgerRepo scope?
 
-**Decision (Orchestrator A):** **NOT REQUIRED.** T5-01 implementation (PR #209, commit `538c516`) demonstrated the placeholder pattern is unnecessary when:
-1. Gateway runs inside handler-owned transaction (single tx for `synthesize_answer` call lifetime).
-2. `pg_advisory_xact_lock(LLM_BUDGET_LOCK_ID)` held until tx commit.
-3. Ledger row inserted ONCE, post-dispatch, with actual cost.
+**Decision (Orchestrator A) — REVISED 2026-05-11:** **REQUIRED.** Original ratification of "NOT REQUIRED" was INCORRECT and is hereby REVOKED.
 
-**Why this is equivalent to placeholder pattern:** The advisory lock serializes concurrent `synthesize_answer` calls at the budget-check critical section. Each tx reads the running `daily_cost_usd` AFTER the previous tx commits its ledger row (per Postgres MVCC + advisory lock semantics). No race window opens between read and write because both happen in the same locked tx.
+### Why the original ratification was wrong
 
-**T5-03 LedgerRepo scope (FROZEN):** ONLY the three methods in §5.1 — `record(...)`, `daily_cost_usd(day)`, `monthly_cost_usd(year, month)`. NO `update_placeholder`. NO `reserve(estimated_cost)`. NO `finalize(call_id, actual_cost)`.
+The first ratification claimed "single-tx + advisory_lock is equivalent to placeholder pattern". Both Claude critic (a531181bccac06fdf) and Codex review (a91950604f3af56a6) on T5-01 PR #209 independently identified two real defects this introduces:
 
-**Updates to §5.1 of this file:** the implicit "update_placeholder" method referenced in earlier draft is REMOVED. The §3.6 step 5 description in this document is updated by T5-04 PR if needed (current description is correct as written; T5-04 may simply reference the simpler pattern T5-01 established).
+1. **Availability defect (Claude critic Finding 1, Codex Finding 1 part 1):** `pg_advisory_xact_lock` released only when the outer (handler-owned) transaction commits. The provider HTTP call (Anthropic, 5-15s typical) executes INSIDE that transaction. So while Call-A waits on Anthropic, every other concurrent `/recall` request blocks on the same lock for the full HTTP RTT. Under burst load (10 concurrent users), the 10th request waits ~80s — aiogram timeouts fire, Telegram retries cascade, bot appears hung.
+
+2. **Audit gap (Codex Finding 1 part 2):** If the process crashes or the request is cancelled between provider dispatch (line ~405 in T5-01 impl) and post-dispatch `_ledger(...)` call (line ~481), a real LLM call was made WITHOUT a corresponding `llm_usage_ledger` row. Violates "every LLM call logged in ledger" exit-gate from PHASE5_PLAN.md §2.
+
+Both defects are eliminated by the spec's placeholder pattern (PHASE5_PLAN.md §5.A step 5):
+- Inner short-lived tx acquires lock, reads cost, INSERTs placeholder row (with `error=NULL, cost_usd=0`), commits inner tx, releases lock.
+- Provider HTTP call dispatched WITHOUT holding the lock — no global serialization.
+- Placeholder row guarantees an audit record even if process dies before UPDATE.
+- Post-dispatch UPDATE fills in actual `cost_usd`, `tokens_in/out`, `response_hash`, etc. via `LedgerRepo.update_placeholder(...)`.
+
+### T5-03 LedgerRepo scope (REVISED — FROZEN)
+
+`LedgerRepo` ships FOUR methods (NOT three):
+
+1. `record(session, *, qa_trace_id, provider, model, prompt_hash, response_hash, tokens_in, tokens_out, cost_usd, latency_ms, request_id, cache_hit, error) -> LlmUsageLedger`
+   — Used by cache-hit path (cache_hit=True, all fields known up-front). Flushes; caller commits.
+
+2. `daily_cost_usd(session, *, day: date) -> Decimal`
+   — UTC-bounded sum; zero rows = `Decimal("0")` not None.
+
+3. `monthly_cost_usd(session, *, year: int, month: int) -> Decimal`
+   — UTC-bounded sum.
+
+4. **NEW** `update_placeholder(session, *, llm_call_id: int, cost_usd: Decimal, response_hash: str | None, tokens_in: int, tokens_out: int, request_id: str | None, latency_ms: int, error: str | None) -> None`
+   — UPDATEs an existing placeholder row by `id`. Used by gateway post-dispatch path. Flushes; caller commits. Raises if `llm_call_id` not found (placeholder row missing).
+
+### Cross-stream impact
+
+- **T5-01 (PR #209) fix-pass (a0fbe00b7a84a5504):** Rewrite `_budget_check` to use placeholder pattern. Add `update_placeholder` to `LedgerRepoProtocol` for test fakes. Document the lock-released-before-HTTP invariant.
+- **T5-03 (issue #199):** Implement `update_placeholder` as the 4th `LedgerRepo` method.
+- **PHASE5_PLAN.md §5.C:** No change needed — already mentioned placeholder pattern; this ratification merely confirms it is BINDING.
+- **§3.6 step 5 of this document:** Already describes placeholder pattern correctly. Reinforce by referencing this revised ratification.
 
 ### §12.3 Ratification: `QaTraceRepo.update_llm_fields` method
 
