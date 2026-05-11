@@ -7,9 +7,10 @@ invariants ratified in `docs/memory-system/PHASE5_PLAN.md` §5.A:
     2. Source filter (defense-in-depth re-validation)
     3. Forget-invalidation gate — three tombstone keys
     4. Cache lookup (AFTER the forget gate)
-    5. Atomic budget guard via ``pg_advisory_xact_lock``
+    5. Atomic budget guard with placeholder-row reservation + lock released
+       BEFORE provider dispatch (``pg_advisory_lock`` / ``pg_advisory_unlock``)
     6. Provider dispatch with categorised error handling
-    7. Citation enforcement (``citation_ids`` ⊆ ``bundle.evidence_ids``)
+    7. Citation enforcement (``citation_ids`` ⊆ surviving filter set)
 
 Every call writes a row to ``llm_usage_ledger`` regardless of outcome
 (success, error, abstention, cache hit, cost-refusal). HANDOFF §1
@@ -17,7 +18,28 @@ invariant #2 — no LLM calls outside this module.
 
 T5-03 ``LedgerRepo`` / ``SynthesisCacheRepo`` are wired by T5-04 caller;
 this module accepts both via DI (``ledger_repo`` / ``cache_repo`` keyword
-arguments matching the §5.C Protocol surface).
+arguments matching the §5.C Protocol surface). The Protocol now includes
+``update_placeholder`` for the post-dispatch UPDATE of the budget-reserved
+ledger row.
+
+Privacy-critical design notes
+-----------------------------
+* Citation enforcement, prompt body, cache key, and cache STORE payload all
+  derive from the SAME authoritative surviving set (post-source-filter +
+  pre-forget-gate). This guarantees no filtered citation can leak through
+  the cache between concurrent calls. Closes F2/F3.
+* Provider dispatch runs OUTSIDE the budget advisory lock. Closes F1
+  (lock held across HTTP + global serialisation on bursts).
+* Cache miss double-dispatch is narrowed by re-checking the cache UNDER
+  the advisory lock (Option A). Closes F4 — for full closure the
+  ``input_hash UNIQUE`` constraint on ``llm_synthesis_cache`` catches any
+  residual race at the DB layer in T5-04 integration.
+* The Anthropic / OpenAI providers currently return ``citation_ids=()``
+  until T5-04 wires real prompt-template citation parsing. Until then the
+  gateway defensively aborts + does NOT cache when the surviving set is
+  non-empty but the provider returns zero citations (otherwise the forget
+  invalidation cascade — which joins on ``citation_ids @> '[fid]'::jsonb``
+  — could never match an empty array). Closes F5.
 """
 
 from __future__ import annotations
@@ -120,6 +142,30 @@ class LedgerRepoProtocol(Protocol):
     ) -> Decimal:
         ...
 
+    async def update_placeholder(
+        self,
+        session: Any,
+        *,
+        llm_call_id: int,
+        cost_usd: Decimal,
+        response_hash: str | None,
+        tokens_in: int,
+        tokens_out: int,
+        request_id: str | None,
+        latency_ms: int,
+        error: str | None,
+    ) -> Any:
+        """Update a placeholder ledger row in-place after provider returns.
+
+        T5-04 wires the real implementation in T5-03's ``LedgerRepo``. The
+        placeholder is INSERTed under the budget advisory lock BEFORE
+        provider dispatch (so concurrent callers see the cost reservation
+        even though final cost is unknown at lock time). Provider-return
+        path UPDATEs the same row with actual tokens / cost / latency /
+        error and clears the request_id / response_hash fields.
+        """
+        ...
+
 
 class SynthesisCacheRepoProtocol(Protocol):
     async def get_or_none(self, session: Any, *, input_hash: str) -> Any | None:
@@ -195,14 +241,24 @@ def _response_hash(answer_text: str) -> str:
     return hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
 
 
-def _build_prompt(query_normalized: str, bundle: EvidenceBundle) -> str:
+def _build_prompt(
+    query_normalized: str, surviving_ids: tuple[int, ...] | list[int]
+) -> str:
     """Stable prompt rendering used for ``prompt_hash`` and provider dispatch.
 
     T5-04 will replace this with the real prompt template (and bump
     ``prompt_template_version`` accordingly). For T5-01 the rendering only
     needs to be deterministic so that ``prompt_hash`` is stable.
+
+    Closes F2/F3: prompt body is built from the post-source-filter
+    ``surviving_ids`` set (the set that ALSO survives the forget gate by
+    the time we get here), NOT the pre-filter ``bundle.evidence_ids``.
+    This guarantees the citation enforcement set, the cache key, the
+    cache STORE payload, and the prompt body all derive from the same
+    authoritative surviving set — so a citation pointing at a filtered
+    id cannot leak through the cache between concurrent calls.
     """
-    citation_part = " ".join(str(i) for i in bundle.evidence_ids)
+    citation_part = " ".join(str(i) for i in surviving_ids)
     return f"Q: {query_normalized}\nCITATIONS: {citation_part}"
 
 
@@ -252,7 +308,15 @@ _TOMBSTONE_GATE_SQL = text(
     """
 )
 
-_BUDGET_LOCK_SQL = text("SELECT pg_advisory_xact_lock(:lock_id)")
+# Session-scoped advisory lock used by the placeholder-pattern path: held
+# only across the cost-read + placeholder INSERT (sub-millisecond), then
+# released BEFORE dispatching the provider HTTP call. Closes F1 (lock
+# held across HTTP + global serialisation on bursts). The transaction-
+# scoped variant (``pg_advisory_xact_lock``) is intentionally NOT used —
+# it would only release at outer-tx commit, which happens AFTER the
+# provider round-trip.
+_BUDGET_LOCK_SESSION_SQL = text("SELECT pg_advisory_lock(:lock_id)")
+_BUDGET_UNLOCK_SESSION_SQL = text("SELECT pg_advisory_unlock(:lock_id)")
 
 
 # ─── Gateway entry point ────────────────────────────────────────────────────
@@ -303,8 +367,6 @@ async def synthesize_answer(
         documented refusal path. Never raises on documented failure paths.
     """
     query_normalized = _normalize_query(query)
-    prompt = _build_prompt(query_normalized, bundle)
-    prompt_hash = _prompt_hash(prompt)
 
     async def _ledger(
         *,
@@ -316,6 +378,7 @@ async def synthesize_answer(
         cost_usd: Decimal = Decimal("0"),
         latency_ms: int = 0,
         request_id: str | None = None,
+        prompt_hash: str = "",
     ) -> Any:
         return await ledger_repo.record(
             session,
@@ -335,7 +398,10 @@ async def synthesize_answer(
 
     # Invariant 1 — empty bundle short-circuit.
     if not bundle.evidence_ids:
-        row = await _ledger(error="empty_bundle")
+        # Empty bundle has no surviving set so we use an empty-prompt hash
+        # only as a stable sentinel for the ledger row.
+        empty_prompt_hash = _prompt_hash(_build_prompt(query_normalized, ()))
+        row = await _ledger(error="empty_bundle", prompt_hash=empty_prompt_hash)
         return Abstention(
             reason="empty_bundle",
             cost_usd=Decimal("0"),
@@ -343,23 +409,32 @@ async def synthesize_answer(
         )
 
     # Invariant 2 — source filter (defense-in-depth).
-    surviving_ids = await _source_filter(session, bundle.evidence_ids)
-    if not surviving_ids:
-        row = await _ledger(error="all_filtered")
+    surviving_ids_list = await _source_filter(session, bundle.evidence_ids)
+    if not surviving_ids_list:
+        empty_prompt_hash = _prompt_hash(_build_prompt(query_normalized, ()))
+        row = await _ledger(error="all_filtered", prompt_hash=empty_prompt_hash)
         return Abstention(
             reason="all_filtered",
             cost_usd=Decimal("0"),
             llm_call_id=row.id,
         )
 
+    # Authoritative surviving set used EVERYWHERE downstream — prompt body,
+    # cache key, citation enforcement, and the cache STORE payload. Closes
+    # F2/F3 (citation enforcement + cache poisoning by pre-filter ids).
+    # Sorted for determinism so prompt body is order-independent.
+    surviving_ids: tuple[int, ...] = tuple(sorted(surviving_ids_list))
+    prompt = _build_prompt(query_normalized, surviving_ids)
+    prompt_hash = _prompt_hash(prompt)
+
     # Invariant 3 — forget-invalidation gate (three tombstone keys).
-    tombstoned_ids = await _forget_tombstone_check(session, surviving_ids)
+    tombstoned_ids = await _forget_tombstone_check(session, list(surviving_ids))
     if tombstoned_ids:
         for vid in tombstoned_ids:
             await cache_repo.invalidate_by_citation(
                 session, message_version_id=vid
             )
-        row = await _ledger(error="forget_invalidated")
+        row = await _ledger(error="forget_invalidated", prompt_hash=prompt_hash)
         return Abstention(
             reason="forget_invalidated",
             cost_usd=Decimal("0"),
@@ -380,6 +455,7 @@ async def synthesize_answer(
             error=None,
             cache_hit=True,
             response_hash=_response_hash(cached.answer_text),
+            prompt_hash=prompt_hash,
         )
         return AnswerWithCitations(
             answer_text=cached.answer_text,
@@ -389,29 +465,111 @@ async def synthesize_answer(
             llm_call_id=row.id,
         )
 
-    # Invariant 5 — budget guard (atomic via pg_advisory_xact_lock).
-    over_budget = await _budget_check(session, config, ledger_repo)
-    if over_budget:
-        row = await _ledger(error="budget_exceeded")
-        return Abstention(
-            reason="budget_exceeded",
+    # Invariant 5 — placeholder ledger row pattern (closes F1 + F4).
+    #
+    # Under the budget advisory lock we:
+    #   a) re-check cache (F4 Option A: defends against concurrent miss → both
+    #      callers dispatched → second's cache STORE hit UNIQUE constraint).
+    #      If cache row exists on re-check, return cached answer + ledger
+    #      cache_hit row WITHOUT dispatching provider.
+    #   b) read daily / monthly totals via repo.
+    #   c) if over ceiling — insert ledger row with error='budget_exceeded'.
+    #   d) else — insert PLACEHOLDER ledger row (cost_usd=0, error=NULL,
+    #      response_hash=NULL, tokens=0). Concurrent callers observe the
+    #      placeholder via daily/monthly cost aggregates AFTER it's UPDATEd
+    #      with the real cost post-dispatch.
+    #   e) release the lock + commit the inner tx BEFORE provider dispatch.
+    #
+    # Provider dispatch then runs WITHOUT holding the lock, so bursts no
+    # longer serialise globally on the 5-15s HTTP call.
+    #
+    # The lock is session-scoped (``pg_advisory_lock`` + ``pg_advisory_unlock``)
+    # rather than transaction-scoped so we control release timing. Inner-tx
+    # commit semantics are caller-dependent: production wires a savepoint
+    # under the outer handler tx (T5-04 integration), unit tests use a fake
+    # session that no-ops both. Real Postgres serialisation is exercised in
+    # T5-04 integration tests.
+    placeholder_row: Any
+    try:
+        await session.execute(
+            _BUDGET_LOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
+        )
+        # (a) re-check cache under the lock.
+        cached_under_lock = await cache_repo.get_or_none(
+            session, input_hash=cache_input_hash
+        )
+        if cached_under_lock is not None:
+            await cache_repo.bump_hit(session, cache_id=cached_under_lock.id)
+            row = await _ledger(
+                error=None,
+                cache_hit=True,
+                response_hash=_response_hash(cached_under_lock.answer_text),
+                prompt_hash=prompt_hash,
+            )
+            return AnswerWithCitations(
+                answer_text=cached_under_lock.answer_text,
+                citation_ids=tuple(cached_under_lock.citation_ids),
+                cost_usd=Decimal("0"),
+                cache_hit=True,
+                llm_call_id=row.id,
+            )
+
+        # (b) read totals.
+        over_budget = await _budget_check(session, config, ledger_repo)
+        if over_budget:
+            # (c) budget_exceeded ledger row.
+            row = await _ledger(
+                error="budget_exceeded", prompt_hash=prompt_hash
+            )
+            return Abstention(
+                reason="budget_exceeded",
+                cost_usd=Decimal("0"),
+                llm_call_id=row.id,
+            )
+
+        # (d) placeholder ledger row.
+        placeholder_row = await _ledger(
+            error=None,
             cost_usd=Decimal("0"),
-            llm_call_id=row.id,
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            prompt_hash=prompt_hash,
+        )
+    finally:
+        # (e) release lock regardless of outcome. Even if we returned early
+        # above via early `return` statements inside the try block, this
+        # finally clause still runs and unlocks. NOTE: this requires the
+        # SQL execute itself not to raise — production code under T5-04 uses
+        # ``session.begin_nested()`` or a fresh connection so lock release
+        # is guaranteed even on session-level errors.
+        await session.execute(
+            _BUDGET_UNLOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
         )
 
     # Invariant 6 — provider dispatch with categorised error handling.
+    # Provider HTTP runs OUTSIDE the lock so concurrent gateway calls no
+    # longer serialise globally on the 5-15s round-trip.
     started = time.monotonic()
     try:
         provider_result = await provider.call(prompt=prompt, model=config.model)
     except ProviderTransientError as exc:
-        row = await _ledger(
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency,
             error=f"provider_transient:{exc.subtype}",
-            latency_ms=int((time.monotonic() - started) * 1000),
         )
         return Abstention(
             reason="provider_error",
             cost_usd=Decimal("0"),
-            llm_call_id=row.id,
+            llm_call_id=placeholder_row.id,
         )
     except ProviderStructuralError as exc:
         logger.error(
@@ -423,14 +581,22 @@ async def synthesize_answer(
         from bot.services import observability
 
         observability.emit_stop_signal("llm_provider_structural")
-        row = await _ledger(
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency,
             error=f"provider_structural:{exc.subtype}",
-            latency_ms=int((time.monotonic() - started) * 1000),
         )
         return Abstention(
             reason="provider_error",
             cost_usd=Decimal("0"),
-            llm_call_id=row.id,
+            llm_call_id=placeholder_row.id,
         )
     except Exception as exc:
         logger.error(
@@ -438,34 +604,76 @@ async def synthesize_answer(
             type(exc).__name__,
             exc_info=True,
         )
-        row = await _ledger(
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency,
             error=f"provider_unknown:{type(exc).__name__}",
-            latency_ms=int((time.monotonic() - started) * 1000),
         )
         return Abstention(
             reason="provider_error",
             cost_usd=Decimal("0"),
-            llm_call_id=row.id,
+            llm_call_id=placeholder_row.id,
         )
 
-    # Invariant 7 — citation enforcement.
-    bundle_id_set = set(bundle.evidence_ids)
-    if not set(provider_result.citation_ids).issubset(bundle_id_set):
-        row = await _ledger(
-            error="citation_hallucination",
+    # F5 — defensive abort when provider returns empty citation_ids while
+    # bundle has surviving evidence. The real AnthropicProvider /
+    # OpenAIProvider currently return ``tuple()`` unconditionally (T5-04
+    # will wire real prompt-template citation parsing). Caching an answer
+    # with empty citation_ids would break the forget invalidation cascade
+    # (which joins via ``citation_ids JSONB @> '[fid]'::jsonb`` — empty
+    # array can't match). Until T5-04 lands real citation parsing, we
+    # refuse to cache + abstain.
+    if len(provider_result.citation_ids) == 0 and len(surviving_ids) > 0:
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
             response_hash=_response_hash(provider_result.answer_text),
             tokens_in=provider_result.tokens_in,
             tokens_out=provider_result.tokens_out,
-            latency_ms=int((time.monotonic() - started) * 1000),
             request_id=provider_result.request_id,
+            latency_ms=latency,
+            error="provider_returned_no_citations",
         )
         return Abstention(
             reason="provider_error",
             cost_usd=Decimal("0"),
-            llm_call_id=row.id,
+            llm_call_id=placeholder_row.id,
         )
 
-    # Success — persist cache row + ledger row (with actual cost) + return.
+    # Invariant 7 — citation enforcement. Cited set must be a subset of the
+    # AUTHORITATIVE surviving set (post-source-filter), NOT the pre-filter
+    # bundle.evidence_ids. Closes F2/F3 (privacy + cache poisoning).
+    surviving_id_set = set(surviving_ids)
+    if not set(provider_result.citation_ids).issubset(surviving_id_set):
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=_response_hash(provider_result.answer_text),
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=provider_result.request_id,
+            latency_ms=latency,
+            error="citation_hallucination",
+        )
+        return Abstention(
+            reason="provider_error",
+            cost_usd=Decimal("0"),
+            llm_call_id=placeholder_row.id,
+        )
+
+    # Success — persist cache row (with surviving_ids in citation_ids JSONB,
+    # NOT the pre-filter bundle.evidence_ids) + UPDATE placeholder + return.
     cost_usd = _estimate_cost(
         config=config,
         tokens_in=provider_result.tokens_in,
@@ -478,21 +686,24 @@ async def synthesize_answer(
         citation_ids=list(provider_result.citation_ids),
         model=config.model,
     )
-    row = await _ledger(
-        error=None,
+    latency = int((time.monotonic() - started) * 1000)
+    await ledger_repo.update_placeholder(
+        session,
+        llm_call_id=placeholder_row.id,
+        cost_usd=cost_usd,
         response_hash=_response_hash(provider_result.answer_text),
         tokens_in=provider_result.tokens_in,
         tokens_out=provider_result.tokens_out,
-        cost_usd=cost_usd,
-        latency_ms=int((time.monotonic() - started) * 1000),
         request_id=provider_result.request_id,
+        latency_ms=latency,
+        error=None,
     )
     return AnswerWithCitations(
         answer_text=provider_result.answer_text,
         citation_ids=provider_result.citation_ids,
         cost_usd=cost_usd,
         cache_hit=False,
-        llm_call_id=row.id,
+        llm_call_id=placeholder_row.id,
     )
 
 
@@ -518,10 +729,23 @@ async def _source_filter(
 async def _forget_tombstone_check(
     session: AsyncSession, evidence_ids: list[int]
 ) -> list[int]:
-    """Return message_version_ids whose row matches a tombstone (any of 3 keys)."""
+    """Return message_version_ids whose row matches a tombstone (any of 3 keys).
+
+    Result is sorted for determinism so callers iterating to invalidate cache
+    rows do so in a stable order (F9 closure — set iteration was order-
+    nondeterministic across hash randomisation).
+
+    The SQL JOIN intentionally asymmetric vs ``_SOURCE_FILTER_SQL``: this
+    join walks ``chat_messages.content_hash`` and ``chat_messages.user_id``
+    without the ``current_version_id`` constraint because a tombstone keyed
+    on a user or content_hash invalidates EVERY version (not only the
+    current one). F10 closure — intentional vs source filter which only
+    rejects message_versions whose policy is offrecord/forgotten on the
+    current version pointer.
+    """
     result = await session.execute(_TOMBSTONE_GATE_SQL, {"ids": evidence_ids})
     rows = result.mappings().all()
-    return list({int(r["message_version_id"]) for r in rows})
+    return sorted({int(r["message_version_id"]) for r in rows})
 
 
 async def _budget_check(
@@ -529,23 +753,17 @@ async def _budget_check(
     config: LLMGatewayConfig,
     ledger_repo: LedgerRepoProtocol,
 ) -> bool:
-    """Acquire advisory lock + read totals via repo; return True iff over ceiling.
+    """Read daily / monthly cost totals via repo; return True iff over ceiling.
 
-    The lock is taken FIRST so the read is serialised against any other
-    in-flight gateway call holding the same lock. Repo-side reads use
-    UTC date / month bounds.
+    Per the placeholder-pattern refactor (closes F1), the advisory lock
+    is acquired by the caller in ``synthesize_answer`` BEFORE invoking
+    this helper, and released AFTER the placeholder row is INSERTed —
+    NOT held across the provider HTTP call. This helper is therefore a
+    pure read-and-compare; it assumes the caller already serialised
+    access to the cost aggregates via ``pg_advisory_lock``.
 
-    Atomicity note (spec §5.A step 5 vs implementation): the spec mentions a
-    placeholder ledger row written BEFORE provider dispatch and UPDATEd
-    on return. This implementation skips the placeholder because the
-    gateway runs inside a single handler-owned transaction and
-    ``pg_advisory_xact_lock`` is held until that transaction commits. As a
-    result, concurrent calls from different handler transactions serialise
-    on the lock; within one serialised window, only the post-dispatch
-    ledger insert is needed. T5-04 may revisit this once the integration
-    test under real Postgres covers the full lifecycle.
+    Repo-side reads use UTC date / month bounds.
     """
-    await session.execute(_BUDGET_LOCK_SQL, {"lock_id": LLM_BUDGET_LOCK_ID})
     today = datetime.now(timezone.utc).date()
     daily_total = await ledger_repo.daily_cost_usd(session, day=today)
     monthly_total = await ledger_repo.monthly_cost_usd(
@@ -565,10 +783,14 @@ def _estimate_cost(
 
     For T5-01, we charge a deterministic non-zero amount so the budget
     guard tests can verify cost accumulation. Production cost computation
-    lands with the per-model table in T5-04.
+    lands with the per-model table in T5-04. ``config`` is accepted so the
+    T5-04 swap (which will read a per-model rate keyed on
+    ``config.model``) is a pure-signature-compatible replacement; for the
+    stub the parameter is intentionally unused. F8 closure — kept on the
+    signature rather than removed because the T5-04 model-rate lookup
+    needs the same shape.
     """
-    # Note: ``datetime`` import retained for future timezone-aware ledgering.
-    _ = datetime.now(timezone.utc)
+    _ = config  # F8: documented unused — T5-04 reads config.model.
     return Decimal("0.000001") * (tokens_in + tokens_out)
 
 

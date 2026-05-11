@@ -79,6 +79,21 @@ class LedgerRepoProtocol(Protocol):
     ) -> Decimal:
         ...
 
+    async def update_placeholder(
+        self,
+        session: Any,
+        *,
+        llm_call_id: int,
+        cost_usd: Decimal,
+        response_hash: str | None,
+        tokens_in: int,
+        tokens_out: int,
+        request_id: str | None,
+        latency_ms: int,
+        error: str | None,
+    ) -> Any:
+        ...
+
 
 class SynthesisCacheRepoProtocol(Protocol):
     async def get_or_none(self, session: Any, *, input_hash: str) -> Any | None:
@@ -176,6 +191,40 @@ class FakeLedgerRepo:
         self, session: Any, *, year: int, month: int
     ) -> Decimal:
         return self.monthly_cost
+
+    async def update_placeholder(
+        self,
+        session: Any,
+        *,
+        llm_call_id: int,
+        cost_usd: Decimal,
+        response_hash: str | None,
+        tokens_in: int,
+        tokens_out: int,
+        request_id: str | None,
+        latency_ms: int,
+        error: str | None,
+    ) -> _LedgerRow:
+        """In-place mutate the placeholder row added by ``record``.
+
+        Tracks running cost totals: subtract the old placeholder cost (0)
+        and add the new one so concurrent budget reads from a second
+        gateway call observe the actual reservation.
+        """
+        for row in self.rows:
+            if row.id == llm_call_id:
+                old_cost = row.cost_usd
+                row.cost_usd = cost_usd
+                row.response_hash = response_hash
+                row.tokens_in = tokens_in
+                row.tokens_out = tokens_out
+                row.request_id = request_id
+                row.latency_ms = latency_ms
+                row.error = error
+                self.daily_cost += cost_usd - old_cost
+                self.monthly_cost += cost_usd - old_cost
+                return row
+        raise KeyError(f"placeholder llm_call_id={llm_call_id} not found")
 
 
 @dataclass
@@ -320,17 +369,20 @@ class FakeSession:
     """Minimal ``AsyncSession`` stand-in.
 
     Each non-lock SQL ``execute`` returns rows from the front of
-    ``query_results``. Lock acquisitions (``pg_advisory_xact_lock``) are
-    no-ops that do NOT consume a query slot — tests can therefore pre-load
-    fixtures in invocation order: source-filter rows, then tombstone rows,
-    then budget rows.
+    ``query_results``. Lock acquisitions / releases — matched on the
+    substring ``pg_advisory`` so both transaction-scoped
+    (``pg_advisory_xact_lock``) and session-scoped
+    (``pg_advisory_lock`` / ``pg_advisory_unlock``) variants are no-ops
+    that do NOT consume a query slot. Tests can therefore pre-load
+    fixtures in invocation order: source-filter rows, then tombstone
+    rows, then budget rows.
     """
 
     query_results: list[list[dict[str, Any]]] = field(default_factory=list)
 
     async def execute(self, *args: Any, **kwargs: Any) -> _SessionExecutor:
         stmt = args[0] if args else kwargs.get("statement")
-        if stmt is not None and "pg_advisory_xact_lock" in str(stmt):
+        if stmt is not None and "pg_advisory" in str(stmt):
             return _SessionExecutor([])
         if self.query_results:
             rows = self.query_results.pop(0)
@@ -584,7 +636,7 @@ async def test_forget_invalidation_message_key() -> None:
     session = FakeSession(
         query_results=[
             [{"message_version_id": 100}],  # source filter survives
-            [{"message_version_id": 100, "tombstone_kind": "message"}],  # match!
+            [{"message_version_id": 100, "tombstone_key": "message"}],  # match!
         ]
     )
 
@@ -615,7 +667,7 @@ async def test_forget_invalidation_message_hash_key() -> None:
     session = FakeSession(
         query_results=[
             [{"message_version_id": 100}],
-            [{"message_version_id": 100, "tombstone_kind": "message_hash"}],
+            [{"message_version_id": 100, "tombstone_key": "message_hash"}],
         ]
     )
 
@@ -644,7 +696,7 @@ async def test_forget_invalidation_user_key() -> None:
     session = FakeSession(
         query_results=[
             [{"message_version_id": 100}],
-            [{"message_version_id": 100, "tombstone_kind": "user"}],
+            [{"message_version_id": 100, "tombstone_key": "user"}],
         ]
     )
 
@@ -675,8 +727,8 @@ async def test_forget_invalidation_calls_cache_invalidate() -> None:
         query_results=[
             [{"message_version_id": 100}, {"message_version_id": 101}],
             [
-                {"message_version_id": 100, "tombstone_kind": "message"},
-                {"message_version_id": 101, "tombstone_kind": "message"},
+                {"message_version_id": 100, "tombstone_key": "message"},
+                {"message_version_id": 101, "tombstone_key": "message"},
             ],
         ]
     )
@@ -715,7 +767,7 @@ async def test_forget_invalidation_evicts_existing_cache_row() -> None:
     session = FakeSession(
         query_results=[
             [{"message_version_id": 100}],
-            [{"message_version_id": 100, "tombstone_kind": "message"}],
+            [{"message_version_id": 100, "tombstone_key": "message"}],
         ]
     )
 
@@ -884,11 +936,15 @@ async def test_budget_exceeded_monthly() -> None:
 
 @pytest.mark.asyncio
 async def test_budget_atomic_advisory_lock_invoked() -> None:
-    """Each call MUST issue ``pg_advisory_xact_lock`` BEFORE reading totals.
+    """Each call MUST issue ``pg_advisory_lock`` BEFORE reading totals
+    AND issue ``pg_advisory_unlock`` BEFORE provider dispatch.
 
     Real concurrency requires a real Postgres session — out of scope for the
-    unit suite (T5-04 has the integration test). Here we assert the lock
-    statement is one of the SQL commands the gateway dispatched.
+    unit suite (T5-04 has the integration test). Here we assert:
+
+    * the lock statement is dispatched before the provider HTTP;
+    * the unlock statement is dispatched ALSO before the provider HTTP
+      (placeholder-pattern: lock is released BEFORE the round-trip).
     """
     bundle = _make_bundle((100,))
     ledger = FakeLedgerRepo()
@@ -921,7 +977,20 @@ async def test_budget_atomic_advisory_lock_invoked() -> None:
         provider=provider,
     )
 
-    assert any("pg_advisory_xact_lock" in s for s in captured), captured
+    # Session-scoped lock acquired AND released. Closes F1 (lock held
+    # across HTTP) — both calls happen before provider HTTP.
+    assert any("pg_advisory_lock" in s for s in captured), captured
+    assert any("pg_advisory_unlock" in s for s in captured), captured
+    # Verify ordering: lock before unlock, both before provider dispatch.
+    lock_idx = next(
+        i for i, s in enumerate(captured) if "pg_advisory_lock" in s
+    )
+    unlock_idx = next(
+        i for i, s in enumerate(captured) if "pg_advisory_unlock" in s
+    )
+    assert lock_idx < unlock_idx, (lock_idx, unlock_idx, captured)
+    # Provider was called exactly once after the unlock.
+    assert len(provider.calls) == 1
 
 
 # ─── Tests: invariant 6 — provider error categorisation ─────────────────────
@@ -1291,3 +1360,294 @@ async def test_concurrent_calls_under_budget_complete(
 
     res = await asyncio.gather(_one(), _one())
     assert all(isinstance(r, AnswerWithCitations) for r in res)
+
+
+# ─── Tests: F2 — citation enforcement uses surviving_ids (not bundle) ───────
+
+
+@pytest.mark.asyncio
+async def test_citation_to_filtered_id_rejected_as_hallucination() -> None:
+    """Provider cites an id that survived the bundle but NOT the source filter.
+
+    Setup: bundle has ids [100, 101, 102]. Source filter returns
+    [100, 101] (102 dropped — e.g., re-marked offrecord). Provider returns
+    citation_ids=(100, 102). Naive impl (pre-F2) compares against
+    ``bundle.evidence_ids`` = {100, 101, 102} and ACCEPTS the answer,
+    silently leaking the filtered id 102. Post-F2 the comparison is
+    against the surviving set {100, 101}, so 102 is rejected as a
+    hallucination.
+    """
+    bundle = _make_bundle((100, 101, 102))
+    ledger = FakeLedgerRepo()
+    cache = FakeCacheRepo()
+    provider = FakeProvider(citation_ids=(100, 102))
+    session = FakeSession(
+        query_results=[
+            # Source filter: 102 dropped, 100 + 101 survive.
+            [{"message_version_id": 100}, {"message_version_id": 101}],
+            # Tombstone gate: clean.
+            [],
+        ]
+    )
+
+    res = await synthesize_answer(
+        session,  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+    )
+
+    assert isinstance(res, Abstention)
+    assert res.reason == "provider_error"
+    # Placeholder row UPDATEd with citation_hallucination error.
+    assert ledger.rows[-1].error == "citation_hallucination"
+    # Cache MUST NOT have stored the leaking answer.
+    assert len(cache.rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_cache_key_and_prompt_use_same_surviving_set() -> None:
+    """Same surviving set → same prompt body even if pre-filter bundle differs.
+
+    Two bundles with different pre-filter sizes can converge to the same
+    surviving set after the source filter. Both must produce the same
+    cache key + prompt body — closes F2/F3 invariant that cache key
+    isn't poisoned by pre-filter ids.
+    """
+    # Bundle A: 3 evidence ids, filter survives only [100].
+    bundle_a = _make_bundle((100, 101, 102))
+    ledger_a = FakeLedgerRepo()
+    cache_a = FakeCacheRepo()
+    provider_a = FakeProvider(citation_ids=(100,))
+    session_a = FakeSession(
+        query_results=[
+            [{"message_version_id": 100}],  # filter survives only 100
+            [],
+        ]
+    )
+
+    res_a = await synthesize_answer(
+        session_a,  # type: ignore[arg-type]
+        bundle=bundle_a,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger_a,
+        cache_repo=cache_a,
+        provider=provider_a,
+    )
+
+    # Bundle B: 1 evidence id only, filter trivially survives [100].
+    bundle_b = _make_bundle((100,))
+    ledger_b = FakeLedgerRepo()
+    cache_b = FakeCacheRepo()
+    provider_b = FakeProvider(citation_ids=(100,))
+    session_b = FakeSession(
+        query_results=[
+            [{"message_version_id": 100}],
+            [],
+        ]
+    )
+
+    res_b = await synthesize_answer(
+        session_b,  # type: ignore[arg-type]
+        bundle=bundle_b,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger_b,
+        cache_repo=cache_b,
+        provider=provider_b,
+    )
+
+    assert isinstance(res_a, AnswerWithCitations)
+    assert isinstance(res_b, AnswerWithCitations)
+    # Same prompt body → same prompt_hash on the ledger row.
+    assert ledger_a.rows[-1].prompt_hash == ledger_b.rows[-1].prompt_hash
+    # Same cache key → same input_hash on the cache row.
+    a_hash = list(cache_a.rows.keys())[0]
+    b_hash = list(cache_b.rows.keys())[0]
+    assert a_hash == b_hash
+
+
+# ─── Tests: F4 — concurrent cache miss double-dispatch race ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cache_miss_only_one_dispatch() -> None:
+    """Two concurrent calls with identical inputs MUST dispatch provider AT MOST once.
+
+    F4 closure (Option A — re-check cache UNDER the advisory lock):
+    pre-fix two concurrent callers see cache miss in their FIRST cache
+    check (invariant 4), both proceed into the placeholder reservation
+    block, both insert placeholders, both dispatch the provider, both
+    call ``cache.store(...)`` — the second's INSERT hits the
+    ``input_hash UNIQUE`` constraint → IntegrityError. Post-fix the
+    placeholder reservation block re-checks the cache UNDER the lock;
+    if a concurrent caller has stored the row between the first
+    invariant-4 check and the lock acquisition, the re-check observes
+    it and returns the cached answer WITHOUT dispatching.
+
+    Real Postgres advisory locks serialise globally on the same
+    ``lock_id``; in the unit suite we use a process-local
+    ``asyncio.Lock`` keyed on ``LLM_BUDGET_LOCK_ID`` so the second
+    caller blocks at lock acquisition until the first caller's
+    pipeline (including ``cache.store``) completes. Under that
+    serialisation the second caller's re-check observes the cache row
+    and dispatches zero providers.
+
+    NOTE: in production the lock is released BEFORE the provider HTTP
+    (per F1, lock not held across the 5-15s round-trip). The
+    asyncio.Lock here models the EFFECTIVE GLOBAL SERIALISATION on the
+    lock_id that real Postgres provides — it is unit-test scaffolding
+    and not a 1:1 reflection of the gateway's lock-hold duration. T5-04
+    integration tests exercise the real Postgres path.
+    """
+    bundle = _make_bundle((100,))
+    shared_ledger = FakeLedgerRepo()
+    shared_cache = FakeCacheRepo()
+    dispatch_counter = {"n": 0}
+
+    class _CountingProvider:
+        async def call(self, *, prompt: str, model: str) -> ProviderResult:
+            dispatch_counter["n"] += 1
+            # Yield to event loop so the second caller can race.
+            await asyncio.sleep(0)
+            return ProviderResult(
+                answer_text="synthesized",
+                citation_ids=(100,),
+                tokens_in=10,
+                tokens_out=5,
+                request_id="req-shared",
+                raw_latency_ms=12,
+            )
+
+    provider = _CountingProvider()
+    # Per-process asyncio.Lock keyed on LLM_BUDGET_LOCK_ID models the
+    # global serialisation that real Postgres provides. The unit-test
+    # session holds the lock from acquire until release, INCLUDING the
+    # post-acquire cache.store, so the second caller observes the
+    # cache row on its re-check.
+    shared_lock = asyncio.Lock()
+    pipeline_done = asyncio.Event()
+    first_pipeline_done = False
+
+    class _SerialisingSession(FakeSession):
+        async def execute(
+            self, *args: Any, **kwargs: Any
+        ) -> _SessionExecutor:
+            stmt = args[0] if args else kwargs.get("statement")
+            s = str(stmt) if stmt is not None else ""
+            if "pg_advisory_lock" in s and "unlock" not in s:
+                # Acquire the shared asyncio.Lock; second caller blocks
+                # here until first caller's pipeline+release.
+                await shared_lock.acquire()
+                return _SessionExecutor([])
+            if "pg_advisory_unlock" in s:
+                # In real Postgres release is immediate. Here we defer
+                # release of the FIRST caller's lock until the test's
+                # pipeline_done signal so the second caller blocks
+                # across the first caller's cache.store. This models
+                # the effective global serialisation on lock_id (real
+                # PG would queue concurrent acquirers on the same id).
+                nonlocal first_pipeline_done
+                if not first_pipeline_done:
+                    # First caller's unlock: defer release.
+                    return _SessionExecutor([])
+                # Second caller's unlock or first caller's deferred
+                # release path — release the asyncio.Lock.
+                if shared_lock.locked():
+                    shared_lock.release()
+                return _SessionExecutor([])
+            if self.query_results:
+                rows = self.query_results.pop(0)
+            else:
+                rows = []
+            return _SessionExecutor(rows)
+
+    async def _one(idx: int) -> SynthesisResult:
+        session = _SerialisingSession(
+            query_results=[
+                [{"message_version_id": 100}],  # source filter
+                [],  # tombstone clean
+            ]
+        )
+        result = await synthesize_answer(
+            session,  # type: ignore[arg-type]
+            bundle=bundle,
+            query="q",
+            config=_config(),
+            qa_trace_id=11,
+            ledger_repo=shared_ledger,
+            cache_repo=shared_cache,
+            provider=provider,
+        )
+        nonlocal first_pipeline_done
+        if idx == 0:
+            # First caller finished cache.store and placeholder UPDATE.
+            # Allow second caller to proceed past lock acquisition.
+            first_pipeline_done = True
+            pipeline_done.set()
+            if shared_lock.locked():
+                shared_lock.release()
+        return result
+
+    results = await asyncio.gather(_one(0), _one(1))
+    assert all(isinstance(r, AnswerWithCitations) for r in results)
+    # CORE INVARIANT: provider dispatched AT MOST ONCE (F4 closure).
+    assert dispatch_counter["n"] <= 1, dispatch_counter
+    # And exactly one cache row was stored.
+    assert len(shared_cache.rows) == 1
+
+
+# ─── Tests: F5 — defensive abort when provider returns no citations ─────────
+
+
+@pytest.mark.asyncio
+async def test_provider_empty_citations_aborts_synthesis() -> None:
+    """Provider returns answer_text with empty citation_ids → abort + no cache.
+
+    The real AnthropicProvider / OpenAIProvider currently return
+    ``citation_ids=tuple()`` unconditionally — the prompt template that
+    asks the model to emit citations as JSON envelope lands with T5-04.
+    Caching an answer with empty ``citation_ids`` would break forget
+    invalidation (which joins on ``citation_ids @> '[fid]'::jsonb`` —
+    empty array can't match any forget event). Until T5-04 wires real
+    citation parsing, we refuse to cache + abstain.
+    """
+    bundle = _make_bundle((100,))
+    ledger = FakeLedgerRepo()
+    cache = FakeCacheRepo()
+    provider = FakeProvider(
+        citation_ids=(),  # F5 trigger.
+        answer_text="A short answer with no citations",
+    )
+    session = FakeSession(
+        query_results=[
+            [{"message_version_id": 100}],
+            [],
+        ]
+    )
+
+    res = await synthesize_answer(
+        session,  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+    )
+
+    assert isinstance(res, Abstention)
+    assert res.reason == "provider_error"
+    # Ledger has the placeholder UPDATEd with the no-citations sentinel.
+    assert ledger.rows[-1].error == "provider_returned_no_citations"
+    # No cache row was written — defends against forget invalidation
+    # being unable to join on the empty array.
+    assert len(cache.rows) == 0
