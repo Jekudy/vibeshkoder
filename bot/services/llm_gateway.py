@@ -733,9 +733,34 @@ async def synthesize_answer(
                 cache_hit=False,  # provider was called; we just lost the store race
                 llm_call_id=placeholder_row.id,
             )
-        # Race-recovery itself failed: re-raise so the outer handler can
-        # surface an Abstention via the unknown-error path.
-        raise
+        # Race-recovery edge case (Codex round-3): IntegrityError fired but
+        # the existing row is GONE by the time we re-fetch. Plausible
+        # sequence: winner stored → forget_invalidate_by_citation deleted
+        # the row before our re-fetch. Cannot return a cached answer; cannot
+        # silently raise into the handler (invariant #1 gatekeeper
+        # preservation). Write ledger marker + abstain cleanly.
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=cost_usd,
+            response_hash=None,
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=provider_result.request_id,
+            latency_ms=latency,
+            error="cache_store_race_winner_invalidated",
+        )
+        logger.warning(
+            "cache-store race: winner row disappeared before re-fetch — likely "
+            "concurrent forget_invalidate. Returning Abstention; no cache row.",
+            extra={"llm_call_id": placeholder_row.id},
+        )
+        return Abstention(
+            reason="provider_error",
+            cost_usd=cost_usd,
+            llm_call_id=placeholder_row.id,
+        )
     latency = int((time.monotonic() - started) * 1000)
     await ledger_repo.update_placeholder(
         session,
