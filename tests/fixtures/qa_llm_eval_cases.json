@@ -17,7 +17,9 @@
     "expected_outcome": "abstention",
     "expected_abstention_reason": "all_filtered",
     "expected_citation_subset_of": [],
-    "expected_cost_usd_max": "0.00"
+    "expected_cost_usd_max": "0.00",
+    "_runtime_seeded": true,
+    "_seed_hint": "Test seeds a non-empty bundle at runtime with all citations memory_policy='offrecord' so the gateway STEP_SOURCE_FILTER drops every cited message_version_id. evidence_message_version_ids=[] here means 'consumer must seed dynamic ids'; consumer's bundle is non-empty but post-filter set is empty."
   },
   {
     "id": "eval-003-budget-exceeded",
@@ -27,7 +29,9 @@
     "expected_outcome": "abstention",
     "expected_abstention_reason": "budget_exceeded",
     "expected_citation_subset_of": [],
-    "expected_cost_usd_max": "0.00"
+    "expected_cost_usd_max": "0.00",
+    "_runtime_seeded": true,
+    "_seed_hint": "Test pre-loads llm_usage_ledger rows totalling > config.daily_ceiling_usd. Consumer must seed the ledger rows + a valid bundle (any version_id) so STEP_BUDGET_GUARD_ATOMIC trips on the pre-loaded daily total."
   },
   {
     "id": "eval-004-provider-error-transient",
@@ -38,7 +42,9 @@
     "expected_abstention_reason": "provider_error",
     "expected_ledger_error": "provider_transient:rate_limit",
     "expected_citation_subset_of": [],
-    "expected_cost_usd_max": "0.00"
+    "expected_cost_usd_max": "0.00",
+    "_runtime_seeded": true,
+    "_seed_hint": "Test wires a FakeProvider raising ProviderTransientError(subtype='rate_limit') and seeds a non-empty bundle so dispatch is reached. Consumer must inject a transient-error provider + seed dynamic ids."
   },
   {
     "id": "eval-005-cache-hit",
@@ -63,7 +69,9 @@
     "expected_abstention_reason": "provider_error",
     "expected_ledger_error": "citation_hallucination",
     "expected_citation_subset_of": [],
-    "expected_cost_usd_max": "0.10"
+    "expected_cost_usd_max": "0.10",
+    "_runtime_seeded": true,
+    "_seed_hint": "Test wires a FakeProvider returning citation_ids containing an id NOT in the seeded bundle. Consumer seeds a bundle + provider that emits hallucinated ids; gateway STEP_CITATION_ENFORCEMENT must reject."
   },
   {
     "id": "eval-007-forget-invalidated",
@@ -73,7 +81,9 @@
     "expected_outcome": "abstention",
     "expected_abstention_reason": "forget_invalidated",
     "expected_citation_subset_of": [],
-    "expected_cost_usd_max": "0.00"
+    "expected_cost_usd_max": "0.00",
+    "_runtime_seeded": true,
+    "_seed_hint": "Test seeds a non-empty bundle + a forget_event whose tombstone_key matches one of the cited message_version_ids (via 'message:' || chat_id || ':' || message_id form). Consumer must seed both."
   },
   {
     "id": "eval-008-answer-happy-path",

@@ -67,9 +67,16 @@ commit `5fcd99b`). Wave 2 = T5-03 repos (PR #223, commit `18c98893`) + T5-04 han
 alembic 025 + cascade + pricing (PR #226, commit `43f21ee`). Flag
 `memory.qa.llm_synthesis.enabled` default OFF — Phase 4 byte-for-byte preserved.
 
-**Wave 3 next: T5-05 eval harness** (`tests/eval/test_qa_llm_eval_cases.py` + fixtures
-per contracts.md §9). After Wave 3 merge → FHR per superflow Rule 9 → Phase 5 CLOSED
-declaration + Phase 6 (cards) authorization.
+**Phase 5 (LLM gateway + answer synthesis) — CLOSED 2026-05-11.** All 6 tickets merged
+across Wave 0/1/2/3 (T5-W0-01..T5-05). Wave 3 = T5-05 eval harness (PR #229
+`5faea1d`). FHR Claude `deep-product-reviewer` ACCEPTED with 4 MEDIUM carryovers in
+closure PR. Phase 11 (Orch C) binding tests green on main.
+
+**Next active phase: Phase 6 (knowledge cards + admin review)** — authorized per
+`AUTHORIZED_SCOPE.md`. Sprint 0 = ratify `prompts/PHASE6_PLAN_DRAFT.md` →
+`PHASE6_PLAN.md`. Phase 5 FHR M-1 + M-4 carryovers must close as part of Phase 6
+kickoff: (M-1) tighten `synthesize_answer.qa_trace_id: int | None` OR add runtime
+assert; (M-4) add direct cascade `message_hash` sub-case tests with NULL assertions.
 
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:

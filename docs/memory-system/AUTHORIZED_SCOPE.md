@@ -55,10 +55,18 @@ must wait for its phase gate.
 
 ---
 
-## Authorized: Phase 5 — LLM gateway + answer synthesis (2026-04-30)
+## Authorized: Phase 5 — LLM gateway + answer synthesis (2026-04-30) — **CLOSED 2026-05-11**
 
 Phase 5 is authorized for implementation. Predecessor (Phase 4) closed 2026-04-30 with
-6/6 tickets shipped, FHR pending. Owned by Orchestrator A per `ORCHESTRATOR_REGISTRY.md`.
+6/6 tickets shipped. Owned by Orchestrator A per `ORCHESTRATOR_REGISTRY.md`.
+
+**Status: CLOSED 2026-05-11.** All 6 Phase 5 tickets merged (T5-W0-01 via #203;
+T5-01 #209 `7dcb218`; T5-02 #207 `5fcd99b`; T5-03 #223 `18c98893`; T5-04 #226 `43f21ee`;
+T5-05 #229 `5faea1d`). Wave-2 closure docs #227 `358e144`. FHR Claude `deep-product-reviewer`
+ACCEPTED with 4 MEDIUM carryovers (qa_trace_id type tightening, contracts.md field-name
+drift fixed in closure PR, fixture runtime-seeded annotation fixed in closure PR, cascade
+message_hash sub-case test deferred to Phase 6 kickoff). Phase 11 (Orch C) binding tests
+green on main HEAD. Phase 6 (cards) now authorized below.
 
 Authorized scope:
 - `bot/services/llm_gateway.py` — single-entry LLM call interface; ALL provider calls
@@ -129,11 +137,39 @@ Promotion to "authorized for implementation" requires:
 
 ---
 
+## Authorized: Phase 6 — Knowledge cards + admin review (2026-05-11)
+
+Phase 6 is authorized for implementation following Phase 5 closure 2026-05-11.
+Owned by Orchestrator A per the synthesis chain (Phase 5 → 6 → 7 → 8).
+
+Authorized scope (per `prompts/PHASE6_PLAN_DRAFT.md` until promoted to `PHASE6_PLAN.md`):
+- `knowledge_cards` + `card_sources` + `card_revisions` tables / repos / handlers
+- Card extraction pipelines (using Phase 5 `llm_gateway` ONLY — no new LLM entry points)
+- Admin review surface for card approval / rejection
+- Cascade extension for card content tied to `forget_events`
+- Privacy invariants #2 / #3 / #5 / #9 binding (cards are summaries — never canonical truth)
+
+Phase 6 implementation must:
+- Ratify `prompts/PHASE6_PLAN_DRAFT.md` → `PHASE6_PLAN.md` as Sprint 0 (similar to Phase 5
+  Sprint 0 plan ratification).
+- Close the Phase 5 FHR carryovers:
+  - **M-1**: tighten `bot/services/llm_gateway.py::synthesize_answer` annotation
+    `qa_trace_id: int | None` OR add runtime `assert qa_trace_id is not None`.
+  - **M-4**: add direct `_cascade_qa_traces_llm` + `_cascade_llm_synthesis_cache`
+    `message_hash` sub-case tests with `llm_response_summary` NULL assertions.
+
+NOT in Phase 6 scope (defer):
+- Daily/weekly digests (Phase 7).
+- Reflection / observations / memory_events / memory_candidates / reflection_runs (Phase 8).
+- Wiki (Phase 9), graph projection (Phase 10), butler (Phase 12).
+
+---
+
 ## NOT authorized (future phases — gates not passed)
 
 Do not start, design, or write speculative code for:
 
-- Phase 6 catalog / cards — Orchestrator A unblocks after Phase 5 closure.
+
 - Phase 7 daily summaries — depends on Phase 5 + Phase 6.
 - Phase 8 reflection / observations — depends on Phase 7.
 - Wiki (member or public) implementation — Phase 9, conditionally above.

@@ -134,8 +134,8 @@ Field semantics:
 class LLMGatewayConfig:
     provider: Literal["anthropic", "openai"]
     model: str                              # e.g., "claude-haiku-4-5-20251001"
-    daily_usd_ceiling: Decimal              # default Decimal("5.00")
-    monthly_usd_ceiling: Decimal            # default Decimal("50.00")
+    daily_ceiling_usd: Decimal              # default Decimal("5.00")
+    monthly_ceiling_usd: Decimal            # default Decimal("50.00")
     prompt_template_version: str            # semver string, e.g. "1.0.0"
     request_timeout_s: float                # provider-call hard timeout
     max_tokens_out: int                     # provider call cap
@@ -144,7 +144,7 @@ class LLMGatewayConfig:
 Field semantics:
 
 * `prompt_template_version` — semver-style string used as a component of the cache input hash and ledger correlation. Bumping this version invalidates cache rows generated under previous versions WITHOUT requiring a DDL change. T5-04 hardcodes the initial value; future revisions of the prompt template MUST bump this BEFORE merge.
-* `daily_usd_ceiling` / `monthly_usd_ceiling` — `Decimal` only; loaded from env (`LLM_DAILY_USD_CEILING`, `LLM_MONTHLY_USD_CEILING`) or `feature_flags.config_json`. Defaults: 5.00 / 50.00 USD per the ratification table in PHASE5_PLAN.md §11.
+* `daily_ceiling_usd` / `monthly_ceiling_usd` — `Decimal` only; loaded from env (`LLM_DAILY_USD_CEILING`, `LLM_MONTHLY_USD_CEILING`) or `feature_flags.config_json`. Defaults: 5.00 / 50.00 USD per the ratification table in PHASE5_PLAN.md §11. (Field name reconciled to impl at Phase 5 closure 2026-05-11 — was previously `daily_usd_ceiling` in spec; impl shipped `daily_ceiling_usd`.)
 * `provider` — closed `Literal`. Adding a new provider requires updating both the literal and the dispatcher in T5-01.
 * `model` — provider-specific model identifier. Default for `provider='anthropic'`: `claude-haiku-4-5-20251001`. Stop signal #10 in PHASE5_PLAN.md §8 binds: if SDK rejects this ID at T5-01 implementation time, halt and re-verify against the current Anthropic models catalog before resuming.
 
@@ -191,7 +191,7 @@ The gateway MUST execute the following seven steps in this exact order. Each ste
 
    If ANY tombstone matches, call `SynthesisCacheRepo.invalidate_by_citation(message_version_id)` for each affected id (best-effort cache cleanup), write ledger row with `error='forget_invalidated'`, return `Abstention(reason='forget_invalidated', cost_usd=Decimal("0"), llm_call_id=<new>)`. Closes Codex round-1 HIGH 3 (was previously checking only `message:` keys).
 4. **`STEP_CACHE_LOOKUP`** — Compute `input_hash = sha256(query_normalized || sorted(citation_ids) || config.model || config.prompt_template_version)` where `query_normalized = query.strip()[:256].strip()` (double-strip is load-bearing — byte-mirrors `bot/services/search.py:43,55`). Call `SynthesisCacheRepo.get_or_none(input_hash=...)`. On hit: write ledger row with `cache_hit=True`, `cost_usd=Decimal("0")`, `tokens_in=0`, `tokens_out=0`, `response_hash=<sha256 of cached answer_text>`, then return `AnswerWithCitations(answer_text=cached.answer_text, citation_ids=tuple(cached.citation_ids), cost_usd=Decimal("0"), cache_hit=True, llm_call_id=<new>)`. Cache lookup MUST happen AFTER step 3 — closes Codex round-1 HIGH 2 (cache cannot serve forgotten content).
-5. **`STEP_BUDGET_GUARD_ATOMIC`** — Wrap budget check + reservation in a single transaction guarded by `pg_advisory_xact_lock(LLM_BUDGET_LOCK_ID)` where `LLM_BUDGET_LOCK_ID` is a deterministic int64 derived from `int.from_bytes(sha256(b"llm_budget_guard").digest()[:8], "big", signed=True)`. Inside the lock: read `LedgerRepo.daily_cost_usd(...)` and `monthly_cost_usd(...)`, compare against `config.daily_usd_ceiling` and `config.monthly_usd_ceiling`. If over either ceiling, write ledger row with `error='budget_exceeded'`, return `Abstention(reason='budget_exceeded', cost_usd=Decimal("0"), llm_call_id=<new>)`. Otherwise, write a PLACEHOLDER ledger row with `error=NULL`, `cost_usd=Decimal("0")`, `tokens_in=0`, `tokens_out=0`, `response_hash=NULL` (capture its `id` for the post-dispatch UPDATE). Closes Codex round-1 MEDIUM 1 (atomic concurrent budget).
+5. **`STEP_BUDGET_GUARD_ATOMIC`** — Wrap budget check + reservation in a single transaction guarded by `pg_advisory_xact_lock(LLM_BUDGET_LOCK_ID)` where `LLM_BUDGET_LOCK_ID` is a deterministic int64 derived from `int.from_bytes(sha256(b"llm_budget_guard").digest()[:8], "big", signed=True)`. Inside the lock: read `LedgerRepo.daily_cost_usd(...)` and `monthly_cost_usd(...)`, compare against `config.daily_ceiling_usd` and `config.monthly_ceiling_usd`. If over either ceiling, write ledger row with `error='budget_exceeded'`, return `Abstention(reason='budget_exceeded', cost_usd=Decimal("0"), llm_call_id=<new>)`. Otherwise, write a PLACEHOLDER ledger row with `error=NULL`, `cost_usd=Decimal("0")`, `tokens_in=0`, `tokens_out=0`, `response_hash=NULL` (capture its `id` for the post-dispatch UPDATE). Closes Codex round-1 MEDIUM 1 (atomic concurrent budget).
 6. **`STEP_PROVIDER_DISPATCH`** — Dispatch via the configured provider. Categorize all exceptions (closes Codex round-1 MEDIUM 2):
    * **Transient** (`rate_limit`, `timeout`, `5xx`, `connection_reset`): UPDATE placeholder ledger row with `error='provider_transient:<subtype>'`, return `Abstention(reason='provider_error', cost_usd=Decimal("0"), llm_call_id=placeholder.id)`. Log at WARNING.
    * **Structural** (`auth`, `bad_request`, `contract_violation`, `model_not_found`): UPDATE ledger row with `error='provider_structural:<subtype>'`, log at ERROR with full exception, emit `bot.services.observability.emit_stop_signal("llm_provider_structural")`, return `Abstention(reason='provider_error', cost_usd=Decimal("0"), llm_call_id=placeholder.id)`. NEVER raise into the handler (invariant #1: gatekeeper preservation).
@@ -416,7 +416,7 @@ Binding details:
 
 * All four methods `flush`-only, NEVER `commit`. The orchestration transaction is owned by the caller (T5-04 handler invokes `await session.commit()` once after `synthesize_answer` returns).
 * `daily_cost_usd` / `monthly_cost_usd` boundary: UTC midnight. The calendar conversion uses `datetime.combine(day, time(0), tzinfo=timezone.utc)` and the next day at 00:00 UTC as the half-open upper bound.
-* Zero-row return is `Decimal("0")` literal — never `None`, never `0.0` (float). T5-04 budget guard does `if daily_cost_usd > config.daily_usd_ceiling`; a `None` here would `TypeError` in the lock window and is forbidden.
+* Zero-row return is `Decimal("0")` literal — never `None`, never `0.0` (float). T5-04 budget guard does `if daily_cost_usd > config.daily_ceiling_usd`; a `None` here would `TypeError` in the lock window and is forbidden.
 * `update_placeholder` is the post-dispatch ledger UPDATE. T5-01 calls it inside `STEP_PROVIDER_DISPATCH` and `STEP_CITATION_ENFORCEMENT`. Returning rowcount allows T5-01 to assert exactly-one-update and surface the regression early.
 
 ### §5.2 `SynthesisCacheRepo`
