@@ -15,7 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.eval_runner import run_eval_recall
 
-pytestmark = pytest.mark.usefixtures("eval_app_env", "golden_recall_seed")
+pytestmark = [
+    pytest.mark.usefixtures("eval_app_env", "golden_recall_seed"),
+    pytest.mark.asyncio(loop_scope="class"),
+]
 
 
 class TestDeterminism:
