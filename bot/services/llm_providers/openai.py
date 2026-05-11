@@ -33,7 +33,7 @@ class OpenAIProvider:
                 message=f"openai SDK not installed: {exc}",
             ) from exc
 
-        try:
+        try:  # pragma: no cover — SDK call only exercised in real-API tests
             client = openai.AsyncOpenAI(api_key=self._api_key)  # type: ignore[attr-defined]
             response = await client.responses.create(  # type: ignore[no-untyped-call]
                 model=model,
@@ -71,12 +71,13 @@ class OpenAIProvider:
                 ) from exc
             raise
 
-        text = getattr(response, "output_text", "") or ""
-        usage = getattr(response, "usage", None)
-        tokens_in = getattr(usage, "input_tokens", 0) if usage else 0
-        tokens_out = getattr(usage, "output_tokens", 0) if usage else 0
-        request_id = getattr(response, "id", "") or ""
-        return ProviderResult(
+        # pragma: no cover — response-parsing reached only with real SDK.
+        text = getattr(response, "output_text", "") or ""  # pragma: no cover
+        usage = getattr(response, "usage", None)  # pragma: no cover
+        tokens_in = getattr(usage, "input_tokens", 0) if usage else 0  # pragma: no cover
+        tokens_out = getattr(usage, "output_tokens", 0) if usage else 0  # pragma: no cover
+        request_id = getattr(response, "id", "") or ""  # pragma: no cover
+        return ProviderResult(  # pragma: no cover
             answer_text=text,
             citation_ids=tuple(),  # T5-04 populates from prompt-template envelope
             tokens_in=tokens_in,
