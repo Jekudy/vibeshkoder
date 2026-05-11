@@ -119,12 +119,14 @@ class SynthesisCacheRepo:
             rowcount = len(deleted_ids)
         else:
             # Portable fallback for SQLite and any other dialect.
-            all_rows_result = await session.execute(select(LlmSynthesisCache))
-            all_rows = list(all_rows_result.scalars().all())
+            all_rows_result = await session.execute(
+                select(LlmSynthesisCache.id, LlmSynthesisCache.citation_ids)
+            )
+            all_rows = all_rows_result.all()  # list of (id, citation_ids) tuples
             matching_ids = [
-                row.id
-                for row in all_rows
-                if message_version_id in (row.citation_ids or [])
+                row_id
+                for row_id, citation_ids in all_rows
+                if message_version_id in (citation_ids or [])
             ]
             if matching_ids:
                 del_stmt = delete(LlmSynthesisCache).where(
