@@ -34,10 +34,14 @@ LLM_PROVIDER_PREFIXES: tuple[str, ...] = (
     "replicate",
 )
 
-# Once Phase 5 lands, llm_gateway.py is the ONLY file allowed to import these.
+# Phase 5 (T5-01) has shipped: llm_gateway.py orchestrates calls; the actual
+# SDK imports live in llm_providers/anthropic.py + llm_providers/openai.py
+# (gateway itself contains zero `import anthropic` / `import openai` — verified
+# via grep). Both provider files are part of the Phase 5 invariant-#2 boundary.
 ALLOWED_LLM_IMPORT_FILES: frozenset[str] = frozenset(
     [
-        # "bot/services/llm_gateway.py",  # uncomment when Phase 5 ships
+        "bot/services/llm_providers/anthropic.py",
+        "bot/services/llm_providers/openai.py",
     ]
 )
 
@@ -143,9 +147,20 @@ def test_i2_no_llm_provider_in_runtime_dependencies() -> None:
 
 
 def test_i3_allow_list_contract_documented() -> None:
-    """I3: allow-list constant is the explicit contract; will be extended in Phase 5."""
-    assert ALLOWED_LLM_IMPORT_FILES == frozenset(), (
-        "ALLOWED_LLM_IMPORT_FILES is not empty — Phase 5 has shipped llm_gateway.py "
-        "and this test must be updated to reflect the new contract: the gateway is "
-        "the ONLY file allowed to import LLM providers."
+    """I3: allow-list contains exactly the Phase 5 provider boundary files.
+
+    Updated 2026-05-11 when T5-01 (Phase 5 LLM gateway) shipped. The two
+    provider files (anthropic.py + openai.py) are the ONLY files allowed to
+    import LLM SDK packages; llm_gateway.py itself stays SDK-import-free
+    (verified by grep + by the I1 test).
+    """
+    assert ALLOWED_LLM_IMPORT_FILES == frozenset(
+        [
+            "bot/services/llm_providers/anthropic.py",
+            "bot/services/llm_providers/openai.py",
+        ]
+    ), (
+        "ALLOWED_LLM_IMPORT_FILES contract drift — Phase 5 boundary is "
+        "bot/services/llm_providers/{anthropic,openai}.py. If a new provider "
+        "is added, extend the allow-list AND re-confirm gateway invariant #2."
     )
