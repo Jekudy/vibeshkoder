@@ -106,6 +106,68 @@ async def _make_version(
     return msg.id, ver.id
 
 
+class _VersionResult:
+    """Returned by _make_version_full; carries all IDs needed for tombstone key building."""
+
+    __slots__ = ("chat_message_id", "version_id", "chat_id", "message_id", "user_id")
+
+    def __init__(self, chat_message_id: int, version_id: int, chat_id: int, message_id: int, user_id: int) -> None:
+        self.chat_message_id = chat_message_id
+        self.version_id = version_id
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.user_id = user_id
+
+
+async def _make_version_full(
+    db_session,
+    *,
+    memory_policy: str = "normal",
+    is_redacted: bool = False,
+    content_hash: str | None = None,
+) -> _VersionResult:
+    """Create a ChatMessage + MessageVersion. Returns _VersionResult with all IDs."""
+    from bot.db.models import ChatMessage, MessageVersion
+
+    uid = await _make_user(db_session)
+    chat_id = _next_chat_id()
+    msg_id = _next_msg_id()
+    when = datetime.now(UTC)
+
+    hash_val = content_hash or f"hash-{uuid4().hex[:12]}"
+
+    msg = ChatMessage(
+        message_id=msg_id,
+        chat_id=chat_id,
+        user_id=uid,
+        text="some content" if not is_redacted else None,
+        date=when,
+        memory_policy=memory_policy,
+        is_redacted=is_redacted,
+        content_hash=hash_val,
+    )
+    db_session.add(msg)
+    await db_session.flush()
+
+    ver = MessageVersion(
+        chat_message_id=msg.id,
+        version_seq=1,
+        text="some content" if not is_redacted else None,
+        content_hash=hash_val,
+        is_redacted=is_redacted,
+    )
+    db_session.add(ver)
+    await db_session.flush()
+
+    return _VersionResult(
+        chat_message_id=msg.id,
+        version_id=ver.id,
+        chat_id=chat_id,
+        message_id=msg_id,
+        user_id=uid,
+    )
+
+
 async def _make_forget_event(db_session, *, tombstone_key: str) -> int:
     """Create a forget_events row. Returns its id."""
     from bot.db.repos.forget_event import ForgetEventRepo
@@ -124,6 +186,7 @@ async def _make_forget_event(db_session, *, tombstone_key: str) -> int:
 # ─── 1. happy paths ───────────────────────────────────────────────────────────
 
 
+@pytest.mark.integration
 async def test_empty_cited_list_is_visible(db_session) -> None:
     """Empty cited_message_version_ids → VISIBLE (no constraints)."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -134,6 +197,7 @@ async def test_empty_cited_list_is_visible(db_session) -> None:
     assert result.blocking_source_ids == ()
 
 
+@pytest.mark.integration
 async def test_all_normal_sources_visible(db_session) -> None:
     """All sources have memory_policy='normal', not redacted → VISIBLE."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -147,6 +211,7 @@ async def test_all_normal_sources_visible(db_session) -> None:
     assert result.blocking_source_ids == ()
 
 
+@pytest.mark.integration
 async def test_single_offrecord_source_is_redacted(db_session) -> None:
     """One source with memory_policy='offrecord' → REDACTED."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -160,6 +225,7 @@ async def test_single_offrecord_source_is_redacted(db_session) -> None:
     assert v_offrecord in result.blocking_source_ids
 
 
+@pytest.mark.integration
 async def test_single_redacted_flag_is_redacted(db_session) -> None:
     """One source with is_redacted=True → REDACTED."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -172,6 +238,7 @@ async def test_single_redacted_flag_is_redacted(db_session) -> None:
     assert v_redacted in result.blocking_source_ids
 
 
+@pytest.mark.integration
 async def test_single_nomem_source_is_nomem(db_session) -> None:
     """One source with memory_policy='nomem' → NOMEM."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -184,6 +251,7 @@ async def test_single_nomem_source_is_nomem(db_session) -> None:
     assert v_nomem in result.blocking_source_ids
 
 
+@pytest.mark.integration
 async def test_single_forgotten_source_is_forgotten(db_session) -> None:
     """One source whose content_hash matches a forget_events tombstone → FORGOTTEN."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -201,6 +269,7 @@ async def test_single_forgotten_source_is_forgotten(db_session) -> None:
 # ─── 2. multi-source combinatorics ────────────────────────────────────────────
 
 
+@pytest.mark.integration
 async def test_visible_plus_offrecord_is_redacted(db_session) -> None:
     """1 visible + 1 offrecord → REDACTED."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -215,6 +284,7 @@ async def test_visible_plus_offrecord_is_redacted(db_session) -> None:
     assert v_ok not in result.blocking_source_ids
 
 
+@pytest.mark.integration
 async def test_visible_plus_nomem_is_nomem(db_session) -> None:
     """1 visible + 1 nomem → NOMEM."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -228,6 +298,7 @@ async def test_visible_plus_nomem_is_nomem(db_session) -> None:
     assert v_nm in result.blocking_source_ids
 
 
+@pytest.mark.integration
 async def test_nomem_plus_forgotten_is_nomem(db_session) -> None:
     """NOMEM beats FORGOTTEN — precedence invariant."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -242,6 +313,7 @@ async def test_nomem_plus_forgotten_is_nomem(db_session) -> None:
     assert result.visibility == CardVisibility.NOMEM
 
 
+@pytest.mark.integration
 async def test_redacted_beats_nomem(db_session) -> None:
     """REDACTED beats NOMEM — highest precedence invariant."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -254,6 +326,7 @@ async def test_redacted_beats_nomem(db_session) -> None:
     assert result.visibility == CardVisibility.REDACTED
 
 
+@pytest.mark.integration
 async def test_redacted_flag_beats_nomem(db_session) -> None:
     """is_redacted=True beats nomem policy."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -266,6 +339,7 @@ async def test_redacted_flag_beats_nomem(db_session) -> None:
     assert result.visibility == CardVisibility.REDACTED
 
 
+@pytest.mark.integration
 async def test_redacted_beats_forgotten(db_session) -> None:
     """REDACTED beats FORGOTTEN — highest precedence."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -280,6 +354,7 @@ async def test_redacted_beats_forgotten(db_session) -> None:
     assert result.visibility == CardVisibility.REDACTED
 
 
+@pytest.mark.integration
 async def test_five_sources_one_nomem(db_session) -> None:
     """5 sources, 1 nomem + 4 normal → NOMEM (matches golden fixture 05)."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -297,6 +372,7 @@ async def test_five_sources_one_nomem(db_session) -> None:
     assert v_nm in result.blocking_source_ids
 
 
+@pytest.mark.integration
 async def test_all_categories_redacted_wins(db_session) -> None:
     """All four states present — REDACTED wins (strictest precedence)."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -316,6 +392,7 @@ async def test_all_categories_redacted_wins(db_session) -> None:
 # ─── 3. edge cases ────────────────────────────────────────────────────────────
 
 
+@pytest.mark.integration
 async def test_missing_version_ids_treated_as_absent(db_session) -> None:
     """Cited IDs that don't exist in DB → treated as non-blocking (absent rows).
 
@@ -331,6 +408,7 @@ async def test_missing_version_ids_treated_as_absent(db_session) -> None:
     assert result.visibility == CardVisibility.VISIBLE
 
 
+@pytest.mark.integration
 async def test_forgotten_policy_in_chat_messages_is_redacted(db_session) -> None:
     """message.memory_policy='forgotten' on chat_messages → treated as REDACTED
     (cascade has already run; content is gone, effectively offrecord)."""
@@ -343,6 +421,7 @@ async def test_forgotten_policy_in_chat_messages_is_redacted(db_session) -> None
     assert result.visibility == CardVisibility.REDACTED
 
 
+@pytest.mark.integration
 async def test_tombstone_match_by_content_hash_not_id(db_session) -> None:
     """Tombstone matching is by content_hash, NOT by message_version.id.
 
@@ -366,6 +445,7 @@ async def test_tombstone_match_by_content_hash_not_id(db_session) -> None:
     assert result_clear.visibility == CardVisibility.VISIBLE
 
 
+@pytest.mark.integration
 async def test_tombstone_wrong_key_format_no_match(db_session) -> None:
     """A forget_events row with target_type='message' (not 'message_hash') does NOT
     block via content_hash. The tombstone_key format must be 'message_hash:<hash>'."""
@@ -392,6 +472,7 @@ async def test_tombstone_wrong_key_format_no_match(db_session) -> None:
     assert result.visibility == CardVisibility.VISIBLE
 
 
+@pytest.mark.integration
 async def test_multiple_blocking_sources_all_listed(db_session) -> None:
     """When multiple sources block, all are listed in blocking_source_ids."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -406,6 +487,7 @@ async def test_multiple_blocking_sources_all_listed(db_session) -> None:
     assert v2 in result.blocking_source_ids
 
 
+@pytest.mark.integration
 async def test_reason_is_non_empty_string(db_session) -> None:
     """VisibilityDerivation.reason must always be a non-empty string."""
     from bot.services.visibility_derivation import derive_card_visibility
@@ -417,6 +499,7 @@ async def test_reason_is_non_empty_string(db_session) -> None:
     assert len(result.reason) > 0
 
 
+@pytest.mark.integration
 async def test_reason_describes_blocking_state(db_session) -> None:
     """Reason for non-visible states mentions the blocking policy."""
     from bot.services.visibility_derivation import derive_card_visibility
@@ -430,6 +513,7 @@ async def test_reason_describes_blocking_state(db_session) -> None:
 # ─── 4. precedence ordering invariants ───────────────────────────────────────
 
 
+@pytest.mark.integration
 async def test_precedence_redacted_over_all(db_session) -> None:
     """REDACTED > NOMEM > FORGOTTEN > VISIBLE: REDACTED wins over all others."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -446,6 +530,7 @@ async def test_precedence_redacted_over_all(db_session) -> None:
     assert result.visibility == CardVisibility.REDACTED
 
 
+@pytest.mark.integration
 async def test_precedence_nomem_over_forgotten(db_session) -> None:
     """NOMEM beats FORGOTTEN."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -460,6 +545,7 @@ async def test_precedence_nomem_over_forgotten(db_session) -> None:
     assert result.visibility == CardVisibility.NOMEM
 
 
+@pytest.mark.integration
 async def test_precedence_forgotten_over_visible(db_session) -> None:
     """FORGOTTEN beats VISIBLE."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -474,6 +560,7 @@ async def test_precedence_forgotten_over_visible(db_session) -> None:
     assert result.visibility == CardVisibility.FORGOTTEN
 
 
+@pytest.mark.integration
 async def test_precedence_nomem_over_visible(db_session) -> None:
     """NOMEM beats VISIBLE."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -489,6 +576,7 @@ async def test_precedence_nomem_over_visible(db_session) -> None:
 # ─── 5. VisibilityDerivation dataclass properties ────────────────────────────
 
 
+@pytest.mark.integration
 async def test_derivation_is_frozen(db_session) -> None:
     """VisibilityDerivation must be frozen (immutable)."""
     from bot.services.visibility_derivation import derive_card_visibility
@@ -499,6 +587,7 @@ async def test_derivation_is_frozen(db_session) -> None:
         result.visibility = "anything"  # type: ignore[misc]
 
 
+@pytest.mark.integration
 async def test_blocking_source_ids_is_tuple(db_session) -> None:
     """blocking_source_ids must be a tuple (frozen)."""
     from bot.services.visibility_derivation import derive_card_visibility
@@ -521,6 +610,7 @@ async def test_card_visibility_enum_values() -> None:
 # ─── 6. forgotten policy on chat_messages (cascade already ran) ───────────────
 
 
+@pytest.mark.integration
 async def test_parent_memory_policy_forgotten_is_redacted(db_session) -> None:
     """If chat_messages.memory_policy='forgotten' (cascade already ran), result is REDACTED.
 
@@ -541,6 +631,7 @@ async def test_parent_memory_policy_forgotten_is_redacted(db_session) -> None:
 # ─── 7. async behavior — read-only guarantee ─────────────────────────────────
 
 
+@pytest.mark.integration
 async def test_no_db_writes_on_visible(db_session) -> None:
     """derive_card_visibility must not write to the DB (read-only invariant).
 
@@ -564,6 +655,7 @@ async def test_no_db_writes_on_visible(db_session) -> None:
     assert not db_session.dirty
 
 
+@pytest.mark.integration
 async def test_no_db_writes_on_redacted(db_session) -> None:
     """derive_card_visibility must not write to the DB even for blocking sources."""
     from bot.services.visibility_derivation import CardVisibility, derive_card_visibility
@@ -589,6 +681,7 @@ def _golden_fixture_ids():
     return sorted(GOLDEN_FIXTURES_DIR.glob("*.json"))
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("fixture_path", _golden_fixture_ids(), ids=lambda p: p.stem)
 async def test_golden_fixture(db_session, fixture_path: Path) -> None:
     """Parameterized: each golden JSON file → run derive_card_visibility and assert expected."""
@@ -605,17 +698,28 @@ async def test_golden_fixture(db_session, fixture_path: Path) -> None:
         is_redacted = src.get("is_redacted", False)
         content_hash = src.get("content_hash", f"hash-golden-{uuid4().hex[:8]}")
 
-        _, ver_id = await _make_version(
+        # Use _make_version_full so we can build dynamic tombstone keys for
+        # message: and user: formats (chat_id, message_id, user_id are DB-generated).
+        vr = await _make_version_full(
             db_session,
             memory_policy=memory_policy,
             is_redacted=is_redacted,
             content_hash=content_hash,
         )
-        id_map[local_id] = ver_id
+        id_map[local_id] = vr.version_id
 
-        # If this source has a tombstone, create the forget_event
-        if src.get("tombstone_key"):
-            await _make_forget_event(db_session, tombstone_key=src["tombstone_key"])
+        # Build tombstone key based on the format specified in the fixture.
+        # tombstone_key: literal string → use as-is (existing message_hash: fixtures)
+        # tombstone_format: "message" → build "message:{chat_id}:{message_id}" dynamically
+        # tombstone_format: "user"    → build "user:{user_id}" dynamically
+        tombstone_key: str | None = src.get("tombstone_key")
+        tombstone_format: str | None = src.get("tombstone_format")
+        if tombstone_format == "message":
+            tombstone_key = f"message:{vr.chat_id}:{vr.message_id}"
+        elif tombstone_format == "user":
+            tombstone_key = f"user:{vr.user_id}"
+        if tombstone_key:
+            await _make_forget_event(db_session, tombstone_key=tombstone_key)
 
     cited_version_ids = [id_map[src["local_id"]] for src in data["sources"]]
 

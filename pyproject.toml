@@ -52,6 +52,9 @@ include = ["bot*", "web*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+markers = [
+    "integration: marks tests that require a real Postgres database (deselect with -m 'not integration')",
+]
 
 [tool.ruff]
 line-length = 100

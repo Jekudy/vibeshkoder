@@ -30,6 +30,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import ChatMessage, ForgetEvent, MessageVersion
 
+
+def _build_tombstone_keys(
+    content_hash: str | None,
+    chat_id: int | None,
+    message_id: int | None,
+    from_user_id: int | None,
+) -> list[str]:
+    """Build all tombstone key formats for a single message_version row.
+
+    Production creates three tombstone formats (HANDOFF §10):
+      - ``message_hash:{sha256}``  — content-level forget (forget_cascade.py)
+      - ``message:{chat_id}:{message_id}`` — /forget_reply handler
+      - ``user:{tg_id}``           — /forget_me handler
+
+    Missing fields → that key format is omitted (graceful skip, never emits
+    malformed keys like ``message::99``).
+
+    Returns a list of 0-3 keys (no duplicates).
+    """
+    keys: list[str] = []
+    if content_hash is not None:
+        keys.append(f"message_hash:{content_hash}")
+    if chat_id is not None and message_id is not None:
+        keys.append(f"message:{chat_id}:{message_id}")
+    if from_user_id is not None:
+        keys.append(f"user:{from_user_id}")
+    return keys
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,7 +143,8 @@ async def derive_card_visibility(
         )
 
     # Step 1: Fetch versions + parent chat_messages data in one query.
-    # We join chat_messages to get memory_policy and is_redacted at the parent level.
+    # We join chat_messages to get memory_policy, is_redacted, and the fields
+    # needed to build all three tombstone key formats (chat_id, message_id, user_id).
     stmt = (
         select(
             MessageVersion.id.label("ver_id"),
@@ -123,33 +152,52 @@ async def derive_card_visibility(
             MessageVersion.is_redacted.label("ver_is_redacted"),
             ChatMessage.memory_policy.label("parent_policy"),
             ChatMessage.is_redacted.label("parent_is_redacted"),
+            ChatMessage.chat_id.label("parent_chat_id"),
+            ChatMessage.message_id.label("parent_message_id"),
+            ChatMessage.user_id.label("parent_user_id"),
         )
         .join(ChatMessage, MessageVersion.chat_message_id == ChatMessage.id)
         .where(MessageVersion.id.in_(cited_message_version_ids))
     )
     rows = (await session.execute(stmt)).all()
 
-    # Step 2: Fetch content hashes for these versions to check tombstones.
-    # Collect hashes from the fetched rows; then check forget_events.tombstone_key.
-    content_hashes = [row.ver_content_hash for row in rows if row.ver_content_hash]
+    # Step 2: Build all tombstone keys for all rows (3 formats per message_version),
+    # then do a SINGLE forget_events lookup covering all key formats in one IN query.
+    # Production formats (HANDOFF §10, forget_cascade.py, forget_reply.py, forget_me.py):
+    #   message_hash:{sha256}         — content-level redact
+    #   message:{chat_id}:{message_id} — /forget_reply handler
+    #   user:{tg_id}                  — /forget_me handler
+    all_tombstone_keys: list[str] = []
+    for row in rows:
+        all_tombstone_keys.extend(
+            _build_tombstone_keys(
+                content_hash=row.ver_content_hash,
+                chat_id=row.parent_chat_id,
+                message_id=row.parent_message_id,
+                from_user_id=row.parent_user_id,
+            )
+        )
 
-    tombstoned_hashes: set[str] = set()
-    if content_hashes:
-        # tombstone_key format for hash-based tombstones: "message_hash:<sha256>"
-        tombstone_keys = [f"message_hash:{h}" for h in content_hashes]
+    active_tombstones: set[str] = set()
+    if all_tombstone_keys:
         tomb_stmt = select(ForgetEvent.tombstone_key).where(
-            ForgetEvent.tombstone_key.in_(tombstone_keys)
+            ForgetEvent.tombstone_key.in_(all_tombstone_keys)
         )
         tomb_rows = (await session.execute(tomb_stmt)).scalars().all()
-        # Extract just the hash portion after "message_hash:"
-        tombstoned_hashes = {key.split(":", 1)[1] for key in tomb_rows}
+        active_tombstones = set(tomb_rows)
 
     # Step 3: Classify each version and track blocking sources.
     worst: CardVisibility = CardVisibility.VISIBLE
     blocking: list[int] = []
 
     for row in rows:
-        has_tombstone = row.ver_content_hash in tombstoned_hashes
+        row_keys = _build_tombstone_keys(
+            content_hash=row.ver_content_hash,
+            chat_id=row.parent_chat_id,
+            message_id=row.parent_message_id,
+            from_user_id=row.parent_user_id,
+        )
+        has_tombstone = bool(active_tombstones & set(row_keys))
         classification = _classify_version(
             ver_is_redacted=row.ver_is_redacted,
             parent_memory_policy=row.parent_policy,
@@ -164,7 +212,11 @@ async def derive_card_visibility(
             worst = classification
 
     # Step 4: Build reason string for audit log.
-    reason = _build_reason(worst, blocking, len(rows), len(cited_message_version_ids))
+    # Collect matched tombstone keys for audit trail specificity.
+    matched_keys = sorted(active_tombstones & set(all_tombstone_keys))
+    reason = _build_reason(
+        worst, blocking, len(rows), len(cited_message_version_ids), matched_keys
+    )
 
     return VisibilityDerivation(
         visibility=worst,
@@ -178,6 +230,7 @@ def _build_reason(
     blocking: list[int],
     fetched: int,
     requested: int,
+    matched_tombstone_keys: list[str] | None = None,
 ) -> str:
     """Build a human-readable reason string for the audit log."""
     if visibility == CardVisibility.VISIBLE:
@@ -197,8 +250,18 @@ def _build_reason(
             f"(blocking ids: {blocking}){suffix}"
         )
     if visibility == CardVisibility.FORGOTTEN:
+        # Include matched tombstone key formats for audit trail specificity.
+        # Keys may be message_hash:, message:, or user: format.
+        if matched_tombstone_keys:
+            formats = sorted({k.split(":")[0] for k in matched_tombstone_keys})
+            keys_repr = matched_tombstone_keys[:5]  # cap at 5 to avoid huge logs
+            return (
+                f"{n_blocking} source(s) match a forget_events tombstone "
+                f"(formats: {formats}, keys: {keys_repr}, "
+                f"blocking ids: {blocking}){suffix}"
+            )
         return (
-            f"{n_blocking} source(s) match a forget_events tombstone by content_hash "
+            f"{n_blocking} source(s) match a forget_events tombstone "
             f"(blocking ids: {blocking}){suffix}"
         )
     # Unreachable, but keep exhaustive

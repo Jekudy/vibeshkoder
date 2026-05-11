@@ -1,0 +1,28 @@
+{
+  "description": "One source has a forget_events tombstone in 'message:{chat_id}:{message_id}' format → FORGOTTEN (HIGH-1 privacy invariant: /forget_reply handler tombstone format)",
+  "card": {
+    "title": "Card with message-tombstone source",
+    "body_markdown": "This card cites a message that was forgotten via /forget_reply.",
+    "card_status": "approved"
+  },
+  "sources": [
+    {
+      "local_id": 1,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-message-tombstone-06-aaa",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 2,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-message-tombstone-06-bbb",
+      "tombstone_format": "message"
+    }
+  ],
+  "expected": {
+    "visibility": "forgotten",
+    "note": "Source 2 has tombstone_format='message' → tombstone_key='message:{chat_id}:{message_id}'. FORGOTTEN."
+  }
+}

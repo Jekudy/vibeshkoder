@@ -1,0 +1,28 @@
+{
+  "description": "One source's author has a 'user:{tg_id}' tombstone in forget_events → FORGOTTEN (HIGH-1 privacy invariant: /forget_me handler tombstone format)",
+  "card": {
+    "title": "Card with user-tombstone source",
+    "body_markdown": "This card cites a message whose author requested /forget_me.",
+    "card_status": "approved"
+  },
+  "sources": [
+    {
+      "local_id": 1,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-user-tombstone-07-aaa",
+      "tombstone_key": null
+    },
+    {
+      "local_id": 2,
+      "memory_policy": "normal",
+      "is_redacted": false,
+      "content_hash": "hash-user-tombstone-07-bbb",
+      "tombstone_format": "user"
+    }
+  ],
+  "expected": {
+    "visibility": "forgotten",
+    "note": "Source 2 has tombstone_format='user' → tombstone_key='user:{tg_id}'. FORGOTTEN."
+  }
+}
