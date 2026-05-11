@@ -44,14 +44,14 @@
     "id": "eval-005-cache-hit",
     "description": "Pre-seeded cache row served without provider call; cost_usd = 0; cache_hit = true",
     "query": "идентичный запрос кэша",
-    "evidence_message_version_ids": [],
+    "evidence_message_version_ids": [7005],
     "preseed_cache": {
       "answer_text": "ответ из кэша",
-      "citation_ids": []
+      "citation_ids": [7005]
     },
     "expected_outcome": "answer",
     "expected_cache_hit": true,
-    "expected_citation_subset_of": [],
+    "expected_citation_subset_of": [7005],
     "expected_cost_usd_max": "0.00"
   },
   {
@@ -79,9 +79,9 @@
     "id": "eval-008-answer-happy-path",
     "description": "Non-empty bundle, valid provider response with subset citations -> AnswerWithCitations + cost > 0",
     "query": "расскажи о проекте",
-    "evidence_message_version_ids": [],
+    "evidence_message_version_ids": [7008],
     "expected_outcome": "answer",
-    "expected_citation_subset_of": [],
+    "expected_citation_subset_of": [7008],
     "expected_cost_usd_max": "1.00"
   }
 ]
