@@ -484,11 +484,20 @@ async def synthesize_answer(
     # longer serialise globally on the 5-15s HTTP call.
     #
     # The lock is session-scoped (``pg_advisory_lock`` + ``pg_advisory_unlock``)
-    # rather than transaction-scoped so we control release timing. Inner-tx
-    # commit semantics are caller-dependent: production wires a savepoint
-    # under the outer handler tx (T5-04 integration), unit tests use a fake
-    # session that no-ops both. Real Postgres serialisation is exercised in
-    # T5-04 integration tests.
+    # rather than transaction-scoped so we control release timing.
+    #
+    # KNOWN LIMITATION until T5-04: placeholder INSERT is NOT committed before
+    # lock release. Under Postgres read-committed isolation, concurrent gateway
+    # calls can miss each other's in-flight reservations between unlock and
+    # the outer handler tx commit (which happens AFTER provider HTTP returns).
+    # Daily budget ceiling may overshoot by up to N*call_cost where N = burst
+    # size. Acceptable for Wave 1 ship (flag default OFF; no production burst).
+    # T5-04 integration test MUST exercise burst load under real Postgres and
+    # either (a) wire savepoint-commit inside the lock window, or (b) move
+    # placeholder INSERT to a dedicated short-lived connection.
+    #
+    # Unit tests use a fake session that no-ops both lock SQL statements; the
+    # ordering test asserts lock_idx < unlock_idx < provider_idx.
     placeholder_row: Any
     try:
         await session.execute(
