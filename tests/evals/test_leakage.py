@@ -289,24 +289,29 @@ async def _create_case(
     raise AssertionError(f"unknown case id: {case_id}")
 
 
-@pytest.mark.parametrize("case_id", ["L1", "L2", "L3", "L4", "L5"])
-async def test_recall_governance_leakage(
-    eval_app_env: None,
-    leakage_session: AsyncSession,
-    case_id: str,
-) -> None:
-    _ = eval_app_env
-    eval_runner = importlib.import_module("bot.services.eval_runner")
-    chat_id, query, blocked_ids = await _create_case(leakage_session, case_id)
+pytestmark = pytest.mark.asyncio(loop_scope="class")
 
-    bundle, trace = await eval_runner.run_eval_recall(
-        leakage_session,
-        query=query,
-        chat_id=chat_id,
-    )
 
-    assert trace is None
-    assert set(bundle.evidence_ids).isdisjoint(blocked_ids)
-    if case_id == "L5":
-        assert bundle.items
-        assert all(item.chat_id == L5_CHAT_ID for item in bundle.items)
+class TestRecallGovernanceLeakage:
+    @pytest.mark.parametrize("case_id", ["L1", "L2", "L3", "L4", "L5"])
+    async def test_recall_governance_leakage(
+        self,
+        eval_app_env: None,
+        leakage_session: AsyncSession,
+        case_id: str,
+    ) -> None:
+        _ = eval_app_env
+        eval_runner = importlib.import_module("bot.services.eval_runner")
+        chat_id, query, blocked_ids = await _create_case(leakage_session, case_id)
+
+        bundle, trace = await eval_runner.run_eval_recall(
+            leakage_session,
+            query=query,
+            chat_id=chat_id,
+        )
+
+        assert trace is None
+        assert set(bundle.evidence_ids).isdisjoint(blocked_ids)
+        if case_id == "L5":
+            assert bundle.items
+            assert all(item.chat_id == L5_CHAT_ID for item in bundle.items)
