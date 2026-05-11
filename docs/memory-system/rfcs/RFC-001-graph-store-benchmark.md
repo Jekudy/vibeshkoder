@@ -141,14 +141,25 @@ full Cypher query language and has extensive tooling, connectors, and documentat
 
 **Source:** https://neo4j.com/docs/
 
-**License.** Neo4j Community Edition: GPL v3 (open source but copyleft). Neo4j Enterprise:
-commercial license required. For a privacy-sensitive community memory system, GPL v3 is
-generally acceptable for server-side use if the project is not distributed as SaaS to
-third parties. However, if Shkoderbot ever offers the memory system as a hosted product,
-GPL v3 triggers copyleft for the server code — this must be reviewed by team-lead.
+**License.** Neo4j Community Edition: GPL v3 (open source, copyleft). Neo4j Enterprise:
+commercial license required.
 ([https://github.com/neo4j/neo4j/blob/4.4/LICENSE.txt](https://github.com/neo4j/neo4j/blob/4.4/LICENSE.txt))
-Community Edition is free to use for most scenarios; Enterprise features (clustering,
-advanced security, commercial support) require paid license.
+
+GPL v3 obligations attach to **distribution of modified code** — running an unmodified
+Neo4j Community binary as a backend service (whether internal or SaaS) does NOT itself
+trigger source-disclosure obligations, because network use is not distribution under
+GPL v3. The practical risks are different:
+
+- If Shkoderbot modifies the Neo4j server source and distributes those modifications
+  (including via container images shipped to third parties), GPL v3 obligates publishing
+  the modified server source.
+- If Shkoderbot extends Neo4j via plugins, the plugin-vs-derivative-work question is
+  unsettled; team-lead review needed before shipping any in-process Neo4j extension.
+- Enterprise features (clustering, advanced security, fine-grained access control,
+  commercial support) require a paid license — Community Edition lacks them.
+
+Community Edition is acceptable for internal hosted use under GPL v3 without source
+disclosure; modification + redistribution requires team-lead legal review.
 
 **Integration model.** Separate Docker service. Neo4j 5.x runs on JVM (Java 17+), exposes
 the bolt protocol on port 7687 and an HTTP browser on port 7474. Requires a new service block
@@ -291,12 +302,12 @@ For each criterion, ✅ = satisfies cleanly, ⚠️ = satisfies with caveats or 
 | Criterion | AGE | Neo4j | Graphiti | NetworkX |
 |-----------|-----|-------|----------|----------|
 | Insert throughput — 50k triples bulk | ? | ? | ? | ? |
-| 3-hop traversal P50 latency (1k queries) | ? | ? | ? | ? |
-| 3-hop traversal P95 latency (1k queries) | ? | ? | ? | ? |
+| 3-hop traversal P50 latency (10k queries) | ? | ? | ? | ? |
+| 3-hop traversal P95 latency (10k queries) | ? | ? | ? | ? |
 | Forget cascade latency (1k source deletes + graph purge) | ? | ? | ? | ? |
 | Cascade synchronous in same Postgres tx (invariant #9) | ✅ Same DB | ⚠️ Async worker needed | ⚠️ Inherits Neo4j risk | ✅ Process-local (trivial) |
 | Privacy: no external data egress | ✅ | ✅ Community | ❌ LLM extraction by default | ✅ |
-| Ops cost (1=trivial, 5=heavy) | ✅ 1 | ⚠️ 4 | ❌ 5 | ✅ 1 |
+| Ops cost (1=trivial, 5=heavy) — *qualitative pre-benchmark estimate* | ? (~1 — extension on existing PG) | ? (~4 — JVM service, separate backup, monitoring) | ? (~5 — Neo4j stack + LLM service) | ? (~1 — in-process library) |
 | Backup story | ✅ pg_dump | ⚠️ Separate tooling | ⚠️ Separate tooling | ❌ No persistence |
 | License compatibility (privacy-respecting OSS) | ✅ Apache 2.0 | ⚠️ GPL v3 — review needed for SaaS | ✅ Apache 2.0 | ✅ BSD 3-Clause |
 | Community maturity | ⚠️ Growing (graduated Apache 2023) | ✅ Dominant, 10+ years | ⚠️ New (2024), evolving API | ✅ Stable library |
@@ -333,8 +344,11 @@ methodology + qualitative analysis; quantitative confirmation is a follow-up mul
 1. **Bulk insert 50k triples** — wall-clock time from first insert to last commit. Measured
    once per store after schema setup. Reports: total seconds, triples/second.
 
-2. **3-hop random traversal** — 1,000 randomly selected start entities, each traversed up to
-   3 hops across any edge type. Reports: P50, P95, P99 latency in milliseconds.
+2. **3-hop random traversal** — 10,000 randomly selected start entities (with replacement),
+   each traversed up to 3 hops across any edge type. Sample size chosen so P99 is statistically
+   stable (at 1k queries the P99 estimator has ~30% relative error; 10k brings it under 10%).
+   Reports: P50, P95, P99 latency in milliseconds. If a store's traversal is consistently
+   sub-millisecond, also report P99.9 for differentiation.
 
 3. **Forget cascade simulation** — select 1,000 `source_message_version_ids` at random, mark
    them as `forgotten` (simulate tombstone), then delete all derived graph nodes/edges whose
@@ -464,10 +478,14 @@ store and hosting model):
    (`card_status='approved'` filter) translate cleanly to a graph projection eligibility check?
    Orch A should ack or raise concerns at promotion time.
 
-3. **Orchestrator C (evals angle):** Can graph traversal evals (leakage tests, cascade tests,
-   rebuild determinism) be expressed without store-specific Cypher dialect lock-in? If AGE is
-   chosen, evals must work against AGE's openCypher variant. If tests require full Cypher
-   (e.g., `shortestPath`), that is a compatibility risk for AGE that Orch C should flag.
+3. **Orchestrator C (evals angle — optional, courtesy review):** Per
+   `ORCHESTRATOR_REGISTRY.md §5`, Orch C is NOT formally a Phase 10 reviewer (the dependency
+   table routes Orch C ← Orch A Phase 5, not Orch C ↔ Orch B Phase 10). However, since
+   graph traversal evals (leakage tests, cascade tests, rebuild determinism) eventually need
+   to run against whatever store is chosen, Orch C is invited to comment on Cypher-dialect
+   lock-in risk: if AGE is chosen, evals must work against AGE's openCypher subset (no
+   `shortestPath`, no full path predicates). Orch C's comments are advisory, not blocking
+   for ratification. Final compatibility decisions sit with Orch B + team-lead.
 
 4. **Human team-lead (final authority):** Final ratification. The team-lead must approve:
    - The Docker image upgrade path for production.
