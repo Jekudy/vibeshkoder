@@ -93,7 +93,7 @@ def eval_app_env() -> Iterator[None]:
     yield from _eval_env()
 
 
-@pytest_asyncio.fixture(scope="class")
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def eval_postgres_engine(eval_app_env: None) -> AsyncIterator[Any]:
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -112,7 +112,7 @@ async def eval_postgres_engine(eval_app_env: None) -> AsyncIterator[Any]:
         await engine.dispose()
 
 
-@pytest_asyncio.fixture(scope="class")
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def eval_db_session(eval_postgres_engine: Any) -> AsyncIterator[Any]:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -267,7 +267,7 @@ async def _persist_seed_message(session: Any, row: dict[str, Any]) -> int:
     return int(version.id)
 
 
-@pytest_asyncio.fixture(scope="class")
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def golden_recall_seed(eval_db_session: Any) -> Seed:
     rows = _load_jsonl(CHAT_HISTORY_PATH)
     seed_hash = hashlib.sha256(_canonical_jsonl_bytes(rows)).hexdigest()
