@@ -35,6 +35,7 @@ from bot.services.llm_gateway import (
     AnswerWithCitations,
     LLMGatewayConfig,
     SynthesisResult,
+    _estimate_cost,
     _normalize_query,
     synthesize_answer,
 )
@@ -1651,3 +1652,38 @@ async def test_provider_empty_citations_aborts_synthesis() -> None:
     # No cache row was written — defends against forget invalidation
     # being unable to join on the empty array.
     assert len(cache.rows) == 0
+
+
+# ─── T5-04: real pricing wired via bot.services.llm_pricing ──────────────────
+
+
+def test_estimate_cost_haiku_one_million_input_tokens_matches_pricing_table() -> None:
+    """contracts.md §12.6 acceptance test — verbatim.
+
+    ``_estimate_cost(model="claude-haiku-4-5-20251001", tokens_in=1_000_000,
+    tokens_out=0) == Decimal("1.000000")``.
+    """
+    cfg = _config()  # model="claude-haiku-4-5-20251001"
+    cost = _estimate_cost(config=cfg, tokens_in=1_000_000, tokens_out=0)
+    assert cost == Decimal("1.000000")
+
+
+def test_estimate_cost_unknown_model_returns_zero_emits_stop_signal(monkeypatch) -> None:
+    """KeyError on unknown model → log + emit_stop_signal + return Decimal("0")."""
+    from bot.services import observability
+
+    emitted: list[str] = []
+    monkeypatch.setattr(
+        observability, "emit_stop_signal", lambda name: emitted.append(name)
+    )
+
+    cfg = LLMGatewayConfig(
+        provider="anthropic",
+        model="nonexistent-model",  # type: ignore[arg-type]
+        daily_ceiling_usd=Decimal("5"),
+        monthly_ceiling_usd=Decimal("50"),
+        prompt_template_version="v1.0.0",
+    )
+    cost = _estimate_cost(config=cfg, tokens_in=100, tokens_out=100)
+    assert cost == Decimal("0")
+    assert emitted == ["llm_provider_structural"]
