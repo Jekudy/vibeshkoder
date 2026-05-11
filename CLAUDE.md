@@ -60,11 +60,16 @@ T4-03 via #157 (evidence bundle), T4-04 via #162 (/recall handler), T4-05 via #1
 #156. Forward-looking design drafts for Phase 5/6/7/8/9/10/11/12 ratified as docs-only
 artifacts in `docs/memory-system/prompts/` (PRs #159 + #160). FHR in flight.
 
-**Next active phase: Phase 5 (LLM gateway + answer synthesis)** — design ratified per
-`docs/memory-system/prompts/PHASE5_PLAN_DRAFT.md`, awaiting AUTHORIZED_SCOPE.md update
-before implementation kickoff. Open known follow-ups: qa_traces cascade layer wiring
-(deferred from Stream E xfail), Phase 11 numbering conflict (HANDOFF = Shkoderbench/evals
-vs draft = expertise pages).
+**Phase 5 (LLM gateway + answer synthesis) — Wave 0 + Wave 1 + Wave 2 CLOSED 2026-05-11.**
+Plan ratified per `docs/memory-system/PHASE5_PLAN.md`. Wave 0 = T5-W0-01 hotfix #164
+(PR #203). Wave 1 = T5-01 gateway (PR #209, commit `7dcb218`) + T5-02 schema (PR #207,
+commit `5fcd99b`). Wave 2 = T5-03 repos (PR #223, commit `18c98893`) + T5-04 handler +
+alembic 025 + cascade + pricing (PR #226, commit `43f21ee`). Flag
+`memory.qa.llm_synthesis.enabled` default OFF — Phase 4 byte-for-byte preserved.
+
+**Wave 3 next: T5-05 eval harness** (`tests/eval/test_qa_llm_eval_cases.py` + fixtures
+per contracts.md §9). After Wave 3 merge → FHR per superflow Rule 9 → Phase 5 CLOSED
+declaration + Phase 6 (cards) authorization.
 
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
