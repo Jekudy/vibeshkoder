@@ -305,10 +305,16 @@ class TestRefusal:
         trace_create.assert_awaited_once()
         assert trace_create.call_args.kwargs["abstained"] is True
 
-    async def test_r3c_wrong_chat_group_silent_audit_no_reply(self) -> None:
-        """R3c (wrong-chat non-private branch): /recall invoked from a
-        third-party group → handler does NOT reply (silent), does NOT run
-        run_qa, but DOES write an abstained qa_trace for audit."""
+    async def test_r3c_wrong_chat_forbidden_silent_audit(self) -> None:
+        """R3c (wrong-chat + TelegramForbiddenError branch): /recall invoked
+        from a chat where the bot lacks send permission → reply attempt is
+        swallowed via `except TelegramForbiddenError`, audit qa_trace still
+        written for abstention record. Verifies the silent-fallback path in
+        bot/handlers/qa.py — without this case a regression could surface
+        the exception and break wrong-chat handling for kicked / restricted
+        bots."""
+        from aiogram.exceptions import TelegramForbiddenError
+
         handler = import_module("bot.handlers.qa")
         trace_create, run_qa, _persist = _patch_handler_db_edges(handler)
         handler.FeatureFlagRepo.get = AsyncMock(return_value=True)
@@ -321,10 +327,16 @@ class TestRefusal:
             user_id=1001,
             message_id=903,
         )
+        # Simulate the bot lacking can_send_messages — handler must swallow
+        # the exception (logger.info) and continue to audit_empty + return.
+        message.reply = AsyncMock(
+            side_effect=TelegramForbiddenError(method=None, message="kicked")  # type: ignore[arg-type]
+        )
 
         await handler.recall_handler(message, _command("память"), AsyncMock())
 
-        message.reply.assert_not_awaited()
+        # Reply WAS attempted (then raised); audit must still happen abstained.
+        message.reply.assert_awaited_once()
         run_qa.assert_not_awaited()
         trace_create.assert_awaited_once()
         assert trace_create.call_args.kwargs["abstained"] is True
