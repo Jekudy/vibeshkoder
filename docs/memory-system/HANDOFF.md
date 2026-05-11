@@ -477,8 +477,18 @@ Cannot parallelize without gate:
 
 ### Phase 11 — shkoderbench / evals hardening
 
+> **Reconciliation 2026-05-11:** The canonical Phase 11 plan is
+> `docs/memory-system/PHASE11_PLAN.md` (ratified 2026-05-02, closed 2026-05-11).
+> Per `AUTHORIZED_SCOPE.md §Phase 11` (narrowed 2026-04-30), the actual Phase 11
+> ships as an **offline / CI-only harness** — NO `eval_cases` / `eval_runs` /
+> `eval_results` DB tables, NO `add_eval_tables` migration, NO admin eval view.
+> The pre-2026-05 scope sketched below (tables + admin UI) is preserved as
+> historical reference; if durable eval persistence becomes desirable later,
+> it lands in a successor phase under separate authorization.
+
 - **Objective:** regression safety for q&a / catalog / digest / governance.
-- **Scope:** `eval_cases`, `eval_runs`, `eval_results`, runner, admin eval view.
+- **Scope (historical, pre-narrowing):** `eval_cases`, `eval_runs`, `eval_results`, runner, admin eval view.
+- **Actual delivered scope (closed 2026-05-11):** `tests/evals/` test category (leakage L1-L5, citations C1-C4, refusal R1-R4, no-LLM-imports I1-I3, determinism, recall_precision smoke); `bot/services/eval_runner.py` / `eval_seeds.py` / `eval_metrics.py` (no production wiring); golden `seed_v1` fixture; nightly `.github/workflows/evals.yml` (gated by `secrets.EVAL_HARNESS_ENABLED`); `.github/workflows/lint-privacy.yml` allowlist gate. See `PHASE11_PLAN.md`.
 - **Acceptance:** no-evidence, citation, leakage, stale tests exist.
 
 ### Phase 12 — future butler action layer (design only / postponed)
@@ -714,7 +724,7 @@ this cycle. Implementing additional migrations without a ticket is out-of-scope 
 | `add_summaries` / `add_summary_sources` | 7       | Phase 7.                                                       |
 | `add_digests` / `add_digest_sections`   | 8       | Phase 8.                                                       |
 | `add_graph_sync_runs`                   | 10      | Phase 10.                                                      |
-| `add_eval_tables`                       | 11      | Phase 11.                                                      |
+| ~~`add_eval_tables`~~ — DEFERRED          | 11      | Phase 11 narrowed to offline / CI-only harness; no migration shipped. If durable eval persistence is later required, lands as a successor phase under separate authorization. See `PHASE11_PLAN.md §0` supersede note. |
 
 Full column-by-column spec lives further down in the architect's original handoff (see archived
 copy if needed). For each migration in this cycle, the implementation ticket holds the column

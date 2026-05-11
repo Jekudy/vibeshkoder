@@ -10,7 +10,7 @@
 
 ✅ AUTHORIZED — Phase 11 evals harness, offline / CI-only.
 
-This is the canonical Phase 11 plan. The earlier file `prompts/PHASE11_PLAN_DRAFT.md` is a **deferred draft for person expertise pages** (a future Phase 6+ feature) and is NOT this plan. See §11 for the reconciliation note.
+This is the canonical Phase 11 plan. The earlier file `prompts/EXPERTISE_PAGES_DRAFT.md` is a **deferred draft for person expertise pages** (a future Phase 6+ feature) and is NOT this plan. See §11 for the reconciliation note.
 
 **Supersede note (2026-05-02).** This plan **supersedes the original Phase 11 scope sketched in `HANDOFF.md §Phase 11` (lines ~476-480) and the `add_eval_tables` migration row in `HANDOFF.md §5` (line ~715).** Per `AUTHORIZED_SCOPE.md §Phase 11` (ratified 2026-04-30, narrowed to offline / CI-only), Phase 11 ships **no DB tables** (`eval_cases` / `eval_runs` / `eval_results`), **no migrations**, and **no admin eval view** in this iteration. If durable eval persistence is later required, it lands in a successor phase (e.g., a future Phase 11.x or 13) under separate authorization. HANDOFF.md will be reconciled in a follow-up shared-file PR (Sprint 0 keeps shared-file edits minimal per `ORCHESTRATOR_REGISTRY.md §3.3`).
 
@@ -339,14 +339,14 @@ Created as GitHub issues with label `phase:11` in Sprint 0 PR follow-up.
 | T11-W3-02 | 3 | Citation drift test | after Orch A Phase 5 merged |
 | T11-W3-03 | 3 | Cost / latency benchmark | after Orch A Phase 5 merged |
 | T11-W3-04 | 3 | Phase 11 FHR | end of phase |
-| T11-CHORE-01 | — | Follow-up: rename `prompts/PHASE11_PLAN_DRAFT.md` → `prompts/EXPERTISE_PAGES_DRAFT.md` (deferrable; per PAR §7 finding) | low priority |
-| T11-CHORE-02 | — | Follow-up: reconcile HANDOFF.md §Phase 11 + §5 stale rows in a separate shared-file PR | low priority |
+| T11-CHORE-01 | — | ~~Rename `prompts/PHASE11_PLAN_DRAFT.md` → `prompts/EXPERTISE_PAGES_DRAFT.md`~~ | **DONE 2026-05-11** (cleanup PR) |
+| T11-CHORE-02 | — | ~~Reconcile HANDOFF.md §Phase 11 + §5 stale rows~~ | **DONE 2026-05-11** (cleanup PR) |
 
 ---
 
-## §11. Reconciliation note — `prompts/PHASE11_PLAN_DRAFT.md`
+## §11. Reconciliation note — `prompts/EXPERTISE_PAGES_DRAFT.md`
 
-The file `docs/memory-system/prompts/PHASE11_PLAN_DRAFT.md` (created earlier in design exploration) drafts **person expertise pages** ("who knows X"). That feature:
+The file `docs/memory-system/prompts/EXPERTISE_PAGES_DRAFT.md` (created earlier in design exploration) drafts **person expertise pages** ("who knows X"). That feature:
 
 - is explicitly listed in `AUTHORIZED_SCOPE.md` as "Person expertise pages — Phase 6+" (NOT authorized in current cycle);
 - conflicts with the canonical Phase 11 numbering established in `ROADMAP.md`, `HANDOFF.md §Phase 11`, and `AUTHORIZED_SCOPE.md §Phase 11`;

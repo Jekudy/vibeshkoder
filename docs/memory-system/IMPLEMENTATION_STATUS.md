@@ -167,6 +167,72 @@ ticket grid; will be picked up before or alongside Phase 4 work.
   hardening; current path is correct under aiogram contract but lacks an explicit None
   guard).
 
+## Phase 11 — Shkoderbench / evaluation harness — **CLOSED 2026-05-11**
+
+11 PRs merged (Sprint 0 + Wave 1 + Wave 2 round 1 + W2-04 baseline freeze).
+
+**Sprint 0 — plan ratification:**
+- PR #173 — `PHASE11_PLAN.md` canonical + draft reconciliation + REGISTRY/ROADMAP updates
+
+**Wave 1 — eval harness skeleton (7/7):**
+
+| ID    | Title                                                            | PR    | Status |
+|-------|------------------------------------------------------------------|-------|--------|
+| T11-W1-01 | `bot/services/eval_runner.py` skeleton                       | #193  | done   |
+| T11-W1-02 | `bot/services/eval_seeds.py` (SeedSpec loader)               | #202  | done   |
+| T11-W1-03 | `bot/services/eval_metrics.py` (recall@K/precision@K)        | #194  | done   |
+| T11-W1-04 | `tests/fixtures/golden_recall/seed_v1` + `tests/evals/conftest.py` | #196 | done |
+| T11-W1-05 | `test_determinism.py` + `test_recall_precision.py` smoke + `test_no_llm_imports.py` AST + conftest `loop_scope='class'` | #205 | done |
+| T11-W1-06 | `.github/workflows/evals.yml` (gated) + `eval-results-schema.md` | #192 | done |
+| T11-W1-07 | `.github/workflows/lint-privacy.yml` + allowlist script + precommit hook proposal | #195 | done |
+
+**Wave 2 round 1 — privacy + correctness binding (3/3):**
+
+| ID    | Title                                          | PR    | Status |
+|-------|------------------------------------------------|-------|--------|
+| T11-W2-01 | `tests/evals/test_leakage.py` (L1–L5)      | #211  | done   |
+| T11-W2-02 | `tests/evals/test_citations.py` (C1–C4)    | #208  | done   |
+| T11-W2-03 | `tests/evals/test_refusal.py` (R1–R4)      | #216  | done   |
+
+**Wave 2 closer (W2-04):**
+- PR #217 — baseline_thresholds frozen in `seed_meta.yaml` (commit `bc98bbd`); REGISTRY §5 binding flipped to **ACTIVE since 2026-05-11**; ROADMAP row 11 → DONE; CLAUDE.md narrative; `lint_privacy_check.sh` allowlist extended for root `CLAUDE.md`.
+
+**Binding contract for Phase 5 closure (verbatim from `PHASE11_PLAN.md §8.1` + `ORCHESTRATOR_REGISTRY.md §5`):**
+
+```bash
+EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 \
+    tests/evals/test_leakage.py \
+    tests/evals/test_citations.py \
+    tests/evals/test_refusal.py \
+    tests/evals/test_no_llm_imports.py
+```
+
+These four files collectively bind invariants 2 (no LLM imports outside `llm_gateway` / `llm_providers/*`), 3 (no q&a over offrecord/nomem/forgotten), 4 (citations point to `message_version_id`), and 9 (tombstones durable).
+
+**Observed baseline (commit `bc98bbd`):**
+
+| Metric | @1 | @3 | @5 |
+|---|---|---|---|
+| mean_recall | 0.125 | 0.125 | 0.125 |
+| mean_precision | 0.125 | 0.042 | 0.025 |
+| abstain rate | 7/8 (87.5%) | 7/8 | 7/8 |
+
+**Deferred to post-Phase-5 (Wave 3):**
+
+| ID    | Title                                          | GitHub issue | Status |
+|-------|------------------------------------------------|--------------|--------|
+| T11-W3-01 | LLM-synthesis hallucination test           | #185 | deferred (needs `/recall` wired to LLM) |
+| T11-W3-02 | Citation drift test                        | #186 | deferred (needs `qa_traces.answer_text` Phase 5 schema) |
+| T11-W3-03 | Cost / latency benchmark                   | #187 | deferred (needs `llm_usage_ledger`) |
+| T11-W3-04 | Phase 11 Final Holistic Review (FHR)       | #188 | retrospective FHR scheduled on Phase 11 PR set; full Wave 3 FHR after Phase 5 closes |
+
+**Outstanding follow-ups (not blocking):**
+- #219 — `seed_v1` quality (7/8 abstain rate; rewrite queries or expand corpus)
+- #220 — soak window (monitor first 3 nightly `evals.yml` runs; revert flag if flaky)
+- T11-CHORE-01 / T11-CHORE-02 (this PR) — rename deferred draft + reconcile HANDOFF stale rows
+
+---
+
 ## Phase 4 — Hybrid search + Q&A with citations — **CLOSED 2026-04-30**
 
 6/6 implementation tickets merged. FHR in flight (Codex deep-product + deep-spec reviewers running over the full Phase 4 diff).
