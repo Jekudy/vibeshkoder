@@ -298,8 +298,8 @@ def test_message_version_metadata_includes_search_tsv(app_env) -> None:
 
 async def test_alembic_downgrade_minus_one_drops_search_tsv(temp_database_url: str) -> None:
     _run_alembic(temp_database_url, "upgrade", "head")
-    # Head is now 023 (backfill); -3 reaches 020 where search_tsv was added by 021.
-    _run_alembic(temp_database_url, "downgrade", "-3")
+    # Head is now 024 (llm_usage_ledger + cache); -4 reaches 020 where search_tsv was added by 021.
+    _run_alembic(temp_database_url, "downgrade", "-4")
 
     column_exists = await _fetch_value(
         temp_database_url,
