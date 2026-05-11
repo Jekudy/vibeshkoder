@@ -8,9 +8,10 @@ Tests are skipped automatically if postgres is unreachable.
 from __future__ import annotations
 
 import itertools
+from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 pytestmark = pytest.mark.usefixtures("app_env")
@@ -120,7 +121,6 @@ async def test_store_raises_integrity_error_on_duplicate_input_hash(db_session) 
 
 
 async def test_bump_hit_increments_hit_count(db_session) -> None:
-    from bot.db.models import LlmSynthesisCache
     from bot.db.repos.llm_synthesis_cache import SynthesisCacheRepo
 
     row = await SynthesisCacheRepo.store(
@@ -132,17 +132,20 @@ async def test_bump_hit_increments_hit_count(db_session) -> None:
     )
     initial_hit_count = row.hit_count  # server_default = 1
 
-    await SynthesisCacheRepo.bump_hit(db_session, cache_id=row.id)
-
-    # Reload from DB to see updated values.
-    result = await db_session.execute(
-        select(LlmSynthesisCache).where(LlmSynthesisCache.id == row.id)
+    # Backdate last_hit_at by 1 hour to make the advance observable.
+    old_ts = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    await db_session.execute(
+        text("UPDATE llm_synthesis_cache SET last_hit_at = :old WHERE id = :id"),
+        {"old": old_ts, "id": row.id},
     )
-    updated = result.scalar_one()
-    assert updated.hit_count == initial_hit_count + 1
-    # last_hit_at must be updated (may be equal if the UPDATE runs within same
-    # millisecond, but rowcount must be 1 as a minimum guarantee)
-    assert updated.last_hit_at is not None
+    await db_session.flush()
+
+    await SynthesisCacheRepo.bump_hit(db_session, cache_id=row.id)
+    await db_session.flush()
+    await db_session.refresh(row)
+
+    assert row.hit_count == initial_hit_count + 1
+    assert row.last_hit_at > old_ts
 
 
 # ─── Test 6: invalidate_by_citation returns 0 when no rows reference the id ──

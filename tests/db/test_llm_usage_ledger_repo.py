@@ -66,41 +66,47 @@ async def test_record_inserts_and_returns_row(db_session) -> None:
 
 
 async def test_record_flushes_but_does_not_commit(db_session) -> None:
-    """After record(), the session is still in transaction (outer tx not committed).
+    """Repo MUST NOT commit — gateway/handler owns the transaction.
 
-    We verify by rolling back and asserting the row is absent in a fresh SELECT.
-    The outer transaction in db_session fixture rolls back at teardown; here we
-    verify the state is consistent with still being inside the transaction.
+    We assert this structurally by replacing session.commit with a raise.
     """
     from bot.db.repos.llm_usage_ledger import LedgerRepo
-
-    row = await LedgerRepo.record(
-        db_session,
-        qa_trace_id=None,
-        provider="openai",
-        model="gpt-4o",
-        prompt_hash=_prompt_hash(),
-        response_hash="b" * 64,
-        tokens_in=50,
-        tokens_out=25,
-        cost_usd=Decimal("0.001"),
-        latency_ms=200,
-        request_id=None,
-        cache_hit=False,
-        error=None,
-    )
-    inserted_id = row.id
-
-    # Session is still in transaction (flush does not commit).
-    assert db_session.in_transaction()
-
-    # The row IS visible inside the same session (flush made it visible to this conn).
     from bot.db.models import LlmUsageLedger
 
-    result = await db_session.execute(
-        select(LlmUsageLedger).where(LlmUsageLedger.id == inserted_id)
-    )
-    assert result.scalar_one_or_none() is not None
+    original_commit = db_session.commit
+
+    async def _forbidden_commit():  # pragma: no cover — must never run
+        raise AssertionError("LedgerRepo must not commit; caller owns the tx")
+
+    db_session.commit = _forbidden_commit  # type: ignore[method-assign]
+    try:
+        row = await LedgerRepo.record(
+            db_session,
+            qa_trace_id=None,
+            provider="openai",
+            model="gpt-4o",
+            prompt_hash=_prompt_hash(),
+            response_hash="b" * 64,
+            tokens_in=50,
+            tokens_out=25,
+            cost_usd=Decimal("0.001"),
+            latency_ms=200,
+            request_id=None,
+            cache_hit=False,
+            error=None,
+        )
+        inserted_id = row.id
+
+        # Row is visible inside the same session (flush made it readable).
+        result = await db_session.execute(
+            select(LlmUsageLedger).where(LlmUsageLedger.id == inserted_id)
+        )
+        assert result.scalar_one_or_none() is not None
+
+        # Still inside outer tx (commit was not called, otherwise we'd have asserted).
+        assert db_session.in_transaction()
+    finally:
+        db_session.commit = original_commit  # type: ignore[method-assign]
 
 
 # ─── Test 3: daily_cost_usd returns Decimal("0") when zero rows ──────────────
