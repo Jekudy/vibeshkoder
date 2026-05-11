@@ -30,6 +30,9 @@ _CITATION_QUERY = "Когда будет воркшоп по Postgres FTS?"
 _CITATION_USER_TG_ID = 999_000_001  # synthetic user id, never in users table
 
 
+pytestmark = pytest.mark.asyncio(loop_scope="class")
+
+
 @pytest.mark.usefixtures("eval_app_env")
 class TestCitationInvariants:
     """Citation invariant checks — C1 through C4.
