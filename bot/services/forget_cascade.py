@@ -36,13 +36,19 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.engine import async_session
-from bot.db.models import ChatMessage, MessageVersion, QaTrace
+from bot.db.models import (
+    ChatMessage,
+    LlmUsageLedger,
+    MessageVersion,
+    QaTrace,
+)
 from bot.db.repos.feature_flag import FeatureFlagRepo
 from bot.db.repos.forget_event import ForgetEventRepo
+from bot.db.repos.llm_synthesis_cache import SynthesisCacheRepo
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +64,14 @@ CASCADE_LAYER_ORDER: tuple[str, ...] = (
     "chat_messages",
     "message_versions",
     "qa_traces",
+    # Phase 5 / T5-04 layers — ORDER binding per contracts.md §8:
+    # cache invalidated FIRST so no forgotten-content cache row outlives the
+    # event; traces-llm SECOND so summaries are nulled before ledger NULLs the
+    # hashes; ledger LAST to NULL prompt/response hashes (but preserve cost
+    # aggregates for budget audit).
+    "llm_synthesis_cache",
+    "qa_traces_llm",
+    "llm_usage_ledger",
     "message_entities",
     "message_links",
     "attachments",
@@ -67,7 +81,17 @@ CASCADE_LAYER_ORDER: tuple[str, ...] = (
 # Layers that apply only to specific target_types. Layers absent from this dict
 # apply to all target_types (preserves existing behavior).
 _LAYER_APPLICABLE_TARGET_TYPES: dict[str, frozenset[str]] = {
+    # Phase 1 layers operate on chat_messages.id / chat_messages.user_id; the
+    # 'message_hash' target is handled by Phase 5 layers only (which join via
+    # content_hash). Restricting them here makes the dispatcher route
+    # message_hash through Phase 5 layers without raising in Phase 1.
+    "chat_messages": frozenset({"message", "user"}),
+    "message_versions": frozenset({"message", "user"}),
     "qa_traces": frozenset({"user"}),  # user-targeted forgets only
+    # Phase 5 / T5-04 layers — applicability per contracts.md §8:
+    "llm_synthesis_cache": frozenset({"message", "message_hash", "user"}),
+    "qa_traces_llm": frozenset({"message", "message_hash", "user"}),
+    "llm_usage_ledger": frozenset({"user"}),
 }
 
 
@@ -271,12 +295,247 @@ async def _cascade_qa_traces(session: AsyncSession, event) -> int:
     return result.rowcount or 0
 
 
+# ─── Phase 5 / T5-04 cascade layers (contracts.md §8) ───────────────────────
+
+
+async def _cascade_llm_synthesis_cache(session: AsyncSession, event) -> int:
+    """Invalidate ``llm_synthesis_cache`` rows that cite forgotten message_versions.
+
+    Runs FIRST among Phase 5 layers so no forgotten-content cache row survives
+    the cascade (invariant #9 — tombstones durable).
+
+    target_types:
+
+    * ``message`` — resolve the chat_message's current_version_id → call
+      ``SynthesisCacheRepo.invalidate_by_citation`` once.
+    * ``message_hash`` — resolve all message_version_ids sharing the
+      ``content_hash`` → invalidate each.
+    * ``user`` — bulk DELETE every cache row citing ANY of the user's
+      message_version_ids via JSONB containment.
+
+    Returns total rowcount across all invalidations.
+    """
+    if event.target_id is None:
+        raise ValueError(
+            f"forget_event target_type={event.target_type!r} requires non-None target_id"
+        )
+
+    if event.target_type == "message":
+        try:
+            cm_id = int(event.target_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"forget_event target_type='message' requires integer target_id; "
+                f"got {event.target_id!r}"
+            )
+        # Resolve current_version_id of the chat_message. The chat_messages
+        # cascade layer (which runs earlier) NULLed text/caption/raw_json but
+        # left current_version_id intact, so this read still resolves.
+        row = (
+            await session.execute(
+                select(ChatMessage.current_version_id).where(ChatMessage.id == cm_id)
+            )
+        ).first()
+        if row is None or row[0] is None:
+            return 0
+        return await SynthesisCacheRepo.invalidate_by_citation(
+            session, message_version_id=int(row[0])
+        )
+
+    if event.target_type == "message_hash":
+        # Resolve every message_version_id whose chat_message has the given
+        # content_hash. (The hash is stored on message_versions.content_hash;
+        # chat_messages does NOT carry content_hash. So we query
+        # message_versions directly.)
+        target_hash = str(event.target_id)
+        version_ids = (
+            await session.execute(
+                select(MessageVersion.id).where(MessageVersion.content_hash == target_hash)
+            )
+        ).scalars().all()
+        total = 0
+        for vid in version_ids:
+            total += await SynthesisCacheRepo.invalidate_by_citation(
+                session, message_version_id=int(vid)
+            )
+        return total
+
+    if event.target_type == "user":
+        try:
+            telegram_id = int(event.target_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"forget_event target_type='user' requires integer target_id (telegram_id); "
+                f"got {event.target_id!r}"
+            )
+        # Resolve user's complete set of message_version_ids and invalidate
+        # every cache row whose ``citation_ids`` JSONB array intersects.
+        # The chat_messages layer NULLed body fields but the user_id column
+        # is preserved, so this query resolves correctly regardless of layer
+        # ordering. Iterates per-id (instead of a single DELETE) so the
+        # repo's portable PG / SQLite fallback path is reused.
+        version_ids = (
+            await session.execute(
+                select(MessageVersion.id)
+                .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
+                .where(ChatMessage.user_id == telegram_id)
+            )
+        ).scalars().all()
+        total = 0
+        for vid in version_ids:
+            total += await SynthesisCacheRepo.invalidate_by_citation(
+                session, message_version_id=int(vid)
+            )
+        return total
+
+    raise ValueError(
+        f"_cascade_llm_synthesis_cache: unsupported target_type={event.target_type!r}"
+    )
+
+
+async def _cascade_qa_traces_llm(session: AsyncSession, event) -> int:
+    """NULL ``qa_traces.llm_response_summary`` for traces citing forgotten content.
+
+    Runs SECOND among Phase 5 layers. The Phase 4 ``qa_traces`` cascade
+    layer NULLs ``query_text`` for ``target_type='user'`` only; this layer
+    extends coverage to per-message and per-message_hash forgets AND to
+    the LLM-synthesis response summary.
+
+    target_types:
+
+    * ``message`` — NULL ``llm_response_summary`` on every trace whose
+      ``evidence_ids JSONB`` contains the chat_message's current_version_id.
+    * ``message_hash`` — NULL on every trace citing ANY version_id matching
+      the content_hash.
+    * ``user`` — NULL ``llm_response_summary`` for every trace owned by the
+      user (query_text already handled by Phase 4 ``_cascade_qa_traces``).
+
+    Returns rowcount.
+    """
+    if event.target_id is None:
+        raise ValueError(
+            f"forget_event target_type={event.target_type!r} requires non-None target_id"
+        )
+
+    if event.target_type == "message":
+        try:
+            cm_id = int(event.target_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"target_type='message' requires integer target_id; got {event.target_id!r}"
+            )
+        # Resolve the chat_message's current_version_id (preserved across the
+        # Phase 1 cascade layers).
+        row = (
+            await session.execute(
+                select(ChatMessage.current_version_id).where(ChatMessage.id == cm_id)
+            )
+        ).first()
+        if row is None or row[0] is None:
+            return 0
+        vid = int(row[0])
+        # JSONB containment: NULL summary on traces citing this version.
+        stmt = text(
+            "UPDATE qa_traces SET llm_response_summary = NULL "
+            "WHERE evidence_ids @> CAST(:vid AS jsonb)"
+        )
+        result = await session.execute(stmt, {"vid": f"[{vid}]"})
+        await session.flush()
+        return result.rowcount or 0
+
+    if event.target_type == "message_hash":
+        target_hash = str(event.target_id)
+        version_ids = (
+            await session.execute(
+                select(MessageVersion.id).where(MessageVersion.content_hash == target_hash)
+            )
+        ).scalars().all()
+        total = 0
+        for vid in version_ids:
+            stmt = text(
+                "UPDATE qa_traces SET llm_response_summary = NULL "
+                "WHERE evidence_ids @> CAST(:vid AS jsonb)"
+            )
+            result = await session.execute(stmt, {"vid": f"[{int(vid)}]"})
+            total += result.rowcount or 0
+        if total:
+            await session.flush()
+        return total
+
+    if event.target_type == "user":
+        try:
+            telegram_id = int(event.target_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"target_type='user' requires integer target_id (telegram_id); "
+                f"got {event.target_id!r}"
+            )
+        stmt = (
+            update(QaTrace)
+            .where(QaTrace.user_tg_id == telegram_id)
+            .values(llm_response_summary=None)
+        )
+        result = await session.execute(stmt)
+        await session.flush()
+        return result.rowcount or 0
+
+    raise ValueError(
+        f"_cascade_qa_traces_llm: unsupported target_type={event.target_type!r}"
+    )
+
+
+async def _cascade_llm_usage_ledger(session: AsyncSession, event) -> int:
+    """NULL ``prompt_hash`` + ``response_hash`` for the user's ledger rows.
+
+    Runs LAST among Phase 5 layers. Touches ONLY the PII hash fields;
+    cost / token / latency aggregates are PRESERVED for budget audit.
+
+    target_type:
+
+    * ``user`` — NULL both hashes for ledger rows where ``qa_trace_id IN
+      (subquery: user's traces)``.
+    * ``message`` / ``message_hash`` — no-op (filtered upstream via
+      ``_LAYER_APPLICABLE_TARGET_TYPES``).
+
+    Migration 025 relaxed ``prompt_hash`` to NULLable specifically for
+    this layer.
+    """
+    if event.target_type != "user":
+        raise ValueError(
+            f"_cascade_llm_usage_ledger: only target_type='user' is supported; "
+            f"got {event.target_type!r}"
+        )
+    if event.target_id is None:
+        raise ValueError("forget_event target_type='user' requires non-None target_id")
+
+    try:
+        telegram_id = int(event.target_id)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"target_id must be integer telegram_id; got {event.target_id!r}"
+        )
+
+    subq = select(QaTrace.id).where(QaTrace.user_tg_id == telegram_id)
+    stmt = (
+        update(LlmUsageLedger)
+        .where(LlmUsageLedger.qa_trace_id.in_(subq))
+        .values(prompt_hash=None, response_hash=None)
+    )
+    result = await session.execute(stmt)
+    await session.flush()
+    return result.rowcount or 0
+
+
 # Map layer name → cascade function. Layers absent from this map are recorded as
 # skipped. When a future phase adds a layer's table, add its function here.
 _LAYER_FUNCS: dict[str, Any] = {
     "chat_messages": _cascade_chat_messages,
     "message_versions": _cascade_message_versions,
     "qa_traces": _cascade_qa_traces,
+    # T5-04 Phase 5 layers — ORDER binding per contracts.md §8.
+    "llm_synthesis_cache": _cascade_llm_synthesis_cache,
+    "qa_traces_llm": _cascade_qa_traces_llm,
+    "llm_usage_ledger": _cascade_llm_usage_ledger,
 }
 
 
@@ -306,7 +565,10 @@ async def _process_one_event(session: AsyncSession, event) -> None:
     # as 'completed' (all layers explicitly accounted for), but each layer records
     # status='skipped' so the audit trail shows no work was done.
     # Stream Delta #97 (message_hash) and Bravo importer (#105) will fill these in.
-    _SKIP_TARGET_TYPES = frozenset({"message_hash", "export"})
+    # T5-04: ``message_hash`` is now handled by Phase 5 layers (cache + traces_llm)
+    # via JSONB joins on ``content_hash``. Phase 1 layers fall through to
+    # ``not_applicable`` (per ``_LAYER_APPLICABLE_TARGET_TYPES``).
+    _SKIP_TARGET_TYPES = frozenset({"export"})
 
     try:
         for layer in CASCADE_LAYER_ORDER:

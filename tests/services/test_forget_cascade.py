@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -694,9 +695,14 @@ async def test_user_target_wipes_all_user_versions(db_session) -> None:
 
 
 async def test_message_hash_target_records_skipped(db_session) -> None:
-    """target_type='message_hash': cascade finalizes as 'completed' but every layer
-    shows status='skipped' with reason='target_type_not_supported_yet'.
-    No rows in any table must be modified.
+    """target_type='message_hash': cascade finalizes as 'completed'.
+
+    Phase 5 layers (T5-04 — ``llm_synthesis_cache``, ``qa_traces_llm``) run
+    with ``status='completed'`` because they support ``message_hash``.
+    Phase 1 layers (``chat_messages``, ``message_versions``, ``qa_traces``)
+    skip with ``not_applicable``. ``llm_usage_ledger`` skips with
+    ``not_applicable`` (only ``user`` is supported per §8.3). The remaining
+    placeholder layers stay ``target_type_not_supported_yet``.
     """
     from bot.services.forget_cascade import run_cascade_worker_once
 
@@ -717,15 +723,43 @@ async def test_message_hash_target_records_skipped(db_session) -> None:
     ev = await db_session.get(ForgetEvent, event_id, populate_existing=True)
     assert ev.status == "completed"
 
-    # ALL 6 layers: uniformly skipped with target_type_not_supported_yet
-    from bot.services.forget_cascade import CASCADE_LAYER_ORDER
-
-    for layer in CASCADE_LAYER_ORDER:
-        assert ev.cascade_status[layer]["status"] == "skipped", (
-            f"Layer {layer} should be skipped for message_hash target, got: {ev.cascade_status[layer]}"
+    # Phase 5 layers (T5-04) support message_hash → completed with rows count.
+    p5_layers = ("llm_synthesis_cache", "qa_traces_llm")
+    for layer in p5_layers:
+        assert ev.cascade_status[layer]["status"] == "completed", (
+            f"Layer {layer} should be completed for message_hash target, "
+            f"got: {ev.cascade_status[layer]}"
         )
-        assert ev.cascade_status[layer]["reason"] == "target_type_not_supported_yet", (
-            f"Layer {layer} should have reason='target_type_not_supported_yet', got: {ev.cascade_status[layer]}"
+
+    # Phase 1 + qa_traces + llm_usage_ledger layers: not_applicable for
+    # message_hash (Phase 1 layers handle only message + user; ledger handles
+    # only user per §8.3).
+    not_applicable_layers = (
+        "chat_messages",
+        "message_versions",
+        "qa_traces",
+        "llm_usage_ledger",
+    )
+    for layer in not_applicable_layers:
+        cs = ev.cascade_status[layer]
+        assert cs["status"] == "completed", (
+            f"Layer {layer} should be completed (not_applicable) for "
+            f"message_hash target, got: {cs}"
+        )
+        assert cs["reason"] == "not_applicable", (
+            f"Layer {layer} reason should be not_applicable, got: {cs}"
+        )
+
+    # Placeholder layers: tables don't exist yet, so skipped with table_not_exists
+    # (since message_hash is now routed through the per-layer dispatcher).
+    placeholder_layers = ("message_entities", "message_links", "attachments", "fts_rows")
+    for layer in placeholder_layers:
+        cs = ev.cascade_status[layer]
+        assert cs["status"] == "skipped", (
+            f"Layer {layer} should be skipped, got: {cs}"
+        )
+        assert cs["reason"] == "table_not_exists", (
+            f"Layer {layer} reason should be table_not_exists, got: {cs}"
         )
 
 
@@ -861,3 +895,425 @@ async def test_per_event_db_error_isolation_via_savepoint(db_session, monkeypatc
     assert ev_a.status == "completed", f"event A should be completed, got {ev_a.status}"
     assert ev_b.status == "failed", f"event B should be failed, got {ev_b.status}"
     assert ev_c.status == "completed", f"event C should be completed, got {ev_c.status}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# T5-04 — Phase 5 cascade layers (llm_synthesis_cache → qa_traces_llm → ledger)
+# Per contracts.md §8. All three layers must land in the same PR as alembic 025.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def _make_chat_message_with_v1_for_user(
+    db_session, user_id: int, *, text: str = "secret"
+) -> tuple[int, int]:
+    """Create a ChatMessage + v1 MessageVersion attributed to ``user_id``.
+
+    Returns ``(chat_message_id, message_version_id)``. The chat_message's
+    ``current_version_id`` is set to the v1 id so source filter + cascade
+    join logic resolves correctly.
+    """
+    from bot.db.models import ChatMessage, MessageVersion
+    from sqlalchemy import update as sa_update
+
+    chat_id = _next_chat_id()
+    message_id = _next_msg_id()
+    when = datetime.now(timezone.utc)
+
+    msg = ChatMessage(
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text=text,
+        date=when,
+        caption=None,
+        raw_json={"text": text},
+        memory_policy="normal",
+        is_redacted=False,
+    )
+    db_session.add(msg)
+    await db_session.flush()
+    v = MessageVersion(
+        chat_message_id=msg.id,
+        version_seq=1,
+        text=text,
+        caption=None,
+        normalized_text=text,
+        entities_json={"entities": []},
+        content_hash=f"h-cascade-{msg.id}",
+        is_redacted=False,
+    )
+    db_session.add(v)
+    await db_session.flush()
+    # Set current_version_id on the chat_message.
+    await db_session.execute(
+        sa_update(ChatMessage).where(ChatMessage.id == msg.id).values(current_version_id=v.id)
+    )
+    await db_session.flush()
+    return msg.id, v.id
+
+
+async def _make_cache_row(
+    db_session, *, citation_ids: list[int], answer_text: str = "cached answer"
+) -> int:
+    """Insert an llm_synthesis_cache row; return its id."""
+    from bot.db.models import LlmSynthesisCache
+
+    row = LlmSynthesisCache(
+        input_hash=f"h-{citation_ids}-{answer_text}"[:64].ljust(64, "0"),
+        answer_text=answer_text,
+        citation_ids=list(citation_ids),
+        model="claude-haiku-4-5-20251001",
+    )
+    db_session.add(row)
+    await db_session.flush()
+    return row.id
+
+
+async def _make_ledger_row_for_trace(
+    db_session, *, qa_trace_id: int | None = None
+) -> int:
+    """Insert a minimal llm_usage_ledger row. Returns id."""
+    from bot.db.models import LlmUsageLedger
+    from decimal import Decimal as _Dec
+
+    row = LlmUsageLedger(
+        qa_trace_id=qa_trace_id,
+        provider="anthropic",
+        model="claude-haiku-4-5-20251001",
+        prompt_hash="a" * 64,
+        response_hash="b" * 64,
+        tokens_in=100,
+        tokens_out=50,
+        cost_usd=_Dec("0.000550"),
+        latency_ms=120,
+        cache_hit=False,
+        error=None,
+    )
+    db_session.add(row)
+    await db_session.flush()
+    return row.id
+
+
+async def test_phase5_cascade_layer_order_constant(db_session) -> None:
+    """contracts.md §8 ORDER: cache → qa_traces_llm → ledger AFTER qa_traces.
+
+    Asserts the constant tuple is correct; this is the binding contract.
+    """
+    from bot.services.forget_cascade import CASCADE_LAYER_ORDER
+
+    idx_qa_traces = CASCADE_LAYER_ORDER.index("qa_traces")
+    idx_cache = CASCADE_LAYER_ORDER.index("llm_synthesis_cache")
+    idx_traces_llm = CASCADE_LAYER_ORDER.index("qa_traces_llm")
+    idx_ledger = CASCADE_LAYER_ORDER.index("llm_usage_ledger")
+
+    assert idx_qa_traces < idx_cache
+    assert idx_cache < idx_traces_llm
+    assert idx_traces_llm < idx_ledger
+
+
+async def test_phase5_cascade_layers_registered_in_layer_funcs(db_session) -> None:
+    """The three Phase 5 layers must be wired in _LAYER_FUNCS."""
+    from bot.services.forget_cascade import _LAYER_FUNCS
+
+    for layer in ("llm_synthesis_cache", "qa_traces_llm", "llm_usage_ledger"):
+        assert layer in _LAYER_FUNCS, f"layer {layer} not registered"
+
+
+async def test_cascade_llm_synthesis_cache_user_target(db_session) -> None:
+    """target_type='user' → bulk DELETE every cache row citing user's versions."""
+    from bot.db.models import LlmSynthesisCache
+    from bot.services.forget_cascade import run_cascade_worker_once
+
+    uid = _next_user()
+    await _make_user_raw(db_session, uid)
+    cm_a, vid_a = await _make_chat_message_with_v1_for_user(db_session, uid, text="a")
+    cm_b, vid_b = await _make_chat_message_with_v1_for_user(db_session, uid, text="b")
+
+    # Other user — must remain untouched.
+    uid_other = _next_user()
+    await _make_user_raw(db_session, uid_other)
+    cm_o, vid_o = await _make_chat_message_with_v1_for_user(db_session, uid_other, text="o")
+
+    cache_a = await _make_cache_row(db_session, citation_ids=[vid_a], answer_text="A")
+    cache_b = await _make_cache_row(db_session, citation_ids=[vid_b, 999], answer_text="B")
+    cache_other = await _make_cache_row(db_session, citation_ids=[vid_o], answer_text="O")
+
+    await _make_pending_forget_event(
+        db_session,
+        target_type="user",
+        target_id=str(uid),
+        tombstone_key=f"user:{uid}",
+    )
+
+    await run_cascade_worker_once(db_session)
+
+    # A + B deleted (cited a user-owned version); other survives.
+    from sqlalchemy import select as sa_select
+
+    remaining_ids = (
+        await db_session.execute(sa_select(LlmSynthesisCache.id))
+    ).scalars().all()
+    assert cache_a not in remaining_ids
+    assert cache_b not in remaining_ids
+    assert cache_other in remaining_ids
+
+
+async def test_cascade_llm_synthesis_cache_message_target(db_session) -> None:
+    """target_type='message' → invalidate by message_version_id of current version."""
+    from bot.db.models import LlmSynthesisCache
+    from bot.services.forget_cascade import run_cascade_worker_once
+
+    uid = _next_user()
+    await _make_user_raw(db_session, uid)
+    cm_id, vid = await _make_chat_message_with_v1_for_user(db_session, uid)
+    # Unrelated cache row that should survive.
+    unrelated = await _make_cache_row(
+        db_session, citation_ids=[12345], answer_text="unrelated"
+    )
+    target_cache = await _make_cache_row(
+        db_session, citation_ids=[vid], answer_text="target"
+    )
+
+    await _make_pending_forget_event(
+        db_session,
+        target_type="message",
+        target_id=str(cm_id),
+        tombstone_key=f"message:test:{cm_id}",
+    )
+
+    await run_cascade_worker_once(db_session)
+
+    from sqlalchemy import select as sa_select
+
+    remaining_ids = (
+        await db_session.execute(sa_select(LlmSynthesisCache.id))
+    ).scalars().all()
+    assert target_cache not in remaining_ids
+    assert unrelated in remaining_ids
+
+
+async def test_cascade_qa_traces_llm_message_target_nulls_summary(db_session) -> None:
+    """target_type='message' → NULL llm_response_summary on traces citing the version."""
+    from bot.db.repos.qa_trace import QaTraceRepo
+    from bot.services.forget_cascade import run_cascade_worker_once
+
+    uid = _next_user()
+    await _make_user_raw(db_session, uid)
+    cm_id, vid = await _make_chat_message_with_v1_for_user(db_session, uid)
+
+    # Trace citing the to-be-forgotten version.
+    trace = await QaTraceRepo.create(
+        db_session,
+        user_tg_id=uid,
+        chat_id=_next_chat_id(),
+        query="q",
+        evidence_ids=[vid],
+        abstained=False,
+        redact_query=False,
+    )
+    ledger_id = await _make_ledger_row_for_trace(db_session, qa_trace_id=trace.id)
+    await QaTraceRepo.update_llm_fields(
+        db_session,
+        qa_trace_id=trace.id,
+        llm_call_id=ledger_id,
+        llm_response_summary="answer about message",
+        llm_response_redacted=False,
+        cost_usd=Decimal("0.001"),
+    )
+
+    # Unrelated trace cites a different version.
+    other_trace = await QaTraceRepo.create(
+        db_session,
+        user_tg_id=uid,
+        chat_id=_next_chat_id(),
+        query="q2",
+        evidence_ids=[99999],
+        abstained=False,
+        redact_query=False,
+    )
+    other_ledger = await _make_ledger_row_for_trace(db_session, qa_trace_id=other_trace.id)
+    await QaTraceRepo.update_llm_fields(
+        db_session,
+        qa_trace_id=other_trace.id,
+        llm_call_id=other_ledger,
+        llm_response_summary="unrelated answer",
+        llm_response_redacted=False,
+        cost_usd=Decimal("0.001"),
+    )
+
+    await _make_pending_forget_event(
+        db_session,
+        target_type="message",
+        target_id=str(cm_id),
+        tombstone_key=f"message:cqal:{cm_id}",
+    )
+
+    await run_cascade_worker_once(db_session)
+
+    await db_session.refresh(trace)
+    await db_session.refresh(other_trace)
+    # Citing trace summary → NULL; unrelated → preserved.
+    assert trace.llm_response_summary is None
+    assert other_trace.llm_response_summary == "unrelated answer"
+
+
+async def test_cascade_llm_usage_ledger_user_nulls_hashes_preserves_aggregates(
+    db_session,
+) -> None:
+    """target_type='user' → NULL prompt_hash + response_hash; preserve cost/tokens/latency.
+
+    Invariant #9 (tombstones durable for PII fields) AND budget audit preservation
+    co-exist via this NULL-the-hash-keep-the-aggregate pattern.
+    """
+    from bot.db.models import LlmUsageLedger
+    from bot.db.repos.qa_trace import QaTraceRepo
+    from bot.services.forget_cascade import run_cascade_worker_once
+
+    uid = _next_user()
+    await _make_user_raw(db_session, uid)
+    trace = await QaTraceRepo.create(
+        db_session,
+        user_tg_id=uid,
+        chat_id=_next_chat_id(),
+        query="q",
+        evidence_ids=[1, 2, 3],
+        abstained=False,
+        redact_query=False,
+    )
+    ledger_id = await _make_ledger_row_for_trace(db_session, qa_trace_id=trace.id)
+    # Snapshot the aggregates BEFORE cascade for preservation assertion.
+    pre_row = await db_session.get(LlmUsageLedger, ledger_id, populate_existing=True)
+    pre_cost = pre_row.cost_usd
+    pre_tokens_in = pre_row.tokens_in
+    pre_tokens_out = pre_row.tokens_out
+    pre_latency = pre_row.latency_ms
+
+    await _make_pending_forget_event(
+        db_session,
+        target_type="user",
+        target_id=str(uid),
+        tombstone_key=f"user:{uid}:ledger",
+    )
+
+    await run_cascade_worker_once(db_session)
+
+    row = await db_session.get(LlmUsageLedger, ledger_id, populate_existing=True)
+    # Hashes NULLed.
+    assert row.prompt_hash is None
+    assert row.response_hash is None
+    # Aggregates preserved for budget audit.
+    assert row.cost_usd == pre_cost
+    assert row.tokens_in == pre_tokens_in
+    assert row.tokens_out == pre_tokens_out
+    assert row.latency_ms == pre_latency
+
+
+async def test_cascade_llm_usage_ledger_message_target_not_applicable(db_session) -> None:
+    """target_type='message' / 'message_hash' → ledger layer reports not_applicable."""
+    from bot.db.models import ForgetEvent
+    from bot.services.forget_cascade import run_cascade_worker_once
+
+    uid = _next_user()
+    await _make_user_raw(db_session, uid)
+    cm_id, vid = await _make_chat_message_with_v1_for_user(db_session, uid)
+
+    event_id = await _make_pending_forget_event(
+        db_session,
+        target_type="message",
+        target_id=str(cm_id),
+        tombstone_key=f"message:lulnna:{cm_id}",
+    )
+
+    await run_cascade_worker_once(db_session)
+
+    ev = await db_session.get(ForgetEvent, event_id, populate_existing=True)
+    cs = ev.cascade_status["llm_usage_ledger"]
+    assert cs["status"] == "completed"
+    assert cs["reason"] == "not_applicable"
+
+
+async def test_cascade_layer_execution_order_runtime(db_session, monkeypatch) -> None:
+    """Runtime check: cache invalidate runs BEFORE traces_llm UPDATE BEFORE ledger NULL.
+
+    Spy on each layer function and record call order; assert the 3 Phase 5 layers
+    are invoked in the binding order (§8).
+    """
+    from bot.db.repos.qa_trace import QaTraceRepo
+    from bot.services import forget_cascade
+
+    uid = _next_user()
+    await _make_user_raw(db_session, uid)
+    cm_id, vid = await _make_chat_message_with_v1_for_user(db_session, uid)
+    trace = await QaTraceRepo.create(
+        db_session,
+        user_tg_id=uid,
+        chat_id=_next_chat_id(),
+        query="q",
+        evidence_ids=[vid],
+        abstained=False,
+        redact_query=False,
+    )
+    ledger_id = await _make_ledger_row_for_trace(db_session, qa_trace_id=trace.id)
+    await QaTraceRepo.update_llm_fields(
+        db_session,
+        qa_trace_id=trace.id,
+        llm_call_id=ledger_id,
+        llm_response_summary="answer",
+        llm_response_redacted=False,
+        cost_usd=Decimal("0.001"),
+    )
+
+    call_order: list[str] = []
+
+    def _spy(layer_name: str, original):
+        async def wrapper(session, event):
+            call_order.append(layer_name)
+            return await original(session, event)
+
+        return wrapper
+
+    for name in ("llm_synthesis_cache", "qa_traces_llm", "llm_usage_ledger"):
+        monkeypatch.setitem(
+            forget_cascade._LAYER_FUNCS, name, _spy(name, forget_cascade._LAYER_FUNCS[name])
+        )
+
+    await _make_pending_forget_event(
+        db_session,
+        target_type="user",
+        target_id=str(uid),
+        tombstone_key=f"user:{uid}:order",
+    )
+    await forget_cascade.run_cascade_worker_once(db_session)
+
+    # Filter to just the three Phase 5 layers and assert relative order.
+    p5_only = [c for c in call_order if c in ("llm_synthesis_cache", "qa_traces_llm", "llm_usage_ledger")]
+    assert p5_only == ["llm_synthesis_cache", "qa_traces_llm", "llm_usage_ledger"]
+
+
+async def test_cascade_user_target_invariant_no_surviving_cache_row(db_session) -> None:
+    """Invariant #9: after forget event finalises, independent SELECT confirms
+    no surviving cache row references any of the user's versions.
+    """
+    from bot.db.models import LlmSynthesisCache
+    from bot.services.forget_cascade import run_cascade_worker_once
+
+    uid = _next_user()
+    await _make_user_raw(db_session, uid)
+    cm_id, vid = await _make_chat_message_with_v1_for_user(db_session, uid)
+
+    await _make_cache_row(db_session, citation_ids=[vid], answer_text="prejudice")
+    await _make_pending_forget_event(
+        db_session,
+        target_type="user",
+        target_id=str(uid),
+        tombstone_key=f"user:{uid}:inv9",
+    )
+
+    await run_cascade_worker_once(db_session)
+
+    from sqlalchemy import select as sa_select
+
+    # Independent SELECT — read every cache row and verify none cites vid.
+    rows = (await db_session.execute(sa_select(LlmSynthesisCache.citation_ids))).all()
+    for (citation_ids,) in rows:
+        assert vid not in (citation_ids or [])
