@@ -1,0 +1,87 @@
+[
+  {
+    "id": "eval-001-empty-bundle",
+    "description": "Empty bundle short-circuits to abstention before any SQL or provider call",
+    "query": "что такое kotlin?",
+    "evidence_message_version_ids": [],
+    "expected_outcome": "abstention",
+    "expected_abstention_reason": "empty_bundle",
+    "expected_citation_subset_of": [],
+    "expected_cost_usd_max": "0.00"
+  },
+  {
+    "id": "eval-002-all-filtered",
+    "description": "All citations dropped by source filter (offrecord policy) -> abstention(all_filtered)",
+    "query": "когда стартовал проект?",
+    "evidence_message_version_ids": [],
+    "expected_outcome": "abstention",
+    "expected_abstention_reason": "all_filtered",
+    "expected_citation_subset_of": [],
+    "expected_cost_usd_max": "0.00"
+  },
+  {
+    "id": "eval-003-budget-exceeded",
+    "description": "Daily budget ceiling already consumed -> abstention(budget_exceeded)",
+    "query": "сколько участников?",
+    "evidence_message_version_ids": [],
+    "expected_outcome": "abstention",
+    "expected_abstention_reason": "budget_exceeded",
+    "expected_citation_subset_of": [],
+    "expected_cost_usd_max": "0.00"
+  },
+  {
+    "id": "eval-004-provider-error-transient",
+    "description": "Provider raises rate-limit transient error -> abstention(provider_error) + ledger.error startswith provider_transient:",
+    "query": "кто основал сообщество?",
+    "evidence_message_version_ids": [],
+    "expected_outcome": "abstention",
+    "expected_abstention_reason": "provider_error",
+    "expected_ledger_error": "provider_transient:rate_limit",
+    "expected_citation_subset_of": [],
+    "expected_cost_usd_max": "0.00"
+  },
+  {
+    "id": "eval-005-cache-hit",
+    "description": "Pre-seeded cache row served without provider call; cost_usd = 0; cache_hit = true",
+    "query": "идентичный запрос кэша",
+    "evidence_message_version_ids": [],
+    "preseed_cache": {
+      "answer_text": "ответ из кэша",
+      "citation_ids": []
+    },
+    "expected_outcome": "answer",
+    "expected_cache_hit": true,
+    "expected_citation_subset_of": [],
+    "expected_cost_usd_max": "0.00"
+  },
+  {
+    "id": "eval-006-citation-hallucination",
+    "description": "Provider returns citation_id NOT in surviving bundle -> abstention(provider_error) + ledger.error=citation_hallucination",
+    "query": "что обсуждали вчера?",
+    "evidence_message_version_ids": [],
+    "expected_outcome": "abstention",
+    "expected_abstention_reason": "provider_error",
+    "expected_ledger_error": "citation_hallucination",
+    "expected_citation_subset_of": [],
+    "expected_cost_usd_max": "0.10"
+  },
+  {
+    "id": "eval-007-forget-invalidated",
+    "description": "Tombstone gate fires for a cited message_version_id -> abstention(forget_invalidated)",
+    "query": "что было обсуждено?",
+    "evidence_message_version_ids": [],
+    "expected_outcome": "abstention",
+    "expected_abstention_reason": "forget_invalidated",
+    "expected_citation_subset_of": [],
+    "expected_cost_usd_max": "0.00"
+  },
+  {
+    "id": "eval-008-answer-happy-path",
+    "description": "Non-empty bundle, valid provider response with subset citations -> AnswerWithCitations + cost > 0",
+    "query": "расскажи о проекте",
+    "evidence_message_version_ids": [],
+    "expected_outcome": "answer",
+    "expected_citation_subset_of": [],
+    "expected_cost_usd_max": "1.00"
+  }
+]
