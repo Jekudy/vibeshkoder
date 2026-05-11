@@ -25,7 +25,10 @@ from bot.services.eval_seeds import (
     resolve_expected_ids,
 )
 
-pytestmark = pytest.mark.usefixtures("eval_app_env", "golden_recall_seed")
+pytestmark = [
+    pytest.mark.usefixtures("eval_app_env", "golden_recall_seed"),
+    pytest.mark.asyncio(loop_scope="class"),
+]
 
 SEED_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "golden_recall" / "seed_v1"
 SEED_CHAT_ID = -1001234567890
