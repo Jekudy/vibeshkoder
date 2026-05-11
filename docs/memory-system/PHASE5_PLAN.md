@@ -170,11 +170,16 @@ async def synthesize_answer(
     bundle: EvidenceBundle,
     query: str,
     config: LLMGatewayConfig,
-    qa_trace_id: int,                    # REQUIRED — handler MUST create QaTrace BEFORE
-                                          # calling gateway so cascade FK is always populated
-                                          # (closes Codex review HIGH 4: cascade direction)
+    qa_trace_id: int,                        # REQUIRED — handler MUST create QaTrace BEFORE
+                                              # calling gateway so cascade FK is always populated
+                                              # (closes Codex review HIGH 4: cascade direction)
+    ledger_repo: LedgerRepoProtocol,         # T5-04 wires real T5-03 repo
+    cache_repo: SynthesisCacheRepoProtocol,  # T5-04 wires real T5-03 repo
+    provider: LLMProvider,                   # T5-04 wires real provider per config
 ) -> SynthesisResult: ...
 ```
+
+**Option A DI wiring (closes F6 — signature drift between spec and implementation).** The three repo / provider keyword arguments are REQUIRED and represent the contracts.md §12.4 dependency-injection pattern. T5-01 ships the gateway against Protocol surfaces (`LedgerRepoProtocol`, `SynthesisCacheRepoProtocol`, `LLMProvider`) with in-memory fakes in the unit suite; T5-04 wires the real T5-03 `LedgerRepo` / `SynthesisCacheRepo` and the real `AnthropicProvider` / `OpenAIProvider` per `config.provider`. The handler-side `_call_synthesize_answer` helper (added in §5.E step 2) is responsible for resolving these dependencies from the application container and passing them through unchanged. Keeping them on the public signature (rather than hiding them behind a singleton/factory) makes the test seam explicit and keeps the gateway pure-functional — no module-level mutable state, no late binding.
 
 **Query normalization** (for cache key + ledger `prompt_hash`): `query_normalized = query.strip()[:256].strip()` — exact byte-mirror of `bot/services/search.py:43,55` (which calls `.strip()` first, then if `len > MAX_QUERY_LENGTH=256` truncates and calls `.strip()` AGAIN to drop trailing whitespace from a mid-word truncation). The double-`.strip()` is load-bearing: if the original query has trailing whitespace AND length > 256, search.py's normalized form differs from a single-strip form. Cache hit-rate symmetry with search hit-rate requires byte equality, so the gateway uses the same recipe verbatim. Closes Codex LOW 1 (round 1 used `.strip()[:256]` which was off-by-one-strip vs search.py).
 `prompt_template_version` lives on `LLMGatewayConfig` as `prompt_template_version: str` (semver-string; bumped on every prompt-template revision; cache rows with stale version are inert and aged out).
