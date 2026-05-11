@@ -263,11 +263,11 @@ async def _create_case(
     if case_id == "L3b":
         # L3b — tombstone by `message_hash:<content_hash>` key.
         # Production search.py uses this branch when forget targets a content
-        # fingerprint rather than a specific (chat, message_id) tuple.
+        # fingerprint rather than a specific (chat, message_id) tuple. Persist
+        # via the handler path (same as L1/L2) so content_hash is populated.
         forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
-        created = await _persist_via_service(
+        created = await _persist_via_handler(
             session,
-            chat_id=SEED_CHAT_ID,
             message_id=11_007,
             user_id=91_007,
             text_value="забываемая тау люкс",
