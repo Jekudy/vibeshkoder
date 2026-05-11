@@ -110,7 +110,7 @@ def _gateway_config(
         model="claude-haiku-4-5-20251001",
         daily_ceiling_usd=daily,
         monthly_ceiling_usd=monthly,
-        prompt_template_version="v1",
+        prompt_template_version="v1.0.0",
     )
 
 
@@ -137,6 +137,7 @@ async def _seed_message_version(
     message_id: int | None = None,
     memory_policy: str = "normal",
     is_redacted: bool = False,
+    explicit_version_id: int | None = None,
 ) -> tuple[int, int]:
     """Insert ChatMessage + MessageVersion; return (chat_message.id, version.id)."""
     from bot.db.models import ChatMessage, MessageVersion
@@ -162,7 +163,7 @@ async def _seed_message_version(
     db_session.add(cm)
     await db_session.flush()
 
-    version = MessageVersion(
+    version_kwargs: dict = dict(
         chat_message_id=cm.id,
         version_seq=1,
         text="текст сообщения для eval",
@@ -171,6 +172,9 @@ async def _seed_message_version(
         is_redacted=is_redacted,
         captured_at=now,
     )
+    if explicit_version_id is not None:
+        version_kwargs["id"] = explicit_version_id
+    version = MessageVersion(**version_kwargs)
     db_session.add(version)
     await db_session.flush()
 
@@ -412,11 +416,13 @@ async def test_eval_005_cache_hit(db_session) -> None:
 
     case = next(c for c in _CASES if c["id"] == "eval-005-cache-hit")
 
-    # Seed a real message so source filter passes.
-    cm_id, version_id = await _seed_message_version(
+    # Seed a real message with deterministic PK from fixture (7005) so Phase 11 can consume verbatim.
+    version_id = case["evidence_message_version_ids"][0]  # 7005
+    cm_id, _ = await _seed_message_version(
         db_session,
         user_id=99_005,
         message_id=_unique_int(),
+        explicit_version_id=version_id,
     )
 
     query = case["query"]
@@ -435,7 +441,7 @@ async def test_eval_005_cache_hit(db_session) -> None:
         db_session,
         input_hash=input_hash,
         answer_text=preseed["answer_text"],
-        citation_ids=[version_id],
+        citation_ids=preseed["citation_ids"],
         model=cfg.model,
     )
 
@@ -464,9 +470,9 @@ async def test_eval_005_cache_hit(db_session) -> None:
     assert result.answer_text == preseed["answer_text"]
     assert provider.calls == [], "provider must NOT be called on cache hit"
     assert result.cost_usd <= Decimal(case["expected_cost_usd_max"])
-    # Citation subset check.
-    expected_subset = set(case["expected_citation_subset_of"]) if case["expected_citation_subset_of"] else {version_id}
-    assert set(result.citation_ids).issubset(expected_subset | {version_id})
+    # Citation subset check — consume fixture verbatim (Phase 11 cross-orch contract).
+    expected_subset = set(case["expected_citation_subset_of"])
+    assert set(result.citation_ids).issubset(expected_subset)
 
     if case.get("expected_cache_hit") is not None:
         assert result.cache_hit == case["expected_cache_hit"]
@@ -605,10 +611,13 @@ async def test_eval_008_answer_happy_path(db_session) -> None:
 
     case = next(c for c in _CASES if c["id"] == "eval-008-answer-happy-path")
 
-    cm_id, version_id = await _seed_message_version(
+    # Seed with deterministic PK from fixture (7008) so Phase 11 can consume verbatim.
+    version_id = case["evidence_message_version_ids"][0]  # 7008
+    cm_id, _ = await _seed_message_version(
         db_session,
         user_id=99_008,
         message_id=_unique_int(),
+        explicit_version_id=version_id,
     )
 
     bundle = _bundle_from_version(
@@ -641,7 +650,9 @@ async def test_eval_008_answer_happy_path(db_session) -> None:
     assert result.cost_usd > Decimal("0"), "happy-path must incur non-zero cost"
     assert result.cost_usd <= Decimal(case["expected_cost_usd_max"])
     assert result.cache_hit is False
-    assert set(result.citation_ids).issubset({version_id})
+    # Consume fixture verbatim (Phase 11 cross-orch contract).
+    expected_subset = set(case["expected_citation_subset_of"])
+    assert set(result.citation_ids).issubset(expected_subset)
     assert provider.calls, "provider MUST be called on happy path"
 
 
