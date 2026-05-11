@@ -373,7 +373,7 @@ async def test_update_llm_fields_writes_all_four_columns(db_session) -> None:
     )
     ledger_id = await _make_ledger_row(db_session)
 
-    rowcount = await QaTraceRepo.update_llm_fields(
+    await QaTraceRepo.update_llm_fields(
         db_session,
         qa_trace_id=trace.id,
         llm_call_id=ledger_id,
@@ -382,7 +382,6 @@ async def test_update_llm_fields_writes_all_four_columns(db_session) -> None:
         cost_usd=Decimal("0.001234"),
     )
 
-    assert rowcount == 1
     await db_session.refresh(trace)
     assert trace.llm_call_id == ledger_id
     assert trace.llm_response_summary == "LLM-synthesized answer"

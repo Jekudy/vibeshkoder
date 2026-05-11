@@ -48,7 +48,7 @@ class QaTraceRepo:
         llm_response_summary: str | None,
         llm_response_redacted: bool,
         cost_usd: Decimal,
-    ) -> int:
+    ) -> None:
         """Update the four Phase 5 LLM-extension columns on an existing QaTrace.
 
         Called by ``bot/handlers/qa.py`` step 3 of the binding 4-step ORDER
@@ -59,7 +59,7 @@ class QaTraceRepo:
         ``abstained``, ``query_redacted`` MUST NOT be modified. Tested in
         ``tests/db/test_qa_trace.py::test_update_llm_fields_touches_only_phase5_columns``.
 
-        Returns rowcount (must be 1). Flushes; caller commits.
+        Returns None per contracts.md §12.3. Flushes; caller commits.
         Raises ``LookupError`` if ``qa_trace_id`` is not found — the handler
         guarantees the trace was created in step 1, so a missing row signals
         a bug rather than a recoverable runtime condition.
@@ -82,4 +82,3 @@ class QaTraceRepo:
                 "must precede step 3 (update_llm_fields)"
             )
         await session.flush()
-        return rowcount

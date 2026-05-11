@@ -14,7 +14,7 @@ from . import (
     ProviderTransientError,
 )
 
-DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 
 class OpenAIProvider:

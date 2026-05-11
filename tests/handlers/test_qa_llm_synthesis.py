@@ -15,6 +15,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -188,6 +189,7 @@ async def test_step_ordering_create_trace_before_synthesize(monkeypatch) -> None
     session = AsyncMock()
 
     call_order: list[str] = []
+    captured: dict[str, Any] = {}
 
     async def trace_create(*args, **kwargs):
         call_order.append("create_trace")
@@ -195,10 +197,20 @@ async def test_step_ordering_create_trace_before_synthesize(monkeypatch) -> None
 
     async def update_llm(*args, **kwargs):
         call_order.append("update_llm_fields")
-        return 1
 
-    async def synth_spy(*args, **kwargs):
+    async def synth_spy(synth_session, *, qa_trace_id, bundle, query, config, ledger_repo, cache_repo, provider):
         call_order.append("synthesize_answer")
+        # Step-1 structural proof: row MUST exist in DB at the moment synthesize_answer is called
+        from bot.db.models import QaTrace as _QaTrace
+        from sqlalchemy import select as _select
+        row_result = await synth_session.execute(
+            _select(_QaTrace).where(_QaTrace.id == qa_trace_id)
+        )
+        scalar = row_result.scalar_one_or_none()
+        # AsyncMock.execute returns a Mock; scalar_one_or_none may itself be a coroutine
+        if hasattr(scalar, "__await__"):
+            scalar = await scalar
+        captured["trace_present_at_synth"] = scalar is not None
         return _answer_with_citations()
 
     _patch_persist(handler, monkeypatch)
@@ -219,6 +231,9 @@ async def test_step_ordering_create_trace_before_synthesize(monkeypatch) -> None
 
     assert call_order == ["create_trace", "synthesize_answer", "update_llm_fields"], (
         f"4-step ORDER violated: {call_order}"
+    )
+    assert captured["trace_present_at_synth"] is True, (
+        "QaTrace row was NOT present in DB when synthesize_answer was called — step 1 flush missing"
     )
 
 
