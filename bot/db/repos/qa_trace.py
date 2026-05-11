@@ -1,7 +1,14 @@
-"""Repository for ``qa_traces`` (T4-05)."""
+"""Repository for ``qa_traces`` (T4-05 base + T5-04 LLM extension).
+
+Flush-only — NEVER calls ``session.commit()`` or ``session.rollback()``.
+The caller (handler) owns the transaction lifecycle.
+"""
 
 from __future__ import annotations
 
+from decimal import Decimal
+
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import QaTrace
@@ -31,3 +38,48 @@ class QaTraceRepo:
         session.add(trace)
         await session.flush()
         return trace
+
+    @staticmethod
+    async def update_llm_fields(
+        session: AsyncSession,
+        *,
+        qa_trace_id: int,
+        llm_call_id: int,
+        llm_response_summary: str | None,
+        llm_response_redacted: bool,
+        cost_usd: Decimal,
+    ) -> int:
+        """Update the four Phase 5 LLM-extension columns on an existing QaTrace.
+
+        Called by ``bot/handlers/qa.py`` step 3 of the binding 4-step ORDER
+        (CREATE QaTrace → synthesize_answer → UPDATE QaTrace → render) per
+        contracts.md §6.1 + §12.3.
+
+        Touches ONLY the 4 Phase 5 columns — ``query_text``, ``evidence_ids``,
+        ``abstained``, ``query_redacted`` MUST NOT be modified. Tested in
+        ``tests/db/test_qa_trace.py::test_update_llm_fields_touches_only_phase5_columns``.
+
+        Returns rowcount (must be 1). Flushes; caller commits.
+        Raises ``LookupError`` if ``qa_trace_id`` is not found — the handler
+        guarantees the trace was created in step 1, so a missing row signals
+        a bug rather than a recoverable runtime condition.
+        """
+        stmt = (
+            update(QaTrace)
+            .where(QaTrace.id == qa_trace_id)
+            .values(
+                llm_call_id=llm_call_id,
+                llm_response_summary=llm_response_summary,
+                llm_response_redacted=llm_response_redacted,
+                cost_usd=cost_usd,
+            )
+        )
+        result = await session.execute(stmt)
+        rowcount: int = result.rowcount
+        if rowcount == 0:
+            raise LookupError(
+                f"QaTrace(id={qa_trace_id}) not found — handler step 1 (create) "
+                "must precede step 3 (update_llm_fields)"
+            )
+        await session.flush()
+        return rowcount

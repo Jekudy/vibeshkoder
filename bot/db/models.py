@@ -505,6 +505,7 @@ class QaTrace(Base):
     __table_args__ = (
         Index("ix_qa_traces_user_tg_id", "user_tg_id"),
         Index("ix_qa_traces_chat_id_created_at", "chat_id", "created_at"),
+        Index("ix_qa_traces_llm_call_id", "llm_call_id"),  # Phase 5 / 025
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -529,6 +530,29 @@ class QaTrace(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+    # ── Phase 5 / alembic 025 LLM extension columns ────────────────────────
+    # Populated by ``QaTraceRepo.update_llm_fields`` from the gateway's
+    # ``SynthesisResult`` per handler 4-step ORDER (contracts.md §6.1).
+    # ``llm_response_summary`` is the raw answer text; durability is bounded by
+    # the ``_cascade_qa_traces_llm`` cascade layer which NULLs it on forget.
+    llm_call_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "llm_usage_ledger.id",
+            name="fk_qa_traces_llm_call_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    llm_response_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    llm_response_redacted: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        default=False,
+        server_default="false",
+    )
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 6), nullable=True)
 
 
 class IntroRefreshTracking(Base):
@@ -792,7 +816,10 @@ class LlmUsageLedger(Base):
     )
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
-    prompt_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    # ``prompt_hash`` relaxed to nullable in alembic 025 so the
+    # ``_cascade_llm_usage_ledger`` cascade layer can NULL it on user forget
+    # while preserving cost / token aggregates for budget audit.
+    prompt_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
     response_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
     tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))

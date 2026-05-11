@@ -181,7 +181,9 @@ async def migrated_database_url(temp_database_url: str) -> AsyncIterator[str]:
 async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str) -> None:
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
 
-    assert current == "024"
+    # T5-04 (alembic 025) advanced the head past 024. Assert the current head
+    # explicitly; revisit when future migrations land.
+    assert current == "025"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(
@@ -298,8 +300,9 @@ def test_message_version_metadata_includes_search_tsv(app_env) -> None:
 
 async def test_alembic_downgrade_minus_one_drops_search_tsv(temp_database_url: str) -> None:
     _run_alembic(temp_database_url, "upgrade", "head")
-    # Head is now 024 (llm_usage_ledger + cache); -4 reaches 020 where search_tsv was added by 021.
-    _run_alembic(temp_database_url, "downgrade", "-4")
+    # Head is 025 (T5-04 qa_traces LLM extension); target revision 020 explicitly
+    # to drop search_tsv regardless of how many migrations sit ABOVE it.
+    _run_alembic(temp_database_url, "downgrade", "020")
 
     column_exists = await _fetch_value(
         temp_database_url,

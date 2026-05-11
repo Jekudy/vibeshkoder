@@ -1,8 +1,13 @@
-"""T4-05 acceptance tests — qa_traces table + QaTraceRepo."""
+"""T4-05 acceptance tests — qa_traces table + QaTraceRepo.
+
+T5-04 extends with tests for ``update_llm_fields`` (the new method
+introduced by alembic 025 + ORM extension; contracts.md §12.3).
+"""
 
 from __future__ import annotations
 
 import itertools
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
@@ -328,3 +333,141 @@ async def test_qa_trace_cascade_redacts_multiple_rows(db_session) -> None:
         await db_session.refresh(t)
         assert t.query_text is None, f"trace {t.id} query_text must be NULL"
         assert t.query_redacted is True, f"trace {t.id} query_redacted must be True"
+
+
+# ─── T5-04 update_llm_fields tests ─────────────────────────────────────────
+
+
+async def _make_ledger_row(db_session) -> int:
+    """Insert a minimal llm_usage_ledger row and return its id."""
+    from sqlalchemy import text as sa_text
+
+    result = await db_session.execute(
+        sa_text(
+            """
+            INSERT INTO llm_usage_ledger
+              (provider, model, prompt_hash, tokens_in, tokens_out, cost_usd, latency_ms, cache_hit)
+            VALUES ('anthropic', 'claude-haiku-4-5-20251001', :ph, 0, 0, 0, 0, false)
+            RETURNING id
+            """
+        ),
+        {"ph": "0" * 64},
+    )
+    return result.scalar_one()
+
+
+async def test_update_llm_fields_writes_all_four_columns(db_session) -> None:
+    """T5-04: update_llm_fields populates llm_call_id / summary / redacted / cost."""
+    from bot.db.repos.qa_trace import QaTraceRepo
+
+    user_id = _next_user_id()
+    chat_id = _next_chat_id()
+    trace = await QaTraceRepo.create(
+        db_session,
+        user_tg_id=user_id,
+        chat_id=chat_id,
+        query="hello",
+        evidence_ids=[100, 200],
+        abstained=False,
+        redact_query=False,
+    )
+    ledger_id = await _make_ledger_row(db_session)
+
+    rowcount = await QaTraceRepo.update_llm_fields(
+        db_session,
+        qa_trace_id=trace.id,
+        llm_call_id=ledger_id,
+        llm_response_summary="LLM-synthesized answer",
+        llm_response_redacted=False,
+        cost_usd=Decimal("0.001234"),
+    )
+
+    assert rowcount == 1
+    await db_session.refresh(trace)
+    assert trace.llm_call_id == ledger_id
+    assert trace.llm_response_summary == "LLM-synthesized answer"
+    assert trace.llm_response_redacted is False
+    assert trace.cost_usd == Decimal("0.001234")
+
+
+async def test_update_llm_fields_touches_only_phase5_columns(db_session) -> None:
+    """T5-04: update_llm_fields must NOT modify query / evidence_ids / abstained / redact_query."""
+    from bot.db.repos.qa_trace import QaTraceRepo
+
+    user_id = _next_user_id()
+    chat_id = _next_chat_id()
+    trace = await QaTraceRepo.create(
+        db_session,
+        user_tg_id=user_id,
+        chat_id=chat_id,
+        query="immutable phase4 query",
+        evidence_ids=[111, 222, 333],
+        abstained=False,
+        redact_query=False,
+    )
+    ledger_id = await _make_ledger_row(db_session)
+
+    # Snapshot Phase 4 column values BEFORE the update.
+    before_query = trace.query_text
+    before_evidence = list(trace.evidence_ids)
+    before_abstained = trace.abstained
+    before_redact = trace.query_redacted
+
+    await QaTraceRepo.update_llm_fields(
+        db_session,
+        qa_trace_id=trace.id,
+        llm_call_id=ledger_id,
+        llm_response_summary="answer",
+        llm_response_redacted=False,
+        cost_usd=Decimal("0.000001"),
+    )
+
+    await db_session.refresh(trace)
+    # Phase 4 columns unchanged.
+    assert trace.query_text == before_query
+    assert trace.evidence_ids == before_evidence
+    assert trace.abstained == before_abstained
+    assert trace.query_redacted == before_redact
+
+
+async def test_update_llm_fields_raises_lookup_error_when_missing(db_session) -> None:
+    """T5-04: unknown qa_trace_id → LookupError (handler bug detector)."""
+    from bot.db.repos.qa_trace import QaTraceRepo
+
+    ledger_id = await _make_ledger_row(db_session)
+    with pytest.raises(LookupError):
+        await QaTraceRepo.update_llm_fields(
+            db_session,
+            qa_trace_id=9_999_999_999,
+            llm_call_id=ledger_id,
+            llm_response_summary=None,
+            llm_response_redacted=False,
+            cost_usd=Decimal("0"),
+        )
+
+
+async def test_update_llm_fields_summary_can_be_none(db_session) -> None:
+    """T5-04: ``Abstention`` path leaves llm_response_summary=NULL."""
+    from bot.db.repos.qa_trace import QaTraceRepo
+
+    trace = await QaTraceRepo.create(
+        db_session,
+        user_tg_id=_next_user_id(),
+        chat_id=_next_chat_id(),
+        query="abstain",
+        evidence_ids=[],
+        abstained=False,
+        redact_query=False,
+    )
+    ledger_id = await _make_ledger_row(db_session)
+    await QaTraceRepo.update_llm_fields(
+        db_session,
+        qa_trace_id=trace.id,
+        llm_call_id=ledger_id,
+        llm_response_summary=None,
+        llm_response_redacted=False,
+        cost_usd=Decimal("0"),
+    )
+    await db_session.refresh(trace)
+    assert trace.llm_response_summary is None
+    assert trace.cost_usd == Decimal("0")

@@ -339,7 +339,14 @@ def test_llm_usage_ledger_tablename_registered(app_env) -> None:
 
 
 async def test_llm_usage_ledger_downgrade_drops_table(temp_database_url: str) -> None:
-    """alembic downgrade -1 from 024 drops llm_usage_ledger."""
+    """alembic downgrade past 024 drops llm_usage_ledger.
+
+    Step down to revision 023 (the predecessor of 024) so the table is dropped
+    regardless of how many migrations sit ABOVE 024. T5-04 adds 025, so a bare
+    ``downgrade -1`` from head would only revert 025 (leaving 024's tables).
+    Targeting revision 023 explicitly keeps the test stable as future
+    migrations land.
+    """
     _run_alembic(temp_database_url, "upgrade", "head")
 
     # Verify table exists
@@ -354,7 +361,7 @@ async def test_llm_usage_ledger_downgrade_drops_table(temp_database_url: str) ->
     )
     assert exists_before is True
 
-    _run_alembic(temp_database_url, "downgrade", "-1")
+    _run_alembic(temp_database_url, "downgrade", "023")
 
     exists_after = await _fetch_value(
         temp_database_url,
@@ -372,9 +379,13 @@ async def test_llm_usage_ledger_downgrade_drops_table(temp_database_url: str) ->
 
 
 async def test_migration_024_upgrade_downgrade_roundtrip(migrated_database_url: str) -> None:
-    """Downgrade -1 drops both tables; upgrade head restores them + accepts rows."""
-    # Step 1: downgrade -1 — both tables must vanish
-    _run_alembic(migrated_database_url, "downgrade", "-1")
+    """Downgrade past 024 drops both tables; upgrade head restores them + accepts rows.
+
+    See ``test_llm_usage_ledger_downgrade_drops_table`` for the rationale —
+    targeting revision 023 explicitly keeps the test stable as 025+ land.
+    """
+    # Step 1: downgrade to 023 — both tables must vanish
+    _run_alembic(migrated_database_url, "downgrade", "023")
 
     for table_name in ("llm_usage_ledger", "llm_synthesis_cache"):
         exists = await _fetch_value(
