@@ -273,26 +273,66 @@ approved_card_hits AS (
                 )
         )
 ),
+-- Per-source tombstone re-check. ``approved_card_hits`` excludes a card
+-- when ANY source is tombstoned, so in normal flow no forgotten source
+-- reaches the anchor or the mvid array. This CTE re-applies the same
+-- 3-key tombstone check per individual source as belt-and-suspenders
+-- against:
+--   1. A future refactor of ``approved_card_hits`` that loosens the
+--      exclusion condition.
+--   2. A race window where the cascade has not yet deleted forgotten
+--      ``card_sources`` rows but the forget_event is already visible.
+-- This guarantees no tombstoned mvid can appear in the anchor row or
+-- the ``card_source_message_version_ids`` array. Per-source re-check
+-- requested by Codex round-2 review (CRITICAL #2).
+unforgotten_card_sources AS (
+    SELECT cs.id AS card_source_id,
+           cs.card_id,
+           cs.message_version_id,
+           cs.position
+    FROM card_sources cs
+    JOIN message_versions mv ON mv.id = cs.message_version_id
+    JOIN chat_messages c ON c.id = mv.chat_message_id
+    WHERE cs.card_id IN (SELECT card_id FROM approved_card_hits)
+        AND NOT EXISTS (
+            SELECT 1
+            FROM forget_events AS fe
+            WHERE (
+                fe.tombstone_key
+                    = 'message:' || c.chat_id::text || ':' || c.message_id::text
+                OR (
+                    mv.content_hash IS NOT NULL
+                    AND fe.tombstone_key = 'message_hash:' || mv.content_hash
+                )
+                OR (
+                    c.user_id IS NOT NULL
+                    AND fe.tombstone_key = 'user:' || c.user_id::text
+                )
+            )
+            AND fe.status IN ('pending', 'processing', 'completed')
+        )
+),
 card_anchors AS (
-    SELECT DISTINCT ON (cs.card_id)
-        cs.card_id,
+    SELECT DISTINCT ON (ucs.card_id)
+        ucs.card_id,
         mv.id AS message_version_id,
         c.id AS chat_message_id,
         c.chat_id AS chat_id,
         c.message_id AS message_id,
         c.date AS source_message_date
-    FROM card_sources cs
-    JOIN message_versions mv ON mv.id = cs.message_version_id
+    FROM unforgotten_card_sources ucs
+    JOIN message_versions mv ON mv.id = ucs.message_version_id
     JOIN chat_messages c ON c.id = mv.chat_message_id
-    WHERE cs.card_id IN (SELECT card_id FROM approved_card_hits)
-    ORDER BY cs.card_id, cs.position ASC, cs.id ASC
+    ORDER BY ucs.card_id, ucs.position ASC, ucs.card_source_id ASC
 ),
 card_source_lists AS (
-    SELECT cs.card_id,
-           ARRAY_AGG(cs.message_version_id ORDER BY cs.position ASC, cs.id ASC) AS mvids
-    FROM card_sources cs
-    WHERE cs.card_id IN (SELECT card_id FROM approved_card_hits)
-    GROUP BY cs.card_id
+    SELECT ucs.card_id,
+           ARRAY_AGG(
+               ucs.message_version_id
+               ORDER BY ucs.position ASC, ucs.card_source_id ASC
+           ) AS mvids
+    FROM unforgotten_card_sources ucs
+    GROUP BY ucs.card_id
 ),
 card_hits AS (
     SELECT
