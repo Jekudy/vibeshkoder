@@ -1136,6 +1136,8 @@ async def test_card_detail_returns_not_found_for_draft(
     assert "LeakyDraftTitle" not in reply
     assert "LeakyDraftBody" not in reply
     assert "draft" not in reply.lower()
+    # And positive assertion: the handler explicitly says "not found".
+    assert "Card not found" in reply
 
 
 async def test_card_detail_returns_not_found_for_archived(
@@ -1163,3 +1165,5 @@ async def test_card_detail_returns_not_found_for_archived(
     assert "LeakyArchivedBody" not in reply
     assert "archived for a leaky reason" not in reply
     assert "archived" not in reply.lower()
+    # And positive assertion: the handler explicitly says "not found".
+    assert "Card not found" in reply
