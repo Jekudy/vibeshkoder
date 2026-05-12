@@ -196,7 +196,7 @@ async def test_synthesize_answer_excludes_live_message_via_mv_content_hash_tombs
     ``_TOMBSTONE_GATE_SQL`` ``message_hash:`` predicate MUST therefore
     match ``mv.content_hash`` (joined), NOT ``c.content_hash`` —
     otherwise a ``message_hash:<X>`` forget event fails to invalidate the
-    live row and the gateway leaks the forgotten content to the LLM.
+    live row and the gateway leaks the tombstoned content to the LLM.
 
     Acceptance: ``synthesize_answer`` returns
     ``Abstention(reason='forget_invalidated')`` and the provider is NOT
