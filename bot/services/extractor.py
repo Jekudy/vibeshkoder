@@ -255,7 +255,7 @@ async def _select_eligible_sources(
     #     path (``bot/db/repos/message.py::MessageRepo.save``) never sets it —
     #     only the import path (``bot/services/import_apply.py``) populates it.
     #     Filtering on ``c.content_hash`` silently no-op's every
-    #     ``message_hash:`` tombstone for live messages, letting forgotten
+    #     ``message_hash:`` tombstone for live messages, letting tombstoned
     #     content leak to the LLM.
     #
     # Keep this comment in sync with search.py / llm_gateway.py if any of the

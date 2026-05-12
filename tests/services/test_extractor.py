@@ -445,17 +445,17 @@ async def test_run_extraction_pass_excludes_messages_with_forget_tombstone(
         db_session, when=when, text="alpha normal"
     )
     # Forgotten message — excluded.
-    cm_forgotten, ver_forgotten, chat_id_f, msg_id_f = await _make_chat_message(
-        db_session, when=when, text="DO_NOT_LEAK_FORGOTTEN"
+    cm_tombstoned, ver_tombstoned, chat_id_f, msg_id_f = await _make_chat_message(
+        db_session, when=when, text="DO_NOT_LEAK_TOMBSTONED"
     )
-    # Insert pending forget_event matching the forgotten message by
+    # Insert pending forget_event matching the tombstoned message by
     # tombstone_key = 'message:<chat_id>:<message_id>'.
     from bot.db.repos.forget_event import ForgetEventRepo
 
     await ForgetEventRepo.create(
         db_session,
         target_type="message",
-        target_id=str(cm_forgotten),
+        target_id=str(cm_tombstoned),
         actor_user_id=None,
         authorized_by="admin",
         tombstone_key=f"message:{chat_id_f}:{msg_id_f}",
@@ -485,10 +485,10 @@ async def test_run_extraction_pass_excludes_messages_with_forget_tombstone(
         for call in gw.calls
         for sv in call["source_versions"]
     ]
-    assert ver_forgotten not in forwarded_ids
+    assert ver_tombstoned not in forwarded_ids
     for call in gw.calls:
         for sv in call["source_versions"]:
-            assert "DO_NOT_LEAK_FORGOTTEN" not in (sv.get("text") or "")
+            assert "DO_NOT_LEAK_TOMBSTONED" not in (sv.get("text") or "")
 
 
 # ─── Test 4: empty window — zero candidates, completed run ───────────────────
@@ -868,7 +868,7 @@ async def test_run_extraction_pass_rejects_bundle_when_fresh_forget_event_arrive
     The materialized ``memory_policy`` / ``is_redacted`` fields in the
     bundle are point-in-time snapshots. Without a re-query of
     ``forget_events`` inside ``_bundle_is_clean``, a forget event that
-    lands in this gap would leak forgotten content to the LLM. Same
+    lands in this gap would leak tombstoned content to the LLM. Same
     class of race as H-Cdx-2.
 
     We simulate the race by inserting the forget_event AFTER
@@ -886,7 +886,7 @@ async def test_run_extraction_pass_rejects_bundle_when_fresh_forget_event_arrive
     window_end = datetime.now(timezone.utc) + timedelta(hours=1)
     when = window_start + timedelta(minutes=5)
     cm_id, _, chat_id_v, msg_id_v = await _make_chat_message(
-        db_session, when=when, text="will-be-forgotten-mid-pass"
+        db_session, when=when, text="will-be-tombstoned-mid-pass"
     )
 
     # Patch _select_eligible_sources to insert a forget_event AFTER the
