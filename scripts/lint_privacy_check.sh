@@ -11,6 +11,12 @@ is_allowed_path() {
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_forgotten.*\.jsonl$ ]] && return 0
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_redacted.*\.jsonl$ ]] && return 0
 
+  # Phase 6+ design docs document privacy invariants verbatim — they must be
+  # allowed to reference the canonical token names defined by the pattern
+  # above. This entry only matches Phase implementation/wave design docs
+  # under docs/memory-system/, not arbitrary docs.
+  [[ "$path" =~ ^docs/memory-system/T[0-9]+(-[0-9A-Z]+)+_design\.md$ ]] && return 0
+
   return 1
 }
 
