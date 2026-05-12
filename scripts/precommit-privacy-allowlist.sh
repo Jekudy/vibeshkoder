@@ -22,6 +22,9 @@ is_allowed_path() {
   [[ "$path" =~ ^tests/handlers/test_qa_llm_synthesis\.py$ ]] && return 0
   [[ "$path" =~ ^tests/handlers/test_qa_recall_phase4_preserved\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_forget_cascade\.py$ ]] && return 0
+  # Phase 6 / T6-01 — P6 cascade tests reference the cascade semantics in docstrings.
+  [[ "$path" =~ ^tests/services/test_p6_card_sources_cascade\.py$ ]] && return 0
+  [[ "$path" =~ ^tests/services/test_p6_advisory_lock\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_llm_gateway\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_ingestion.*\.py$ ]] && return 0
   [[ "$path" =~ ^tests/services/test_import_apply\.py$ ]] && return 0
