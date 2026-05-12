@@ -116,8 +116,14 @@ WHERE c.chat_id = :chat_id
         WHERE (
             fe.tombstone_key = 'message:' || c.chat_id::text || ':' || c.message_id::text
             OR (
-                c.content_hash IS NOT NULL
-                AND fe.tombstone_key = 'message_hash:' || c.content_hash
+                -- #255 + T6-02 round 3 lesson: ``message_hash:`` tombstone MUST
+                -- match against ``message_versions.content_hash`` (NOT NULL by
+                -- schema), NOT ``chat_messages.content_hash`` (nullable — live
+                -- ingestion via ``MessageRepo.save`` never populates it; only
+                -- import path does). Filtering on ``c.content_hash`` silently
+                -- leaks live messages whose hash IS tombstoned.
+                mv.content_hash IS NOT NULL
+                AND fe.tombstone_key = 'message_hash:' || mv.content_hash
             )
             OR (
                 c.user_id IS NOT NULL
@@ -198,8 +204,10 @@ message_hits AS (
             WHERE (
                 fe.tombstone_key = 'message:' || c.chat_id::text || ':' || c.message_id::text
                 OR (
-                    c.content_hash IS NOT NULL
-                    AND fe.tombstone_key = 'message_hash:' || c.content_hash
+                    -- #255: see ``_PHASE4_SQL`` comment — same fix here for the
+                    -- Phase 6 ``message_hits`` branch.
+                    mv.content_hash IS NOT NULL
+                    AND fe.tombstone_key = 'message_hash:' || mv.content_hash
                 )
                 OR (
                     c.user_id IS NOT NULL
