@@ -1,7 +1,7 @@
 # Memory System — Implementation Status
 
-**Last updated:** 2026-05-02 (Phase 4 hotfix #164 CLOSED via PR #203; Phase 5 plan ratified by Orchestrator A — Wave 0 = #164 hotfix landed).
-**Active worktrees:** `.worktrees/orch-A` (Phase 5 planning, branch `plan/p5-ratify`), `.worktrees/orch-B` (Phase 9/10/12 planning), `.worktrees/orch-C` (Phase 11 planning). Historical: `.worktrees/p2-alpha/bravo/charlie/delta` (Phase 2 closed 2026-04-29 — Phase 1 closed on `main` 2026-04-27); `.worktrees/p4-hotfix-164` (closed by PR #203 merge — 18 commits, 4 CRITICAL/HIGH FHR gaps + 4 Codex review fixes resolved).
+**Last updated:** 2026-05-12 (Phase 6 Wave 1 IN PROGRESS — T6-00 merged PR #242, T6-01 merged PR #245, T6-02 in PAR on branch `feat/p6-t6-02-extractor`; Phase 11 follow-up #224 High #5 merged PR #243).
+**Active worktrees:** `.worktrees/p6-w1-stream-b` (T6-02 extractor, branch `feat/p6-t6-02-extractor`). Historical: `.worktrees/orch-A` (Phase 5–6 planning); `.worktrees/orch-B` (Phase 9/10/12 planning); `.worktrees/orch-C` (Phase 11 planning); `.worktrees/p2-alpha/bravo/charlie/delta` (Phase 2 closed 2026-04-29); `.worktrees/p4-hotfix-164` (closed by PR #203).
 **Source of truth:** this file is updated after every PR merge into `main`.
 
 ---
@@ -342,18 +342,40 @@ Plus L-1..L-4 cosmetic carryovers (N+1 perf, alembic 025 `import hashlib` placem
 - contracts.md §5.1+§10.1+§12.2 update_placeholder return type drift (-> None vs -> int rowcount).
 - contracts.md §12.3 update_llm_fields return type drift (-> None vs -> rowcount + LookupError note).
 
-## Phases 6–12
+## Phase 6 — Knowledge cards + admin review (IN PROGRESS)
+
+**Sprint 0 RATIFIED 2026-05-12.** Plan promoted to `docs/memory-system/PHASE6_PLAN.md`. Wave 1 authorized: T6-00 + T6-01 + T6-02 + T6-03.
+
+**Owned alembic range:** 030–049 (Wave 1 = 030–035).
+
+| Ticket | Wave | Title | Status | Notes |
+|--------|------|-------|--------|-------|
+| T6-00 | 0 | FHR carryover — M-1 ValueError guard + M-4 message_hash cascade tests | merged | **Merged via PR #242** 2026-05-12, commits `1a33c16`..`793cddf` on main. M-1: `qa_trace_id` annotation changed to `int \| None` (annotation-only; gateway robust to None per ledger FK nullable). M-4: direct `_cascade_qa_traces_llm` + `_cascade_llm_synthesis_cache` message_hash sub-case tests with `llm_response_summary IS NULL` assertions added. Codex round 1 MED (ledger aggregate preservation asserts) fixed in `7e8d558`. |
+| T6-01 | 1 | Phase 6 schema — migrations 030-034 + ORM + `_p6_mvid_advisory_lock_id` helper + `_cascade_card_sources_on_forget` | merged | **Merged via PR #245** 2026-05-12, HEAD commit `4db6081` on main. 9 commits on branch `feat/p6-t6-01-schema`. Creates tables: `extraction_runs` (030), `extraction_candidates` (031), `knowledge_cards` (032), `card_sources` (033), `extraction_decisions` (034). ORM models in `bot/db/models.py`. Advisory lock helper `_p6_mvid_advisory_lock_id(mvid) -> int` deterministic SHA-256→signed-int64. Cascade `_cascade_card_sources_on_forget` in `forget_cascade.py`. PAR: Codex round 2 — SQLite-compatible `server_default` fix (`4db6081`), ORM default fix (`5ad3ffc`), idempotency test (`567caa7`), ORM delete cascade (`4b33dec`). |
+| T6-02 | 1 | Extractor service + scheduler flag + `/admin_extract` handler + migration 035 `operator_user_id` | in progress | Branch `feat/p6-t6-02-extractor`, HEAD `182095f`, 10 commits. PAR Codex round 2 in progress (as of 2026-05-12). PR not yet created. T6-03 blocked until T6-02 merged. |
+| T6-03 | 1 | Gateway `extract_candidates` endpoint | not started | Unblocked after T6-02 merge. Must clear Phase 11 leakage binding test (`tests/evals/test_leakage.py`) before merge. Wave 1 Stream B sprint 2. |
+
+### Phase 11 follow-ups (#224)
+
+| Issue | Title | Status | Notes |
+|-------|-------|--------|-------|
+| #224 High #5 | httpx URL-level no-LLM guard | merged | **Merged via PR #243** 2026-05-12, commits `1cf4c43`..`3d97e56` on main. Adds async `httpx` hook that blocks non-allowlisted HTTP calls from inside LLM gateway; environment-independent negative tests. Codex review (HIGH async hook + MED drift + LOW name) fixed in `06fc1e2`. |
+| #224 Critical #4 | Allowlist hardening | in progress | Branch in flight; PR not yet created. |
+| #224 High #1 | Test hardening (item 1) | in progress | Bundled with Critical #4 sprint. |
+| #224 High #2 | Test hardening (item 2) | in progress | Bundled with Critical #4 sprint. |
+| #224 High #3 | Test hardening (item 3) | in progress | Bundled with Critical #4 sprint. |
+| #224 High #4 | Test hardening (item 4) | in progress | Bundled with Critical #4 sprint. |
+
+## Phases 7–12
 
 **Implementation:** not started.
 
-- **Phase 6 (cards) authorization:** gated on Phase 5 closure.
 - **Phase 7 (digests):** gated on Phase 6 closure.
 - **Phase 8 (reflection / observations / memory_events / memory_candidates / reflection_runs):** gated on Phase 7 closure. Note: HANDOFF originally placed extraction tables in Phase 5; PHASE5_PLAN.md §2 ratifies synthesis-first slice and defers extraction tables to Phase 8.
 - **Phase 9 (wiki) + Phase 10 (graph projection):** Orchestrator B owns; gated on Phase 6 cards closure.
-- **Phase 11 (Shkoderbench / evals):** Orchestrator C owns; runs in parallel with Phase 5 (per AUTHORIZED_SCOPE.md). Phase 11 numbering conflict (HANDOFF = evals vs. early DRAFT = expertise pages) — reconcile before kickoff.
 - **Phase 12 (butler design):** Orchestrator B; design-only, no implementation, authorized 2026-04-30.
 
-Design drafts for Phase 6/7/8/9/10/11/12 remain in `docs/memory-system/prompts/PHASE{6,7,8,9,10,11,12}_PLAN_DRAFT.md` until each phase's owning orchestrator promotes to `_PLAN.md` per the parallel pattern this Phase 5 plan establishes.
+Design drafts for Phase 6/7/8/9/10/11/12 remain in `docs/memory-system/prompts/PHASE{6,7,8,9,10,11,12}_PLAN_DRAFT.md` until each phase's owning orchestrator promotes to `_PLAN.md`.
 
 ---
 
