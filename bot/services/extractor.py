@@ -299,7 +299,9 @@ async def _select_eligible_sources(
     ]
 
 
-def _bundle_is_clean(rows: list[_SourceRow]) -> tuple[bool, str | None]:
+async def _bundle_is_clean(
+    session: AsyncSession, rows: list[_SourceRow]
+) -> tuple[bool, str | None]:
     """Defense-in-depth re-check after SELECT.
 
     Returns ``(True, None)`` when every row is eligible. Otherwise
@@ -308,6 +310,19 @@ def _bundle_is_clean(rows: list[_SourceRow]) -> tuple[bool, str | None]:
     PHASE6_PLAN.md §5.B "Invariant: the LLM call is forbidden whenever ANY
     source row in the evidence bundle has memory_policy != 'normal'. The
     guard runs BEFORE llm_gateway.extract_candidates() is invoked."
+
+    Two layers of defense:
+
+    1. **Materialized fast-path.** The SELECT already filtered out
+       offrecord / redacted rows; this loop re-confirms the snapshotted
+       fields before forwarding. Cheap (in-memory only).
+
+    2. **Fresh forget_events re-query.** SAME CLASS OF RACE AS H-Cdx-2:
+       between ``_select_eligible_sources`` and the gateway call, a new
+       ``forget_events`` row can land that targets a bundle row. The
+       materialized snapshot would miss it, so we re-query the live
+       ``forget_events`` table for any tombstone matching the bundle's
+       chat_message ids. If a fresh tombstone exists, refuse the call.
     """
     for row in rows:
         if row.memory_policy != "normal":
@@ -319,6 +334,48 @@ def _bundle_is_clean(rows: list[_SourceRow]) -> tuple[bool, str | None]:
             return False, f"source_redacted:cm_id={row.chat_message_id}"
         if row.version_is_redacted:
             return False, f"source_version_redacted:mv_id={row.message_version_id}"
+
+    if not rows:
+        return True, None
+
+    # Fresh forget_events re-query — closes the SELECT→gateway race window.
+    # The join clauses match the cascade's tombstone_key construction
+    # (see bot/services/forget_cascade.py): forget_reply emits
+    # ``message:<chat>:<msg>``, /forget-me emits ``user:<tg_id>``, and
+    # message_hash tombstones use chat_messages.content_hash (the same
+    # hash value is also stored on message_versions.content_hash; both
+    # tables share the hash so filtering on c.content_hash is sufficient).
+    chat_msg_ids = [row.chat_message_id for row in rows]
+    result = await session.execute(
+        text(
+            """
+            SELECT c.id AS chat_message_id
+            FROM chat_messages AS c
+            JOIN forget_events AS fe ON (
+                fe.tombstone_key = 'message:' || c.chat_id::text || ':' || c.message_id::text
+                OR (
+                    c.content_hash IS NOT NULL
+                    AND fe.tombstone_key = 'message_hash:' || c.content_hash
+                )
+                OR (
+                    c.user_id IS NOT NULL
+                    AND fe.tombstone_key = 'user:' || c.user_id::text
+                )
+            )
+            WHERE c.id = ANY(:chat_msg_ids)
+              AND fe.status IN ('pending', 'processing', 'completed')
+            LIMIT 1
+            """
+        ),
+        {"chat_msg_ids": chat_msg_ids},
+    )
+    raced_row = result.first()
+    if raced_row is not None:
+        return (
+            False,
+            f"fresh_forget_event_during_extraction:cm_id={raced_row[0]}",
+        )
+
     return True, None
 
 
@@ -417,7 +474,7 @@ async def run_extraction_pass(
         force_include_chat_message_ids=_force_include_chat_message_ids,
     )
 
-    clean, reason = _bundle_is_clean(rows)
+    clean, reason = await _bundle_is_clean(session, rows)
     if not clean:
         return await _persist_failed_run(
             session,
