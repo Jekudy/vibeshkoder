@@ -167,7 +167,6 @@ async def test_admin_extract_rejects_non_admin(
         fake_nonadmin_message,
         cmd,
         session=db_session,
-        gateway=MagicMock(),
     )
 
     # Either no-op or explicit error — either way, no pass invocation.
@@ -209,7 +208,6 @@ async def test_admin_extract_calls_run_extraction_pass_with_window(
         fake_admin_message,
         cmd,
         session=db_session,
-        gateway=MagicMock(),
     )
 
     assert "window_start" in captured
@@ -252,7 +250,6 @@ async def test_admin_extract_returns_summary_with_run_metadata(
         fake_admin_message,
         cmd,
         session=db_session,
-        gateway=MagicMock(),
     )
 
     # Inspect every call to .answer / .reply and confirm summary content.
@@ -290,7 +287,6 @@ async def test_admin_extract_rejects_missing_window(
         fake_admin_message,
         cmd,
         session=db_session,
-        gateway=MagicMock(),
     )
     assert called["count"] == 0
 
@@ -316,7 +312,6 @@ async def test_admin_extract_rejects_invalid_window_format(
         fake_admin_message,
         cmd,
         session=db_session,
-        gateway=MagicMock(),
     )
     assert called["count"] == 0
     # Admin received an error reply.
@@ -348,6 +343,80 @@ async def test_admin_extract_rejects_window_over_30_days(
         fake_admin_message,
         cmd,
         session=db_session,
-        gateway=MagicMock(),
     )
     assert called["count"] == 0
+
+
+# ─── T6-03: DI refactor — handler builds gateway locally ─────────────────────
+
+
+async def test_admin_extract_builds_gateway_locally_t6_03(
+    db_session,
+    fake_admin_message,
+    fake_command_object_factory,
+) -> None:
+    """T6-03 design §3: handler MUST build LiveExtractCandidatesGateway locally
+    rather than accept a gateway kwarg from aiogram DI middleware.
+
+    The handler signature should expose ONLY ``message``, ``command``,
+    ``session`` (matches the Phase 5 ``qa.recall_handler`` precedent at
+    bot/handlers/qa.py:332-343 — local instantiation, not aiogram DI).
+    """
+    import inspect
+
+    import bot.handlers.admin_extract as h_module
+
+    sig = inspect.signature(h_module.cmd_admin_extract)
+    # T6-03 contract: ``gateway`` MUST NOT appear in the public signature.
+    assert "gateway" not in sig.parameters, (
+        "T6-03: handler should not declare ``gateway`` kwarg — gateway is "
+        "constructed locally inside the handler body, matching the Phase 5 "
+        "QA precedent (bot/handlers/qa.py)."
+    )
+
+    # The handler should accept (message, command, session) at minimum.
+    assert "message" in sig.parameters
+    assert "command" in sig.parameters
+    assert "session" in sig.parameters
+
+
+async def test_admin_extract_invokes_run_extraction_pass_without_gateway_kwarg(
+    db_session,
+    fake_admin_message,
+    fake_command_object_factory,
+    monkeypatch,
+) -> None:
+    """Handler must construct gateway internally and pass it to
+    ``run_extraction_pass``. Verifies the wired local LiveExtractCandidatesGateway.
+    """
+    import uuid
+
+    import bot.handlers.admin_extract as h_module
+    from bot.services.extractor import ExtractionResult
+    from bot.services.llm_gateway import LiveExtractCandidatesGateway
+
+    captured: dict = {}
+
+    async def fake_run_pass(session, *, window_start, window_end, gateway, **kwargs):
+        captured["gateway"] = gateway
+        return ExtractionResult(
+            extraction_run_id=uuid.uuid4(),
+            run_status="completed",
+            candidate_count=0,
+            llm_usage_ledger_id=1,
+        )
+
+    monkeypatch.setattr(h_module, "run_extraction_pass", fake_run_pass)
+
+    cmd = fake_command_object_factory(
+        "--window 2026-05-12T00:00:00Z..2026-05-13T00:00:00Z"
+    )
+    # NOTE: NO ``gateway=`` kwarg passed — handler builds it locally.
+    await h_module.cmd_admin_extract(
+        fake_admin_message,
+        cmd,
+        session=db_session,
+    )
+
+    assert "gateway" in captured
+    assert isinstance(captured["gateway"], LiveExtractCandidatesGateway)

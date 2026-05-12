@@ -28,10 +28,13 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
+from bot.db.repos.llm_usage_ledger import LedgerRepo
 from bot.filters.chat_type import PrivateChatFilter
-from bot.services.extractor import (
-    ExtractCandidatesGateway,
-    run_extraction_pass,
+from bot.services.extractor import run_extraction_pass
+from bot.services.llm_gateway import (
+    LiveExtractCandidatesGateway,
+    load_gateway_config,
+    resolve_provider,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,7 +120,6 @@ async def cmd_admin_extract(
     message: Message,
     command: CommandObject,
     session: AsyncSession,
-    gateway: ExtractCandidatesGateway,
 ) -> None:
     """Admin-only ``/admin_extract --window <start>..<end>`` handler.
 
@@ -136,6 +138,11 @@ async def cmd_admin_extract(
     * Window parser → ``run_extraction_pass`` direct invocation
       (scheduler flag is NOT checked here — operator-explicit backfill
       per PHASE6_PLAN.md Q5).
+    * **Gateway DI (T6-03)**: the handler constructs
+      ``LiveExtractCandidatesGateway`` locally from env-derived config,
+      mirroring the Phase 5 QA precedent (``bot/handlers/qa.py:332-343``).
+      No aiogram middleware DI is used; the Protocol seam from T6-02
+      keeps tests injectable via ``monkeypatch``.
     * Returns summary text with ``candidate_count`` + ``run_status`` +
       ``llm_usage_ledger_id``.
     """
@@ -193,6 +200,13 @@ async def cmd_admin_extract(
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
         },
+    )
+
+    # T6-03 design §3: build the gateway locally (Phase 5 precedent).
+    cfg = load_gateway_config()
+    provider = resolve_provider(cfg.provider)
+    gateway = LiveExtractCandidatesGateway(
+        ledger_repo=LedgerRepo(), provider=provider, config=cfg
     )
 
     result = await run_extraction_pass(

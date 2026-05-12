@@ -897,6 +897,78 @@ def _estimate_cost(
         return Decimal("0")
 
 
+# ─── Shared config loader (T6-03 R-7 / design §3) ────────────────────────────
+
+
+# Default prompt template version pinned for the Phase 5 ``synthesize_answer``
+# call site (matches the v1.0.0 baseline introduced with T5-04b — see
+# contracts.md §12.5). Re-exported here so both the QA handler and the
+# Phase 6 admin/scheduler call sites share a single source of truth.
+DEFAULT_PROMPT_TEMPLATE_VERSION = "v1.0.0"
+
+
+def load_gateway_config(
+    *, prompt_template_version: str = DEFAULT_PROMPT_TEMPLATE_VERSION
+) -> "LLMGatewayConfig":
+    """Resolve ``LLMGatewayConfig`` from env vars with sane defaults.
+
+    Reads (per global rule — NEVER rename existing env var keys):
+
+    * ``LLM_PROVIDER`` (default ``"anthropic"``).
+    * ``LLM_MODEL`` (provider-specific default).
+    * ``LLM_DAILY_USD_CEILING`` (default ``Decimal("5.00")``).
+    * ``LLM_MONTHLY_USD_CEILING`` (default ``Decimal("50.00")``).
+
+    Shared by Phase 5 QA synthesis (``bot/handlers/qa.py::recall_handler``)
+    and Phase 6 extraction (``bot/handlers/admin_extract.py`` + scheduler
+    tick wrapper). Budget ceilings are SHARED across synthesis and
+    extraction (single ledger, simpler accounting — T6-03 design open
+    question #2 resolution).
+    """
+    # Lazy import — provider modules import the SDK lazily inside ``call``,
+    # but importing the class at module load creates an unwanted dep from
+    # every call site. Lazy here keeps this file SDK-import-free.
+    import os
+
+    from bot.services.llm_providers.anthropic import DEFAULT_ANTHROPIC_MODEL
+    from bot.services.llm_providers.openai import DEFAULT_OPENAI_MODEL
+
+    provider = os.environ.get("LLM_PROVIDER", "anthropic")
+    if provider not in ("anthropic", "openai"):
+        raise ValueError(f"unknown provider: {provider}")
+
+    default_model = (
+        DEFAULT_OPENAI_MODEL if provider == "openai" else DEFAULT_ANTHROPIC_MODEL
+    )
+    model = os.environ.get("LLM_MODEL", default_model)
+    daily = Decimal(os.environ.get("LLM_DAILY_USD_CEILING", "5.00"))
+    monthly = Decimal(os.environ.get("LLM_MONTHLY_USD_CEILING", "50.00"))
+    return LLMGatewayConfig(
+        provider=provider,  # type: ignore[arg-type]  # validated above
+        model=model,
+        daily_ceiling_usd=daily,
+        monthly_ceiling_usd=monthly,
+        prompt_template_version=prompt_template_version,
+    )
+
+
+def resolve_provider(provider_name: str) -> LLMProvider:
+    """Instantiate Anthropic or OpenAI provider per config.
+
+    Raises ``ValueError`` on unknown ``provider_name``. Lazy import keeps
+    the gateway module SDK-import-free at top level.
+    """
+    if provider_name == "anthropic":
+        from bot.services.llm_providers.anthropic import AnthropicProvider
+
+        return AnthropicProvider()
+    if provider_name == "openai":
+        from bot.services.llm_providers.openai import OpenAIProvider
+
+        return OpenAIProvider()
+    raise ValueError(f"unknown provider: {provider_name}")
+
+
 # ─── Phase 6 / T6-03 — extract_candidates gateway entry point ───────────────
 
 
@@ -1221,6 +1293,7 @@ __all__ = [
     "Abstention",
     "AbstentionReason",
     "AnswerWithCitations",
+    "DEFAULT_PROMPT_TEMPLATE_VERSION",
     "LLM_BUDGET_LOCK_ID",
     "LLMGatewayConfig",
     "LedgerRepoProtocol",
@@ -1231,5 +1304,7 @@ __all__ = [
     "_cache_input_hash",
     "_normalize_query",
     "extract_candidates",
+    "load_gateway_config",
+    "resolve_provider",
     "synthesize_answer",
 ]
