@@ -1392,6 +1392,18 @@ async def test_cascade_qa_traces_llm_message_hash_subcase_nulls_summary(
         cost_usd=Decimal("0.001"),
     )
 
+    # Snapshot ledger aggregate fields BEFORE cascade — Phase 5 cascade contract
+    # NULLs PII (prompt_hash + response_hash) but PRESERVES budget aggregates
+    # (cost_usd / tokens_in / tokens_out / latency_ms). Per Codex T6-00 round 1
+    # M-Cdx (test coverage gap): assert this preservation explicitly.
+    from bot.db.models import LlmUsageLedger
+
+    ledger_pre = await db_session.get(LlmUsageLedger, ledger_id)
+    cost_pre = ledger_pre.cost_usd
+    tokens_in_pre = ledger_pre.tokens_in
+    tokens_out_pre = ledger_pre.tokens_out
+    latency_pre = ledger_pre.latency_ms
+
     # Create forget_event with target_type='message_hash', target_id=content_hash.
     event_id = await _make_pending_forget_event(
         db_session,
@@ -1407,6 +1419,7 @@ async def test_cascade_qa_traces_llm_message_hash_subcase_nulls_summary(
 
     await db_session.refresh(trace)
     await db_session.refresh(other_trace)
+    await db_session.refresh(ledger_pre)
 
     # Citing trace: llm_response_summary must be NULL after cascade.
     assert trace.llm_response_summary is None, (
@@ -1416,6 +1429,17 @@ async def test_cascade_qa_traces_llm_message_hash_subcase_nulls_summary(
     assert other_trace.llm_response_summary == "unrelated summary preserved"
     # At least one row was affected.
     assert rows_affected >= 1
+
+    # Ledger budget aggregates MUST be preserved across `_cascade_qa_traces_llm`
+    # — this cascade NULLs `qa_traces.llm_response_summary` only; it does NOT
+    # touch `llm_usage_ledger` rows. Ledger PII NULL'ing is a separate cascade
+    # (`_cascade_llm_usage_ledger`) tested elsewhere. Closes Codex T6-00 round 1
+    # coverage gap: assert this isolation explicitly so a future refactor that
+    # accidentally widens this cascade's WHERE clause fails fast.
+    assert ledger_pre.cost_usd == cost_pre, "M-4: ledger.cost_usd must survive qa_traces_llm cascade"
+    assert ledger_pre.tokens_in == tokens_in_pre, "M-4: ledger.tokens_in must survive qa_traces_llm cascade"
+    assert ledger_pre.tokens_out == tokens_out_pre, "M-4: ledger.tokens_out must survive qa_traces_llm cascade"
+    assert ledger_pre.latency_ms == latency_pre, "M-4: ledger.latency_ms must survive qa_traces_llm cascade"
 
 
 async def test_cascade_llm_synthesis_cache_message_hash_subcase(
