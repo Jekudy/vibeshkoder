@@ -286,7 +286,24 @@ _SOURCE_FILTER_SQL = text(
     """
 )
 
-# Mirrors bot/services/search.py:99/102/106 — three tombstone keys.
+# Mirrors bot/services/search.py + bot/services/extractor.py — three
+# tombstone keys.
+#
+# The ``message_hash:`` key MUST match ``message_versions.content_hash``,
+# NOT ``chat_messages.content_hash`` (FHR P5 follow-up CRITICAL — same bug
+# class as #255 in search.py and Codex round 3 in extractor.py):
+#
+#   * ``MessageVersion.content_hash`` is NOT NULL (DB-enforced) — every
+#     live message has it populated by ``MessageVersionRepo.insert_version``.
+#   * ``ChatMessage.content_hash`` is nullable AND the live persistence
+#     path (``bot/db/repos/message.py::MessageRepo.save``) never sets it —
+#     only the import path (``bot/services/import_apply.py``) populates it.
+#     Filtering on ``c.content_hash`` silently no-op'd every
+#     ``message_hash:`` tombstone for live messages, letting tombstoned
+#     content leak through the gateway's forget-invalidation gate to the LLM.
+#
+# Keep this comment in sync with extractor.py / search.py if any of the
+# three target_type → tombstone_key conventions changes.
 _TOMBSTONE_GATE_SQL = text(
     """
     SELECT mv.id AS message_version_id, fe.tombstone_key AS tombstone_key
@@ -296,10 +313,7 @@ _TOMBSTONE_GATE_SQL = text(
     JOIN forget_events AS fe
         ON (
             fe.tombstone_key = 'message:' || c.chat_id::text || ':' || c.message_id::text
-            OR (
-                c.content_hash IS NOT NULL
-                AND fe.tombstone_key = 'message_hash:' || c.content_hash
-            )
+            OR fe.tombstone_key = 'message_hash:' || mv.content_hash
             OR (
                 c.user_id IS NOT NULL
                 AND fe.tombstone_key = 'user:' || c.user_id::text
