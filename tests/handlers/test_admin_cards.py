@@ -1106,3 +1106,60 @@ async def test_approve_governance_select_uses_for_share(
         "revalidate_sources query MUST use FOR SHARE on message_versions to "
         f"block concurrent forget cascades; captured SQL: {captured_sql}"
     )
+
+
+# ─── /card status-filter regression (Codex round 2 MED #1) ──────────────────
+
+
+async def test_card_detail_returns_not_found_for_draft(
+    db_session, fake_admin_message, cmd_factory
+) -> None:
+    """A draft card MUST appear as 'not found' — title and status must NOT
+    leak (Codex round 2 MED #1). T6-05 spec: /card filters approved-only.
+    """
+    from bot.db.models import KnowledgeCard
+    from bot.handlers.admin_cards import cmd_card
+
+    draft = KnowledgeCard(
+        title="LeakyDraftTitle",
+        body_markdown="LeakyDraftBody",
+        card_status="draft",
+    )
+    db_session.add(draft)
+    await db_session.flush()
+
+    await cmd_card(
+        fake_admin_message, cmd_factory(str(draft.id)), session=db_session
+    )
+    reply = _collect_replies(fake_admin_message)
+    # Whole record exclusion: neither title nor status string may appear.
+    assert "LeakyDraftTitle" not in reply
+    assert "LeakyDraftBody" not in reply
+    assert "draft" not in reply.lower()
+
+
+async def test_card_detail_returns_not_found_for_archived(
+    db_session, fake_admin_message, cmd_factory
+) -> None:
+    """An archived card MUST appear as 'not found' — title, status, and
+    archived_reason must NOT leak (Codex round 2 MED #1)."""
+    from bot.db.models import KnowledgeCard
+    from bot.handlers.admin_cards import cmd_card
+
+    archived = KnowledgeCard(
+        title="LeakyArchivedTitle",
+        body_markdown="LeakyArchivedBody",
+        card_status="archived",
+        archived_reason="archived for a leaky reason",
+    )
+    db_session.add(archived)
+    await db_session.flush()
+
+    await cmd_card(
+        fake_admin_message, cmd_factory(str(archived.id)), session=db_session
+    )
+    reply = _collect_replies(fake_admin_message)
+    assert "LeakyArchivedTitle" not in reply
+    assert "LeakyArchivedBody" not in reply
+    assert "archived for a leaky reason" not in reply
+    assert "archived" not in reply.lower()

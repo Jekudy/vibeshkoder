@@ -571,9 +571,11 @@ async def cmd_card(
 ) -> None:
     """Admin-only card detail view.
 
-    Renders title + body (only when ``card_status='approved'``) + approval
-    metadata + source back-citations. For draft/archived cards, body
-    content is hidden — only status info is shown (T6-05 design §3).
+    Renders title + body + approval metadata + source back-citations — ONLY
+    for ``card_status='approved'`` rows. Draft and archived cards are
+    excluded from the lookup entirely (treated as not-found) so neither
+    title/status nor archived_reason leak via this endpoint (Codex round 2
+    MED #1 / T6-05 design §3).
     """
     if not _is_admin(message):
         return
@@ -605,62 +607,47 @@ async def cmd_card(
         if len(prefix_rows) == 1:
             card = prefix_rows[0]
 
-    if card is None:
+    # Privacy filter: non-approved cards are treated as not-found so neither
+    # title, status, nor archived_reason leak. The previous implementation
+    # surfaced these fields for draft/archived rows — Codex round 2 MED #1
+    # flagged that as a leak vector for any admin who happens to know a
+    # full card UUID.
+    if card is None or card.card_status != "approved":
         await message.answer("❌ Card not found.", parse_mode="HTML")
         return
 
-    # Common header.
+    # Approver name.
+    approver = "—"
+    if card.approved_by_user_id is not None:
+        user = await UserRepo.get(session, card.approved_by_user_id)
+        if user is not None and user.username:
+            approver = html.escape(f"@{user.username}")
+        else:
+            approver = f"tg{card.approved_by_user_id}"
+    approved_at = (
+        _format_dt(card.approved_at) if card.approved_at else "—"
+    )
+
     header_lines = [
         f"📄 <b>Card detail</b>  <code>{card.id}</code>",
         f"Status: <code>{card.card_status}</code>",
+        f"Approved: {approved_at} by {approver}",
+        f"Title: {html.escape(str(card.title or '—'))}",
     ]
+    # Body — render as HTML <pre> to avoid MarkdownV2 parse-crash risk
+    # (T6-05 design §3 conservative choice). Body content is admin-
+    # authored output from the extractor.
+    body_text = str(card.body_markdown or "")
+    if len(body_text) > 3500:
+        body_text = body_text[:3500] + "\n… (truncated)"
+    header_lines.append(
+        f"\n<b>Body:</b>\n<pre>{html.escape(body_text)}</pre>"
+    )
 
-    if card.card_status == "approved":
-        # Approver name.
-        approver = "—"
-        if card.approved_by_user_id is not None:
-            user = await UserRepo.get(session, card.approved_by_user_id)
-            if user is not None and user.username:
-                approver = html.escape(f"@{user.username}")
-            else:
-                approver = f"tg{card.approved_by_user_id}"
-        approved_at = (
-            _format_dt(card.approved_at) if card.approved_at else "—"
-        )
-        header_lines.append(f"Approved: {approved_at} by {approver}")
-        header_lines.append(f"Title: {html.escape(str(card.title or '—'))}")
-        # Body — render as HTML <pre> to avoid MarkdownV2 parse-crash risk
-        # (T6-05 design §3 conservative choice). Body content is admin-
-        # authored output from the extractor.
-        body_text = str(card.body_markdown or "")
-        if len(body_text) > 3500:
-            body_text = body_text[:3500] + "\n… (truncated)"
-        header_lines.append(
-            f"\n<b>Body:</b>\n<pre>{html.escape(body_text)}</pre>"
-        )
-
-        sources = await CardSourceRepo.list_for_card(session, card.id)
-        if sources:
-            header_lines.append(f"\n<b>Sources ({len(sources)}):</b>")
-            header_lines.extend(_format_source_lines(sources))
-    elif card.card_status == "draft":
-        header_lines.append(
-            "Title: " + html.escape(str(card.title or "—"))
-        )
-        header_lines.append(
-            "Card is in DRAFT state — not yet approved. "
-            "Use /candidates to find pending candidates."
-        )
-        # Body deliberately hidden.
-    elif card.card_status == "archived":
-        header_lines.append(
-            "Title: " + html.escape(str(card.title or "—"))
-        )
-        reason = html.escape(str(card.archived_reason or "—"))
-        header_lines.append(
-            f"Card is ARCHIVED. archived_reason: <code>{reason}</code>"
-        )
-        # Body deliberately hidden.
+    sources = await CardSourceRepo.list_for_card(session, card.id)
+    if sources:
+        header_lines.append(f"\n<b>Sources ({len(sources)}):</b>")
+        header_lines.extend(_format_source_lines(sources))
 
     await message.answer(
         "\n".join(header_lines),
