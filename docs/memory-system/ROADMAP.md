@@ -32,12 +32,12 @@ phase 0 safety
 | 3 | Governance (`#nomem` / `#offrecord` / `/forget` / tombstones) | SKELETON DONE 2026-04-29 (T3-01..T3-05 merged in Phase 2 wave Charlie) | forbidden content excluded from future search/extraction/import           |
 | 4 | Hybrid search + Q&A with citations         | NO          | bot answers from evidence only or refuses; no LLM general knowledge       |
 | 5 | LLM gateway + answer synthesis (synthesis-first slice)        | **DONE 2026-05-11** (Orch A; canonical plan: `PHASE5_PLAN.md`; closure PR pending) | every LLM call logged in ledger; no forbidden source sent to LLM; flag-OFF Phase 4 byte-for-byte preserved (T5-W0-01..T5-05 merged; FHR ACCEPTED; extraction tables deferred to Phase 8 per §2 ratification) |
-| 6 | Knowledge cards + admin review             | NO          | active card requires source + admin approval                              |
+| 6 | Knowledge cards + admin review             | **IN PROGRESS** (Wave 1) | T6-00 + T6-01 merged 2026-05-12 (PRs #242 + #245). T6-02 extractor in PAR. T6-03 next. `card_revisions` + `card_relations` deferred to Phase 6.5/9. active card requires source + admin approval |
 | 7 | Daily summaries                            | NO          | every bullet has source; forgotten source redacts bullet                  |
 | 8 | Weekly digest                              | NO          | reviewed sourced sections; no auto-publish                                |
 | 9 | Wiki (member / internal)                   | NO          | visibility filter + governance + source trace; public stays disabled      |
 | 10| Graph projection (Neo4j / Graphiti)        | NO          | derived only; rebuildable from postgres; forget purges graph              |
-| 11| Shkoderbench / evals                       | **DONE 2026-05-11** (Orch C; canonical plan: `PHASE11_PLAN.md`; baseline frozen at T11-W2-04) | leakage / citation / no-answer / no-LLM-imports tests in CI nightly (`evals.yml` + `lint-privacy.yml`) |
+| 11| Shkoderbench / evals                       | **DONE 2026-05-11** + follow-up #224 partial | leakage / citation / no-answer / no-LLM-imports tests in CI nightly (`evals.yml` + `lint-privacy.yml`). Follow-up #224: High #5 httpx URL guard merged PR #243 2026-05-12; Critical #4 + High #1-#4 in flight. |
 | 12| Future butler — design-only                | NO          | docs only; no execution code                                              |
 
 ## Phase gates (must be true to advance)

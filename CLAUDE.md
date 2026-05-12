@@ -81,6 +81,14 @@ Phase 11 leakage binding test before merge. `card_revisions` and `card_relations
 deferred to Phase 6.5/9. Phase 8 `memory_candidates` (reflection cluster queue)
 remains distinct from Phase 6 `extraction_candidates`.
 
+**Phase 6 Wave 1 IN PROGRESS** — T6-00 (FHR carryover) + T6-01 (schema 030-034 +
+`_p6_mvid_advisory_lock_id` helper + `_cascade_card_sources_on_forget` cascade) merged
+2026-05-12 via PRs #242 + #245. T6-02 (extractor + scheduler flag + /admin_extract
+handler + migration 035 operator_user_id) in PAR on branch `feat/p6-t6-02-extractor`.
+T6-03 (gateway extract_candidates) next. Phase 11 binding stays green on T6-03 sub-gate.
+Phase 11 follow-up #224: High #5 (httpx URL guard) merged PR #243; Critical #4 + High
+#1-#4 in flight.
+
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
 
