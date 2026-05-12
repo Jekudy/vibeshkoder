@@ -383,10 +383,21 @@ async def search_messages(
     The governance filter is intentionally repeated here instead of depending
     on index shape for privacy.
 
-    SQLite dialect: ``to_tsvector`` / ``ts_rank_cd`` / ``ts_headline`` are
-    Postgres-only. For SQLite-bound sessions the card branch is silently
-    skipped via dialect detection — the function returns only message hits
-    (or an empty list if even the Phase 4 SQL isn't Postgres-compatible).
+    SQLite dialect: this function is **Postgres-only** at the contract
+    level. Both ``_PHASE4_SQL`` and ``_PHASE6_SQL`` rely on
+    ``plainto_tsquery`` / ``ts_rank_cd`` / ``ts_headline`` and the
+    ``message_versions.search_tsv`` (and, for cards, ``knowledge_cards.body_tsv``)
+    GIN-indexed ``tsvector`` columns. None of those exist in SQLite.
+
+    The dialect guard below flips ``include_cards=False`` on non-Postgres
+    sessions to remove the **card branch** from the SQL — that branch alone
+    references tables and indexes (``knowledge_cards``, ``card_sources``,
+    ``body_tsv``) that ORM-only SQLite tests do not create. The guard does
+    **not** make the Phase 4 SQL itself SQLite-safe. ORM-only SQLite tests
+    that call this function will fail at the database layer; the guard's
+    only contract is "the card-extension does not make Phase 4 callers any
+    less SQLite-compatible than they already were." Production runs on
+    Postgres.
     """
     normalized_query = query.strip()
     if not normalized_query:
@@ -407,10 +418,15 @@ async def search_messages(
         f"MaxWords={headline_max_words},MinWords=10,ShortWord=2,HighlightAll=false"
     )
 
-    # T6-06 dialect guard: SQLite has no Russian tsvector functions. Strip the
-    # card branch on SQLite even if the caller asked for it (returns only the
-    # Phase 4 result set, possibly empty). Production runs on Postgres; this
-    # branch keeps ORM-only SQLite tests from breaking.
+    # T6-06 dialect guard — SCOPE: card-branch removal only, NOT full
+    # SQLite safety. The Phase 4 SQL underneath still uses
+    # ``plainto_tsquery`` / ``ts_rank_cd`` / ``ts_headline`` which are
+    # Postgres-only; running this on SQLite will fail in the message
+    # branch regardless. The guard's sole purpose is to avoid widening
+    # the SQLite-incompatibility surface by referencing card tables that
+    # ORM-only SQLite tests do not create (``knowledge_cards`` /
+    # ``card_sources`` / ``body_tsv``). Production runs on Postgres.
+    # See the docstring above for the full contract.
     dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
     if dialect_name != "postgresql":
         include_cards = False
