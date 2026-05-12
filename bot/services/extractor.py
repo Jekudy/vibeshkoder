@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import uuid as _uuid_module
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -45,10 +45,8 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import (
-    ChatMessage,
     ExtractionCandidate,
     ExtractionRun,
-    MessageVersion,
 )
 from bot.db.repos.feature_flag import FeatureFlagRepo
 
