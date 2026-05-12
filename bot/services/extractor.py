@@ -433,6 +433,7 @@ async def _persist_failed_run(
     window_start: datetime,
     window_end: datetime,
     failure_reason: str,
+    operator_user_id: int | None = None,
 ) -> ExtractionResult:
     """Insert a ``run_status='failed'`` ExtractionRun row and return."""
     run = ExtractionRun(
@@ -440,6 +441,7 @@ async def _persist_failed_run(
         ingestion_window_end=window_end,
         candidate_count=0,
         run_status="failed",
+        operator_user_id=operator_user_id,
     )
     session.add(run)
     await session.flush()
@@ -450,6 +452,7 @@ async def _persist_failed_run(
             "failure_reason": failure_reason,
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
+            "operator_user_id": operator_user_id,
         },
     )
     return ExtractionResult(
@@ -506,6 +509,7 @@ async def run_extraction_pass(
             ingestion_window_end=window_end,
             candidate_count=0,
             run_status="completed",
+            operator_user_id=operator_user_id,
         )
         session.add(run)
         await session.flush()
@@ -529,6 +533,7 @@ async def run_extraction_pass(
             window_start=window_start,
             window_end=window_end,
             failure_reason=reason or "governance_violation",
+            operator_user_id=operator_user_id,
         )
 
     if not rows:
@@ -537,6 +542,7 @@ async def run_extraction_pass(
             ingestion_window_end=window_end,
             candidate_count=0,
             run_status="completed",
+            operator_user_id=operator_user_id,
         )
         session.add(run)
         await session.flush()
@@ -564,6 +570,7 @@ async def run_extraction_pass(
         ingestion_window_end=window_end,
         candidate_count=0,
         run_status="running",
+        operator_user_id=operator_user_id,
     )
     session.add(run)
     await session.flush()
