@@ -247,16 +247,33 @@ Note: `decided_by` is nullable to survive user soft-delete via `ON DELETE SET NU
 
 ### 5.A.5. Cascade extension on forget_events (`_cascade_card_sources_on_forget`)
 
-When a `forget_event` matches a `message_version_id` covered by any `card_sources` row, the cascade:
+**Transaction-level lock acquisition (P6 contract for `apply_forget_event`):** the `apply_forget_event(session, forget_event_id)` orchestrator MUST acquire `pg_advisory_xact_lock(mvid_lock_id)` for each affected `message_version_id` as the **FIRST operation in the transaction — before the `forget_events` INSERT and before ANY cascade call** (including `_cascade_qa_traces_llm`). `mvid_lock_id = signed_int64(sha256(f'p6:mvid:{mvid}'))`. xact-scoped → auto-release on COMMIT/ROLLBACK; no manual release.
 
-1. **Acquires `pg_advisory_xact_lock(mvid_lock_id)`** for each affected `message_version_id` — `mvid_lock_id = signed_int64(sha256(f'p6:mvid:{mvid}'))`. Same lock space as `/approve` (§5.C step 2). This serializes the forget-cascade vs concurrent `/approve` on the SAME mvid; whichever transaction acquires the lock first wins, the other waits until the holder commits/rolls back. xact-scoped → auto-release on COMMIT/ROLLBACK; no manual release.
-2. Acquires `SELECT ... FOR UPDATE` on every affected `knowledge_cards` row BEFORE mutating `card_sources` (additional defence-in-depth on top of the advisory lock; handles edge case where `card_sources` was inserted by a transaction holding the same advisory lock that has since released).
-3. DELETEs every `card_sources` row whose `message_version_id` matches the forgotten version.
-4. For each affected `card_id`, recounts remaining `card_sources` rows.
-5. If remaining count drops to **0**, demote the card: `card_status='archived'`, `archived_reason='all sources forgotten via cascade <forget_event_id>'`, `updated_at=now()`.
-6. If remaining count > 0, leave the card in its current state (the lost source is simply unlinked; card content may now be partially un-attributable — flag for later admin review).
+```
+BEGIN  # apply_forget_event transaction
+SELECT pg_advisory_xact_lock(:mvid_lock_id_1), pg_advisory_xact_lock(:mvid_lock_id_2), ...
+  # Lock acquired BEFORE any data mutation. Any concurrent /approve targeting
+  # one of these mvids now waits until this transaction commits or rolls back.
+INSERT INTO forget_events (...)
+_cascade_qa_traces_llm(...)            # Phase 5 cascade — runs UNDER the P6 lock.
+_cascade_llm_synthesis_cache(...)      # Phase 5 cascade — runs UNDER the P6 lock.
+_cascade_card_sources_on_forget(...)   # P6 cascade — runs UNDER the same lock.
+COMMIT  # lock auto-released; concurrent /approve unblocks and re-reads forget_events.
+```
 
-Implementation: lives in `bot/services/forget_cascade.py` alongside Phase 5 `_cascade_qa_traces_llm` / `_cascade_llm_synthesis_cache`. Invoked from the same `apply_forget_event(session, forget_event_id)` transaction; runs AFTER `_cascade_qa_traces_llm` (so `qa_traces` are NULL'd before card-source row deletion can affect citation_ids lookup) and BEFORE commit. The `pg_advisory_xact_lock` in step 1 is the **canonical serialization point** between `/approve` and forget-cascade — it must be the FIRST tombstone-relevant op in either transaction (see §5.C step 2). Pattern reference: `docs/memory-system/import-chunking.md::acquire_advisory_lock` (same SHA-256 → int64 derivation; different namespace prefix).
+This ordering closes the race window Codex flagged in round 2/3: if `/approve` started before `apply_forget_event` took the lock, `/approve` either (a) acquired the lock first → `apply_forget_event` waits → `/approve`'s `SELECT forget_events` sees no row, approval proceeds, then on commit `apply_forget_event` acquires the lock and the cascade demotes the just-approved card to `archived` (final state honors Invariant #4), or (b) `apply_forget_event` acquired the lock first → `/approve` waits → `apply_forget_event` inserts forget_event + cascades + commits → `/approve` unblocks, its `SELECT forget_events` now sees the committed row → R3 abort with no `extraction_decisions` row.
+
+Under no interleaving can `/recall` return an approved card pointing to a forgotten source: either the card is archived before commit, or its approval is aborted before commit. No intermediate visible state with approved-card-on-forgotten-source.
+
+`_cascade_card_sources_on_forget` (the P6-specific function called from step 3 above) does:
+
+1. Acquires `SELECT ... FOR UPDATE` on every affected `knowledge_cards` row BEFORE mutating `card_sources` (defence-in-depth row-level lock; covers cards inserted under a *previous* P6 lock that has since released).
+2. DELETEs every `card_sources` row whose `message_version_id` matches the forgotten version.
+3. For each affected `card_id`, recounts remaining `card_sources` rows.
+4. If remaining count drops to **0**, demote the card: `card_status='archived'`, `archived_reason='all sources forgotten via cascade <forget_event_id>'`, `updated_at=now()`.
+5. If remaining count > 0, leave the card in its current state (the lost source is simply unlinked; card content may now be partially un-attributable — flag for later admin review).
+
+Implementation: `_cascade_card_sources_on_forget` lives in `bot/services/forget_cascade.py` alongside Phase 5 `_cascade_qa_traces_llm` / `_cascade_llm_synthesis_cache`. The advisory xact lock is taken by `apply_forget_event` orchestrator (NOT by the individual cascade function) — this is the canonical serialization point with `/approve` (§5.C step 2). `_cascade_card_sources_on_forget` runs AFTER `_cascade_qa_traces_llm` (so `qa_traces` are NULL'd before card-source row deletion affects citation_ids lookup) and BEFORE commit. Pattern reference: `docs/memory-system/import-chunking.md::acquire_advisory_lock` (same SHA-256 → int64 derivation; different namespace prefix).
 
 **Demote, not hard-delete (R2):** Cards are durable artifacts; demote to `archived` preserves audit trail. This is parallel to Phase 5's `_cascade_llm_synthesis_cache.invalidate_by_citation` but with demote semantics instead of hard-delete (Phase 5 cache rows are ephemeral; Phase 6 cards are not).
 
