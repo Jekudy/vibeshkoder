@@ -290,10 +290,9 @@ async def _select_eligible_sources(
     if force_include_chat_message_ids:
         # Test-only path. Rows joined by id are forwarded raw — exactly the
         # bypass that lets the defense-in-depth guard fire in tests.
-        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         # SAFE: base_predicate is a module-level constant SQL string (lines 196-288).
         # No user input is interpolated; runtime values use bound :params.
-        stmt = text(
+        stmt = text(  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
             f"""
             SELECT
                 c.id AS chat_message_id,
@@ -338,10 +337,9 @@ async def _select_eligible_sources(
             "force_ids": force_include_chat_message_ids,
         }
     else:
-        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
         # SAFE: base_predicate is a module-level constant SQL string (lines 196-288).
         # No user input is interpolated; runtime values use bound :params.
-        stmt = text(
+        stmt = text(  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
             f"""
             SELECT
                 c.id AS chat_message_id,
