@@ -230,6 +230,15 @@ approved_card_hits AS (
         AND NOT EXISTS (
             -- Defense-in-depth #1: exclude card if ANY source is tombstoned
             -- (forget_event open in pending|processing|completed status).
+            --
+            -- The ``message_hash:`` branch MUST filter on ``mv2.content_hash``
+            -- (NOT NULL by schema), NOT on ``c2.content_hash`` (nullable; live
+            -- persistence in ``bot/db/repos/message.py::MessageRepo.save``
+            -- leaves it NULL). Filtering on ``c2.content_hash`` silently
+            -- no-op's every ``message_hash:`` tombstone for live messages,
+            -- letting tombstoned content leak via cards. Same class as the
+            -- T6-02 round 3 fix in ``bot/services/extractor.py`` — keep the
+            -- two query bodies in lock-step.
             SELECT 1
             FROM card_sources cs2
             JOIN message_versions mv2 ON mv2.id = cs2.message_version_id
@@ -238,8 +247,8 @@ approved_card_hits AS (
                 fe2.tombstone_key
                     = 'message:' || c2.chat_id::text || ':' || c2.message_id::text
                 OR (
-                    c2.content_hash IS NOT NULL
-                    AND fe2.tombstone_key = 'message_hash:' || c2.content_hash
+                    mv2.content_hash IS NOT NULL
+                    AND fe2.tombstone_key = 'message_hash:' || mv2.content_hash
                 )
                 OR (
                     c2.user_id IS NOT NULL
