@@ -352,7 +352,10 @@ async def synthesize_answer(
     qa_trace_id:
         REQUIRED — the handler MUST create the ``qa_traces`` row BEFORE
         calling the gateway so cascade FKs are populated upfront. Closes
-        Codex round-1 HIGH 4 (cascade direction).
+        Codex round-1 HIGH 4 (cascade direction). Raises ``ValueError`` at
+        function entry if ``None`` — guard against handler misuse; the single
+        call site at ``bot/handlers/qa.py:312-334`` always passes ``trace.id``
+        (non-None).
     ledger_repo:
         T5-03 surface; injected by the caller. Wave 1 uses fakes.
     cache_repo:
@@ -367,6 +370,12 @@ async def synthesize_answer(
         Either ``AnswerWithCitations`` on success or ``Abstention`` on any
         documented refusal path. Never raises on documented failure paths.
     """
+    if qa_trace_id is None:
+        raise ValueError(
+            "synthesize_answer: qa_trace_id is REQUIRED — handler must create "
+            "QaTrace via QaTraceRepo.create() BEFORE invoking this gateway "
+            "(see bot/handlers/qa.py:312-334 for the only call site contract)."
+        )
     query_normalized = _normalize_query(query)
 
     async def _ledger(
