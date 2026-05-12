@@ -463,3 +463,46 @@ async def _tombstone_key_of(db_session, fe_id: int) -> str:
 
     ev = await db_session.get(ForgetEvent, fe_id)
     return ev.tombstone_key
+
+
+# ─── Test 8: idempotency — re-running cascade is a no-op ─────────────────────
+
+
+async def test_cascade_card_sources_idempotent_re_run(db_session) -> None:
+    """Re-running cascade after cards already archived is a no-op.
+
+    PHASE6_PLAN §8 invariant: cascades must be safe to run twice.
+    Second invocation must return rowcount==0 (no rows to delete) and must
+    NOT alter archived_reason or card_status already set by the first run.
+    """
+    from bot.db.models import ForgetEvent, KnowledgeCard
+    from bot.services.forget_cascade import _cascade_card_sources_on_forget
+
+    cm_id, ver_id, _, _ = await _make_chat_message_with_v1(db_session)
+    card_id = await _make_approved_card_with_sources(
+        db_session, source_version_ids=[ver_id]
+    )
+
+    fe_id = await _make_pending_forget_event(
+        db_session, target_type="message", target_id=cm_id
+    )
+    ev = await db_session.get(ForgetEvent, fe_id)
+
+    # First run: card_sources row deleted, card archived.
+    first_rowcount = await _cascade_card_sources_on_forget(db_session, ev)
+    assert first_rowcount >= 1
+
+    card_after_first = await db_session.get(KnowledgeCard, card_id)
+    assert card_after_first.card_status == "archived"
+    first_reason = card_after_first.archived_reason
+
+    # Second run: no card_sources rows remain → rowcount must be 0.
+    second_rowcount = await _cascade_card_sources_on_forget(db_session, ev)
+    assert second_rowcount == 0, (
+        f"Second cascade run should be a no-op (0 rows), got {second_rowcount}"
+    )
+
+    # Card state must be unchanged after the second run.
+    await db_session.refresh(card_after_first)
+    assert card_after_first.card_status == "archived"
+    assert card_after_first.archived_reason == first_reason
