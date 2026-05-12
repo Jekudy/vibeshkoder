@@ -30,7 +30,11 @@ import os
 import httpx
 import pytest
 
-from tests.evals._llm_guard import LLMNetworkCallDetected, make_async_llm_guard_hook, make_llm_guard_hook
+from tests.evals._llm_guard import (
+    LLMNetworkCallDetected,
+    make_async_llm_guard_hook,
+    make_llm_guard_hook,
+)
 
 
 # ---------------------------------------------------------------------------
