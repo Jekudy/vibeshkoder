@@ -72,11 +72,14 @@ across Wave 0/1/2/3 (T5-W0-01..T5-05). Wave 3 = T5-05 eval harness (PR #229
 `5faea1d`). FHR Claude `deep-product-reviewer` ACCEPTED with 4 MEDIUM carryovers in
 closure PR. Phase 11 (Orch C) binding tests green on main.
 
-**Next active phase: Phase 6 (knowledge cards + admin review)** — authorized per
-`AUTHORIZED_SCOPE.md`. Sprint 0 = ratify `prompts/PHASE6_PLAN_DRAFT.md` →
-`PHASE6_PLAN.md`. Phase 5 FHR M-1 + M-4 carryovers must close as part of Phase 6
-kickoff: (M-1) tighten `synthesize_answer.qa_trace_id: int | None` OR add runtime
-assert; (M-4) add direct cascade `message_hash` sub-case tests with NULL assertions.
+**Phase 6 (knowledge cards + admin review) — Sprint 0 RATIFIED 2026-05-12.** Plan
+promoted to `docs/memory-system/PHASE6_PLAN.md` with 5 migrations (030 extraction_runs,
+031 extraction_candidates, 032 knowledge_cards, 033 card_sources, 034
+extraction_decisions). Wave 1 authorized: T6-00 (FHR carryover M-1+M-4) + T6-01
+(schema) + T6-02 (extractor) + T6-03 (gateway extract_candidates). T6-03 must clear
+Phase 11 leakage binding test before merge. `card_revisions` and `card_relations`
+deferred to Phase 6.5/9. Phase 8 `memory_candidates` (reflection cluster queue)
+remains distinct from Phase 6 `extraction_candidates`.
 
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:

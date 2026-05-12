@@ -143,7 +143,7 @@ Phase 6 is authorized for implementation following Phase 5 closure 2026-05-11.
 Owned by Orchestrator A per the synthesis chain (Phase 5 → 6 → 7 → 8).
 
 Authorized scope (per `prompts/PHASE6_PLAN_DRAFT.md` until promoted to `PHASE6_PLAN.md`):
-- `knowledge_cards` + `card_sources` + `card_revisions` tables / repos / handlers
+- `extraction_runs` + `extraction_candidates` + `knowledge_cards` + `card_sources` + `extraction_decisions` tables / repos / handlers (`card_revisions` deferred to Phase 6.5/9; see PHASE6_PLAN.md §11)
 - Card extraction pipelines (using Phase 5 `llm_gateway` ONLY — no new LLM entry points)
 - Admin review surface for card approval / rejection
 - Cascade extension for card content tied to `forget_events`
@@ -160,8 +160,12 @@ Phase 6 implementation must:
 
 NOT in Phase 6 scope (defer):
 - Daily/weekly digests (Phase 7).
-- Reflection / observations / memory_events / memory_candidates / reflection_runs (Phase 8).
+- Reflection / observations / memory_events / memory_candidates / reflection_runs (Phase 8). Note: Phase 8 `memory_candidates` (reflection cluster queue) is a distinct concept from Phase 6 `extraction_candidates` (LLM-extracted card candidate queue); see PHASE6_PLAN.md §10 glossary.
 - Wiki (Phase 9), graph projection (Phase 10), butler (Phase 12).
+- `card_revisions` and `card_relations` — deferred to Phase 6.5/9.
+- `/edit-card` admin command — deferred to Phase 6.5.
+
+**Sprint 0 RATIFIED 2026-05-12**: see `docs/memory-system/PHASE6_PLAN.md`. Wave 1 (T6-00 carryover + T6-01 schema + T6-02 extractor + T6-03 gateway extract) authorized.
 
 ---
 
