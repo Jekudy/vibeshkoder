@@ -755,7 +755,7 @@ async def test_cards_renders_approved_only(
         first_name="Admin",
         last_name=None,
     )
-    approved = await KnowledgeCardRepo.create(
+    await KnowledgeCardRepo.create(
         db_session,
         title="Approved title",
         body_markdown="body",
@@ -909,7 +909,7 @@ async def test_card_detail_hides_body_for_archived(
         title="ArchivedTitle",
         body_markdown="SECRET_ARCHIVED_BODY",
         card_status="archived",
-        archived_reason="all sources forgotten",
+        archived_reason="all sources tombstoned",
     )
     db_session.add(archived)
     await db_session.flush()
@@ -942,7 +942,7 @@ async def test_card_detail_redacts_forgotten_source(
     placeholder, NEVER a clickable link or body content."""
     from sqlalchemy import update
 
-    from bot.db.models import ChatMessage, MessageVersion
+    from bot.db.models import ChatMessage
     from bot.db.repos.card_source import CardSourceRepo
     from bot.db.repos.knowledge_card import KnowledgeCardRepo
     from bot.db.repos.user import UserRepo
@@ -969,11 +969,13 @@ async def test_card_detail_redacts_forgotten_source(
         db_session, card_id=card.id, message_version_ids=[mvid]
     )
     # Simulate cascade-in-progress: chat_message redacted but card_sources
-    # row still present.
+    # row still present. Flipping ``is_redacted`` alone is sufficient — the
+    # /card renderer treats any non-pristine source as redacted regardless
+    # of memory_policy.
     await db_session.execute(
         update(ChatMessage)
         .where(ChatMessage.id == cm_id)
-        .values(is_redacted=True, memory_policy="forgotten")
+        .values(is_redacted=True)
     )
     await db_session.flush()
 

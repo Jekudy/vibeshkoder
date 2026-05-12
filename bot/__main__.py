@@ -10,6 +10,7 @@ from aiogram.enums import ParseMode
 from bot.config import settings
 from bot.handlers import (
     admin,
+    admin_cards,
     admin_extract,
     chat_events,
     chat_messages,
@@ -110,6 +111,7 @@ async def main() -> None:
         vouch.router,
         admin.router,
         admin_extract.router,  # T6-03: /admin_extract — Phase 6 backfill (private chat + admin gated)
+        admin_cards.router,    # T6-04/T6-05: /candidates /approve /reject /cards /card
         chat_events.router,
         edited_message.router,  # T1-14: edited_message handler (before chat_messages catch-all)
         forget_me.router,  # T3-03: /forget_me command (DM or in-chat)

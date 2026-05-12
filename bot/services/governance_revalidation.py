@@ -14,13 +14,12 @@ Two failure modes:
 * **source_redacted** — ``chat_messages.is_redacted=TRUE`` OR
   ``message_versions.is_redacted=TRUE``.
 * **source_memory_policy_not_normal** — ``chat_messages.memory_policy``
-  is anything other than ``'normal'`` (``'nomem'`` / ``'offrecord'`` /
-  ``'forgotten'`` all block).
+  is anything other than ``'normal'`` (non-normal policies all block).
 
 Canonical tombstone-key form: ``mv.content_hash``, NOT
 ``chat_messages.content_hash``. The live-persistence path leaves
 ``chat_messages.content_hash`` NULL — using it silently no-ops every
-``message_hash:`` tombstone and leaks forgotten content. See
+``message_hash:`` tombstone and leaks tombstoned content. See
 ``bot/services/extractor.py`` lines 240-289 + Codex round 3 CRITICAL on
 T6-02. Keep this module in sync with the extractor's predicate.
 """
