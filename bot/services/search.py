@@ -274,13 +274,13 @@ approved_card_hits AS (
         )
 ),
 -- Per-source tombstone re-check. ``approved_card_hits`` excludes a card
--- when ANY source is tombstoned, so in normal flow no forgotten source
+-- when ANY source is tombstoned, so in normal flow no tombstoned source
 -- reaches the anchor or the mvid array. This CTE re-applies the same
 -- 3-key tombstone check per individual source as belt-and-suspenders
 -- against:
 --   1. A future refactor of ``approved_card_hits`` that loosens the
 --      exclusion condition.
---   2. A race window where the cascade has not yet deleted forgotten
+--   2. A race window where the cascade has not yet deleted tombstoned
 --      ``card_sources`` rows but the forget_event is already visible.
 -- This guarantees no tombstoned mvid can appear in the anchor row or
 -- the ``card_source_message_version_ids`` array. Per-source re-check
