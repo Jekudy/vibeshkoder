@@ -249,13 +249,14 @@ Note: `decided_by` is nullable to survive user soft-delete via `ON DELETE SET NU
 
 When a `forget_event` matches a `message_version_id` covered by any `card_sources` row, the cascade:
 
-1. Acquires `SELECT ... FOR UPDATE` on every affected `knowledge_cards` row BEFORE mutating `card_sources` (serializes with concurrent `/approve` transactions; see H-Cdx-2 / §5.C protocol).
-2. DELETEs every `card_sources` row whose `message_version_id` matches the forgotten version.
-3. For each affected `card_id`, recounts remaining `card_sources` rows.
-4. If remaining count drops to **0**, demote the card: `card_status='archived'`, `archived_reason='all sources forgotten via cascade <forget_event_id>'`, `updated_at=now()`.
-5. If remaining count > 0, leave the card in its current state (the lost source is simply unlinked; card content may now be partially un-attributable — flag for later admin review).
+1. **Acquires `pg_advisory_xact_lock(mvid_lock_id)`** for each affected `message_version_id` — `mvid_lock_id = signed_int64(sha256(f'p6:mvid:{mvid}'))`. Same lock space as `/approve` (§5.C step 2). This serializes the forget-cascade vs concurrent `/approve` on the SAME mvid; whichever transaction acquires the lock first wins, the other waits until the holder commits/rolls back. xact-scoped → auto-release on COMMIT/ROLLBACK; no manual release.
+2. Acquires `SELECT ... FOR UPDATE` on every affected `knowledge_cards` row BEFORE mutating `card_sources` (additional defence-in-depth on top of the advisory lock; handles edge case where `card_sources` was inserted by a transaction holding the same advisory lock that has since released).
+3. DELETEs every `card_sources` row whose `message_version_id` matches the forgotten version.
+4. For each affected `card_id`, recounts remaining `card_sources` rows.
+5. If remaining count drops to **0**, demote the card: `card_status='archived'`, `archived_reason='all sources forgotten via cascade <forget_event_id>'`, `updated_at=now()`.
+6. If remaining count > 0, leave the card in its current state (the lost source is simply unlinked; card content may now be partially un-attributable — flag for later admin review).
 
-Implementation: lives in `bot/services/forget_cascade.py` alongside Phase 5 `_cascade_qa_traces_llm` / `_cascade_llm_synthesis_cache`. Invoked from the same `apply_forget_event(session, forget_event_id)` transaction; runs AFTER `_cascade_qa_traces_llm` (so `qa_traces` are NULL'd before card-source row deletion can affect citation_ids lookup) and BEFORE commit. The row-level lock on `knowledge_cards` in step 1 prevents a concurrent `/approve` from completing on a card whose sources are being cascaded.
+Implementation: lives in `bot/services/forget_cascade.py` alongside Phase 5 `_cascade_qa_traces_llm` / `_cascade_llm_synthesis_cache`. Invoked from the same `apply_forget_event(session, forget_event_id)` transaction; runs AFTER `_cascade_qa_traces_llm` (so `qa_traces` are NULL'd before card-source row deletion can affect citation_ids lookup) and BEFORE commit. The `pg_advisory_xact_lock` in step 1 is the **canonical serialization point** between `/approve` and forget-cascade — it must be the FIRST tombstone-relevant op in either transaction (see §5.C step 2). Pattern reference: `docs/memory-system/import-chunking.md::acquire_advisory_lock` (same SHA-256 → int64 derivation; different namespace prefix).
 
 **Demote, not hard-delete (R2):** Cards are durable artifacts; demote to `archived` preserves audit trail. This is parallel to Phase 5's `_cascade_llm_synthesis_cache.invalidate_by_citation` but with demote semantics instead of hard-delete (Phase 5 cache rows are ephemeral; Phase 6 cards are not).
 
@@ -303,23 +304,32 @@ Commands (T6-04 + T6-05):
 ```
 BEGIN
 SELECT FOR UPDATE FROM extraction_candidates WHERE id = :candidate_id
--- For each msg_version_id in candidate.source_message_version_ids JSON staging field:
--- 1. Check forget_events for ANY matching tombstone (drop age filter):
+-- 1. Lock candidate row (prevents double-approve from concurrent admin).
+-- 2. Acquire advisory xact lock on each candidate.source_message_version_id:
+--    mvid_lock_id = signed_int64(sha256(f'p6:mvid:{mvid}'))
+--    (Same lock namespace as forget_cascade §5.A.5 step 1; serializes /approve vs cascade.)
+SELECT pg_advisory_xact_lock(:mvid_lock_id_1), pg_advisory_xact_lock(:mvid_lock_id_2), ...
+-- 3. NOW that we hold the serialization lock, check forget_events for ANY matching tombstone
+--    (drop age filter — any tombstone blocks regardless of when it was inserted):
 SELECT 1 FROM forget_events WHERE
     (target_type='message_version' AND target_id = :mvid) OR
     (target_type='message_hash' AND target_hash = (SELECT content_hash FROM message_versions WHERE id = :mvid)) OR
     (target_type='message' AND chat_id = :chat AND message_id = :mid)
--- ANY hit → ABORT with explicit error (no extraction_decisions row; see §8 + R3-block log-only behavior).
--- 2. Lock and re-validate message_versions:
+-- ANY hit → ABORT (no extraction_decisions row; see §8 + R3-block log-only behavior).
+-- A forget_event inserted between this check and step 6 cannot exist: any concurrent
+-- apply_forget_event for this mvid is waiting on the advisory lock from step 2.
+-- 4. Lock and re-validate message_versions:
 SELECT id FROM message_versions WHERE id IN (:mvids) FOR SHARE
--- Confirm chat_messages.memory_policy='normal' AND chat_messages.is_redacted=false on each
+-- Confirm chat_messages.memory_policy='normal' AND chat_messages.is_redacted=false on each.
 -- ANY failure → ABORT.
--- 3. INSERT knowledge_cards row (status='approved').
--- 4. INSERT card_sources rows (FK enforced).
--- 5. UPDATE extraction_candidates SET status='approved', reviewed_by=:admin, reviewed_at=now().
--- 6. INSERT extraction_decisions (action='approved', decided_by=:admin, decided_by_username=:admin_username).
-COMMIT
+-- 5. INSERT knowledge_cards row (card_status='approved').
+-- 6. INSERT card_sources rows (FK enforced).
+-- 7. UPDATE extraction_candidates SET status='approved', reviewed_by=:admin, reviewed_at=now().
+-- 8. INSERT extraction_decisions (action='approved', decided_by=:admin, decided_by_username=:admin_username).
+COMMIT  -- pg_advisory_xact_lock auto-released here.
 ```
+
+**Serialization invariant:** the advisory xact lock in step 2 MUST be acquired BEFORE the `forget_events` check in step 3 — otherwise an `apply_forget_event` running concurrently could land between the SELECT and the INSERT in step 6 (closing H-Cdx-2 round 1+2 race window). Lock ordering with `forget_cascade.py` MUST match exactly: both transactions hash the same `mvid` to the same `mvid_lock_id` via the same `f'p6:mvid:{mvid}'` namespace; deadlock-free because the lock is acquired before any data-mutating SQL.
 
 R3-block behavior: when re-validation rejects approval, NO row is written to `extraction_decisions`. The candidate's `status` remains `pending`. Failure is logged via structured logger with fields: `event=approve_blocked`, `candidate_id`, `admin_user_id`, `failure_reason` (e.g., `forget_tombstone_match`, `source_redacted`, `source_memory_policy_not_normal`), and `forget_event_id` or `message_version_id` that triggered the block. The admin sees a Telegram error message explaining the block but no permanent state changes occur. The candidate can re-enter `/candidates` only if its governance state changes externally (currently out of scope; see §11 R3 row).
 
@@ -488,6 +498,7 @@ Wave 3 (optional):     E
   - `card_status='approved'` cannot exist without `approved_by_user_id` + `approved_at`.
   - `card_sources` has `UNIQUE(card_id, message_version_id)` and reverse index on `message_version_id`.
   - `_cascade_card_sources_on_forget` extension wired per §5.A.5.
+  - Advisory-lock helper `_p6_mvid_advisory_lock_id(mvid: int) -> int` defined in `bot/services/forget_cascade.py` (or a shared `bot/services/_advisory_locks.py`): returns `signed_int64(sha256(f'p6:mvid:{mvid}'))`. MUST be used by BOTH `/approve` (§5.C step 2) and `_cascade_card_sources_on_forget` (§5.A.5 step 1) — single source of truth for the lock_id derivation. Unit-tested for determinism + signed-int64 range.
 - Dependencies: T6-00.
 - Stream: Wave 1 / Stream A.
 
@@ -591,6 +602,7 @@ Wave 3 (optional):     E
   - **Cascade demote:** a `forget_event` matching the only source `message_version_id` of an approved card demotes the card to `card_status='archived'` with `archived_reason` referencing the `forget_event_id`.
   - **`/approve` re-validation rejection:** a candidate whose source acquired `memory_policy='offrecord'` or a `forget_event` tombstone between extraction and `/approve` is rejected by the deterministic re-validation with an explicit error.
   - **Concurrent forget+approve race test:** forget_event applied while an admin `/approve` transaction is open must abort approval OR cascade-demote the just-approved card; final state has `card_status='archived'` OR `/approve` returns governance error (no half-approved state).
+  - **Advisory-lock serialization test:** explicit test that `/approve` and `apply_forget_event` both call `pg_advisory_xact_lock` with the SAME `mvid_lock_id` derivation. Spawn two concurrent transactions targeting the same `message_version_id`; assert one blocks on `pg_locks` until the other commits; assert no race-induced approved-card-with-forgotten-source state exists post-commit.
 - Dependencies: T6-02, T6-04, T6-06, T6-07.
 - Stream: Wave 2 closeout / holistic verification.
 
