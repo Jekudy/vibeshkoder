@@ -99,11 +99,11 @@ The following privacy invariants are enforced at merge time and gate every futur
 | Invariant | Enforcement |
 |-----------|-------------|
 | No LLM calls outside `llm_gateway` | AST-level `test_no_llm_imports.py` + runtime `_llm_guard` httpx hook (PR #243) |
-| No extraction over `#nomem` / `#offrecord` / tombstoned messages | `memory_policy='normal'` filter + `_bundle_is_clean` fresh re-query |
-| Forget cascade demotes cards when all sources forgotten | `_cascade_card_sources_on_forget` (PR #245) |
+| No extraction over non-normal-policy or tombstoned messages | `memory_policy='normal'` filter + `_bundle_is_clean` fresh re-query |
+| Forget cascade demotes cards when all sources tombstoned | `_cascade_card_sources_on_forget` (PR #245) |
 | `archived_reason` never contains message body | FK to `forget_event_id` only |
 | Advisory lock serializes concurrent access per `message_version_id` | `_p6_mvid_advisory_lock_id` helper (PR #245) |
-| Privacy allowlist narrowed to 4 exact globs | PR #247 (`leakage_offrecord*`, `leakage_nomem*`, `leakage_forgotten*`, `leakage_redacted*`) |
+| Privacy allowlist narrowed to 4 exact globs | PR #247 (see `scripts/lint_privacy_check.sh`) |
 | httpx URL-level no-LLM guard in eval mode | `tests/evals/_llm_guard.py` autouse fixture (PR #243) |
 
 ---
