@@ -1,7 +1,7 @@
 # Memory System — Implementation Status
 
-**Last updated:** 2026-05-12 (Phase 6 Wave 1 IN PROGRESS — T6-00 merged PR #242, T6-01 merged PR #245, T6-02 in PAR on branch `feat/p6-t6-02-extractor`; Phase 11 follow-up #224 High #5 merged PR #243).
-**Active worktrees:** `.worktrees/p6-w1-stream-b` (T6-02 extractor, branch `feat/p6-t6-02-extractor`). Historical: `.worktrees/orch-A` (Phase 5–6 planning); `.worktrees/orch-B` (Phase 9/10/12 planning); `.worktrees/orch-C` (Phase 11 planning); `.worktrees/p2-alpha/bravo/charlie/delta` (Phase 2 closed 2026-04-29); `.worktrees/p4-hotfix-164` (closed by PR #203).
+**Last updated:** 2026-05-12 (Phase 6 CLOSED — all tickets merged; FHR APPROVE; carryover issues #260/#261/#262 filed. Phase 11 follow-ups #224/#219/#255 all merged.)
+**Active worktrees:** none (Phase 6 closed). Historical: `.worktrees/p6-w1-stream-b` (T6-02, closed); `.worktrees/orch-A` (Phase 5–6 planning); `.worktrees/orch-B` (Phase 9/10/12 planning); `.worktrees/orch-C` (Phase 11 planning); `.worktrees/p2-alpha/bravo/charlie/delta` (Phase 2 closed 2026-04-29); `.worktrees/p4-hotfix-164` (closed by PR #203).
 **Source of truth:** this file is updated after every PR merge into `main`.
 
 ---
@@ -342,29 +342,46 @@ Plus L-1..L-4 cosmetic carryovers (N+1 perf, alembic 025 `import hashlib` placem
 - contracts.md §5.1+§10.1+§12.2 update_placeholder return type drift (-> None vs -> int rowcount).
 - contracts.md §12.3 update_llm_fields return type drift (-> None vs -> rowcount + LookupError note).
 
-## Phase 6 — Knowledge cards + admin review (IN PROGRESS)
+## Phase 6 — Knowledge cards + admin review (CLOSED 2026-05-12)
 
-**Sprint 0 RATIFIED 2026-05-12.** Plan promoted to `docs/memory-system/PHASE6_PLAN.md`. Wave 1 authorized: T6-00 + T6-01 + T6-02 + T6-03.
+**Sprint 0 RATIFIED 2026-05-12.** Plan promoted to `docs/memory-system/PHASE6_PLAN.md`. All 9 tickets merged across Wave 1 (T6-00..T6-03) + Wave 2 Stream C (T6-04, T6-05, T6-09) + Stream D (T6-06, T6-07). T6-08 deferred (optional web cards page; no Phase 5 web scaffold). FHR: Claude product APPROVED + Claude technical APPROVED 2026-05-12. FHR blocker (LLM gateway `_TOMBSTONE_GATE_SQL` `mv.content_hash` path) fixed via PR #259 in same closure cycle. Carryover issues filed: #260 `_process_one_event` rename, #261 extractor running-row leak, #262 MED/LOW + deferred items (Phase 6.5).
 
 **Owned alembic range:** 030–049 (Wave 1 = 030–035).
 
 | Ticket | Wave | Title | Status | Notes |
 |--------|------|-------|--------|-------|
-| T6-00 | 0 | FHR carryover — M-1 ValueError guard + M-4 message_hash cascade tests | merged | **Merged via PR #242** 2026-05-12, commits `1a33c16`..`793cddf` on main. M-1: `qa_trace_id` annotation changed to `int \| None` (annotation-only; gateway robust to None per ledger FK nullable). M-4: direct `_cascade_qa_traces_llm` + `_cascade_llm_synthesis_cache` message_hash sub-case tests with `llm_response_summary IS NULL` assertions added. Codex round 1 MED (ledger aggregate preservation asserts) fixed in `7e8d558`. |
-| T6-01 | 1 | Phase 6 schema — migrations 030-034 + ORM + `_p6_mvid_advisory_lock_id` helper + `_cascade_card_sources_on_forget` | merged | **Merged via PR #245** 2026-05-12, HEAD commit `4db6081` on main. 9 commits on branch `feat/p6-t6-01-schema`. Creates tables: `extraction_runs` (030), `extraction_candidates` (031), `knowledge_cards` (032), `card_sources` (033), `extraction_decisions` (034). ORM models in `bot/db/models.py`. Advisory lock helper `_p6_mvid_advisory_lock_id(mvid) -> int` deterministic SHA-256→signed-int64. Cascade `_cascade_card_sources_on_forget` in `forget_cascade.py`. PAR: Codex round 2 — SQLite-compatible `server_default` fix (`4db6081`), ORM default fix (`5ad3ffc`), idempotency test (`567caa7`), ORM delete cascade (`4b33dec`). |
-| T6-02 | 1 | Extractor service + scheduler flag + `/admin_extract` handler + migration 035 `operator_user_id` | in progress | Branch `feat/p6-t6-02-extractor`, HEAD `182095f`, 10 commits. PAR Codex round 2 in progress (as of 2026-05-12). PR not yet created. T6-03 blocked until T6-02 merged. |
-| T6-03 | 1 | Gateway `extract_candidates` endpoint | not started | Unblocked after T6-02 merge. Must clear Phase 11 leakage binding test (`tests/evals/test_leakage.py`) before merge. Wave 1 Stream B sprint 2. |
+| T6-00 | 0 | FHR carryover — M-1 ValueError guard + M-4 message_hash cascade tests | merged | **Merged via PR #242** 2026-05-12, commits `1a33c16`..`793cddf` on main. M-1: `qa_trace_id` annotation changed to `int \| None`. M-4: direct `_cascade_qa_traces_llm` + `_cascade_llm_synthesis_cache` message_hash sub-case tests with `llm_response_summary IS NULL` assertions added. Codex round 1 MED fixed in `7e8d558`. |
+| T6-01 | 1 | Phase 6 schema — migrations 030-034 + ORM + `_p6_mvid_advisory_lock_id` helper + `_cascade_card_sources_on_forget` | merged | **Merged via PR #245** 2026-05-12. Creates tables: `extraction_runs` (030), `extraction_candidates` (031), `knowledge_cards` (032), `card_sources` (033), `extraction_decisions` (034). Advisory lock helper + cascade. PAR: Codex round 2 fixes landed. |
+| T6-02 | 1 | Extractor service + scheduler flag + `/admin_extract` handler + migration 035 `operator_user_id` | merged | **Merged via PR #248** 2026-05-12. Extractor service, admin Telegram handler, migration 035 `operator_user_id`. |
+| T6-03 | 1 | Gateway `extract_candidates` endpoint | merged | **Merged via PR #254** 2026-05-12. LLM gateway `extract_candidates` endpoint + router + DI. Phase 11 leakage binding test cleared before merge. Wave 1 complete. |
+| T6-04 | 2 (Stream C) | Admin `/candidates` + `/approve` + `/reject` handlers | merged | **Merged via PR #258** 2026-05-12. Admin candidate review flow with approval/rejection. |
+| T6-05 | 2 (Stream C) | Admin `/cards` handler | merged | **Merged via PR #258** 2026-05-12. Admin cards listing handler. |
+| T6-06 | 2 (Stream D) | Search `include_cards` flag | merged | **Merged via PR #256** 2026-05-12. `/recall` search can include knowledge cards in results. |
+| T6-07 | 2 (Stream D) | `EvidenceItem` `source_type` field | merged | **Merged via PR #256** 2026-05-12. Adds `source_type` discriminator to evidence bundle items. |
+| T6-08 | — | Web cards page (optional) | deferred | No Phase 5 web scaffold; deferred to Phase 6.5. Carryover tracked in #262. |
+| T6-09 | 2 (Stream C) | Collision test + cascade advisory lock wiring | merged | **Merged via PR #258** 2026-05-12. Closes H-Cdx-2 race window via 3-layer defense (per-mvid advisory lock + event-level coarse lock + FOR SHARE row lock). |
 
-### Phase 11 follow-ups (#224)
+**FHR fix (same closure cycle):**
+| Item | Title | Status | Notes |
+|------|-------|--------|-------|
+| FHR blocker | LLM gateway `_TOMBSTONE_GATE_SQL` uses `mv.content_hash` final path | fixed | **Merged via PR #259** 2026-05-12. |
+
+**Carryover issues (Phase 6.5):**
+| Issue | Title |
+|-------|-------|
+| #260 | `_process_one_event` rename |
+| #261 | Extractor running-row leak |
+| #262 | MED/LOW items + deferred items |
+
+### Phase 11 follow-ups (#224, #219, #255) — all closed 2026-05-12
 
 | Issue | Title | Status | Notes |
 |-------|-------|--------|-------|
-| #224 High #5 | httpx URL-level no-LLM guard | merged | **Merged via PR #243** 2026-05-12, commits `1cf4c43`..`3d97e56` on main. Adds async `httpx` hook that blocks non-allowlisted HTTP calls from inside LLM gateway; environment-independent negative tests. Codex review (HIGH async hook + MED drift + LOW name) fixed in `06fc1e2`. |
-| #224 Critical #4 | Allowlist hardening | in progress | Branch in flight; PR not yet created. |
-| #224 High #1 | Test hardening (item 1) | in progress | Bundled with Critical #4 sprint. |
-| #224 High #2 | Test hardening (item 2) | in progress | Bundled with Critical #4 sprint. |
-| #224 High #3 | Test hardening (item 3) | in progress | Bundled with Critical #4 sprint. |
-| #224 High #4 | Test hardening (item 4) | in progress | Bundled with Critical #4 sprint. |
+| #224 High #5 | httpx URL-level no-LLM guard | merged | **Merged via PR #243** 2026-05-12. Adds async `httpx` hook blocking non-allowlisted HTTP calls from LLM gateway. |
+| #224 Critical #4 | Privacy allowlist narrowing + multiset baseline | merged | **Merged via PR #247** 2026-05-12. |
+| #224 High #1-#4 | Test hardening items 1-4 | verified on main | Verified already-on-main; no separate PR needed. |
+| #219 | seed_v1 quality fix (abstain rate 7/8 → 0/8) | merged | **Merged via PR #253** 2026-05-12. |
+| #255 | Phase 4 message-branch tombstone uses `mv.content_hash` | merged | **Merged via PR #257** 2026-05-12. |
 
 ## Phases 7–12
 
@@ -425,4 +442,4 @@ After each PR merge into `main`:
    superseded, write `superseded by T#-##` in Notes.
 5. Update `Last updated` at the top.
 
-<!-- updated-by-superflow:2026-04-29 -->
+<!-- updated-by-superflow:2026-05-12 -->

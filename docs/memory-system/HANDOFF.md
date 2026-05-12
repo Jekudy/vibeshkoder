@@ -435,9 +435,10 @@ Cannot parallelize without gate:
 - **Risks:** hallucinated extraction, budget runaway.
 - **Rollback:** derived rows rebuildable / deletable.
 
-### Phase 6 — knowledge cards + admin review
+### Phase 6 — knowledge cards + admin review (CLOSED 2026-05-12)
 
 - **Objective:** curated catalog with review and source trace.
+- **Status:** CLOSED 2026-05-12. All 9 tickets merged (PRs #242, #245, #248, #254, #256, #258). Migrations 030–035 on main. FHR APPROVE. Carryover issues #260/#261/#262 filed for Phase 6.5.
 - **Scope:** `extraction_runs`, `extraction_candidates`, `knowledge_cards`, `card_sources`, `extraction_decisions`, review UI. (See `PHASE6_PLAN.md` for the ratified Sprint 0 design; `card_revisions` and `card_relations` deferred to Phase 6.5/9.)
 - **Dependencies:** phase 5.
 - **Entry criteria:** candidates with source refs and admin actions.
@@ -1314,3 +1315,5 @@ butler: without tombstones, source trace and review this becomes not a memory sy
 confident archiver of private problems. The first sprint must be boring and ironclad — privacy,
 idempotency, raw archive, versions, policy skeleton. That is what gives shkoder the right to
 remember later.
+
+<!-- updated-by-superflow:2026-05-12 -->
