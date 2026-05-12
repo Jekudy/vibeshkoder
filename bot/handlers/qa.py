@@ -20,7 +20,7 @@ from bot.db.repos.llm_synthesis_cache import SynthesisCacheRepo
 from bot.db.repos.llm_usage_ledger import LedgerRepo
 from bot.db.repos.qa_trace import QaTraceRepo
 from bot.db.repos.user import UserRepo
-from bot.services.evidence import EvidenceBundle
+from bot.services.evidence import EvidenceBundle, EvidenceItem
 from bot.services.governance import detect_policy
 from bot.services.llm_gateway import (
     AnswerWithCitations,
@@ -80,23 +80,84 @@ def _author_name(user: object | None) -> str:
     return "—"
 
 
+def _format_message_item(
+    item: EvidenceItem,
+    short_chat_id: str,
+    users_by_id: dict[int, object],
+) -> str:
+    """T6-07: message-hit renderer used in the mixed-bundle branch only.
+
+    The pure-message bundle keeps its rendering INLINED in ``_format_response``
+    for byte-for-byte Phase 4 preservation (see comment at the Phase 4 fast
+    path below; tests/handlers/test_qa_recall_phase4_preserved.py is the
+    regression guard).
+    """
+    author_name = _author_name(users_by_id.get(item.user_id) if item.user_id else None)
+    date_text = _format_date(item.message_date)
+    snippet = _safe_headline(item.snippet)
+    link = f"https://t.me/c/{short_chat_id}/{item.message_id}"
+    return (
+        f"<blockquote>{snippet}</blockquote>\n"
+        f"<i>— {author_name}, {date_text}</i> · "
+        f"<a href=\"{html.escape(link, quote=True)}\">сообщение</a> · "
+        f"<code>message_version_id:{item.message_version_id}</code>"
+    )
+
+
+def _format_card_item(item: EvidenceItem, short_chat_id: str) -> str:
+    """T6-07 card-hit rendering with back-citation trace.
+
+    Per PHASE6_PLAN.md §1 invariant #4 every card citation MUST surface the
+    source ``message_version_id`` set so the rendered output traces back to
+    the underlying messages. The anchor source's Telegram message is also
+    linked so admins can jump to the primary source.
+    """
+    date_text = _format_date(item.message_date)  # T6-06 substitutes approved_at here
+    snippet = _safe_headline(item.snippet)
+    anchor_link = f"https://t.me/c/{short_chat_id}/{item.message_id}"
+    mvid_list = ", ".join(str(m) for m in item.card_source_message_version_ids)
+    return (
+        f"<blockquote>{snippet}</blockquote>\n"
+        f"<i>\U0001f4cb Карточка, {date_text}</i> · "
+        f"<a href=\"{html.escape(anchor_link, quote=True)}\">первоисточник</a> · "
+        f"<code>card_id:{item.card_id}</code> · "
+        f"<code>sources:[{mvid_list}]</code>"
+    )
+
+
 def _format_response(bundle: EvidenceBundle, users_by_id: dict[int, object]) -> str:
     if bundle.abstained:
         return "Не нашёл подходящих свидетельств в истории чата."
 
+    # T6-07: detect mixed-bundle (any card hit) vs pure-message bundle. The
+    # pure-message path stays INLINED below for byte-for-byte Phase 4 preservation
+    # (tests/handlers/test_qa_recall_phase4_preserved.py is the regression guard).
+    has_card = any(item.source_type == "card" for item in bundle.items)
+    if not has_card:
+        # Phase 4 path — preserved byte-for-byte from the original implementation.
+        parts = ["<b>Найденные свидетельства:</b>"]
+        short_chat_id = _short_chat_id(bundle.chat_id)
+        for item in bundle.items:
+            author_name = _author_name(users_by_id.get(item.user_id) if item.user_id else None)
+            date_text = _format_date(item.message_date)
+            snippet = _safe_headline(item.snippet)
+            link = f"https://t.me/c/{short_chat_id}/{item.message_id}"
+            parts.append(
+                f"<blockquote>{snippet}</blockquote>\n"
+                f"<i>— {author_name}, {date_text}</i> · "
+                f"<a href=\"{html.escape(link, quote=True)}\">сообщение</a> · "
+                f"<code>message_version_id:{item.message_version_id}</code>"
+            )
+        return "\n\n".join(parts)
+
+    # T6-07 mixed/card path — uses the helper renderers above.
     parts = ["<b>Найденные свидетельства:</b>"]
     short_chat_id = _short_chat_id(bundle.chat_id)
     for item in bundle.items:
-        author_name = _author_name(users_by_id.get(item.user_id) if item.user_id else None)
-        date_text = _format_date(item.message_date)
-        snippet = _safe_headline(item.snippet)
-        link = f"https://t.me/c/{short_chat_id}/{item.message_id}"
-        parts.append(
-            f"<blockquote>{snippet}</blockquote>\n"
-            f"<i>— {author_name}, {date_text}</i> · "
-            f"<a href=\"{html.escape(link, quote=True)}\">сообщение</a> · "
-            f"<code>message_version_id:{item.message_version_id}</code>"
-        )
+        if item.source_type == "card":
+            parts.append(_format_card_item(item, short_chat_id))
+        else:
+            parts.append(_format_message_item(item, short_chat_id, users_by_id))
     return "\n\n".join(parts)
 
 
@@ -171,16 +232,46 @@ def _format_synthesized_response(
     surviving evidence so the cascade can invalidate them, but the
     user-facing layout reuses the Phase 4 evidence list verbatim.
     """
+    # T6-07: detect mixed-bundle. Pure-message bundles keep the Phase 5 footer
+    # byte-for-byte (tests/handlers/test_qa_llm_synthesis.py is the guard).
+    has_card = any(item.source_type == "card" for item in bundle.items)
     answer_text = html.escape(answer.answer_text, quote=False)
     parts = [answer_text, "", "<b>Источники:</b>"]
+    if not has_card:
+        # Phase 5 path — preserved byte-for-byte.
+        for idx, item in enumerate(bundle.items, start=1):
+            author_name = _author_name(
+                users_by_id.get(item.user_id) if item.user_id else None
+            )
+            date_text = _format_date(item.message_date)
+            snippet = _safe_headline(item.snippet)
+            parts.append(f"[{idx}] {date_text} — {author_name}: {snippet}")
+        return "\n".join(parts)
+
+    # T6-07 mixed/card path.
     for idx, item in enumerate(bundle.items, start=1):
-        author_name = _author_name(
-            users_by_id.get(item.user_id) if item.user_id else None
-        )
-        date_text = _format_date(item.message_date)
-        snippet = _safe_headline(item.snippet)
-        parts.append(f"[{idx}] {date_text} — {author_name}: {snippet}")
+        if item.source_type == "card":
+            parts.append(_format_synth_card_footer(idx, item))
+        else:
+            author_name = _author_name(
+                users_by_id.get(item.user_id) if item.user_id else None
+            )
+            date_text = _format_date(item.message_date)
+            snippet = _safe_headline(item.snippet)
+            parts.append(f"[{idx}] {date_text} — {author_name}: {snippet}")
     return "\n".join(parts)
+
+
+def _format_synth_card_footer(idx: int, item: EvidenceItem) -> str:
+    """T6-07 Phase 5 synthesis-mode card footer entry."""
+    date_text = _format_date(item.message_date)  # T6-06 substitutes approved_at
+    snippet = _safe_headline(item.snippet)
+    source_count = len(item.card_source_message_version_ids)
+    return (
+        f"[{idx}] {date_text} — \U0001f4cb Card "
+        f"<code>{item.card_id}</code> "
+        f"(sources: {source_count}): {snippet}"
+    )
 
 
 async def _write_trace(
