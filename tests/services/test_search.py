@@ -320,6 +320,47 @@ async def test_search_empty_message_hash_tombstone_does_not_match_null_hash(
     assert [hit.message_version_id for hit in hits] == [created.version_id]
 
 
+async def test_message_hash_tombstone_filters_live_only_content_hash(
+    db_session,
+) -> None:
+    """Regression #255: message_hash tombstone must block live messages where
+    chat_messages.content_hash IS NULL but message_versions.content_hash is set.
+
+    Live message ingestion via ``MessageRepo.save`` does NOT populate
+    ``chat_messages.content_hash``. Only ``message_versions.content_hash`` is
+    populated (NOT NULL by schema). Filtering on ``c.content_hash`` silently
+    no-ops every ``message_hash:<hash>`` tombstone for live messages.
+
+    The fix must use ``mv.content_hash`` instead.
+    """
+    from bot.db.models import ChatMessage
+    from bot.services.search import search_messages
+
+    chat_id = -100_422
+    created = await _create_versioned_message(
+        db_session,
+        chat_id=chat_id,
+        text="live message hash питон",
+    )
+    # Simulate live ingestion: c.content_hash is NULL, mv.content_hash is set.
+    chat_message = await db_session.get(ChatMessage, created.chat_message_id)
+    assert chat_message is not None
+    chat_message.content_hash = None
+    await db_session.flush()
+
+    # Tombstone keyed on the message_versions.content_hash (the only one populated).
+    await _create_forget_event(
+        db_session,
+        tombstone_key=f"message_hash:{created.content_hash}",
+        target_type="message_hash",
+        status="pending",
+    )
+
+    hits = await search_messages(db_session, "питон", chat_id=chat_id)
+
+    assert hits == []
+
+
 async def test_search_chat_isolation(db_session) -> None:
     from bot.services.search import search_messages
 
