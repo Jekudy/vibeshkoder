@@ -985,3 +985,70 @@ async def test_card_detail_redacts_forgotten_source(
     reply = _collect_replies(fake_admin_message)
     # The Telegram link pattern must NOT appear for this redacted source.
     assert f"/{msg_id}" not in reply or "redacted" in reply.lower()
+
+
+# ─── /approve lock-ordering regression test (Codex round 2 CRITICAL #1) ─────
+
+
+async def test_approve_acquires_advisory_lock_before_select_for_update(
+    db_session, fake_admin_message, cmd_factory, monkeypatch
+) -> None:
+    """``/approve`` MUST emit ``pg_advisory_xact_lock`` BEFORE
+    ``SELECT ... FOR UPDATE`` on extraction_candidates.
+
+    Codex round 2 CRITICAL #1: the previous implementation took the FOR UPDATE
+    lock on the candidate row, THEN acquired the per-mvid advisory locks. This
+    re-opened the H-Cdx-2 race window because the FOR UPDATE read happens
+    before serialization with the forget cascade. Per PHASE6_PLAN.md §5.C
+    step 1, advisory locks MUST be the FIRST mutating DB operation.
+    """
+    from bot.db.repos.user import UserRepo
+    from bot.handlers.admin_cards import cmd_approve
+
+    await UserRepo.upsert(
+        db_session,
+        telegram_id=fake_admin_message.from_user.id,
+        username="admin_user",
+        first_name="Admin",
+        last_name=None,
+    )
+    _, mvid, _, _ = await _make_chat_message_with_version(db_session)
+    cid = await _make_candidate(db_session, source_mvids=[mvid])
+
+    captured_sql: list[str] = []
+    original_execute = db_session.execute
+
+    async def spy_execute(stmt, *args, **kwargs):
+        try:
+            sql_text = str(stmt)
+        except Exception:
+            sql_text = repr(stmt)
+        captured_sql.append(sql_text)
+        return await original_execute(stmt, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", spy_execute)
+
+    await cmd_approve(
+        fake_admin_message, cmd_factory(str(cid)), session=db_session
+    )
+
+    # Locate the first pg_advisory_xact_lock call and the first FOR UPDATE
+    # against extraction_candidates. Lock MUST come strictly first.
+    lock_idx = next(
+        (i for i, s in enumerate(captured_sql) if "pg_advisory_xact_lock" in s),
+        None,
+    )
+    for_update_idx = next(
+        (
+            i
+            for i, s in enumerate(captured_sql)
+            if "FOR UPDATE" in s and "extraction_candidates" in s
+        ),
+        None,
+    )
+    assert lock_idx is not None, "no pg_advisory_xact_lock emitted"
+    assert for_update_idx is not None, "no SELECT FOR UPDATE on extraction_candidates"
+    assert lock_idx < for_update_idx, (
+        f"advisory lock at idx {lock_idx} MUST precede SELECT FOR UPDATE at "
+        f"idx {for_update_idx}; SQL captured: {captured_sql}"
+    )
