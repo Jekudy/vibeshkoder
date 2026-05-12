@@ -45,6 +45,7 @@ Privacy-critical design notes
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -896,6 +897,326 @@ def _estimate_cost(
         return Decimal("0")
 
 
+# ─── Phase 6 / T6-03 — extract_candidates gateway entry point ───────────────
+
+
+# Prompt template v0.1.0 — deliberately simple JSON-array envelope.
+# Note: this is the canonical instruction-text only. The wire prompt
+# includes the source mvid set so the model can cite them deterministically.
+# Real prompt-engineering work belongs to later prompt-template versions.
+_EXTRACT_PROMPT_TEMPLATE_V0_1_0 = (
+    "Extract knowledge-card candidates from the following Telegram chat "
+    "messages. Return a JSON array of objects with exact shape:\n"
+    '  [{"candidate_json": {"title": str, "summary": str, "tags": [str]}, '
+    '"source_message_version_ids": [int, ...]}, ...]\n'
+    "Each source_message_version_ids entry MUST be drawn from the input "
+    "message_version_id values. Return [] if no candidates. JSON only — "
+    "no prose, no markdown fences.\n\n"
+    "MESSAGES:\n"
+)
+
+
+def _build_extraction_prompt(
+    source_versions: list[dict[str, Any]],
+    prompt_template_version: str,
+) -> str:
+    """Render a deterministic prompt for extraction.
+
+    Order is preserved (caller passes already-sorted bundle from the
+    extractor). ``prompt_template_version`` is appended so ``_prompt_hash``
+    distinguishes future template revisions. Source bodies are concatenated
+    plainly (no markdown) — the gateway treats the bodies as already-
+    governance-cleared input from ``_bundle_is_clean`` upstream.
+    """
+    body_parts: list[str] = []
+    for sv in source_versions:
+        mvid = sv.get("message_version_id")
+        text = sv.get("text") or sv.get("caption") or sv.get("normalized_text") or ""
+        body_parts.append(f"[mvid={mvid}] {text}")
+    return (
+        f"# template_version={prompt_template_version}\n"
+        + _EXTRACT_PROMPT_TEMPLATE_V0_1_0
+        + "\n".join(body_parts)
+    )
+
+
+def _parse_extraction_response(answer_text: str) -> list[dict[str, Any]]:
+    """Parse the provider response into a list of candidate dicts.
+
+    Returns ``[]`` for unparseable output. The gateway downgrades parse
+    failures to abstention (no candidates) rather than raising — this
+    keeps the SAVEPOINT in ``run_extraction_pass`` clean and lets the
+    audit layer record ``error="no_valid_candidates"`` on the ledger row.
+    """
+    try:
+        parsed = json.loads(answer_text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        out.append(item)
+    return out
+
+
+async def extract_candidates(
+    session: AsyncSession,
+    *,
+    source_versions: list[dict[str, Any]],
+    prompt_template_version: str = "v0.1.0",
+    ledger_repo: LedgerRepoProtocol,
+    provider: LLMProvider,
+    config: LLMGatewayConfig,
+) -> dict[str, Any]:
+    """Single Phase 6 LLM extraction entry point — see T6-03_design.md §1.
+
+    Returns ``{"candidates": [...], "llm_usage_ledger_id": int | None}``
+    matching the ``ExtractCandidatesGateway`` Protocol surface
+    (``bot/services/extractor.py``).
+
+    The gateway is the ONLY allowed LLM call site for extraction (HANDOFF
+    invariant #2). Privacy is gatekept upstream by ``run_extraction_pass``
+    via ``_select_eligible_sources`` + ``_bundle_is_clean`` — the gateway
+    trusts ``source_versions`` as authoritative validated input and does
+    NOT re-filter (re-filtering would create drift risk with the
+    extractor's authoritative governance check).
+
+    Privacy discipline:
+
+    * MUST NOT log raw ``text`` / ``caption`` / ``normalized_text`` —
+      use ``prompt_hash`` + ``message_version_id`` for traceability.
+    * MUST NOT include source content in error messages or ledger fields.
+
+    Failure semantics (alignment with T6-02 invariant #4):
+
+    * Empty input → SHORT-CIRCUIT: no provider call, no ledger row,
+      returns ``llm_usage_ledger_id=None``. This is the asymmetry T6-02
+      handles — "only runs that actually invoked the gateway need a
+      ledger row".
+    * All other paths write at least a placeholder ledger row that the
+      extractor's invariant guard sees as non-None.
+    """
+    # Invariant 1 — empty input short-circuit (no provider, no ledger).
+    if not source_versions:
+        return {"candidates": [], "llm_usage_ledger_id": None}
+
+    # Build deterministic prompt + prompt_hash. The prompt body itself is
+    # used by the provider; ``prompt_hash`` is the stable sentinel stored
+    # in the ledger row for audit/dedup. NO raw source content goes into
+    # the hash beyond what the prompt itself contains (privacy invariant
+    # holds because the gateway is downstream of ``_bundle_is_clean``).
+    prompt = _build_extraction_prompt(source_versions, prompt_template_version)
+    prompt_hash = _prompt_hash(prompt)
+
+    # Authoritative input mvid set — used to drop hallucinated citations
+    # from the provider response (defense-in-depth; the extractor's
+    # ``_bundle_is_clean`` already cleared the input set upstream).
+    valid_mvid_set: frozenset[int] = frozenset(
+        int(sv["message_version_id"]) for sv in source_versions
+    )
+
+    # Invariant 5 — budget guard + placeholder ledger row. Mirrors the
+    # Phase 5 ``synthesize_answer`` pattern: acquire budget advisory
+    # lock, read cost totals, either abort (``budget_exceeded``) or
+    # write a placeholder ledger row, then release the lock BEFORE
+    # provider dispatch. Lock release is in a ``finally`` so any early
+    # return still unlocks.
+    placeholder_row: Any
+    try:
+        await session.execute(
+            _BUDGET_LOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
+        )
+        over_budget = await _budget_check(session, config, ledger_repo)
+        if over_budget:
+            row = await ledger_repo.record(
+                session,
+                qa_trace_id=None,
+                provider=config.provider,
+                model=config.model,
+                prompt_hash=prompt_hash,
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                cost_usd=Decimal("0"),
+                latency_ms=0,
+                request_id=None,
+                cache_hit=False,
+                error="budget_exceeded",
+            )
+            return {"candidates": [], "llm_usage_ledger_id": row.id}
+
+        placeholder_row = await ledger_repo.record(
+            session,
+            qa_trace_id=None,
+            provider=config.provider,
+            model=config.model,
+            prompt_hash=prompt_hash,
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=Decimal("0"),
+            latency_ms=0,
+            request_id=None,
+            cache_hit=False,
+            error=None,
+        )
+    finally:
+        await session.execute(
+            _BUDGET_UNLOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
+        )
+
+    # Invariant 6 — provider dispatch with categorised error handling.
+    # ALL exceptions are caught + translated into ledger error fields so
+    # the SAVEPOINT in ``run_extraction_pass`` stays clean and the
+    # extractor's invariant #4 (non-None ledger_id) holds.
+    started = time.monotonic()
+    try:
+        provider_result = await provider.call(prompt=prompt, model=config.model)
+    except ProviderTransientError as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency,
+            error=f"provider_transient:{exc.subtype}",
+        )
+        return {"candidates": [], "llm_usage_ledger_id": placeholder_row.id}
+    except ProviderStructuralError as exc:
+        logger.error(
+            "llm_gateway: extraction structural provider failure subtype=%s",
+            exc.subtype,
+            exc_info=True,
+        )
+        from bot.services import observability
+
+        observability.emit_stop_signal("llm_provider_structural")
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency,
+            error=f"provider_structural:{exc.subtype}",
+        )
+        return {"candidates": [], "llm_usage_ledger_id": placeholder_row.id}
+    except Exception as exc:
+        logger.error(
+            "llm_gateway: extraction unknown provider failure class=%s",
+            type(exc).__name__,
+            exc_info=True,
+        )
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency,
+            error=f"provider_unknown:{type(exc).__name__}",
+        )
+        return {"candidates": [], "llm_usage_ledger_id": placeholder_row.id}
+
+    # Parse JSON envelope + filter for citation conformance.
+    candidates_raw = _parse_extraction_response(provider_result.answer_text)
+    valid_candidates: list[dict[str, Any]] = []
+    for c in candidates_raw:
+        source_ids_raw = c.get("source_message_version_ids") or []
+        if not isinstance(source_ids_raw, list):
+            continue
+        # Drop hallucinated mvids; keep only those present in input set.
+        source_ids: list[int] = []
+        for x in source_ids_raw:
+            try:
+                xid = int(x)
+            except (TypeError, ValueError):
+                continue
+            if xid in valid_mvid_set:
+                source_ids.append(xid)
+        if not source_ids:
+            # Invariant: no card without source.
+            continue
+        cand_json = c.get("candidate_json")
+        if not isinstance(cand_json, dict):
+            continue
+        valid_candidates.append(
+            {
+                "candidate_json": dict(cand_json),
+                "source_message_version_ids": source_ids,
+            }
+        )
+
+    cost_usd = _estimate_cost(
+        config=config,
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+    )
+    latency = int((time.monotonic() - started) * 1000)
+    await ledger_repo.update_placeholder(
+        session,
+        llm_call_id=placeholder_row.id,
+        cost_usd=cost_usd,
+        response_hash=_response_hash(provider_result.answer_text),
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+        request_id=provider_result.request_id,
+        latency_ms=latency,
+        error=None if valid_candidates else "no_valid_candidates",
+    )
+    return {
+        "candidates": valid_candidates,
+        "llm_usage_ledger_id": placeholder_row.id,
+    }
+
+
+class LiveExtractCandidatesGateway:
+    """Concrete impl of T6-02 ``ExtractCandidatesGateway`` Protocol.
+
+    Stub for TDD RED phase; real implementation lands as the next commit.
+    """
+
+    def __init__(
+        self,
+        *,
+        ledger_repo: LedgerRepoProtocol,
+        provider: LLMProvider,
+        config: LLMGatewayConfig,
+    ) -> None:
+        self._ledger_repo = ledger_repo
+        self._provider = provider
+        self._config = config
+
+    async def extract_candidates(
+        self,
+        session: Any,
+        *,
+        source_versions: list[dict[str, Any]],
+        prompt_template_version: str = "v0.1.0",
+    ) -> dict[str, Any]:
+        return await extract_candidates(
+            session,
+            source_versions=source_versions,
+            prompt_template_version=prompt_template_version,
+            ledger_repo=self._ledger_repo,
+            provider=self._provider,
+            config=self._config,
+        )
+
+
 __all__ = [
     "Abstention",
     "AbstentionReason",
@@ -903,10 +1224,12 @@ __all__ = [
     "LLM_BUDGET_LOCK_ID",
     "LLMGatewayConfig",
     "LedgerRepoProtocol",
+    "LiveExtractCandidatesGateway",
     "MAX_QUERY_LENGTH",
     "SynthesisCacheRepoProtocol",
     "SynthesisResult",
     "_cache_input_hash",
     "_normalize_query",
+    "extract_candidates",
     "synthesize_answer",
 ]
