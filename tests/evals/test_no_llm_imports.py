@@ -49,16 +49,12 @@ ALLOWED_LLM_IMPORT_FILES: frozenset[str] = frozenset(
 # are not the only way to call an LLM endpoint: a direct httpx / requests /
 # aiohttp call to a provider hostname would bypass the invariant-#2 contract
 # while passing the import-graph check. This domain list catches that.
-LLM_PROVIDER_HOSTNAMES: tuple[str, ...] = (
-    "api.anthropic.com",
-    "api.openai.com",
-    "api.cohere.ai",
-    "api.cohere.com",
-    "api.mistral.ai",
-    "generativelanguage.googleapis.com",
-    "api.replicate.com",
-    "api-inference.huggingface.co",
-)
+#
+# Single source of truth: LLM_GUARD_HOSTNAMES in tests/evals/_llm_guard.py.
+# Imported here to avoid drift between the runtime guard and the AST check.
+from tests.evals._llm_guard import LLM_GUARD_HOSTNAMES as _LLM_GUARD_HOSTNAMES
+
+LLM_PROVIDER_HOSTNAMES: tuple[str, ...] = tuple(sorted(_LLM_GUARD_HOSTNAMES))
 
 
 def _relative_to_repo(path: Path) -> str:
