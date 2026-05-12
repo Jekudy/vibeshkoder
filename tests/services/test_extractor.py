@@ -596,6 +596,71 @@ async def test_extraction_scheduler_tick_flag_false_skips(db_session) -> None:
 # ─── Test 8: scheduler flag — True runs the pass with phase_6_enabled_at ─────
 
 
+# ─── Codex HIGH #4: scheduler tick idempotency (advisory lock) ──────────────
+
+
+async def test_extraction_scheduler_tick_skips_when_locked(db_session) -> None:
+    """Two concurrent ``extraction_scheduler_tick`` calls would otherwise
+    process the same window twice. A ``pg_try_advisory_xact_lock`` on a
+    deterministic ``p6:scheduler`` namespace lock id MUST gate the tick:
+    if another tick already holds the lock, the second tick returns
+    ``skipped=True`` with reason ``locked``.
+
+    We simulate "another tick already holding" by monkeypatching
+    ``session.execute`` so the ``pg_try_advisory_xact_lock`` call returns
+    False on first invocation only.
+    """
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+    from bot.services import extractor as ext_module
+    from bot.services.extractor import (
+        MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG,
+        extraction_scheduler_tick,
+    )
+
+    await FeatureFlagRepo.set_enabled(
+        db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, True
+    )
+
+    # Patch the scheduler-lock acquisition to simulate contention.
+    original_try = ext_module._try_acquire_scheduler_lock
+
+    async def fake_try_acquire(session) -> bool:
+        return False  # always "another tick holds it"
+
+    ext_module._try_acquire_scheduler_lock = fake_try_acquire  # type: ignore[assignment]
+    try:
+        gw = FakeGateway(candidates_to_emit=[])
+        result = await extraction_scheduler_tick(db_session, gateway=gw)
+    finally:
+        ext_module._try_acquire_scheduler_lock = original_try  # type: ignore[assignment]
+
+    assert result.skipped is True
+    assert result.reason == "locked"
+    # Gateway must NOT have been called — the tick exited at the lock
+    # gate before any extraction work.
+    assert gw.calls == []
+
+
+def test_p6_scheduler_lock_id_is_deterministic_signed_int64() -> None:
+    """The advisory lock id MUST be deterministic, in the signed-int64
+    range expected by ``pg_advisory_xact_lock(bigint)``, and disjoint
+    from the ``p6:mvid:`` namespace used by /approve + cascade locks.
+    """
+    from bot.services.extractor import _p6_scheduler_lock_id
+    from bot.services.forget_cascade import _p6_mvid_advisory_lock_id
+
+    a = _p6_scheduler_lock_id()
+    b = _p6_scheduler_lock_id()
+    # Determinism.
+    assert a == b
+    # Signed int64 bounds.
+    assert -(2**63) <= a < 2**63
+    # Disjoint from p6:mvid namespace — picking arbitrary mvid values is
+    # enough since prefixes differ.
+    for mvid in (1, 42, 9999, 2**31):
+        assert a != _p6_mvid_advisory_lock_id(mvid)
+
+
 # ─── Codex HIGH #3: ExtractionRun atomic running → completed/failed lifecycle
 
 
