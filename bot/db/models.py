@@ -22,7 +22,9 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
+import uuid as _uuid_module
+
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql.expression import ColumnElement
@@ -880,4 +882,359 @@ class LlmSynthesisCache(Base):
         Integer,
         nullable=False,
         server_default=text("1"),
+    )
+
+
+# ─── Phase 6: knowledge cards / extraction (T6-01 / alembic 030-034) ─────────
+
+
+class ExtractionRun(Base):
+    """One LLM extraction pass over a time window (T6-01 / alembic 030).
+
+    Written by ``bot/services/extractor.py::run_extraction_pass``. Tracks the
+    window boundaries, how many candidates were produced, terminal status,
+    and an optional FK to the Phase 5 LLM usage ledger entry for the audited
+    LLM call.
+
+    Constraints (DB-level, see migration 030):
+
+    * ``candidate_count >= 0``
+    * ``run_status='completed'`` requires both ``ingestion_window_*``
+      timestamps to be non-null.
+    """
+
+    __tablename__ = "extraction_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "run_status IN ('running','completed','failed')",
+            name="ck_extraction_runs_status",
+        ),
+        CheckConstraint(
+            "candidate_count >= 0",
+            name="ck_extraction_runs_candidate_count_nonneg",
+        ),
+        CheckConstraint(
+            "run_status <> 'completed' OR "
+            "(ingestion_window_start IS NOT NULL AND ingestion_window_end IS NOT NULL)",
+            name="ck_extraction_runs_completed_has_window",
+        ),
+        Index("ix_extraction_runs_created_at", "created_at"),
+        Index("ix_extraction_runs_run_status", "run_status"),
+    )
+
+    id: Mapped[_uuid_module.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    ingestion_window_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    ingestion_window_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    candidate_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    run_status: Mapped[str] = mapped_column(Text, nullable=False)
+    llm_usage_ledger_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "llm_usage_ledger.id",
+            name="fk_extraction_runs_llm_usage_ledger_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class ExtractionCandidate(Base):
+    """LLM-extracted fact pending human review (T6-01 / alembic 031).
+
+    Renamed from DRAFT's ``memory_candidates`` per Phase 6 decision D2 —
+    Phase 8 ``memory_candidates`` (reflection cluster queue) is a distinct
+    concept.
+
+    Constraints (DB-level, see migration 031):
+
+    * ``status IN ('pending','approved','rejected','superseded')``
+    * ``source_message_version_ids`` must be a JSONB array.
+    * ``pending`` ⇒ reviewer columns NULL; terminal status ⇒ reviewer
+      columns non-null.
+
+    ``source_message_version_ids`` is staging only. At ``/approve`` time
+    (§5.C), the elements are promoted to ``card_sources`` FK rows.
+    """
+
+    __tablename__ = "extraction_candidates"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','approved','rejected','superseded')",
+            name="ck_extraction_candidates_status",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(source_message_version_ids) = 'array'",
+            name="ck_extraction_candidates_source_ids_is_array",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND reviewed_by IS NULL AND reviewed_at IS NULL) OR "
+            "(status IN ('approved','rejected','superseded') "
+            " AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)",
+            name="ck_extraction_candidates_reviewer_consistency",
+        ),
+        Index("ix_extraction_candidates_status", "status"),
+        Index("ix_extraction_candidates_extraction_run_id", "extraction_run_id"),
+        Index("ix_extraction_candidates_created_at", "created_at"),
+    )
+
+    id: Mapped[_uuid_module.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    extraction_run_id: Mapped[_uuid_module.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "extraction_runs.id",
+            name="fk_extraction_candidates_extraction_run_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    candidate_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    source_message_version_ids: Mapped[list[int]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    reviewed_by: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "users.id",
+            name="fk_extraction_candidates_reviewed_by",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class KnowledgeCard(Base):
+    """Admin-approved canonical knowledge unit (T6-01 / alembic 032).
+
+    Citation-eligible only when ``card_status='approved'`` AND at least one
+    ``card_sources`` row exists (033). Body stored as Telegram MarkdownV2
+    (PHASE6_PLAN.md Q1). Russian-language FTS via generated ``body_tsv``
+    matches the Phase 4 baseline (``message_versions.search_tsv``).
+
+    Constraints (DB-level, see migration 032):
+
+    * ``card_status IN ('draft','approved','archived')`` — Q3 collapsed
+      ``deprecated`` into ``archived`` with the nullable ``archived_reason``
+      column populated when archived.
+    * ``card_status='approved'`` requires both ``approved_by_user_id`` and
+      ``approved_at`` to be set.
+
+    Source-set requirement lives in ``card_sources`` (033), NOT here —
+    keeps the ``/approve`` promotion transaction atomic (§5.C step 5+6).
+    """
+
+    __tablename__ = "knowledge_cards"
+    __table_args__ = (
+        CheckConstraint(
+            "card_status IN ('draft','approved','archived')",
+            name="ck_knowledge_cards_status",
+        ),
+        CheckConstraint(
+            "card_status <> 'approved' OR "
+            "(approved_by_user_id IS NOT NULL AND approved_at IS NOT NULL)",
+            name="ck_knowledge_cards_approved_attribution",
+        ),
+        Index(
+            "ix_knowledge_cards_body_tsv",
+            "body_tsv",
+            postgresql_using="gin",
+        ),
+        Index("ix_knowledge_cards_card_status", "card_status"),
+        Index("ix_knowledge_cards_created_at", "created_at"),
+    )
+
+    id: Mapped[_uuid_module.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body_markdown: Mapped[str] = mapped_column(Text, nullable=False)
+    body_tsv: Mapped[str | None] = mapped_column(
+        TSVECTOR(),
+        Computed(
+            "to_tsvector('russian', coalesce(body_markdown, ''))",
+            persisted=True,
+        ),
+        nullable=True,
+    )
+    card_status: Mapped[str] = mapped_column(Text, nullable=False)
+    archived_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_by_user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "users.id",
+            name="fk_knowledge_cards_approved_by_user_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CardSource(Base):
+    """FK-normalized link from a card to a source ``message_versions`` row
+    (T6-01 / alembic 033).
+
+    Replaces the DRAFT's inline ``source_message_version_ids jsonb`` column
+    on ``knowledge_cards`` per D1. The candidate's staging JSONB
+    (``extraction_candidates.source_message_version_ids``) is promoted to
+    one row per element here at ``/approve`` time (§5.C step 6).
+
+    FK semantics:
+
+    * ``card_id`` → ON DELETE CASCADE (deleting the card scrubs its links).
+    * ``message_version_id`` → ON DELETE RESTRICT (prevents accidental
+      orphan deletes; the §5.A.5 cascade demote path DELETEs the
+      ``card_sources`` row explicitly).
+
+    Indexes:
+
+    * ``UNIQUE(card_id, message_version_id)`` — promotes idempotency of
+      ``/approve`` re-runs; at most one link per pair.
+    * Reverse index on ``message_version_id`` — supports
+      ``_cascade_card_sources_on_forget`` (§5.A.5) which selects affected
+      cards by ``message_version_id``.
+    """
+
+    __tablename__ = "card_sources"
+    __table_args__ = (
+        UniqueConstraint(
+            "card_id",
+            "message_version_id",
+            name="uq_card_sources_card_id_message_version_id",
+        ),
+        Index("ix_card_sources_message_version_id", "message_version_id"),
+    )
+
+    id: Mapped[_uuid_module.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    card_id: Mapped[_uuid_module.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "knowledge_cards.id",
+            name="fk_card_sources_card_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    message_version_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "message_versions.id",
+            name="fk_card_sources_message_version_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    position: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ExtractionDecision(Base):
+    """Audit trail of an admin ``/approve`` / ``/reject`` terminal decision
+    (T6-01 / alembic 034).
+
+    Exactly one decision per candidate (``UNIQUE(candidate_id)``); appeals
+    out of scope per PHASE6_PLAN.md §11. R3-block (deterministic
+    re-validation aborts approval) is NOT a decision and writes NO row
+    here — the candidate stays ``pending`` and the failure is structured-
+    logged only (§5.C, §8).
+
+    FK semantics:
+
+    * ``candidate_id`` → ON DELETE CASCADE (audit trail scoped to its
+      candidate; in practice candidates are not deleted).
+    * ``decided_by`` → ON DELETE SET NULL (audit row survives admin
+      soft-delete). ``decided_by_username`` is the NOT-NULL human-readable
+      shadow snapshotted at decision time so the audit trail survives the
+      FK nullification.
+    """
+
+    __tablename__ = "extraction_decisions"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('approved','rejected')",
+            name="ck_extraction_decisions_action",
+        ),
+        UniqueConstraint(
+            "candidate_id",
+            name="uq_extraction_decisions_candidate_id",
+        ),
+        Index("ix_extraction_decisions_decided_at", "decided_at"),
+    )
+
+    id: Mapped[_uuid_module.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    candidate_id: Mapped[_uuid_module.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "extraction_candidates.id",
+            name="fk_extraction_decisions_candidate_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_by: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "users.id",
+            name="fk_extraction_decisions_decided_by",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    decided_by_username: Mapped[str] = mapped_column(Text, nullable=False)
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
