@@ -25,9 +25,11 @@ class TestDeterminism:
     @pytest.mark.parametrize(
         "query",
         [
+            # Three answerable queries from golden_recall/seed_v1/queries.jsonl.
+            # Aligned with the post-#219 rewrite (Phase 4 FTS AND-semantics).
             "Когда будет воркшоп по Postgres FTS?",
-            "Какие правила дизайна зафиксировали для интерфейса?",
-            "Где пройдет офлайн-встреча и какой нужен переходник?",
+            "Что про радиусы и кнопки в дизайн-системе?",
+            "Что про комнату на Тульской?",
         ],
     )
     async def test_same_seed_same_query_same_evidence_ids(
