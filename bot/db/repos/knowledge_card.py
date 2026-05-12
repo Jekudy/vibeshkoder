@@ -73,8 +73,16 @@ class KnowledgeCardRepo:
         session: AsyncSession,
         card_id: uuid.UUID,
     ) -> KnowledgeCard | None:
-        """Exact-id lookup (no status filter — caller decides visibility)."""
-        stmt = select(KnowledgeCard).where(KnowledgeCard.id == card_id)
+        """Exact-id lookup. Approved-only — draft/archived hidden.
+
+        Privacy: filter at SQL layer so no draft/archived metadata leaks
+        even if the caller forgets to post-check. Codex round 2 MED #1.
+        """
+        stmt = (
+            select(KnowledgeCard)
+            .where(KnowledgeCard.id == card_id)
+            .where(KnowledgeCard.card_status == "approved")
+        )
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -83,16 +91,20 @@ class KnowledgeCardRepo:
         session: AsyncSession,
         prefix: str,
     ) -> list[KnowledgeCard]:
-        """Prefix lookup for short-UUID resolution.
+        """Prefix lookup for short-UUID resolution. Approved-only.
 
-        Returns up to 2 rows so the caller can detect ambiguity without
-        scanning the full table. Empty/very-short prefix returns the first 2
-        matches in arbitrary order — admins should use longer prefixes
-        in practice.
+        Returns up to 2 approved rows so the caller can detect ambiguity
+        without scanning the full table. Empty/very-short prefix returns
+        the first 2 matches in arbitrary order — admins should use longer
+        prefixes in practice.
+
+        Privacy: SQL-layer filter on ``card_status='approved'``. Codex
+        round 2 MED #1.
         """
         stmt = (
             select(KnowledgeCard)
             .where(cast(KnowledgeCard.id, String).like(f"{prefix}%"))
+            .where(KnowledgeCard.card_status == "approved")
             .limit(2)
         )
         result = await session.execute(stmt)
