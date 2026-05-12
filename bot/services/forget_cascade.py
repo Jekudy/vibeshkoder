@@ -38,7 +38,7 @@ import logging
 import struct
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.engine import async_session
@@ -111,6 +111,12 @@ CASCADE_LAYER_ORDER: tuple[str, ...] = (
     "llm_synthesis_cache",
     "qa_traces_llm",
     "llm_usage_ledger",
+    # Phase 6 / T6-01 layer — PHASE6_PLAN.md §5.A.5 invariant:
+    # ``card_sources`` MUST run AFTER ``qa_traces_llm`` so qa_trace summaries
+    # are NULL'd before the card_source rows that the citation_ids referenced
+    # disappear. The card-sources cascade demotes affected cards to
+    # ``card_status='archived'`` when all their sources are forgotten.
+    "card_sources",
     "message_entities",
     "message_links",
     "attachments",
@@ -131,6 +137,11 @@ _LAYER_APPLICABLE_TARGET_TYPES: dict[str, frozenset[str]] = {
     "llm_synthesis_cache": frozenset({"message", "message_hash", "user"}),
     "qa_traces_llm": frozenset({"message", "message_hash", "user"}),
     "llm_usage_ledger": frozenset({"user"}),
+    # Phase 6 / T6-01 (PHASE6_PLAN.md §5.A.5): card_sources point at
+    # message_versions, so the same target_types as the Phase 5
+    # message-level layers apply. user-level forget propagates because
+    # card_sources can reference any message_version owned by the user.
+    "card_sources": frozenset({"message", "message_hash", "user"}),
 }
 
 
@@ -565,6 +576,190 @@ async def _cascade_llm_usage_ledger(session: AsyncSession, event) -> int:
     return result.rowcount or 0
 
 
+# ─── Phase 6 / T6-01 cascade layer (PHASE6_PLAN.md §5.A.5) ───────────────────
+
+
+async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
+    """Demote knowledge_cards whose sources are forgotten (PHASE6_PLAN §5.A.5).
+
+    For every ``message_version_id`` covered by this forget_event:
+
+    1. ``SELECT ... FOR UPDATE`` on every affected ``knowledge_cards`` row
+       (defence-in-depth row-level lock; primary serialization with
+       ``/approve`` runs at the ``apply_forget_event`` orchestrator level
+       via ``pg_advisory_xact_lock(_p6_mvid_advisory_lock_id(mvid))`` — the
+       advisory lock is taken there, NOT here).
+    2. DELETE every ``card_sources`` row whose ``message_version_id``
+       matches the forgotten version.
+    3. For each affected ``card_id``, recount remaining ``card_sources``
+       rows.
+    4. If remaining count == 0, demote the card:
+       ``card_status='archived'``,
+       ``archived_reason='all sources forgotten via cascade <forget_event_id>'``,
+       ``updated_at=now()``.
+    5. If remaining count > 0, leave the card alone (source unlinked,
+       partial attribution; flag for later admin review — out of scope).
+
+    Returns the number of ``card_sources`` rows deleted (not the number of
+    cards demoted).
+
+    **Privacy invariant:** ``archived_reason`` MUST NOT contain quoted
+    body content from the forgotten message — only the
+    ``forget_event_id`` reference. Body content is already redacted at
+    the ``message_versions`` cascade layer (which runs much earlier in
+    ``CASCADE_LAYER_ORDER``), but this function never reads the body in
+    the first place.
+
+    Run-order invariant: this function MUST run AFTER ``_cascade_qa_traces_llm``
+    (see ``CASCADE_LAYER_ORDER``) — qa_traces summaries that referenced the
+    cited card_source via ``citation_ids`` are NULL'd first, so removing
+    the card_source row cannot leave a dangling citation in a populated
+    summary.
+
+    Target type semantics:
+
+    * ``message`` — resolve the ``chat_message.current_version_id`` and
+      treat it as a single mvid. Earlier layers preserve
+      ``current_version_id`` so this lookup still succeeds.
+    * ``message_hash`` — resolve every ``message_version_id`` whose
+      ``content_hash`` matches; demote each affected card per the rules
+      above.
+    * ``user`` — resolve every ``message_version_id`` belonging to any of
+      the user's chat_messages; demote each affected card per the rules
+      above.
+    """
+    # Local import keeps the module import surface small for callers that
+    # only need Phase 1 layers (e.g. early-startup paths).
+    from bot.db.models import CardSource, KnowledgeCard
+
+    if event.target_id is None:
+        raise ValueError(
+            f"forget_event target_type={event.target_type!r} requires non-None target_id"
+        )
+
+    # ── Step A: resolve the set of message_version_ids covered by this event ──
+    if event.target_type == "message":
+        try:
+            cm_id = int(event.target_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"target_type='message' requires integer target_id; "
+                f"got {event.target_id!r}"
+            )
+        row = (
+            await session.execute(
+                select(ChatMessage.current_version_id).where(
+                    ChatMessage.id == cm_id
+                )
+            )
+        ).first()
+        if row is None or row[0] is None:
+            return 0
+        mvids = [int(row[0])]
+
+    elif event.target_type == "message_hash":
+        target_hash = str(event.target_id)
+        mvids = [
+            int(v)
+            for v in (
+                await session.execute(
+                    select(MessageVersion.id).where(
+                        MessageVersion.content_hash == target_hash
+                    )
+                )
+            ).scalars().all()
+        ]
+        if not mvids:
+            return 0
+
+    elif event.target_type == "user":
+        try:
+            telegram_id = int(event.target_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"target_type='user' requires integer target_id (telegram_id); "
+                f"got {event.target_id!r}"
+            )
+        mvids = [
+            int(v)
+            for v in (
+                await session.execute(
+                    select(MessageVersion.id)
+                    .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
+                    .where(ChatMessage.user_id == telegram_id)
+                )
+            ).scalars().all()
+        ]
+        if not mvids:
+            return 0
+
+    else:
+        raise ValueError(
+            f"_cascade_card_sources_on_forget: unsupported target_type="
+            f"{event.target_type!r}"
+        )
+
+    # ── Step B: gather affected card_ids and lock them FOR UPDATE ────────────
+    affected_card_ids = [
+        cid
+        for cid in (
+            await session.execute(
+                select(CardSource.card_id)
+                .where(CardSource.message_version_id.in_(mvids))
+                .distinct()
+            )
+        ).scalars().all()
+    ]
+    if not affected_card_ids:
+        return 0
+
+    # Defence-in-depth: row-lock affected cards before mutating card_sources.
+    # PHASE6_PLAN.md §5.A.5 step 1 — primary serialization is at the
+    # apply_forget_event orchestrator level, but this guards stragglers
+    # inserted under a PREVIOUS advisory lock that has since released.
+    await session.execute(
+        select(KnowledgeCard)
+        .where(KnowledgeCard.id.in_(affected_card_ids))
+        .with_for_update()
+    )
+
+    # ── Step C: DELETE matching card_sources rows ────────────────────────────
+    delete_result = await session.execute(
+        text(
+            "DELETE FROM card_sources WHERE message_version_id = ANY(:mvids)"
+        ),
+        {"mvids": mvids},
+    )
+    deleted_count = delete_result.rowcount or 0
+    await session.flush()
+
+    # ── Step D: per-card recount + demote when remaining == 0 ────────────────
+    # PHASE6_PLAN.md §5.A.5 privacy invariant: archived_reason carries only
+    # the forget_event_id reference, never quoted body content.
+    archived_reason = (
+        f"all sources forgotten via cascade {event.id}"
+    )
+    for card_id in affected_card_ids:
+        remaining = (
+            await session.execute(
+                select(CardSource).where(CardSource.card_id == card_id).limit(1)
+            )
+        ).scalar()
+        if remaining is None:
+            # All sources gone → demote.
+            await session.execute(
+                update(KnowledgeCard)
+                .where(KnowledgeCard.id == card_id)
+                .values(
+                    card_status="archived",
+                    archived_reason=archived_reason,
+                    updated_at=func.now(),
+                )
+            )
+    await session.flush()
+    return deleted_count
+
+
 # Map layer name → cascade function. Layers absent from this map are recorded as
 # skipped. When a future phase adds a layer's table, add its function here.
 _LAYER_FUNCS: dict[str, Any] = {
@@ -575,6 +770,8 @@ _LAYER_FUNCS: dict[str, Any] = {
     "llm_synthesis_cache": _cascade_llm_synthesis_cache,
     "qa_traces_llm": _cascade_qa_traces_llm,
     "llm_usage_ledger": _cascade_llm_usage_ledger,
+    # T6-01 Phase 6 layer — PHASE6_PLAN.md §5.A.5.
+    "card_sources": _cascade_card_sources_on_forget,
 }
 
 
