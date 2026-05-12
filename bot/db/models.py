@@ -19,12 +19,13 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Uuid,
     func,
     text,
 )
 import uuid as _uuid_module
 
-from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql.expression import ColumnElement
@@ -52,6 +53,37 @@ def _compile_search_vector_default(
     **kwargs,
 ) -> str:
     return "coalesce(normalized_text,'') || ' ' || coalesce(caption,'')"
+
+
+class KnowledgeCardBodyTsvExpression(ColumnElement[str]):
+    """Dialect-aware generated-column expression for ``knowledge_cards.body_tsv``.
+
+    PostgreSQL: ``to_tsvector('russian', coalesce(body_markdown, ''))`` —
+    matches the Phase 4 baseline (``message_versions.search_tsv`` and
+    PHASE6_PLAN.md §5.A Q4). SQLite (test fallback): the unparsed body
+    text, so Base.metadata.create_all does not fail on SQLite-only test
+    paths even though FTS itself is Postgres-only.
+    """
+
+    inherit_cache = True
+
+
+@compiles(KnowledgeCardBodyTsvExpression, "postgresql")
+def _compile_card_body_tsv_postgresql(
+    element: KnowledgeCardBodyTsvExpression,
+    compiler,
+    **kwargs,
+) -> str:
+    return "to_tsvector('russian', coalesce(body_markdown, ''))"
+
+
+@compiles(KnowledgeCardBodyTsvExpression)
+def _compile_card_body_tsv_default(
+    element: KnowledgeCardBodyTsvExpression,
+    compiler,
+    **kwargs,
+) -> str:
+    return "coalesce(body_markdown, '')"
 
 
 class Base(DeclarativeBase):
@@ -923,7 +955,7 @@ class ExtractionRun(Base):
     )
 
     id: Mapped[_uuid_module.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(),
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
@@ -977,10 +1009,13 @@ class ExtractionCandidate(Base):
             "status IN ('pending','approved','rejected','superseded')",
             name="ck_extraction_candidates_status",
         ),
+        # jsonb_typeof is Postgres-only — production runs on PG, so the
+        # invariant is enforced there. The CHECK is suppressed on SQLite
+        # so the test-helper ``Base.metadata.create_all`` path works.
         CheckConstraint(
             "jsonb_typeof(source_message_version_ids) = 'array'",
             name="ck_extraction_candidates_source_ids_is_array",
-        ),
+        ).ddl_if(dialect="postgresql"),
         CheckConstraint(
             "(status = 'pending' AND reviewed_by IS NULL AND reviewed_at IS NULL) OR "
             "(status IN ('approved','rejected','superseded') "
@@ -993,12 +1028,12 @@ class ExtractionCandidate(Base):
     )
 
     id: Mapped[_uuid_module.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(),
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
     extraction_run_id: Mapped[_uuid_module.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(),
         ForeignKey(
             "extraction_runs.id",
             name="fk_extraction_candidates_extraction_run_id",
@@ -1006,11 +1041,19 @@ class ExtractionCandidate(Base):
         ),
         nullable=True,
     )
-    candidate_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    source_message_version_ids: Mapped[list[int]] = mapped_column(
-        JSONB,
+    # JSONB on postgres (enables jsonb_typeof CHECK + future @> ops);
+    # JSON elsewhere for sqlite test compat.
+    candidate_json: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
         nullable=False,
-        server_default=text("'[]'::jsonb"),
+    )
+    source_message_version_ids: Mapped[list[int]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        # Default lives in alembic migration 031 (Postgres only:
+        # ``'[]'::jsonb``). The application always supplies a list at
+        # insert time (extractor / promotion); the migration's default
+        # only matters for ad-hoc inserts during ops.
     )
     status: Mapped[str] = mapped_column(Text, nullable=False)
     reviewed_by: Mapped[int | None] = mapped_column(
@@ -1071,18 +1114,15 @@ class KnowledgeCard(Base):
     )
 
     id: Mapped[_uuid_module.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(),
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
     title: Mapped[str] = mapped_column(Text, nullable=False)
     body_markdown: Mapped[str] = mapped_column(Text, nullable=False)
     body_tsv: Mapped[str | None] = mapped_column(
-        TSVECTOR(),
-        Computed(
-            "to_tsvector('russian', coalesce(body_markdown, ''))",
-            persisted=True,
-        ),
+        TSVECTOR().with_variant(Text(), "sqlite"),
+        Computed(KnowledgeCardBodyTsvExpression(), persisted=True),
         nullable=True,
     )
     card_status: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1143,12 +1183,12 @@ class CardSource(Base):
     )
 
     id: Mapped[_uuid_module.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(),
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
     card_id: Mapped[_uuid_module.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(),
         ForeignKey(
             "knowledge_cards.id",
             name="fk_card_sources_card_id",
@@ -1207,12 +1247,12 @@ class ExtractionDecision(Base):
     )
 
     id: Mapped[_uuid_module.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(),
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
     candidate_id: Mapped[_uuid_module.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        Uuid(),
         ForeignKey(
             "extraction_candidates.id",
             name="fk_extraction_decisions_candidate_id",
