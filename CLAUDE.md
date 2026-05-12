@@ -72,22 +72,19 @@ across Wave 0/1/2/3 (T5-W0-01..T5-05). Wave 3 = T5-05 eval harness (PR #229
 `5faea1d`). FHR Claude `deep-product-reviewer` ACCEPTED with 4 MEDIUM carryovers in
 closure PR. Phase 11 (Orch C) binding tests green on main.
 
-**Phase 6 (knowledge cards + admin review) — Sprint 0 RATIFIED 2026-05-12.** Plan
-promoted to `docs/memory-system/PHASE6_PLAN.md` with 5 migrations (030 extraction_runs,
-031 extraction_candidates, 032 knowledge_cards, 033 card_sources, 034
-extraction_decisions). Wave 1 authorized: T6-00 (FHR carryover M-1+M-4) + T6-01
-(schema) + T6-02 (extractor) + T6-03 (gateway extract_candidates). T6-03 must clear
-Phase 11 leakage binding test before merge. `card_revisions` and `card_relations`
-deferred to Phase 6.5/9. Phase 8 `memory_candidates` (reflection cluster queue)
-remains distinct from Phase 6 `extraction_candidates`.
+**Phase 6 (knowledge cards + admin review) — CLOSED 2026-05-12.** All 9 tickets merged
+across Wave 1 (T6-00..T6-03) + Wave 2 Stream C (T6-04, T6-05, T6-09 + cascade advisory
+lock wiring) + Stream D (T6-06, T6-07). T6-08 deferred (optional web cards page; no
+Phase 5 web scaffold). Forget cascade orchestrator advisory lock wiring closes H-Cdx-2
+race window via 3 layered defenses (per-mvid lock + event-level coarse lock + FOR SHARE
+row lock). Phase 11 binding 28/28 green (L1-L5 + L6a/b/c + C1-C4 + C5a-d + R1-R4 +
+I1-I4). FHR APPROVE — Phase 5 LLM gateway tombstone fix landed in same closure cycle
+(PR #259). Carryover issues for Phase 6.5: #260 _process_one_event rename, #261
+extractor running-row leak, #262 MED/LOW + deferred items.
 
-**Phase 6 Wave 1 IN PROGRESS** — T6-00 (FHR carryover) + T6-01 (schema 030-034 +
-`_p6_mvid_advisory_lock_id` helper + `_cascade_card_sources_on_forget` cascade) merged
-2026-05-12 via PRs #242 + #245. T6-02 (extractor + scheduler flag + /admin_extract
-handler + migration 035 operator_user_id) in PAR on branch `feat/p6-t6-02-extractor`.
-T6-03 (gateway extract_candidates) next. Phase 11 binding stays green on T6-03 sub-gate.
-Phase 11 follow-up #224: High #5 (httpx URL guard) merged PR #243; Critical #4 + High
-#1-#4 in flight.
+**Phase 11 follow-ups** all merged 2026-05-12: #224 (High #5 httpx guard PR #243,
+Critical #4 allowlist PR #247, High #1-#4 already on main), #219 seed_v1 quality
+(PR #253), #255 Phase 4 message-branch tombstone (PR #257).
 
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:

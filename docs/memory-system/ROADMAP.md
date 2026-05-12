@@ -32,12 +32,12 @@ phase 0 safety
 | 3 | Governance (`#nomem` / `#offrecord` / `/forget` / tombstones) | SKELETON DONE 2026-04-29 (T3-01..T3-05 merged in Phase 2 wave Charlie) | forbidden content excluded from future search/extraction/import           |
 | 4 | Hybrid search + Q&A with citations         | NO          | bot answers from evidence only or refuses; no LLM general knowledge       |
 | 5 | LLM gateway + answer synthesis (synthesis-first slice)        | **DONE 2026-05-11** (Orch A; canonical plan: `PHASE5_PLAN.md`; closure PR pending) | every LLM call logged in ledger; no forbidden source sent to LLM; flag-OFF Phase 4 byte-for-byte preserved (T5-W0-01..T5-05 merged; FHR ACCEPTED; extraction tables deferred to Phase 8 per §2 ratification) |
-| 6 | Knowledge cards + admin review             | **IN PROGRESS** (Wave 1) | T6-00 + T6-01 merged 2026-05-12 (PRs #242 + #245). T6-02 extractor in PAR. T6-03 next. `card_revisions` + `card_relations` deferred to Phase 6.5/9. active card requires source + admin approval |
+| 6 | Knowledge cards + admin review             | **CLOSED 2026-05-12** | All 9 tickets merged: T6-00..T6-03 (Wave 1) + T6-04/T6-05/T6-09 (Stream C) + T6-06/T6-07 (Stream D). T6-08 deferred. Migrations 030–035. Advisory lock H-Cdx-2 race window closed (3-layer defense). FHR APPROVE. Carryover #260/#261/#262 filed for Phase 6.5. |
 | 7 | Daily summaries                            | NO          | every bullet has source; forgotten source redacts bullet                  |
 | 8 | Weekly digest                              | NO          | reviewed sourced sections; no auto-publish                                |
 | 9 | Wiki (member / internal)                   | NO          | visibility filter + governance + source trace; public stays disabled      |
 | 10| Graph projection (Neo4j / Graphiti)        | NO          | derived only; rebuildable from postgres; forget purges graph              |
-| 11| Shkoderbench / evals                       | **DONE 2026-05-11** + follow-up #224 partial | leakage / citation / no-answer / no-LLM-imports tests in CI nightly (`evals.yml` + `lint-privacy.yml`). Follow-up #224: High #5 httpx URL guard merged PR #243 2026-05-12; Critical #4 + High #1-#4 in flight. |
+| 11| Shkoderbench / evals                       | **DONE 2026-05-11** + follow-ups all closed 2026-05-12 | leakage / citation / no-answer / no-LLM-imports tests in CI nightly (`evals.yml` + `lint-privacy.yml`). Follow-ups: #224 High #5 (PR #243), #224 Critical #4 (PR #247), #224 High #1-#4 (already on main), #219 seed_v1 quality (PR #253), #255 message-branch tombstone (PR #257). |
 | 12| Future butler — design-only                | NO          | docs only; no execution code                                              |
 
 ## Phase gates (must be true to advance)
@@ -78,3 +78,9 @@ Cannot parallelize without gate:
 - reactions before reactions table + handler
 - LLM extraction before `llm_gateway` + governance
 - wiki before review + source trace
+
+## Next phase
+
+Phase 6 closed 2026-05-12. Next: **Phase 7 (daily summaries)** — gated on Phase 6 closure (now satisfied). Phase 9 (wiki) + Phase 10 (graph projection) also unblocked per HANDOFF.md § dependencies.
+
+<!-- updated-by-superflow:2026-05-12 -->
