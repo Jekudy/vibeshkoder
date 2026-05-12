@@ -38,7 +38,7 @@ import logging
 import struct
 from typing import Any
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.engine import async_session
@@ -578,6 +578,11 @@ async def _cascade_llm_usage_ledger(session: AsyncSession, event) -> int:
 
 # ─── Phase 6 / T6-01 cascade layer (PHASE6_PLAN.md §5.A.5) ───────────────────
 
+# TODO(T6-04): orchestrator-level pg_advisory_xact_lock(_p6_mvid_advisory_lock_id(mvid))
+# MUST be acquired before this cascade runs. Currently relies on ORM-level
+# SELECT ... FOR UPDATE (step B) as defence-in-depth. See PHASE6_PLAN §5.A.5
+# step 1 + T6-04 acceptance.
+
 
 async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
     """Demote knowledge_cards whose sources are forgotten (PHASE6_PLAN §5.A.5).
@@ -725,10 +730,7 @@ async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
 
     # ── Step C: DELETE matching card_sources rows ────────────────────────────
     delete_result = await session.execute(
-        text(
-            "DELETE FROM card_sources WHERE message_version_id = ANY(:mvids)"
-        ),
-        {"mvids": mvids},
+        delete(CardSource).where(CardSource.message_version_id.in_(mvids))
     )
     deleted_count = delete_result.rowcount or 0
     await session.flush()
