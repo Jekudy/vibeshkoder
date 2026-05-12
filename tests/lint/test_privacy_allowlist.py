@@ -162,3 +162,41 @@ def test_narrowed_allowlist_only_permits_four_leakage_globs(tmp_path: Path) -> N
         + result.stdout
         + result.stderr
     )
+
+
+def test_duplicate_markers_in_same_file_are_counted(tmp_path: Path) -> None:
+    """When baseline has 1 occurrence of a marker in a file and the PR adds 2 more,
+    the lint must fail (count-semantics / multiset comparison).
+
+    With the old set-membership check (grep -F -x -q), all occurrences after the
+    first are silently exempted because the set already contains that path:content
+    string. This test guards against that regression.
+
+    Setup:
+    - commit 1 (base): 1 line with the marker in alembic/versions/001_init.py
+    - commit 2 (HEAD): 3 lines with the same marker in the same file (+2 new copies)
+
+    Expected: lint exits 1 and mentions at least one extra occurrence.
+    """
+    init_repo(tmp_path)
+
+    marker = "#" + "off" + "record"
+    base_line = f'COMMENT = "{marker} example"\n'
+
+    # Commit 1 (base): 1 occurrence.
+    write_file(tmp_path, "alembic/versions/001_init.py", base_line)
+    commit_all(tmp_path)
+
+    # Commit 2 (HEAD): 3 identical occurrences (+2 new copies).
+    write_file(tmp_path, "alembic/versions/001_init.py", base_line * 3)
+    commit_all(tmp_path)
+
+    result = run_lint(tmp_path)
+
+    assert result.returncode == 1, (
+        "duplicate markers in same file should fail (count semantics) but passed:\n"
+        + result.stdout
+        + result.stderr
+    )
+    # The output must mention the violation line at least once.
+    assert "alembic/versions/001_init.py:" in result.stdout
