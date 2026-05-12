@@ -978,6 +978,12 @@ class ExtractionRun(Base):
         ),
         nullable=True,
     )
+    # Admin who triggered the pass via /admin_extract (alembic 035).
+    # NULL when the pass was scheduler-driven (no operator). Stored as
+    # Telegram user id (no FK to users.id — see migration 035 rationale).
+    operator_user_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

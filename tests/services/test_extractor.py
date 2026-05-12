@@ -596,6 +596,88 @@ async def test_extraction_scheduler_tick_flag_false_skips(db_session) -> None:
 # ─── Test 8: scheduler flag — True runs the pass with phase_6_enabled_at ─────
 
 
+# ─── Codex HIGH #5: operator_user_id persisted on ExtractionRun ─────────────
+
+
+async def test_run_extraction_pass_persists_operator_user_id(db_session) -> None:
+    """When an admin invokes ``/admin_extract``, the resulting ExtractionRun
+    MUST persist the operator's Telegram user id in the DB column
+    ``operator_user_id`` — not just in a structured log. PHASE6_PLAN §5.C
+    requires a durable audit marker so reviewers can attribute an
+    extraction back to the operator who triggered it.
+
+    Scheduler-driven ticks remain ``operator_user_id=NULL`` (no operator).
+    """
+    from bot.db.models import ExtractionRun
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+    window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+    when = window_start + timedelta(minutes=5)
+    _, ver_id, _, _ = await _make_chat_message(db_session, when=when, text="alpha")
+    ledger_id = await _make_llm_usage_ledger_row(db_session)
+
+    gw = FakeGateway(
+        candidates_to_emit=[
+            {
+                "candidate_json": {"title": "ok", "body": "alpha"},
+                "source_message_version_ids": [ver_id],
+            }
+        ],
+        llm_usage_ledger_id=ledger_id,
+    )
+
+    operator_id = 7700700700
+    result = await run_extraction_pass(
+        db_session,
+        window_start=window_start,
+        window_end=window_end,
+        gateway=gw,
+        operator_user_id=operator_id,
+    )
+    assert result.run_status == "completed"
+    run_row = await db_session.get(ExtractionRun, result.extraction_run_id)
+    assert run_row is not None
+    assert run_row.operator_user_id == operator_id
+
+
+async def test_run_extraction_pass_operator_user_id_null_for_scheduler(
+    db_session,
+) -> None:
+    """Without an explicit operator_user_id (scheduler-driven tick), the
+    ExtractionRun.operator_user_id column MUST be NULL — the operator
+    audit marker is opt-in and absent by default."""
+    from bot.db.models import ExtractionRun
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+    window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+    when = window_start + timedelta(minutes=5)
+    _, ver_id, _, _ = await _make_chat_message(db_session, when=when, text="alpha")
+    ledger_id = await _make_llm_usage_ledger_row(db_session)
+
+    gw = FakeGateway(
+        candidates_to_emit=[
+            {
+                "candidate_json": {"title": "ok", "body": "alpha"},
+                "source_message_version_ids": [ver_id],
+            }
+        ],
+        llm_usage_ledger_id=ledger_id,
+    )
+
+    result = await run_extraction_pass(
+        db_session,
+        window_start=window_start,
+        window_end=window_end,
+        gateway=gw,
+    )
+    assert result.run_status == "completed"
+    run_row = await db_session.get(ExtractionRun, result.extraction_run_id)
+    assert run_row is not None
+    assert run_row.operator_user_id is None
+
+
 # ─── Codex HIGH #4: scheduler tick idempotency (advisory lock) ──────────────
 
 
