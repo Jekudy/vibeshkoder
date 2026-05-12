@@ -596,6 +596,73 @@ async def test_extraction_scheduler_tick_flag_false_skips(db_session) -> None:
 # ─── Test 8: scheduler flag — True runs the pass with phase_6_enabled_at ─────
 
 
+# ─── Codex HIGH #3: ExtractionRun atomic running → completed/failed lifecycle
+
+
+async def test_run_extraction_pass_records_failed_state_on_gateway_exception(
+    db_session,
+) -> None:
+    """If the gateway raises mid-pass (network blip, timeout, bug), an
+    ``ExtractionRun`` row MUST still be persisted with
+    ``run_status='failed'`` — no orphan/half-written runs, no leak of a
+    silent ``running`` row.
+
+    The extractor wraps the gateway call in try/except so the failed
+    audit row lands regardless of how the LLM call dies.
+    """
+    from bot.db.models import ExtractionRun
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+    window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+    when = window_start + timedelta(minutes=5)
+    _, ver_id, _, _ = await _make_chat_message(db_session, when=when, text="alpha")
+
+    @dataclass
+    class CrashingGateway:
+        calls: list = None  # type: ignore[assignment]
+
+        def __post_init__(self) -> None:
+            if self.calls is None:
+                self.calls = []
+
+        async def extract_candidates(
+            self,
+            session: Any,
+            *,
+            source_versions: list[dict[str, Any]],
+            prompt_template_version: str = "v0.1.0",
+        ) -> dict[str, Any]:
+            self.calls.append({"source_versions": list(source_versions)})
+            raise RuntimeError("simulated provider blip")
+
+    gw = CrashingGateway()
+    with pytest.raises(RuntimeError, match="simulated provider blip"):
+        await run_extraction_pass(
+            db_session,
+            window_start=window_start,
+            window_end=window_end,
+            gateway=gw,
+        )
+
+    # After the raised exception, an ExtractionRun row exists in the
+    # current transaction with run_status='failed' — the gateway crash
+    # is captured durably. This requires SAVEPOINT-style isolation so
+    # the failed UPDATE survives the gateway call's rollback.
+    rows = (
+        await db_session.execute(
+            select(ExtractionRun).where(
+                ExtractionRun.ingestion_window_start == window_start,
+                ExtractionRun.ingestion_window_end == window_end,
+            )
+        )
+    ).scalars().all()
+    assert len(rows) >= 1
+    failed = [r for r in rows if r.run_status == "failed"]
+    assert len(failed) >= 1
+    assert gw.calls  # gateway WAS invoked before the raise.
+
+
 # ─── Codex CRITICAL #3: SELECT→gateway race window ──────────────────────────
 
 

@@ -507,28 +507,74 @@ async def run_extraction_pass(
             candidate_count=0,
         )
 
-    source_payload = [row.to_gateway_payload() for row in rows]
-    gateway_result = await gateway.extract_candidates(
-        session,
-        source_versions=source_payload,
-        prompt_template_version=prompt_template_version,
+    # ─── Atomic 3-stage lifecycle (Codex HIGH #3) ─────────────────────────
+    # Stage 1: INSERT ExtractionRun with run_status='running' BEFORE the
+    # gateway call. The running row lives in the outer transaction so it
+    # survives a savepoint rollback below.
+    run = ExtractionRun(
+        ingestion_window_start=window_start,
+        ingestion_window_end=window_end,
+        candidate_count=0,
+        run_status="running",
     )
+    session.add(run)
+    await session.flush()
+
+    # Stage 2: gateway call wrapped in a SAVEPOINT. A raised exception
+    # rolls back the savepoint (no half-written candidates) but the
+    # running row inserted above remains visible in the outer
+    # transaction, so we can update it to 'failed' and surface the
+    # failure durably in the audit table.
+    source_payload = [row.to_gateway_payload() for row in rows]
+    try:
+        async with session.begin_nested():
+            gateway_result = await gateway.extract_candidates(
+                session,
+                source_versions=source_payload,
+                prompt_template_version=prompt_template_version,
+            )
+    except Exception as exc:
+        # Update running → failed, then re-raise so the caller knows
+        # the LLM call died. The audit row is intact.
+        run.run_status = "failed"
+        await session.flush()
+        logger.warning(
+            "extraction_pass_gateway_crashed",
+            extra={
+                "extraction_run_id": str(run.id),
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "operator_user_id": operator_user_id,
+                "exception": repr(exc),
+            },
+        )
+        raise
+
     candidates_raw = gateway_result.get("candidates", []) or []
     llm_usage_ledger_id = gateway_result.get("llm_usage_ledger_id")
 
     # Privacy invariant #4 (PHASE6_PLAN.md §8): an extraction run that
     # actually invoked the gateway MUST be associated with an
-    # llm_usage_ledger entry. The empty-bundle short-circuit above already
-    # returned without reaching this point — so here we're guaranteed a
-    # real gateway call happened. If the gateway returns no ledger id,
-    # the audit linkage is missing and the pass MUST fail closed (no
-    # candidates persisted, run_status='failed').
+    # llm_usage_ledger entry. If the gateway returns no ledger id, fail
+    # the existing running row in place — no orphan rows.
     if llm_usage_ledger_id is None:
-        return await _persist_failed_run(
-            session,
-            window_start=window_start,
-            window_end=window_end,
+        run.run_status = "failed"
+        await session.flush()
+        logger.warning(
+            "extraction_pass_aborted",
+            extra={
+                "extraction_run_id": str(run.id),
+                "failure_reason": "no_llm_ledger_entry",
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+            },
+        )
+        return ExtractionResult(
+            extraction_run_id=run.id,
+            run_status="failed",
+            candidate_count=0,
             failure_reason="no_llm_ledger_entry",
+            llm_usage_ledger_id=None,
         )
 
     candidate_objs: list[ExtractionCandidate] = []
@@ -543,14 +589,11 @@ async def run_extraction_pass(
             )
         )
 
-    run = ExtractionRun(
-        ingestion_window_start=window_start,
-        ingestion_window_end=window_end,
-        candidate_count=len(candidate_objs),
-        run_status="completed",
-        llm_usage_ledger_id=llm_usage_ledger_id,
-    )
-    session.add(run)
+    # Stage 3: UPDATE running → completed, populate stats, then INSERT
+    # candidate rows pointing at the now-completed run.
+    run.run_status = "completed"
+    run.candidate_count = len(candidate_objs)
+    run.llm_usage_ledger_id = llm_usage_ledger_id
     await session.flush()
 
     for cand in candidate_objs:
