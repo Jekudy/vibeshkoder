@@ -246,12 +246,22 @@ async def _select_eligible_sources(
     #   * ``message_hash:<content_hash>``      — emitted on cross-chat dedup
     #   * ``user:<telegram_id>``               — emitted by /forget me
     #
-    # The ``message_hash:`` key uses the same hash value stored on BOTH
-    # ``chat_messages.content_hash`` and ``message_versions.content_hash``
-    # (idempotency contract — same content → same SHA-256). Filtering on
-    # ``c.content_hash`` is therefore sufficient; no MV-level OR-clause
-    # needed. Keep this comment in sync with search.py / llm_gateway.py
-    # if any of the three target_type → tombstone_key conventions changes.
+    # The ``message_hash:`` key MUST match ``message_versions.content_hash``,
+    # NOT ``chat_messages.content_hash`` (Codex round 3 CRITICAL):
+    #
+    #   * ``MessageVersion.content_hash`` is NOT NULL (DB-enforced) — every
+    #     live message has it populated by ``MessageVersionRepo.insert_version``.
+    #   * ``ChatMessage.content_hash`` is nullable AND the live persistence
+    #     path (``bot/db/repos/message.py::MessageRepo.save``) never sets it —
+    #     only the import path (``bot/services/import_apply.py``) populates it.
+    #     Filtering on ``c.content_hash`` silently no-op's every
+    #     ``message_hash:`` tombstone for live messages, letting forgotten
+    #     content leak to the LLM.
+    #
+    # Keep this comment in sync with search.py / llm_gateway.py if any of the
+    # three target_type → tombstone_key conventions changes. Note: search.py
+    # has the same live-message bug (filed as a separate follow-up; out of
+    # scope for T6-02).
     base_predicate = """
         c.current_version_id = mv.id
         AND c.memory_policy = 'normal'
@@ -265,8 +275,8 @@ async def _select_eligible_sources(
             WHERE (
                 fe.tombstone_key = 'message:' || c.chat_id::text || ':' || c.message_id::text
                 OR (
-                    c.content_hash IS NOT NULL
-                    AND fe.tombstone_key = 'message_hash:' || c.content_hash
+                    mv.content_hash IS NOT NULL
+                    AND fe.tombstone_key = 'message_hash:' || mv.content_hash
                 )
                 OR (
                     c.user_id IS NOT NULL
@@ -411,20 +421,26 @@ async def _bundle_is_clean(
     # The join clauses match the cascade's tombstone_key construction
     # (see bot/services/forget_cascade.py): forget_reply emits
     # ``message:<chat>:<msg>``, /forget-me emits ``user:<tg_id>``, and
-    # message_hash tombstones use chat_messages.content_hash (the same
-    # hash value is also stored on message_versions.content_hash; both
-    # tables share the hash so filtering on c.content_hash is sufficient).
+    # message_hash tombstones MUST match against ``message_versions.content_hash``
+    # (NOT NULL by schema), not ``chat_messages.content_hash`` (NULL for
+    # live messages — see _select_eligible_sources comment for the
+    # full Codex round 3 CRITICAL rationale). We pin the JOIN to the
+    # row's CURRENT version via ``mv.id = c.current_version_id`` so the
+    # tombstone check sees exactly the same MV the bundle forwarded.
     chat_msg_ids = [row.chat_message_id for row in rows]
     result = await session.execute(
         text(
             """
             SELECT c.id AS chat_message_id
             FROM chat_messages AS c
+            JOIN message_versions AS mv
+              ON mv.chat_message_id = c.id
+             AND mv.id = c.current_version_id
             JOIN forget_events AS fe ON (
                 fe.tombstone_key = 'message:' || c.chat_id::text || ':' || c.message_id::text
                 OR (
-                    c.content_hash IS NOT NULL
-                    AND fe.tombstone_key = 'message_hash:' || c.content_hash
+                    mv.content_hash IS NOT NULL
+                    AND fe.tombstone_key = 'message_hash:' || mv.content_hash
                 )
                 OR (
                     c.user_id IS NOT NULL
