@@ -158,7 +158,7 @@ Phase 4 used ~018–021 and Phase 5 used 022–025. Phase 6 owns 030–034. Migr
 - `ingestion_window_end timestamptz`
 - `candidate_count int not null default 0`
 - `run_status text not null check (run_status in ('running','completed','failed'))`
-- `llm_usage_ledger_id uuid nullable` — FK to Phase 5 ledger when present.
+- `llm_usage_ledger_id bigint nullable` — FK to Phase 5 `llm_usage_ledger.id` (which is BIGINT in Phase 5 schema).
 - `created_at timestamptz not null default now()`
 
 Constraints:
@@ -507,7 +507,7 @@ Wave 3 (optional):     E
   - `card_status='approved'` cannot exist without `approved_by_user_id` + `approved_at`.
   - `card_sources` has `UNIQUE(card_id, message_version_id)` and reverse index on `message_version_id`.
   - `_cascade_card_sources_on_forget` extension wired per §5.A.5.
-  - Advisory-lock helper `_p6_mvid_advisory_lock_id(mvid: int) -> int` defined in `bot/services/forget_cascade.py` (or a shared `bot/services/_advisory_locks.py`): returns `signed_int64(sha256(f'p6:mvid:{mvid}'))`. MUST be used by BOTH `/approve` (§5.C step 2) and `_cascade_card_sources_on_forget` (§5.A.5 step 1) — single source of truth for the lock_id derivation. Unit-tested for determinism + signed-int64 range.
+  - Advisory-lock helper `_p6_mvid_advisory_lock_id(mvid: int) -> int` defined in `bot/services/forget_cascade.py` (or a shared `bot/services/_advisory_locks.py`): returns `signed_int64(sha256(f'p6:mvid:{mvid}'))`. MUST be the single source of truth for lock_id derivation — both `/approve` (§5.C step 2) and the forget-cascade orchestrator (§5.A.5 step 1) MUST import and call this same helper when computing the lock key. Note: the actual `pg_advisory_xact_lock(...)` call sites land in T6-04 (not T6-01); T6-01 delivers the helper and proves determinism + signed-int64 range via unit tests.
 - Dependencies: T6-00.
 - Stream: Wave 1 / Stream A.
 
@@ -551,6 +551,9 @@ Wave 3 (optional):     E
   - `/candidates` paginates pending candidates.
   - `/approve` atomically promotes candidate to approved card, inserts `card_sources` rows, and writes decision audit.
   - `/approve` re-runs deterministic governance filter on each candidate source `message_version_id` per §5.C / R3; BLOCKS promotion with explicit error when any source is no longer eligible (no LLM re-prompt).
+  - `/approve` handler MUST acquire `pg_advisory_xact_lock(_p6_mvid_advisory_lock_id(mvid))` for EVERY source `message_version_id` in candidate as first transaction step (§5.C step 2).
+  - The forget-cascade orchestrator (`_process_one_event` in `bot/services/forget_cascade.py` — the de-facto `apply_forget_event` per §5.A.5) MUST acquire `pg_advisory_xact_lock(_p6_mvid_advisory_lock_id(mvid))` for the affected `message_version_id` as the FIRST step of each event apply.
+  - T6-09 advisory-lock collision test MUST pass on T6-04 PR head.
   - `/reject` marks candidate rejected and writes `extraction_decisions.action='rejected'`.
 - Dependencies: T6-01, T6-02.
 - Stream: Wave 2 / Stream C.
