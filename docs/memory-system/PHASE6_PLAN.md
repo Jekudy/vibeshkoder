@@ -528,6 +528,14 @@ Wave 3 (optional):     E
   - Calls `run_extraction_pass(session, window_start=..., window_end=...)` directly, bypassing the scheduler flag.
   - Records an `ExtractionRun` row with explicit operator `user_id` audit marker.
   - Returns a summary message to the admin (candidates emitted, `run_status`, `llm_usage_ledger` entry id).
+- Notes / known limitations:
+  - **Router registration deferred to T6-03** alongside concrete gateway DI. Both `admin_extract.router` and the scheduler tick wire concrete `ExtractCandidatesGateway` via DI middleware — neither is registered in `bot/__main__.py` from T6-02 alone (T6-02 ships only the Protocol seam + handlers).
+  - **`phase_6_enabled_at` is not monotonic** (Codex MED #1). The value is `FeatureFlag.updated_at`, which regresses if the flag is toggled OFF → ON. This is intentional for the operator-explicit backfill workflow (Q5): re-enabling treats the new timestamp as the new lower bound, and operators cover any OFF window using `/admin_extract --window` for the gap. A durable monotonic watermark may be added in a follow-up if append-only audit is later required.
+  - **Atomic 3-stage lifecycle (Codex HIGH #3)**: `run_extraction_pass` INSERTs `run_status='running'` BEFORE the gateway call, wraps the call in `session.begin_nested()` (SAVEPOINT), and transitions to `completed` or `failed` based on outcome. Gateway crashes leave a durable `failed` audit row.
+  - **Privacy invariant #4 (Codex CRITICAL #1)**: if the gateway returns `llm_usage_ledger_id=None` with candidates, the pass fails closed (`failure_reason='no_llm_ledger_entry'`). Empty-bundle short-circuit (no gateway call) is exempt.
+  - **SELECT→gateway race guard (Codex CRITICAL #3)**: `_bundle_is_clean` re-queries `forget_events` for fresh tombstones AFTER `_select_eligible_sources` and BEFORE the gateway call. Closes the same race-window class as H-Cdx-2.
+  - **Scheduler tick idempotency (Codex HIGH #4)**: `extraction_scheduler_tick` acquires `pg_try_advisory_xact_lock` on `_p6_scheduler_lock_id()` (constant `p6:extraction_scheduler` namespace, disjoint from `p6:mvid:`). Second concurrent tick returns `skipped=True, reason='locked'`.
+  - **Operator audit marker (Codex HIGH #5 + alembic 035)**: `extraction_runs.operator_user_id BIGINT NULLABLE` durably records the admin who triggered `/admin_extract`. NULL = scheduler-driven.
 - Dependencies: T6-00, T6-01.
 - Stream: Wave 1 / Stream B.
 
@@ -539,6 +547,8 @@ Wave 3 (optional):     E
   - Every call is associated with the Phase 5 LLM usage ledger.
   - Output schema includes candidate payload and source `message_version_id`s.
   - Forbidden source content cannot be passed to the gateway.
+  - **Router registration**: register `bot.handlers.admin_extract.router` in `bot/__main__.py` `dp.include_routers(...)` adjacent to `admin.router` (deferred from T6-02 alongside the concrete gateway DI).
+  - **Gateway DI wiring**: wire the concrete `ExtractCandidatesGateway` instance into BOTH the `admin_extract` handler call site AND the `extraction_scheduler_tick` call site. Use the existing aiogram DI middleware pattern (same as the Phase 5 LLM gateway wiring) so per-request session + gateway both reach handlers as kwargs. The Protocol decorator `@runtime_checkable` (added in T6-02) enables a defensive `isinstance(gw, ExtractCandidatesGateway)` validation at wire time if desired.
   - **Phase 11 leakage binding test green on the T6-03 PR head before merge** — critical sub-gate per §6. The sub-gate requires ALL cases L1, L2, L3a, L3b, L3c, L4, L5 in `tests/evals/test_leakage.py::test_leakage_invariants` green, plus R1, R2, R3, R4 refusal cases (`tests/evals/test_refusal.py`) green. The CI nightly `evals.yml` workflow result alone is NOT sufficient — a re-run must be triggered on the T6-03 PR head specifically.
 - Dependencies: Phase 5 gateway/ledger, T6-00, T6-02.
 - Stream: Wave 1 / Stream B.

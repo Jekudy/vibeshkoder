@@ -238,6 +238,20 @@ async def _select_eligible_sources(
     ``run_extraction_pass`` invariant guard catches the leakage in that
     case and records the run as failed.
     """
+    # Tombstone matching mirrors bot/services/search.py and the cascade's
+    # tombstone_key construction in bot/services/forget_cascade.py +
+    # bot/services/import_tombstone.py:
+    #
+    #   * ``message:<chat_id>:<message_id>``   — emitted by /forget reply
+    #   * ``message_hash:<content_hash>``      — emitted on cross-chat dedup
+    #   * ``user:<telegram_id>``               — emitted by /forget me
+    #
+    # The ``message_hash:`` key uses the same hash value stored on BOTH
+    # ``chat_messages.content_hash`` and ``message_versions.content_hash``
+    # (idempotency contract — same content → same SHA-256). Filtering on
+    # ``c.content_hash`` is therefore sufficient; no MV-level OR-clause
+    # needed. Keep this comment in sync with search.py / llm_gateway.py
+    # if any of the three target_type → tombstone_key conventions changes.
     base_predicate = """
         c.current_version_id = mv.id
         AND c.memory_policy = 'normal'
@@ -690,6 +704,16 @@ async def _get_phase_6_enabled_at(session: AsyncSession) -> datetime | None:
     This is the forward-only lower bound (PHASE6_PLAN.md §5.B Q5). Missing
     row → no phase_6_enabled_at and the tick must skip (the flag is OFF
     by default).
+
+    Known semantic (Codex MED #1, deferred to T6-03 / Phase 6 follow-up):
+    the value here is ``FeatureFlag.updated_at``, which is NOT monotonic
+    — toggling the flag OFF → ON regresses the watermark to the latest
+    enable timestamp. This is intentional for the operator-explicit
+    backfill workflow (PHASE6_PLAN.md Q5): re-enabling the flag is
+    treated as "start fresh from this point". Operators who need to
+    cover the OFF window must use ``/admin_extract --window`` for the
+    gap. A future durable monotonic watermark may be added separately
+    if a non-overlapping append-only audit is required.
     """
     from bot.db.models import FeatureFlag
 
