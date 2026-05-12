@@ -370,3 +370,93 @@ async def test_cascade_completes_after_lock_acquisition(db_session) -> None:
     cm = await db_session.get(ChatMessage, cm_id)
     assert cm.is_redacted is True
     assert cm.text is None
+
+
+# ─── Codex round 2 MED #2 regression: lock-order before mvid resolution ─────
+
+
+async def test_process_one_event_locks_before_resolving_chat_messages(
+    db_session, monkeypatch
+) -> None:
+    """``_process_one_event`` MUST acquire its first advisory lock BEFORE any
+    SELECT against ``chat_messages`` or ``message_versions`` for mvid
+    resolution.
+
+    Codex round 2 MED #2 (regression for the CRITICAL #2 fix): the previous
+    implementation called ``_resolve_affected_mvids`` (which reads
+    chat_messages/message_versions) BEFORE acquiring ``pg_advisory_xact_lock``.
+    That violated the "lock before any read that informs cascade work"
+    discipline and opened a residual race window where ``/approve`` could
+    acquire locks for newly-created mvids the cascade had not yet seen,
+    write ``card_sources``, and commit — leaving the cascade with a stale
+    mvid list.
+
+    The CRITICAL #2 fix takes an event-level coarse advisory lock as the
+    FIRST DB action (before any cascade-related read), then resolves mvids
+    inside the locked region. This regression test pins that ordering via
+    mock interception of ``session.execute`` so any future refactor that
+    re-introduces the read-before-lock pattern fires the assertion.
+
+    Test approach: spy on ``session.execute`` for the entire run of
+    ``_process_one_event`` for a ``target_type='user'`` event, then verify
+    the timestamp ordering — first ``pg_advisory_xact_lock`` precedes the
+    first user-resolution SELECT (chat_messages JOIN message_versions on
+    user_id).
+    """
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services import forget_cascade
+
+    user = await _make_user(db_session)
+    for _ in range(2):
+        await _make_chat_message_with_v1(db_session, user_id=user)
+    ev = await _make_pending_forget_event(
+        db_session, target_type="user", target_id=str(user)
+    )
+    claimed = await ForgetEventRepo.mark_status(
+        db_session, ev.id, status="processing"
+    )
+
+    captured_sql: list[str] = []
+    original_execute = db_session.execute
+
+    async def spy_execute(stmt, *args, **kwargs):
+        try:
+            sql_text = str(stmt)
+        except Exception:
+            sql_text = repr(stmt)
+        captured_sql.append(sql_text)
+        return await original_execute(stmt, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", spy_execute)
+    await forget_cascade._process_one_event(db_session, claimed)
+
+    # First advisory lock index.
+    lock_idx = next(
+        (i for i, s in enumerate(captured_sql) if "pg_advisory_xact_lock" in s),
+        None,
+    )
+    assert lock_idx is not None, "expected at least one pg_advisory_xact_lock"
+
+    # First SELECT that joins chat_messages with message_versions (this is the
+    # signature of _resolve_affected_mvids for user-target). MUST come AFTER
+    # the lock.
+    resolve_idx = next(
+        (
+            i
+            for i, s in enumerate(captured_sql)
+            if (
+                "FROM message_versions" in s
+                and "chat_messages" in s
+                and "user_id" in s
+            )
+        ),
+        None,
+    )
+    assert resolve_idx is not None, (
+        "expected mvid-resolution SELECT against chat_messages JOIN "
+        "message_versions for user-target event"
+    )
+    assert lock_idx < resolve_idx, (
+        f"advisory lock at idx {lock_idx} MUST precede mvid-resolution SELECT "
+        f"at idx {resolve_idx}; SQL captured: {captured_sql}"
+    )
