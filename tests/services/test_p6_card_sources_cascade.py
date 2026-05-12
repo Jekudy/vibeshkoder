@@ -31,7 +31,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 pytestmark = pytest.mark.usefixtures("app_env")
 
@@ -260,7 +260,7 @@ async def test_card_with_remaining_sources_stays_approved(db_session) -> None:
 async def test_cascade_noops_for_card_with_no_matching_source(db_session) -> None:
     """Cards whose sources do NOT include the forgotten mvid are left
     untouched. Cascade rowcount is 0 for them."""
-    from bot.db.models import CardSource, ForgetEvent, KnowledgeCard
+    from bot.db.models import ForgetEvent, KnowledgeCard
     from bot.services.forget_cascade import _cascade_card_sources_on_forget
 
     cm_id_1, ver_id_1, _, _ = await _make_chat_message_with_v1(db_session)

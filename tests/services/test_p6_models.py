@@ -15,10 +15,9 @@ from __future__ import annotations
 import itertools
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import text
 
 pytestmark = pytest.mark.usefixtures("app_env")
 
