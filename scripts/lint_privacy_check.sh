@@ -10,6 +10,8 @@ is_allowed_path() {
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_nomem.*\.jsonl$ ]] && return 0
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_forgotten.*\.jsonl$ ]] && return 0
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_redacted.*\.jsonl$ ]] && return 0
+  # T6-03 design doc — describes privacy invariants by name; baseline-stable.
+  [[ "$path" == "docs/memory-system/T6-03_design.md" ]] && return 0
 
   # Phase 6+ design docs document privacy invariants verbatim — they must be
   # allowed to reference the canonical token names defined by the pattern

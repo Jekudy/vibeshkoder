@@ -32,7 +32,6 @@ from bot.services.llm_providers import (
 )
 from tests.services.test_llm_gateway import (
     FakeLedgerRepo,
-    FakeProvider,
     FakeSession,
     _config,
 )
