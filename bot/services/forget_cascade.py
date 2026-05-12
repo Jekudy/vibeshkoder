@@ -578,10 +578,12 @@ async def _cascade_llm_usage_ledger(session: AsyncSession, event) -> int:
 
 # ─── Phase 6 / T6-01 cascade layer (PHASE6_PLAN.md §5.A.5) ───────────────────
 
-# TODO(T6-04): orchestrator-level pg_advisory_xact_lock(_p6_mvid_advisory_lock_id(mvid))
-# MUST be acquired before this cascade runs. Currently relies on ORM-level
-# SELECT ... FOR UPDATE (step B) as defence-in-depth. See PHASE6_PLAN §5.A.5
-# step 1 + T6-04 acceptance.
+# Orchestrator-level ``pg_advisory_xact_lock(_p6_mvid_advisory_lock_id(mvid))``
+# is acquired by ``_process_one_event`` BEFORE this cascade runs (T6-04 /
+# PHASE6_PLAN §5.A.5 step 1). The lock is the canonical serialization point
+# with ``/approve``; the ORM-level ``SELECT ... FOR UPDATE`` here remains as
+# defence-in-depth for stragglers inserted under a previous advisory lock
+# that has since released.
 
 
 async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
@@ -777,6 +779,72 @@ _LAYER_FUNCS: dict[str, Any] = {
 }
 
 
+async def _resolve_affected_mvids(session: AsyncSession, event) -> list[int]:
+    """Resolve the set of ``message_version_id`` rows touched by a forget_event.
+
+    Pure resolver — does NOT mutate anything. Used by ``_process_one_event`` to
+    compute the advisory-lock key set BEFORE the first cascade layer runs
+    (PHASE6_PLAN §5.A.5 step 1 / T6-04 acceptance bullet 5).
+
+    Mirrors the resolution logic inline in ``_cascade_card_sources_on_forget``
+    (lines 645-700) but lives as a top-level helper so both call sites (P6
+    cascade demote + orchestrator lock acquisition) share one source of truth.
+
+    Returns:
+        list of mvids touched by the event. Empty for ``target_type='export'``
+        (cascade skipped) or when the target chat_message has no current
+        version. Empty list ⇒ no lock taken.
+    """
+    if event.target_type == "export":
+        # No mvids to lock; cascade is skipped entirely.
+        return []
+    if event.target_id is None:
+        return []
+
+    if event.target_type == "message":
+        try:
+            cm_id = int(event.target_id)
+        except (TypeError, ValueError):
+            return []
+        row = (
+            await session.execute(
+                select(ChatMessage.current_version_id).where(
+                    ChatMessage.id == cm_id
+                )
+            )
+        ).first()
+        if row is None or row[0] is None:
+            return []
+        return [int(row[0])]
+
+    if event.target_type == "message_hash":
+        target_hash = str(event.target_id)
+        rows = (
+            await session.execute(
+                select(MessageVersion.id).where(
+                    MessageVersion.content_hash == target_hash
+                )
+            )
+        ).scalars().all()
+        return [int(v) for v in rows]
+
+    if event.target_type == "user":
+        try:
+            telegram_id = int(event.target_id)
+        except (TypeError, ValueError):
+            return []
+        rows = (
+            await session.execute(
+                select(MessageVersion.id)
+                .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
+                .where(ChatMessage.user_id == telegram_id)
+            )
+        ).scalars().all()
+        return [int(v) for v in rows]
+
+    return []
+
+
 async def _process_one_event(session: AsyncSession, event) -> None:
     """Run the full cascade for a single (already-claimed) forget_event row.
 
@@ -795,6 +863,14 @@ async def _process_one_event(session: AsyncSession, event) -> None:
     transaction valid so ``run_cascade_worker_once`` can continue with the next
     event. Without the savepoint, a DB error would abort the outer transaction and
     subsequent events would fail with InFailedSQLTransactionError.
+
+    T6-04 (PHASE6_PLAN §5.A.5 step 1): the orchestrator acquires
+    ``pg_advisory_xact_lock(_p6_mvid_advisory_lock_id(mvid))`` for every
+    affected ``message_version_id`` BEFORE any cascade layer fires. Sorted
+    iteration ensures the same acquisition order as the ``/approve`` handler
+    so no deadlock is possible. Lock auto-releases on COMMIT/ROLLBACK of the
+    outer transaction. Closes H-Cdx-2 race window: ``/approve`` and cascade
+    cannot interleave on the same mvid set.
     """
     # Snapshot current per-layer progress so we can resume.
     cascade_state: dict[str, Any] = dict(event.cascade_status or {})
@@ -809,6 +885,20 @@ async def _process_one_event(session: AsyncSession, event) -> None:
     _SKIP_TARGET_TYPES = frozenset({"export"})
 
     try:
+        # T6-04: orchestrator-level advisory lock acquisition. MUST run before
+        # the cascade layer loop so /approve cannot land between this lock and
+        # the card_sources cascade. Dialect-guarded — SQLite test paths skip
+        # the lock (Postgres-only SQL); production always takes it.
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            affected_mvids = await _resolve_affected_mvids(session, event)
+            for lock_id in sorted(
+                _p6_mvid_advisory_lock_id(m) for m in affected_mvids
+            ):
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                    {"lock_id": lock_id},
+                )
+
         for layer in CASCADE_LAYER_ORDER:
             existing = cascade_state.get(layer)
             if isinstance(existing, dict) and existing.get("status") == "completed":
