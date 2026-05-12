@@ -58,7 +58,17 @@ async def _create_versioned_message(
     chat_is_redacted: bool = False,
     version_is_redacted: bool = False,
     message_id: int | None = None,
+    populate_chat_message_content_hash: bool = True,
 ) -> CreatedMessage:
+    """Create one (ChatMessage, MessageVersion) pair.
+
+    ``populate_chat_message_content_hash`` controls whether
+    ``chat_messages.content_hash`` is set. Default ``True`` mirrors the import
+    path (``bot/services/import_apply.py``). Pass ``False`` to simulate the live
+    persistence path (``bot/db/repos/message.py::MessageRepo.save``) which
+    leaves ``chat_messages.content_hash`` NULL while still populating
+    ``MessageVersion.content_hash``.
+    """
     from bot.db.models import ChatMessage, MessageVersion
     from bot.db.repos.user import UserRepo
 
@@ -83,7 +93,7 @@ async def _create_versioned_message(
         date=datetime.now(timezone.utc),
         memory_policy=memory_policy,
         is_redacted=chat_is_redacted,
-        content_hash=content_hash,
+        content_hash=content_hash if populate_chat_message_content_hash else None,
     )
     db_session.add(chat_message)
     await db_session.flush()
@@ -636,3 +646,106 @@ async def test_include_cards_default_is_true_per_spec(db_session) -> None:
     hits = await search_messages(db_session, "диковина14", chat_id=chat_id)
 
     assert any(h.source_type == "card" for h in hits)
+
+
+# ─── Codex round-2 CRITICAL regressions ─────────────────────────────────────
+# These tests pin down the bugs Codex flagged in the round-2 review of T6-06.
+# They MUST stay green after the fix in bot/services/search.py.
+
+
+async def test_card_tombstone_message_hash_filters_live_only_content_hash(
+    db_session,
+) -> None:
+    """CRITICAL #1: forget_event with ``message_hash:<mv.content_hash>`` MUST
+    block a card whose source row was persisted via the live path
+    (``chat_messages.content_hash IS NULL``, only
+    ``MessageVersion.content_hash`` populated).
+
+    The pre-fix SQL filtered on ``c2.content_hash`` (always NULL for live rows)
+    so the ``message_hash:`` tombstone silently no-op'd and the card surfaced.
+    Mirrors the same-class fix already landed in T6-02 (extractor.py).
+    """
+    from bot.services.search import search_messages
+
+    chat_id = -100_618
+    # Live persistence reality: chat_messages.content_hash IS NULL, only
+    # MessageVersion.content_hash populated. Without the fix the tombstone
+    # silently misses this card.
+    msg = await _create_versioned_message(
+        db_session,
+        chat_id=chat_id,
+        text="live-content-hash source",
+        populate_chat_message_content_hash=False,
+    )
+    await _create_approved_card(
+        db_session,
+        body_markdown="карточка live-only диковина20",
+        source_version_ids=(msg.version_id,),
+    )
+    await _create_forget_event(
+        db_session,
+        tombstone_key=f"message_hash:{msg.content_hash}",
+        target_type="message_hash",
+        target_id=msg.content_hash,
+        status="completed",
+    )
+
+    hits = await search_messages(
+        db_session, "диковина20", chat_id=chat_id, include_cards=True
+    )
+
+    assert [h for h in hits if h.source_type == "card"] == []
+
+
+async def test_card_with_partial_source_forget_no_cascade_yet(db_session) -> None:
+    """CRITICAL #2: tombstone ONE source of a 2-source card via a
+    ``message_hash:<mv.content_hash>`` forget_event WITHOUT running the
+    cascade. Both sources persisted via the live path
+    (``chat_messages.content_hash IS NULL``), so the buggy SQL would silently
+    no-op the tombstone match and surface the card.
+
+    The card MUST NOT surface — the search-side per-source defense-in-depth
+    re-checks every source against open forget_events at query time using
+    ``mv.content_hash`` (not ``c.content_hash``) and excludes the card
+    regardless of cascade timing.
+
+    Cross-references the eval suite's L6a but exercises the live-row /
+    ``message_hash:`` path that CRITICAL #1 fixes.
+    """
+    from bot.services.search import search_messages
+
+    chat_id = -100_619
+    src_a = await _create_versioned_message(
+        db_session,
+        chat_id=chat_id,
+        text="partial-forget source A",
+        populate_chat_message_content_hash=False,
+    )
+    src_b = await _create_versioned_message(
+        db_session,
+        chat_id=chat_id,
+        text="partial-forget source B",
+        populate_chat_message_content_hash=False,
+    )
+    await _create_approved_card(
+        db_session,
+        body_markdown="карточка partial-forget диковина21",
+        source_version_ids=(src_a.version_id, src_b.version_id),
+    )
+    # Tombstone ONE of TWO sources via message_hash: key, hitting the
+    # CRITICAL #1 path. Cascade is NOT run (no card_sources DELETE). Card
+    # stays approved with both sources still attached. Pre-fix SQL filters on
+    # c.content_hash (NULL for live rows) → tombstone silently no-op's.
+    await _create_forget_event(
+        db_session,
+        tombstone_key=f"message_hash:{src_a.content_hash}",
+        target_type="message_hash",
+        target_id=src_a.content_hash,
+        status="completed",
+    )
+
+    hits = await search_messages(
+        db_session, "диковина21", chat_id=chat_id, include_cards=True
+    )
+
+    assert [h for h in hits if h.source_type == "card"] == []
