@@ -598,10 +598,23 @@ async def run_extraction_pass(
             candidate_count=0,
         )
 
-    # ─── Atomic 3-stage lifecycle (Codex HIGH #3) ─────────────────────────
-    # Stage 1: INSERT ExtractionRun with run_status='running' BEFORE the
-    # gateway call. The running row lives in the outer transaction so it
-    # survives a savepoint rollback below.
+    # ─── Atomic 3-stage lifecycle (Codex HIGH #3 + round 3 HIGH) ──────────
+    # Stage 1: INSERT ExtractionRun with run_status='running' AND commit
+    # BEFORE the gateway call. Commit is required for crash-safety
+    # (Codex round 3 HIGH): a flushed-but-uncommitted row vanishes if
+    # the process is killed / OOMs / loses its connection mid-gateway,
+    # leaving no audit trail of the attempted pass. ``session.commit()``
+    # makes the row durable; the SAVEPOINT below isolates the gateway
+    # call so a gateway-side exception still leaves the durable
+    # 'running' row in place for the failed-status UPDATE.
+    #
+    # The same commit pattern is used by ``bot/services/import_apply.py``
+    # (per-chunk commits inside a longer logical run). It is compatible
+    # with the test fixture's outer-tx rollback semantics
+    # (``bind=conn`` + outer connection-level transaction in
+    # ``tests/conftest.py::db_session``): commits inside the function
+    # land at the connection level and are still unwound by the outer
+    # rollback at fixture teardown.
     run = ExtractionRun(
         ingestion_window_start=window_start,
         ingestion_window_end=window_end,
@@ -611,11 +624,16 @@ async def run_extraction_pass(
     )
     session.add(run)
     await session.flush()
+    # Crash-safety commit. Subsequent ORM access on ``run`` continues to
+    # work because both production (``bot/db/engine.py``) and tests
+    # (``tests/conftest.py``) configure ``expire_on_commit=False`` —
+    # ``run``'s attributes remain attached for the lifecycle UPDATEs.
+    await session.commit()
 
     # Stage 2: gateway call wrapped in a SAVEPOINT. A raised exception
     # rolls back the savepoint (no half-written candidates) but the
-    # running row inserted above remains visible in the outer
-    # transaction, so we can update it to 'failed' and surface the
+    # running row inserted above remains visible (and durable) in the
+    # outer transaction, so we can update it to 'failed' and surface the
     # failure durably in the audit table.
     source_payload = [row.to_gateway_payload() for row in rows]
     try:
