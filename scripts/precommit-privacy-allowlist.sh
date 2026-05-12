@@ -6,34 +6,12 @@ set -euo pipefail
 is_allowed_path() {
   local path="$1"
 
+  # §7 #5 formal allowlist: only the four leakage-test fixture globs.
+  # Everything else must be clean or appear in the baseline-diff (HEAD).
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_offrecord.*\.jsonl$ ]] && return 0
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_nomem.*\.jsonl$ ]] && return 0
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_forgotten.*\.jsonl$ ]] && return 0
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_redacted.*\.jsonl$ ]] && return 0
-  [[ "$path" =~ ^docs/.*\.md$ ]] && return 0
-  [[ "$path" =~ ^bot/services/governance\.py$ ]] && return 0
-  [[ "$path" =~ ^bot/services/message_persistence\.py$ ]] && return 0
-  [[ "$path" =~ ^bot/services/forget_cascade\.py$ ]] && return 0
-  [[ "$path" =~ ^bot/handlers/edited_message\.py$ ]] && return 0
-  [[ "$path" =~ ^bot/db/models\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/services/test_governance\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/handlers/.*test_chat_messages.*\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/handlers/test_qa\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/handlers/test_qa_llm_synthesis\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/handlers/test_qa_recall_phase4_preserved\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/services/test_forget_cascade\.py$ ]] && return 0
-  # Phase 6 / T6-01 — P6 cascade tests reference the cascade semantics in docstrings.
-  [[ "$path" =~ ^tests/services/test_p6_card_sources_cascade\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/services/test_p6_advisory_lock\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/services/test_llm_gateway\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/services/test_ingestion.*\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/services/test_import_apply\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/services/test_message_persistence\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/db/test_qa_trace\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/eval/test_qa_eval_cases\.py$ ]] && return 0
-  [[ "$path" =~ ^tests/fixtures/qa_eval_cases\.json$ ]] && return 0
-  [[ "$path" =~ ^tests/integration/.*\.py$ ]] && return 0
-  [[ "$path" =~ ^\.github/workflows/lint-privacy\.yml$ ]] && return 0
 
   return 1
 }
@@ -70,7 +48,8 @@ write_baseline_matches() {
   local grep_output
   local grep_status
   set +e
-  grep_output="$(git grep -I -n -E "$pattern" HEAD -- "${files[@]}")"
+  # No -n: path:content format so line-number shifts don't break matching.
+  grep_output="$(git grep -I -E "$pattern" HEAD -- "${files[@]}")"
   grep_status=$?
   set -e
 
@@ -111,7 +90,8 @@ main() {
   local grep_output
   local grep_status
   set +e
-  grep_output="$(git grep --cached -I -n -E "$pattern" -- "${files[@]}")"
+  # No -n: path:content format so line-number shifts don't break matching.
+  grep_output="$(git grep --cached -I -E "$pattern" -- "${files[@]}")"
   grep_status=$?
   set -e
 
