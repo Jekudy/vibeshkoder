@@ -232,3 +232,76 @@ async def test_different_mvids_dont_block(postgres_engine) -> None:
                 )
         finally:
             await trans_a.rollback()
+
+
+# ─── Test 6: event-level lock disjoint from mvid lock (Codex round 2 #2) ─────
+
+
+def test_p6_event_lock_id_distinct_from_mvid_lock_id() -> None:
+    """The event-level coarse lock namespace introduced for Codex round 2
+    CRITICAL #2 fix MUST hash to a distinct lock_id space from the per-mvid
+    locks. Otherwise the event lock could accidentally collide with an
+    unrelated mvid lock and serialize unrelated work.
+
+    Both lock derivations use ``sha256`` over their namespaced payload
+    (``p6:mvid:`` vs ``p6:event:``), so collisions are astronomically
+    improbable — this test pins the invariant against a future refactor
+    that, say, merges the namespaces or strips a prefix.
+    """
+    import uuid as _uuid_module
+
+    from bot.services.forget_cascade import (
+        _p6_event_advisory_lock_id,
+        _p6_mvid_advisory_lock_id,
+    )
+
+    # Use a deterministic UUID for reproducibility.
+    sample_event_id = _uuid_module.UUID("11111111-2222-3333-4444-555555555555")
+    event_lock = _p6_event_advisory_lock_id(sample_event_id)
+
+    # Compare against a handful of mvid lock ids. None should match.
+    for mvid in [0, 1, 42, 4_242, _SAMPLE_MVID, 2**31 - 1]:
+        assert event_lock != _p6_mvid_advisory_lock_id(mvid), (
+            f"event lock collided with mvid={mvid} lock id; namespaces "
+            "must be disjoint to avoid spurious cross-resource blocking"
+        )
+
+
+async def test_p6_event_lock_blocks_same_event_across_connections(
+    postgres_engine,
+) -> None:
+    """The event-level coarse lock blocks a second cascade worker that
+    races on the SAME ``forget_event.id`` — defense in depth on top of the
+    ``mark_status(processing)`` atomic claim.
+
+    Codex round 2 CRITICAL #2 fix introduces the event-level lock as the
+    FIRST DB action in ``_process_one_event``. Two concurrent transactions
+    targeting the same event hash to the same lock_id and serialize at
+    this gate before any mvid-level work begins.
+    """
+    import uuid as _uuid_module
+
+    from bot.services.forget_cascade import _p6_event_advisory_lock_id
+
+    sample_event_id = _uuid_module.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    lock_id = _p6_event_advisory_lock_id(sample_event_id)
+
+    async with postgres_engine.connect() as conn_a:
+        trans_a = await conn_a.begin()
+        try:
+            await conn_a.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": lock_id},
+            )
+            async with postgres_engine.connect() as conn_b:
+                result = await conn_b.execute(
+                    text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": lock_id},
+                )
+                acquired = result.scalar()
+                assert acquired is False, (
+                    "concurrent event-level lock acquisitions on the same "
+                    "event.id MUST serialize"
+                )
+        finally:
+            await trans_a.rollback()

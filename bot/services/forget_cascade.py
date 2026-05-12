@@ -91,6 +91,29 @@ def _p6_mvid_advisory_lock_id(mvid: int) -> int:
     (lock_id,) = struct.unpack(">q", digest[:8])
     return lock_id
 
+
+def _p6_event_advisory_lock_id(event_id) -> int:
+    """Derive the Phase 6 advisory lock id for a ``forget_event.id`` (UUID).
+
+    Coarse-grained gate per Codex round 2 CRITICAL #2 fix: the cascade
+    orchestrator (``_process_one_event``) takes this lock as the FIRST DB
+    action — BEFORE any read of ``chat_messages`` or ``message_versions``
+    to resolve affected mvids — so the discipline "lock before any read
+    that informs cascade work" is preserved.
+
+    This namespace is DISTINCT from ``_p6_mvid_advisory_lock_id`` (which
+    uses the ``"p6:mvid:"`` prefix) — different mvid and event ids cannot
+    collide. ``/approve`` does NOT take this lock; cross-transaction
+    serialization with /approve remains at the mvid-lock layer, which is
+    the contract pinned by the T6-09 collision test.
+
+    Returns a signed-int64 derived from the UUID's hex repr.
+    """
+    payload = f"p6:event:{event_id}".encode("ascii")
+    digest = hashlib.sha256(payload).digest()
+    (lock_id,) = struct.unpack(">q", digest[:8])
+    return lock_id
+
 # Feature flag key — read by the scheduler tick to decide whether to run the worker.
 CASCADE_WORKER_FLAG = "memory.forget.cascade_worker.enabled"
 
@@ -889,8 +912,45 @@ async def _process_one_event(session: AsyncSession, event) -> None:
         # the cascade layer loop so /approve cannot land between this lock and
         # the card_sources cascade. Dialect-guarded — SQLite test paths skip
         # the lock (Postgres-only SQL); production always takes it.
-        if session.bind is not None and session.bind.dialect.name == "postgresql":
+        #
+        # Codex round 2 CRITICAL #2: the event-level coarse lock is taken
+        # FIRST, BEFORE any DB read that informs the cascade work. The
+        # previous implementation called ``_resolve_affected_mvids`` (which
+        # reads chat_messages / message_versions) BEFORE acquiring any
+        # advisory lock, opening a race window where the resolved mvid set
+        # could become stale by the time the per-mvid locks were taken.
+        #
+        # Choice of fix (documented per Codex round 2 request): the
+        # event-level coarse lock is the SIMPLEST closure of the discipline
+        # gap. It guarantees "lock before any read that informs cascade
+        # work" without requiring a heavier user_id or content_hash lock
+        # namespace. The actual cross-tx serialization with /approve
+        # remains at the per-mvid layer (taken next), where it has always
+        # lived — this fix layers a coarse gate on top, not a replacement.
+        if (
+            session.bind is not None
+            and session.bind.dialect.name == "postgresql"
+            and event.target_type not in _SKIP_TARGET_TYPES
+        ):
+            # Step 1: coarse event-level lock — FIRST DB action. Disjoint
+            # namespace from per-mvid locks; cannot collide with /approve
+            # or with another event's cascade. Skipped for
+            # ``target_type='export'`` where the cascade has no work and
+            # no resources to serialize against (matches the original
+            # "no locks for skipped events" invariant pinned by
+            # ``test_process_one_event_no_lock_for_export``).
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": _p6_event_advisory_lock_id(event.id)},
+            )
+
+            # Step 2: canonical mvid resolution INSIDE the event-locked
+            # region. Now the resolution is the "lock-held read" the cascade
+            # uses to derive per-mvid lock keys.
             affected_mvids = await _resolve_affected_mvids(session, event)
+
+            # Step 3: per-mvid advisory locks (sorted) — matches the order
+            # /approve acquires them in, preserving deadlock-avoidance.
             for lock_id in sorted(
                 _p6_mvid_advisory_lock_id(m) for m in affected_mvids
             ):
