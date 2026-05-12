@@ -390,24 +390,15 @@ Deferral:
 
 T6-00 must land **before Wave 1** ships. It closes the Phase 5 FHR MEDIUM carryovers ratified in the Phase 5 closure PR.
 
-**M-1 — `synthesize_answer.qa_trace_id` invariant:**
+**M-1 — `synthesize_answer.qa_trace_id` Protocol-aligned annotation:**
 
-- File: `bot/services/llm_gateway.py:326`.
-- Change: add an explicit runtime check at the top of the `synthesize_answer` body (after the docstring, before any other logic):
+- File: `bot/services/llm_gateway.py:332`.
+- Change: tighten the annotation `qa_trace_id: int → qa_trace_id: int | None`. NO runtime guard.
+- Reason: the Sprint 0 round-1 design (runtime `raise ValueError(qa_trace_id is None)` guard) was reverted after T6-00 round-1 CI surfaced that Phase 5 T5-05 eval fixtures (`tests/eval/test_qa_llm_eval_cases.py`) deliberately pass `qa_trace_id=None` for 8 abstention-path coverage cases (empty bundle, all-filtered, budget exceeded, provider transient/permanent error, cache hit on filtered citation, citation hallucination, valid synthesis without persistence). These are valid gateway call paths — the downstream `LedgerRepoProtocol.record` Protocol surface accepts `qa_trace_id: int | None` (already shipped in T5-03; see `bot/services/llm_gateway.py:123`), and the gateway's `_ledger` closure forwards whatever it receives. A jealous runtime guard would break documented test coverage of abstention paths.
+- Production handler at `bot/handlers/qa.py:312–334` always creates the `QaTrace` row via `QaTraceRepo.create` BEFORE calling the gateway and passes `trace.id` (non-None) — this single-call-site contract is preserved at the handler layer, not enforced at the gateway boundary. Cascade FK direction (Codex Phase 5 round-1 HIGH 4 closure) is satisfied via the handler-layer invariant.
+- Update `synthesize_answer` docstring §Parameters to (a) state that `None` is permitted at the gateway boundary because the ledger Protocol surface accepts `int | None`, (b) cite the production single-call-site invariant, and (c) cite the test-fixture usage that motivates the `int | None` annotation.
 
-  ```python
-  if qa_trace_id is None:
-      raise ValueError(
-          "synthesize_answer: qa_trace_id is REQUIRED — handler must create "
-          "QaTrace via QaTraceRepo.create() BEFORE invoking this gateway "
-          "(see bot/handlers/qa.py:312-334 for the only call site contract)."
-      )
-  ```
-
-  `raise ValueError` (not `assert`) is mandatory: `assert` is stripped when Python runs under `python -O` / `PYTHONOPTIMIZE`, which would silently disable the invariant in any future production image that adopts optimization flags.
-- Type annotation stays `qa_trace_id: int` (no relaxation to `int | None`).
-- Reason: single call site verified — `bot/handlers/qa.py:312–334` creates the `QaTrace` via `QaTraceRepo.create` and passes `trace.id` to the gateway. The runtime check defends the invariant cheaply without leaking a nullable boundary upward.
-- Update `synthesize_answer` docstring §Parameters to call out the `raise ValueError` and the single-call-site invariant.
+Note on the Phase 5 FHR carryover wording: the original M-1 carryover said "tighten `qa_trace_id: int → int | None` OR add runtime `assert qa_trace_id is not None`". The OR was a genuine choice. Sprint 0 (commits `9590dfa`+`55eb677`) selected the runtime-guard branch; T6-00 round-1 CI revealed this conflicts with shipped test coverage. Selecting the annotation branch honors the FHR's first listed option and matches the existing T5-03 Protocol shape.
 
 **M-4 — direct cascade `message_hash` sub-case tests:**
 
@@ -441,7 +432,7 @@ T6-00 must land **before Wave 1** ships. It closes the Phase 5 FHR MEDIUM carryo
 
 | Stream | Owner | Scope | Deps |
 |---|---|---|---|
-| **T6-00** | Single ticket, must merge first | M-1 assert + docstring; M-4 direct cascade tests | Phase 5 closure (done) |
+| **T6-00** | Single ticket, must merge first | M-1 annotation `int → int | None` + docstring; M-4 direct cascade tests | Phase 5 closure (done) |
 
 ### Wave 1 — independent foundations (PARALLEL)
 
@@ -487,13 +478,14 @@ Wave 3 (optional):     E
 
 ### T6-00: Phase 5 FHR carryover (M-1 + M-4)
 
-- Scope: `bot/services/llm_gateway.py:326` runtime `raise ValueError(...)` guard; `synthesize_answer` docstring update; direct `_cascade_qa_traces_llm` + `_cascade_llm_synthesis_cache` `message_hash` sub-case tests with `llm_response_summary IS NULL` assertions.
+- Scope: `bot/services/llm_gateway.py:332` annotation tightening `qa_trace_id: int → int | None`; `synthesize_answer` docstring update; direct `_cascade_qa_traces_llm` + `_cascade_llm_synthesis_cache` `message_hash` sub-case tests with `llm_response_summary IS NULL` assertions + ledger budget aggregate preservation asserts.
 - Acceptance criteria:
-  - `if qa_trace_id is None: raise ValueError(...)` guard present at top of `synthesize_answer` body (NOT `assert`, which is stripped under `python -O` / `PYTHONOPTIMIZE`).
-  - `qa_trace_id` annotation remains `int` (not `int | None`).
-  - Docstring §Parameters mentions the `raise ValueError` guard and the single-call-site invariant.
+  - `qa_trace_id` annotation tightened to `int | None` matching `LedgerRepoProtocol.record` Protocol surface and existing T5-05 eval fixture coverage. No runtime guard.
+  - Docstring §Parameters explains: (a) `None` is permitted at the gateway boundary, (b) production handler `bot/handlers/qa.py:312-334` always passes non-None as a handler-layer invariant, (c) T5-05 abstention-path fixtures pass None.
   - Two new direct cascade tests added; both pass; both assert `llm_response_summary IS NULL` post-cascade.
+  - `_cascade_qa_traces_llm` test also asserts ledger budget aggregates (`cost_usd`, `tokens_in`, `tokens_out`, `latency_ms`) are preserved (this cascade scopes only `qa_traces`, not `llm_usage_ledger`).
   - Phase 11 binding suite remains green.
+  - All Phase 5 T5-05 eval cases (`tests/eval/test_qa_llm_eval_cases.py`) remain green — the abstention-path None inputs MUST continue to work.
 - Dependencies: none (closes Phase 5 FHR carryover).
 - Stream: Pre-Wave 1 (sequential, must land first).
 
