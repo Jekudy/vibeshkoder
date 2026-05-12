@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import itertools
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,6 +12,10 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# Module-local counter to seed unique admin telegram_ids for L6 cards;
+# every L6 parametrize call needs an admin for ``knowledge_cards.approved_by``.
+_admin_counter = itertools.count(start=1)
 
 SEED_CHAT_ID = -1001234567890
 L5_CHAT_ID = 1001
@@ -51,6 +56,8 @@ async def _clear_leakage_tables(session: AsyncSession) -> None:
             TRUNCATE TABLE
                 qa_traces,
                 offrecord_marks,
+                card_sources,
+                knowledge_cards,
                 message_versions,
                 chat_messages,
                 forget_events
@@ -170,6 +177,49 @@ async def _persist_via_handler(
     )
     await chat_messages_handler.save_chat_message(message, session)
     return await _fetch_persisted(session, chat_id=SEED_CHAT_ID, message_id=message_id)
+
+
+async def _create_approved_card(
+    session: AsyncSession,
+    *,
+    body_markdown: str,
+    source_version_ids: tuple[int, ...],
+    title: str = "Карточка",
+) -> Any:
+    """T6-06 helper: insert an approved knowledge_cards row + card_sources."""
+    models = importlib.import_module("bot.db.models")
+    user_repo = importlib.import_module("bot.db.repos.user")
+
+    # Admin must exist for the approved_by_user_id FK.
+    admin_id = 92_000_000 + next(_admin_counter)
+    await user_repo.UserRepo.upsert(
+        session,
+        telegram_id=admin_id,
+        username=f"l6_admin_{admin_id}",
+        first_name="L6Admin",
+        last_name=None,
+    )
+
+    card = models.KnowledgeCard(
+        title=title,
+        body_markdown=body_markdown,
+        card_status="approved",
+        approved_by_user_id=admin_id,
+        approved_at=datetime.now(timezone.utc),
+    )
+    session.add(card)
+    await session.flush()
+
+    for position, mvid in enumerate(source_version_ids):
+        session.add(
+            models.CardSource(
+                card_id=card.id,
+                message_version_id=mvid,
+                position=position,
+            )
+        )
+    await session.flush()
+    return card.id
 
 
 async def _persist_via_service(
@@ -351,6 +401,115 @@ async def _create_case(
         )
         return L5_CHAT_ID, "каппа", {other.version_id}
 
+    # ── T6-06 leakage cases for approved knowledge cards ─────────────────
+    # The L6 family verifies the search-side defense-in-depth that excludes
+    # an approved card when any of its sources has been forgotten / redacted
+    # / marked offrecord, even when the §5.A.5 cascade keeps the card
+    # ``approved`` (remaining_count > 0 after the loss).
+
+    if case_id == "L6a":
+        # L6a — 3-source approved card; forget ONE source. Cascade keeps the
+        # card approved (remaining_count > 0). Search-side guard MUST still
+        # exclude the card from /recall.
+        forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
+        sources = []
+        for idx in range(3):
+            src = await _persist_via_service(
+                session,
+                chat_id=SEED_CHAT_ID,
+                message_id=11_010 + idx,
+                user_id=91_010 + idx,
+                text_value=f"источник пси-{idx} люкс",
+            )
+            sources.append(src)
+        card_id = await _create_approved_card(
+            session,
+            body_markdown="карточка про люкс пси-сюжет",
+            source_version_ids=tuple(s.version_id for s in sources),
+        )
+        await forget_event_repo.ForgetEventRepo.create(
+            session,
+            target_type="message",
+            target_id=str(sources[0].message_id),
+            actor_user_id=None,
+            authorized_by="system",
+            tombstone_key=f"message:{sources[0].chat_id}:{sources[0].message_id}",
+        )
+        # mark completed so the cascade ran (or could have)
+        events = await session.execute(
+            text("SELECT id FROM forget_events ORDER BY id DESC LIMIT 1")
+        )
+        ev_id = events.scalar_one()
+        await forget_event_repo.ForgetEventRepo.mark_status(session, ev_id, status="processing")
+        await forget_event_repo.ForgetEventRepo.mark_status(session, ev_id, status="completed")
+        return SEED_CHAT_ID, "пси-сюжет", {card_id}
+
+    if case_id == "L6b":
+        # L6b — 3-source approved card; forget ALL sources. Cascade demotes
+        # the card to archived. Search must still exclude.
+        forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
+        sources = []
+        for idx in range(3):
+            src = await _persist_via_service(
+                session,
+                chat_id=SEED_CHAT_ID,
+                message_id=11_020 + idx,
+                user_id=91_020 + idx,
+                text_value=f"источник хи-{idx} люкс",
+            )
+            sources.append(src)
+        card_id = await _create_approved_card(
+            session,
+            body_markdown="карточка про люкс хи-сюжет",
+            source_version_ids=tuple(s.version_id for s in sources),
+        )
+        for src in sources:
+            await forget_event_repo.ForgetEventRepo.create(
+                session,
+                target_type="message",
+                target_id=str(src.message_id),
+                actor_user_id=None,
+                authorized_by="system",
+                tombstone_key=f"message:{src.chat_id}:{src.message_id}",
+            )
+            events = await session.execute(
+                text("SELECT id FROM forget_events ORDER BY id DESC LIMIT 1")
+            )
+            ev_id = events.scalar_one()
+            await forget_event_repo.ForgetEventRepo.mark_status(
+                session, ev_id, status="processing"
+            )
+            await forget_event_repo.ForgetEventRepo.mark_status(
+                session, ev_id, status="completed"
+            )
+        return SEED_CHAT_ID, "хи-сюжет", {card_id}
+
+    if case_id == "L6c":
+        # L6c — approved card whose source row gets manually marked
+        # ``is_redacted=TRUE`` (no forget_event issued). Search must still
+        # exclude the card via the defense-in-depth #2 subquery.
+        ChatMessage_local, _ = _model_classes()
+        sources = []
+        for idx in range(3):
+            src = await _persist_via_service(
+                session,
+                chat_id=SEED_CHAT_ID,
+                message_id=11_030 + idx,
+                user_id=91_030 + idx,
+                text_value=f"источник омикрон-{idx} люкс",
+            )
+            sources.append(src)
+        card_id = await _create_approved_card(
+            session,
+            body_markdown="карточка про люкс омикрон-сюжет",
+            source_version_ids=tuple(s.version_id for s in sources),
+        )
+        cm = await session.get(ChatMessage_local, sources[0].chat_message_id)
+        assert cm is not None
+        cm.is_redacted = True
+        await session.flush()
+        return SEED_CHAT_ID, "омикрон-сюжет", {card_id}
+
     raise AssertionError(f"unknown case id: {case_id}")
 
 
@@ -360,7 +519,7 @@ pytestmark = pytest.mark.asyncio(loop_scope="class")
 class TestRecallGovernanceLeakage:
     @pytest.mark.parametrize(
         "case_id",
-        ["L1", "L2", "L3a", "L3b", "L3c", "L4", "L5"],
+        ["L1", "L2", "L3a", "L3b", "L3c", "L4", "L5", "L6a", "L6b", "L6c"],
     )
     async def test_recall_governance_leakage(
         self,
@@ -379,7 +538,18 @@ class TestRecallGovernanceLeakage:
         )
 
         assert trace is None
-        assert set(bundle.evidence_ids).isdisjoint(blocked_ids)
-        if case_id == "L5":
-            assert bundle.items
-            assert all(item.chat_id == L5_CHAT_ID for item in bundle.items)
+        if case_id.startswith("L6"):
+            # L6 cases block CARDS (card_id UUIDs), not mvids. Even if Phase 4
+            # would otherwise return source-message hits, the card itself must
+            # never surface — assert no bundle.item has the blocked card_id.
+            returned_card_ids = {
+                item.card_id for item in bundle.items if item.source_type == "card"
+            }
+            assert returned_card_ids.isdisjoint(blocked_ids), (
+                f"{case_id}: card {blocked_ids & returned_card_ids} leaked into /recall"
+            )
+        else:
+            assert set(bundle.evidence_ids).isdisjoint(blocked_ids)
+            if case_id == "L5":
+                assert bundle.items
+                assert all(item.chat_id == L5_CHAT_ID for item in bundle.items)
