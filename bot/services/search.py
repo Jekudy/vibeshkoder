@@ -5,16 +5,16 @@ a UNION ALL of the Phase 4 message branch + an approved-knowledge-cards
 branch. The card branch enforces:
 
 1. ``card_status='approved'`` (governance gate per PHASE6_PLAN.md §1 #4).
-2. NO source has been forgotten (defense-in-depth NOT EXISTS over
+2. NO source has been tombstoned (defense-in-depth NOT EXISTS over
    ``card_sources`` → ``message_versions`` → ``chat_messages`` →
    ``forget_events`` with the canonical 3-status tombstone-key construction).
 3. NO source has ``memory_policy != 'normal'`` OR ``is_redacted=TRUE``
    (catches manual redaction without a ``forget_event``).
 
 The cascade rule (``_cascade_card_sources_on_forget``) demotes a card to
-``archived`` only when ALL sources are forgotten; T6-06 enforces stricter
+``archived`` only when ALL sources are tombstoned; T6-06 enforces stricter
 exclusion at the search boundary so ``/recall include_cards=True`` cannot
-return a card paraphrasing now-forgotten content before admin re-review.
+return a card paraphrasing now-tombstoned content before admin re-review.
 
 The default is ``include_cards=True`` per PHASE6_PLAN.md §5.D; passing
 ``include_cards=False`` preserves Phase 4 behaviour byte-for-byte (literal
