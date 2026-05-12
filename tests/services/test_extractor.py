@@ -148,6 +148,28 @@ async def _make_pending_forget_event(
     return ev.id
 
 
+async def _make_llm_usage_ledger_row(db_session) -> int:
+    """Insert a synthetic ``llm_usage_ledger`` row so FK refs satisfy.
+
+    Used by extractor tests that need to assert the ExtractionRun's
+    ``llm_usage_ledger_id`` is correctly populated; the row is otherwise
+    unused.
+    """
+    from bot.db.models import LlmUsageLedger
+
+    led = LlmUsageLedger(
+        provider="test-fake",
+        model="test-model",
+        prompt_hash=None,
+        response_hash=None,
+        tokens_in=0,
+        tokens_out=0,
+    )
+    db_session.add(led)
+    await db_session.flush()
+    return led.id
+
+
 # ─── Fake gateway implementations (Protocol seam) ────────────────────────────
 
 
@@ -202,6 +224,12 @@ async def test_run_extraction_pass_writes_candidates_and_completed_run(
         db_session, when=when, text="alpha fact"
     )
 
+    # NOTE: Privacy invariant #4 — gateway-emitted candidates MUST be
+    # paired with an llm_usage_ledger_id (see PHASE6_PLAN §8 and the
+    # null-ledger regression test below). Synthesize a real ledger row
+    # to satisfy the FK + invariant guard.
+    ledger_id = await _make_llm_usage_ledger_row(db_session)
+
     gw = FakeGateway(
         candidates_to_emit=[
             {
@@ -209,7 +237,7 @@ async def test_run_extraction_pass_writes_candidates_and_completed_run(
                 "source_message_version_ids": [ver_id],
             }
         ],
-        llm_usage_ledger_id=None,
+        llm_usage_ledger_id=ledger_id,
     )
 
     result = await run_extraction_pass(
@@ -221,6 +249,7 @@ async def test_run_extraction_pass_writes_candidates_and_completed_run(
 
     assert result.run_status == "completed"
     assert result.candidate_count == 1
+    assert result.llm_usage_ledger_id == ledger_id
     # Gateway was called exactly once.
     assert len(gw.calls) == 1
     assert ver_id in [
@@ -418,6 +447,7 @@ async def test_run_extraction_pass_excludes_messages_with_forget_tombstone(
         tombstone_key=f"message:{chat_id_f}:{msg_id_f}",
     )
 
+    ledger_id = await _make_llm_usage_ledger_row(db_session)
     gw = FakeGateway(
         candidates_to_emit=[
             {
@@ -425,6 +455,7 @@ async def test_run_extraction_pass_excludes_messages_with_forget_tombstone(
                 "source_message_version_ids": [ver_normal],
             }
         ],
+        llm_usage_ledger_id=ledger_id,
     )
 
     result = await run_extraction_pass(
@@ -565,6 +596,103 @@ async def test_extraction_scheduler_tick_flag_false_skips(db_session) -> None:
 # ─── Test 8: scheduler flag — True runs the pass with phase_6_enabled_at ─────
 
 
+# ─── Codex CRITICAL #1: ledger_id=None enforcement ──────────────────────────
+
+
+async def test_run_extraction_pass_fails_when_gateway_returns_null_ledger_id(
+    db_session,
+) -> None:
+    """Privacy invariant #4 (PHASE6_PLAN §8): an extraction run that
+    actually invoked the gateway MUST be associated with an
+    llm_usage_ledger entry. If the gateway returns ``llm_usage_ledger_id
+    is None`` while emitting candidates (i.e. a real LLM call happened
+    but the audit linkage is missing), the pass MUST fail closed:
+    ``run_status='failed'`` with reason ``no_llm_ledger_entry`` and NO
+    candidates persisted.
+
+    The empty-bundle short-circuit path (no gateway call) is exempt — it
+    legitimately produces ``llm_usage_ledger_id=None`` because no LLM
+    call was made.
+    """
+    from bot.db.models import ExtractionCandidate, ExtractionRun
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+    window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+    when = window_start + timedelta(minutes=5)
+    _, ver_id, _, _ = await _make_chat_message(db_session, when=when, text="alpha")
+
+    # Gateway returns candidates but ZERO ledger linkage — represents a
+    # buggy/misconfigured gateway path that must NOT silently persist
+    # un-audited extractions.
+    gw = FakeGateway(
+        candidates_to_emit=[
+            {
+                "candidate_json": {"title": "fact", "body": "alpha"},
+                "source_message_version_ids": [ver_id],
+            }
+        ],
+        llm_usage_ledger_id=None,
+    )
+
+    result = await run_extraction_pass(
+        db_session,
+        window_start=window_start,
+        window_end=window_end,
+        gateway=gw,
+    )
+
+    assert result.run_status == "failed"
+    assert result.failure_reason == "no_llm_ledger_entry"
+    assert result.candidate_count == 0
+    # Run row recorded as failed.
+    run_row = await db_session.get(ExtractionRun, result.extraction_run_id)
+    assert run_row is not None
+    assert run_row.run_status == "failed"
+    # No candidates persisted — gateway output is discarded on audit
+    # invariant violation.
+    cands = (
+        await db_session.execute(
+            select(ExtractionCandidate).where(
+                ExtractionCandidate.extraction_run_id == result.extraction_run_id
+            )
+        )
+    ).scalars().all()
+    assert cands == []
+
+
+async def test_run_extraction_pass_empty_bundle_skips_ledger_check(
+    db_session,
+) -> None:
+    """The empty-bundle short-circuit (no rows in window) must NOT trip
+    the ledger_id=None invariant guard — it's a legitimate no-op."""
+    from bot.db.models import ExtractionRun
+    from bot.services.extractor import run_extraction_pass
+
+    # Far-past window — no eligible rows; gateway should NOT be invoked
+    # at all.
+    window_start = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    window_end = datetime(2000, 1, 2, tzinfo=timezone.utc)
+
+    gw = FakeGateway(candidates_to_emit=[], llm_usage_ledger_id=None)
+    result = await run_extraction_pass(
+        db_session,
+        window_start=window_start,
+        window_end=window_end,
+        gateway=gw,
+    )
+    assert result.run_status == "completed"
+    assert gw.calls == []
+    # No "no_llm_ledger_entry" failure — empty bundle is exempt.
+    assert result.failure_reason is None
+    run_row = await db_session.get(ExtractionRun, result.extraction_run_id)
+    assert run_row is not None
+    assert run_row.run_status == "completed"
+
+
+# ─── Test 8: scheduler flag — True runs the pass with phase_6_enabled_at ─────
+
+
 async def test_extraction_scheduler_tick_flag_true_runs_pass(db_session) -> None:
     """When the scheduler flag is ON, the tick MUST run the pass with the
     flag row's ``updated_at`` as the forward-only lower bound (``window_start``).
@@ -587,6 +715,9 @@ async def test_extraction_scheduler_tick_flag_true_runs_pass(db_session) -> None
         db_session, when=when, text="post-enable msg"
     )
 
+    # Need a real ledger row to satisfy the privacy-invariant #4 guard
+    # (gateway-emitted candidates require an llm_usage_ledger_id).
+    ledger_id = await _make_llm_usage_ledger_row(db_session)
     gw = FakeGateway(
         candidates_to_emit=[
             {
@@ -594,6 +725,7 @@ async def test_extraction_scheduler_tick_flag_true_runs_pass(db_session) -> None
                 "source_message_version_ids": [ver_id],
             }
         ],
+        llm_usage_ledger_id=ledger_id,
     )
     # Pass an explicit ``now`` >> when to guarantee inclusion.
     result = await extraction_scheduler_tick(

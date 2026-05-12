@@ -459,6 +459,21 @@ async def run_extraction_pass(
     candidates_raw = gateway_result.get("candidates", []) or []
     llm_usage_ledger_id = gateway_result.get("llm_usage_ledger_id")
 
+    # Privacy invariant #4 (PHASE6_PLAN.md §8): an extraction run that
+    # actually invoked the gateway MUST be associated with an
+    # llm_usage_ledger entry. The empty-bundle short-circuit above already
+    # returned without reaching this point — so here we're guaranteed a
+    # real gateway call happened. If the gateway returns no ledger id,
+    # the audit linkage is missing and the pass MUST fail closed (no
+    # candidates persisted, run_status='failed').
+    if llm_usage_ledger_id is None:
+        return await _persist_failed_run(
+            session,
+            window_start=window_start,
+            window_end=window_end,
+            failure_reason="no_llm_ledger_entry",
+        )
+
     candidate_objs: list[ExtractionCandidate] = []
     for c in candidates_raw:
         candidate_objs.append(
