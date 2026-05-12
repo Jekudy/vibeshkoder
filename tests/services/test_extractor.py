@@ -596,6 +596,38 @@ async def test_extraction_scheduler_tick_flag_false_skips(db_session) -> None:
 # ─── Test 8: scheduler flag — True runs the pass with phase_6_enabled_at ─────
 
 
+# ─── Codex MED #2: ExtractCandidatesGateway runtime-checkable ──────────────
+
+
+def test_extract_candidates_gateway_protocol_is_runtime_checkable() -> None:
+    """The ``ExtractCandidatesGateway`` Protocol MUST carry the
+    ``@runtime_checkable`` decorator so T6-03 DI can validate gateway
+    instances with ``isinstance(gw, ExtractCandidatesGateway)``.
+
+    Without the decorator, ``isinstance(...)`` against a Protocol raises
+    ``TypeError``. We assert isinstance works against a duck-typed fake.
+    """
+    from bot.services.extractor import ExtractCandidatesGateway
+
+    class _DuckGateway:
+        async def extract_candidates(
+            self,
+            session: Any,
+            *,
+            source_versions: list[dict[str, Any]],
+            prompt_template_version: str = "v0.1.0",
+        ) -> dict[str, Any]:
+            return {"candidates": [], "llm_usage_ledger_id": None}
+
+    class _MissingMethod:
+        pass
+
+    # The bare isinstance call against the Protocol must NOT raise.
+    assert isinstance(_DuckGateway(), ExtractCandidatesGateway)
+    # And it must distinguish — missing extract_candidates → False.
+    assert not isinstance(_MissingMethod(), ExtractCandidatesGateway)
+
+
 # ─── Codex HIGH #5: operator_user_id persisted on ExtractionRun ─────────────
 
 

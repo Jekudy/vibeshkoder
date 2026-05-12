@@ -41,7 +41,7 @@ import struct
 import uuid as _uuid_module
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -110,6 +110,7 @@ MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG = "memory.extraction.scheduler.enabled"
 # ─── Protocol seam — concrete impl lands in T6-03 ────────────────────────────
 
 
+@runtime_checkable
 class ExtractCandidatesGateway(Protocol):
     """Typed contract for the Phase 6 LLM gateway extraction entry point.
 
@@ -121,6 +122,12 @@ class ExtractCandidatesGateway(Protocol):
     invariant #2: "no LLM calls outside ``llm_gateway``"). The extractor
     builds a privacy-cleared evidence bundle, hands it off, and persists
     whatever candidates the gateway emits — no raw provider SDK use.
+
+    ``@runtime_checkable`` enables T6-03 DI middleware to validate gateway
+    instances with ``isinstance(gw, ExtractCandidatesGateway)`` at wire
+    time. Note: ``isinstance`` checks only attribute presence, NOT
+    signatures — call-site contract enforcement still relies on static
+    typing.
     """
 
     async def extract_candidates(
