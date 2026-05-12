@@ -596,6 +596,79 @@ async def test_extraction_scheduler_tick_flag_false_skips(db_session) -> None:
 # ─── Test 8: scheduler flag — True runs the pass with phase_6_enabled_at ─────
 
 
+# ─── Codex CRITICAL #3: SELECT→gateway race window ──────────────────────────
+
+
+async def test_run_extraction_pass_rejects_bundle_when_fresh_forget_event_arrives(
+    db_session,
+) -> None:
+    """A ``forget_events`` row inserted AFTER ``_select_eligible_sources``
+    but BEFORE the gateway call MUST cause the bundle to be rejected.
+
+    The materialized ``memory_policy`` / ``is_redacted`` fields in the
+    bundle are point-in-time snapshots. Without a re-query of
+    ``forget_events`` inside ``_bundle_is_clean``, a forget event that
+    lands in this gap would leak forgotten content to the LLM. Same
+    class of race as H-Cdx-2.
+
+    We simulate the race by inserting the forget_event AFTER
+    ``_select_eligible_sources`` returns (the fake gateway is the seam
+    where the insert occurs — its first call is the proxy for "LLM
+    request about to start"). The bundle re-check inside
+    ``run_extraction_pass`` MUST see the fresh tombstone and refuse to
+    invoke the gateway, recording ``run_status='failed'``.
+    """
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services import extractor as ext_module
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+    window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+    when = window_start + timedelta(minutes=5)
+    cm_id, _, chat_id_v, msg_id_v = await _make_chat_message(
+        db_session, when=when, text="will-be-forgotten-mid-pass"
+    )
+
+    # Patch _select_eligible_sources to insert a forget_event AFTER the
+    # SELECT returns its eligible rows — modelling the race window.
+    original_select = ext_module._select_eligible_sources
+    raced = {"inserted": False}
+
+    async def racing_select(session, **kwargs):
+        rows = await original_select(session, **kwargs)
+        if not raced["inserted"]:
+            await ForgetEventRepo.create(
+                session,
+                target_type="message",
+                target_id=str(cm_id),
+                actor_user_id=None,
+                authorized_by="admin",
+                tombstone_key=f"message:{chat_id_v}:{msg_id_v}",
+            )
+            await session.flush()
+            raced["inserted"] = True
+        return rows
+
+    ext_module._select_eligible_sources = racing_select  # type: ignore[assignment]
+    try:
+        gw = FakeGateway(candidates_to_emit=[])
+        result = await run_extraction_pass(
+            db_session,
+            window_start=window_start,
+            window_end=window_end,
+            gateway=gw,
+        )
+    finally:
+        ext_module._select_eligible_sources = original_select  # type: ignore[assignment]
+
+    assert result.run_status == "failed"
+    # Reason must clearly identify the race-window cause for ops triage.
+    assert result.failure_reason is not None
+    assert "fresh_forget_event" in result.failure_reason
+    # Gateway must NOT have been called — privacy guard fired pre-call.
+    assert gw.calls == []
+
+
 # ─── Codex CRITICAL #1: ledger_id=None enforcement ──────────────────────────
 
 
