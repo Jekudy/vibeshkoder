@@ -181,9 +181,9 @@ async def migrated_database_url(temp_database_url: str) -> AsyncIterator[str]:
 async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str) -> None:
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
 
-    # T6-01 (alembic 030-034) advanced the head past 025. Assert the current
-    # head explicitly; revisit when future migrations land.
-    assert current == "034"
+    # T6-01 (030-034) + T6-02 (035 operator_user_id) advanced the head past 025.
+    # Assert the current head explicitly; revisit when future migrations land.
+    assert current == "035"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(
