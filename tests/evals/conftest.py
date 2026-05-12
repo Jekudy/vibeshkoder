@@ -16,6 +16,9 @@ from unittest.mock import Mock
 import pytest
 import pytest_asyncio
 
+from tests.evals._llm_guard import LLMNetworkCallDetected  # noqa: F401 (re-exported for tests)
+from tests.evals._llm_guard import make_llm_guard_hook
+
 SEED_ID = "golden_recall_v1"
 SEED_VERSION = 1
 SEED_CHAT_ID = -1001234567890
@@ -25,6 +28,46 @@ CHAT_HISTORY_PATH = SEED_DIR / "chat_history.jsonl"
 DEFAULT_LOCAL_POSTGRES_URL = (
     "postgresql+asyncpg://shkoder_dev:shkoder_dev@127.0.0.1:5433/shkoder_dev"
 )
+
+# ---------------------------------------------------------------------------
+# Phase 11 follow-up #224 High #5 — httpx URL/domain-level runtime guard
+# Guard logic lives in _llm_guard.py; this fixture installs it for all evals.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def httpx_llm_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Autouse fixture: installs the LLM network guard for every eval test.
+
+    Active only when ``EVAL_HARNESS_ENABLED`` is truthy.  Patches
+    ``httpx.Client`` and ``httpx.AsyncClient`` ``__init__`` so that every
+    instance created during a test has the guard hook prepended to its
+    ``request`` event-hooks list.  Any outbound call to a known LLM provider
+    hostname then raises ``LLMNetworkCallDetected`` before TCP I/O occurs.
+
+    When ``EVAL_HARNESS_ENABLED`` is absent the hook returned by
+    ``make_llm_guard_hook()`` is a no-op, so production gateway tests are
+    unaffected.
+    """
+    import httpx as _httpx
+
+    hook = make_llm_guard_hook()
+
+    original_client_init = _httpx.Client.__init__
+    original_async_client_init = _httpx.AsyncClient.__init__
+
+    def _patched_client_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_client_init(self, *args, **kwargs)
+        self.event_hooks["request"] = [hook] + list(self.event_hooks.get("request", []))
+
+    def _patched_async_client_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_async_client_init(self, *args, **kwargs)
+        self.event_hooks["request"] = [hook] + list(self.event_hooks.get("request", []))
+
+    monkeypatch.setattr(_httpx.Client, "__init__", _patched_client_init)
+    monkeypatch.setattr(_httpx.AsyncClient, "__init__", _patched_async_client_init)
+
+    yield
 
 
 @dataclass(frozen=True)
