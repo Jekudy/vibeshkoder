@@ -25,8 +25,6 @@ run in every environment where ``EVAL_HARNESS_ENABLED=1`` is set.
 from __future__ import annotations
 
 import asyncio
-import os
-
 import httpx
 import pytest
 
