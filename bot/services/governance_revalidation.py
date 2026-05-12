@@ -39,6 +39,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # the caller surfaces back to the admin — tombstone first (it implies the
 # source was already governance-cleared and then revoked), then redacted,
 # then memory_policy.
+#
+# Codex round 2 HIGH: ``FOR SHARE`` on message_versions blocks concurrent
+# writes (forget cascade UPDATEs to is_redacted, etc.) until the /approve
+# transaction commits. Without FOR SHARE the source row's state could be
+# stale between this read and the subsequent ``INSERT card_sources`` step,
+# narrowing but not closing the H-Cdx-2 race. FOR SHARE complements the
+# advisory lock by adding a row-level read lock on the actual data rows.
+# ``FOR SHARE NOWAIT`` is NOT used — we want to wait for the cascade to
+# finish if it grabbed the row first, then re-read its final state.
 _REVALIDATE_SQL = text(
     """
     WITH src AS (
@@ -54,6 +63,7 @@ _REVALIDATE_SQL = text(
         FROM message_versions AS mv
         JOIN chat_messages AS c ON c.id = mv.chat_message_id
         WHERE mv.id = :mvid
+        FOR SHARE OF mv, c
     ),
     tombstone_hit AS (
         SELECT fe.id AS forget_event_id
