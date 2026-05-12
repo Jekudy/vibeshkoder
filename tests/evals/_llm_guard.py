@@ -12,7 +12,6 @@ name while the test imports it under ``tests.evals.conftest``.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 from urllib.parse import urlparse
 
@@ -65,24 +64,25 @@ def _check_llm_hostname(request: Any, enabled: bool) -> None:
 def make_llm_guard_hook() -> Any:
     """Return a **synchronous** httpx event-hook for use with ``httpx.Client``.
 
-    When ``EVAL_HARNESS_ENABLED`` is absent or falsy the returned callable is
-    a no-op (returns ``None`` for every request).  This ensures the production
-    gateway — which legitimately calls httpx to LLM endpoints — is unaffected
-    in non-eval mode.
+    The returned hook is **always active** — it raises ``LLMNetworkCallDetected``
+    for any request targeting a known LLM provider hostname.  Environment-based
+    gating (``EVAL_HARNESS_ENABLED``) is the responsibility of the caller: the
+    ``httpx_llm_guard`` fixture in ``conftest.py`` installs this hook only when
+    the env var is truthy, leaving production gateway code unaffected in
+    non-eval mode.
 
-    When ``EVAL_HARNESS_ENABLED`` is truthy the hook inspects the request URL
-    and raises ``LLMNetworkCallDetected`` for any host in
-    ``LLM_GUARD_HOSTNAMES`` before any TCP connection is attempted.
+    Tests that need to verify the hook's blocking behaviour regardless of the
+    eval env can create their own ``httpx.Client`` with this hook installed
+    explicitly — no env var required.
 
     .. note::
         ``httpx.Client`` calls ``hook(request)`` (sync call).
         ``httpx.AsyncClient`` calls ``await hook(request)`` (coroutine required).
         Use :func:`make_async_llm_guard_hook` for ``AsyncClient`` instances.
     """
-    enabled = bool(os.environ.get("EVAL_HARNESS_ENABLED"))
 
     def _hook(request: Any) -> None:
-        return _check_llm_hostname(request, enabled)
+        return _check_llm_hostname(request, enabled=True)
 
     return _hook
 
@@ -96,11 +96,11 @@ def make_async_llm_guard_hook() -> Any:
     non-LLM async request.  This factory returns a proper ``async def`` hook
     so that both LLM-blocked and non-LLM (passthrough) paths are safe.
 
-    Same enable/disable semantics as :func:`make_llm_guard_hook`.
+    The returned hook is **always active**.  See :func:`make_llm_guard_hook`
+    for the env-gating design rationale.
     """
-    enabled = bool(os.environ.get("EVAL_HARNESS_ENABLED"))
 
     async def _async_hook(request: Any) -> None:
-        return _check_llm_hostname(request, enabled)
+        return _check_llm_hostname(request, enabled=True)
 
     return _async_hook

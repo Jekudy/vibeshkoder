@@ -45,10 +45,16 @@ def httpx_llm_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ``request`` event-hooks list.  Any outbound call to a known LLM provider
     hostname then raises ``LLMNetworkCallDetected`` before TCP I/O occurs.
 
-    When ``EVAL_HARNESS_ENABLED`` is absent the hook returned by
-    ``make_llm_guard_hook()`` is a no-op, so production gateway tests are
-    unaffected.
+    When ``EVAL_HARNESS_ENABLED`` is absent the fixture is a no-op — no
+    patching occurs, so production gateway tests are unaffected.  The hook
+    factories themselves (``make_llm_guard_hook`` / ``make_async_llm_guard_hook``)
+    are always active when called directly; env-gating lives here, not in the
+    factories.
     """
+    if not os.environ.get("EVAL_HARNESS_ENABLED"):
+        yield
+        return
+
     import httpx as _httpx
 
     # httpx.Client calls hook(request) synchronously; AsyncClient calls

@@ -79,26 +79,31 @@ def test_guard_positive_async_non_llm_call_is_allowed(httpx_llm_guard: None) -> 
         loop.close()
 
 
-def test_guard_negative_direct_httpx_to_llm_hostname_is_detected(
-    httpx_llm_guard: None,
-) -> None:
+def test_guard_negative_direct_httpx_to_llm_hostname_is_detected() -> None:
     """Negative: a direct httpx call to an LLM provider hostname is blocked.
 
     Simulates user-land code that bypasses the gateway and calls
     ``api.anthropic.com`` directly via ``httpx``.  The guard must raise
     ``LLMNetworkCallDetected`` before any real I/O occurs.
+
+    Uses an explicit hook on a local ``httpx.Client`` — environment-independent.
     """
-    with pytest.raises(LLMNetworkCallDetected, match="api.anthropic.com"):
-        httpx.post("https://api.anthropic.com/v1/messages", json={})
+    hook = make_llm_guard_hook()
+    with httpx.Client(event_hooks={"request": [hook]}) as client:
+        with pytest.raises(LLMNetworkCallDetected, match="api.anthropic.com"):
+            client.get("https://api.anthropic.com/v1/messages")
 
 
-def test_guard_negative_async_client_to_llm_hostname_is_detected(
-    httpx_llm_guard: None,
-) -> None:
-    """Negative (async): async httpx.AsyncClient also triggers the guard."""
+def test_guard_negative_async_client_to_llm_hostname_is_detected() -> None:
+    """Negative (async): async httpx.AsyncClient also triggers the guard.
+
+    Uses an explicit async hook on a local ``httpx.AsyncClient`` —
+    environment-independent.
+    """
+    async_hook = make_async_llm_guard_hook()
 
     async def _make_call() -> None:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(event_hooks={"request": [async_hook]}) as client:
             await client.post("https://api.openai.com/v1/chat/completions", json={})
 
     loop = asyncio.new_event_loop()
@@ -109,42 +114,51 @@ def test_guard_negative_async_client_to_llm_hostname_is_detected(
         loop.close()
 
 
-def test_guard_negative_google_gemini_hostname_is_detected(
-    httpx_llm_guard: None,
-) -> None:
-    """Negative: Gemini endpoint is also in the blocked domain list."""
-    with pytest.raises(LLMNetworkCallDetected, match="generativelanguage.googleapis.com"):
-        httpx.get("https://generativelanguage.googleapis.com/v1beta/models")
+def test_guard_negative_google_gemini_hostname_is_detected() -> None:
+    """Negative: Gemini endpoint is also in the blocked domain list.
 
-
-def test_guard_hook_factory_noop_without_eval_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Guard hook factory returns a no-op when EVAL_HARNESS_ENABLED is absent.
-
-    Directly exercises both the sync and async hook factories in the disabled
-    state — verifies they do not raise even for LLM hostnames.  This protects
-    production runtime: the gateway *must* be able to call httpx to LLM
-    endpoints in non-eval mode.
-
-    NOTE: this test does NOT use the ``httpx_llm_guard`` fixture — it
-    explicitly verifies the code-path taken when the guard is inactive.
+    Uses an explicit hook on a local ``httpx.Client`` — environment-independent.
     """
+    hook = make_llm_guard_hook()
+    with httpx.Client(event_hooks={"request": [hook]}) as client:
+        with pytest.raises(LLMNetworkCallDetected, match="generativelanguage.googleapis.com"):
+            client.get("https://generativelanguage.googleapis.com/v1beta/models")
+
+
+def test_guard_fixture_noop_without_eval_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guard fixture is a no-op when EVAL_HARNESS_ENABLED is absent.
+
+    Verifies that the autouse ``httpx_llm_guard`` fixture does NOT patch
+    ``httpx.Client.__init__`` when the env var is absent, so production
+    gateway code can call httpx to LLM endpoints unblocked in non-eval mode.
+
+    The hook factories themselves are always-active (env-gating removed); only
+    the fixture is env-gated.
+
+    NOTE: this test does NOT rely on the autouse ``httpx_llm_guard`` fixture —
+    it explicitly verifies the disabled code-path.
+    """
+    import httpx as _httpx
+
     monkeypatch.delenv("EVAL_HARNESS_ENABLED", raising=False)
 
-    sync_hook = make_llm_guard_hook()
-    async_hook = make_async_llm_guard_hook()
+    # Capture __init__ identities before any fixture patching.
+    original_client_init_id = id(_httpx.Client.__init__)
+    original_async_client_init_id = id(_httpx.AsyncClient.__init__)
 
+    # Sync hook factory is always-active — calling it directly raises for LLM URLs.
     fake_request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    sync_hook = make_llm_guard_hook()
+    with pytest.raises(LLMNetworkCallDetected):
+        sync_hook(fake_request)
 
-    # Sync hook must be a no-op — must not raise.
-    result = sync_hook(fake_request)
-    assert result is None
-
-    # Async hook must also be a no-op when awaited.
-    async def _await_hook() -> None:
-        return await async_hook(fake_request)
-
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(_await_hook())
-    finally:
-        loop.close()
+    # httpx.Client.__init__ must NOT have been patched (fixture is inactive without
+    # env var; the autouse fixture yields immediately when env var is absent).
+    assert id(_httpx.Client.__init__) == original_client_init_id, (
+        "httpx.Client.__init__ was patched without EVAL_HARNESS_ENABLED — "
+        "fixture env-gating is broken"
+    )
+    assert id(_httpx.AsyncClient.__init__) == original_async_client_init_id, (
+        "httpx.AsyncClient.__init__ was patched without EVAL_HARNESS_ENABLED — "
+        "fixture env-gating is broken"
+    )
