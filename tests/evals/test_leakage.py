@@ -403,7 +403,7 @@ async def _create_case(
 
     # ── T6-06 leakage cases for approved knowledge cards ─────────────────
     # The L6 family verifies the search-side defense-in-depth that excludes
-    # an approved card when any of its sources has been forgotten / redacted
+    # an approved card when any of its sources has been tombstoned / redacted
     # / marked offrecord, even when the §5.A.5 cascade keeps the card
     # ``approved`` (remaining_count > 0 after the loss).
 

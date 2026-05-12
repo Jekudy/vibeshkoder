@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from bot.db.models import (
     CardSource,
