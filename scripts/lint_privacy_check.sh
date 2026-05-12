@@ -138,23 +138,43 @@ main() {
   trap 'rm -f "${baseline_file:-}"' EXIT
   write_baseline_matches "$base_ref" "$pattern" "$baseline_file" "${files[@]}"
 
-  local has_violation=0
+  # Build an allowed-path-filtered version of current matches for multiset
+  # comparison.  Lines whose path is in the formal allowlist are excluded
+  # before the count comparison so they don't inflate the current count.
+  local current_file
+  current_file="$(mktemp)"
+  trap 'rm -f "${baseline_file:-}" "${current_file:-}"' EXIT
+
   local line
   local path
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     path="${line%%:*}"
-    if is_allowed_path "$path"; then
-      continue
-    fi
-    if grep -F -x -q -- "$line" "$baseline_file"; then
-      continue
-    fi
-    printf '%s\n' "$line"
-    has_violation=1
+    is_allowed_path "$path" && continue
+    printf '%s\n' "$line" >>"$current_file"
   done <<<"$grep_output"
 
-  return "$has_violation"
+  # Multiset comparison: report lines where current_count > baseline_count.
+  # Uses FILENAME-based file discrimination (not NR==FNR) so that an empty
+  # baseline file does not cause current lines to be misclassified as baseline.
+  local violations
+  violations="$(awk -v bfile="$baseline_file" '
+    FILENAME == bfile { baseline[$0]++; next }
+    {
+      if (baseline[$0] > 0) {
+        baseline[$0]--
+      } else {
+        print
+      }
+    }
+  ' "$baseline_file" "$current_file")"
+
+  if [[ -n "$violations" ]]; then
+    printf '%s\n' "$violations"
+    return 1
+  fi
+
+  return 0
 }
 
 main "$@"
