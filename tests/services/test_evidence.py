@@ -1,7 +1,9 @@
 import json
+import uuid
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -91,3 +93,173 @@ def test_evidence_ids_preserve_search_rank_order() -> None:
     bundle = EvidenceBundle.from_hits("hello", -100123, hits)
 
     assert bundle.evidence_ids == [102, 100, 101]
+
+
+# ─── T6-07: EvidenceItem source discriminator ────────────────────────────────
+
+
+def _now() -> datetime:
+    return datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+
+
+def test_evidence_item_phase4_construct_uses_default_source_type() -> None:
+    """Phase 4 callers construct without the new fields; defaults must trip."""
+    item = EvidenceItem(
+        message_version_id=1,
+        chat_message_id=2,
+        chat_id=-100123,
+        message_id=3,
+        user_id=42,
+        snippet="hi",
+        ts_rank=0.5,
+        captured_at=_now(),
+        message_date=_now(),
+    )
+
+    assert item.source_type == "message"
+    assert item.card_id is None
+    assert item.card_source_message_version_ids == ()
+
+
+def test_evidence_item_card_fields_accepted() -> None:
+    """Card evidence carries card_id + source mvid trace."""
+    card_id = uuid.uuid4()
+    item = EvidenceItem(
+        message_version_id=42,  # anchor source mvid
+        chat_message_id=2,
+        chat_id=-100123,
+        message_id=3,
+        user_id=None,
+        snippet="card snippet",
+        ts_rank=0.7,
+        captured_at=_now(),
+        message_date=_now(),
+        source_type="card",
+        card_id=card_id,
+        card_source_message_version_ids=(42, 43, 44),
+    )
+
+    assert item.source_type == "card"
+    assert item.card_id == card_id
+    assert item.card_source_message_version_ids == (42, 43, 44)
+
+
+def test_evidence_item_to_dict_message_default_shape() -> None:
+    """Message item dict contains the three new keys at default values."""
+    item = EvidenceItem(
+        message_version_id=1,
+        chat_message_id=2,
+        chat_id=-100123,
+        message_id=3,
+        user_id=42,
+        snippet="hi",
+        ts_rank=0.5,
+        captured_at=_now(),
+        message_date=_now(),
+    )
+
+    d = item.to_dict()
+
+    assert d["source_type"] == "message"
+    assert d["card_id"] is None
+    assert d["card_source_message_version_ids"] == []
+    # Phase 4 keys still present.
+    assert d["message_version_id"] == 1
+
+
+def test_evidence_item_to_dict_card_serializes_uuid_and_list() -> None:
+    card_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    item = EvidenceItem(
+        message_version_id=42,
+        chat_message_id=2,
+        chat_id=-100123,
+        message_id=3,
+        user_id=None,
+        snippet="card",
+        ts_rank=0.6,
+        captured_at=_now(),
+        message_date=_now(),
+        source_type="card",
+        card_id=card_id,
+        card_source_message_version_ids=(42, 43),
+    )
+
+    d = item.to_dict()
+
+    assert d["source_type"] == "card"
+    assert d["card_id"] == "12345678-1234-5678-1234-567812345678"
+    assert d["card_source_message_version_ids"] == [42, 43]
+
+
+def test_from_hits_propagates_card_fields_via_getattr() -> None:
+    """SearchHitLike with card fields → EvidenceItem propagates them."""
+    card_id = uuid.uuid4()
+    card_hit = SimpleNamespace(
+        message_version_id=42,
+        chat_message_id=2,
+        chat_id=-100123,
+        message_id=3,
+        user_id=None,
+        snippet="card",
+        ts_rank=0.7,
+        captured_at=_now(),
+        message_date=_now(),
+        source_type="card",
+        card_id=card_id,
+        card_source_message_version_ids=(42, 43, 44),
+    )
+
+    bundle = EvidenceBundle.from_hits("q", -100123, [card_hit])
+
+    assert len(bundle.items) == 1
+    assert bundle.items[0].source_type == "card"
+    assert bundle.items[0].card_id == card_id
+    assert bundle.items[0].card_source_message_version_ids == (42, 43, 44)
+
+
+def test_from_hits_pre_t6_06_hit_without_card_fields_defaults_to_message() -> None:
+    """SearchHit without source_type attr (pre-T6-06 fakes) → defaults trip."""
+    hit = _make_hit(0)  # plain SearchHit; even with new fields, pretend old:
+
+    # _make_hit creates a real SearchHit. After T6-06 it has defaults too — also
+    # check via a stripped-down namespace that doesn't carry the new attrs at all.
+    legacy_hit = SimpleNamespace(
+        message_version_id=hit.message_version_id,
+        chat_message_id=hit.chat_message_id,
+        chat_id=hit.chat_id,
+        message_id=hit.message_id,
+        user_id=hit.user_id,
+        snippet=hit.snippet,
+        ts_rank=hit.ts_rank,
+        captured_at=hit.captured_at,
+        message_date=hit.message_date,
+    )
+
+    bundle = EvidenceBundle.from_hits("q", -100123, [legacy_hit])
+
+    assert bundle.items[0].source_type == "message"
+    assert bundle.items[0].card_id is None
+    assert bundle.items[0].card_source_message_version_ids == ()
+
+
+def test_evidence_ids_returns_anchor_mvid_for_card_items() -> None:
+    """For card items, evidence_ids still resolves via message_version_id (anchor)."""
+    msg_hit = _make_hit(0)  # mvid=100
+    card_hit = SimpleNamespace(
+        message_version_id=200,
+        chat_message_id=2,
+        chat_id=-100123,
+        message_id=3,
+        user_id=None,
+        snippet="card",
+        ts_rank=0.7,
+        captured_at=_now(),
+        message_date=_now(),
+        source_type="card",
+        card_id=uuid.uuid4(),
+        card_source_message_version_ids=(200, 201, 202),
+    )
+
+    bundle = EvidenceBundle.from_hits("q", -100123, [card_hit, msg_hit])
+
+    assert bundle.evidence_ids == [200, 100]
