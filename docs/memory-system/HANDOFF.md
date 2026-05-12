@@ -712,7 +712,6 @@ this cycle. Implementing additional migrations without a ticket is out-of-scope 
 | `add_search_indexes_and_qa_traces`      | 4       | Phase 4 q&a.                                                   |
 | `add_reactions`                         | 5       | Phase 5; requires reactions handler first.                     |
 | `add_llm_usage_ledger`                  | 5       | Phase 5; requires `llm_gateway`.                               |
-| `add_extraction_runs` and downstream    | 5+      | Phase 5+ extraction.                                           |
 | `add_memory_events`                     | 5       | Phase 5.                                                       |
 | `add_observations`                      | 5       | Phase 5.                                                       |
 | `add_reflection_runs`                   | 5       | Phase 5.                                                       |
@@ -720,7 +719,7 @@ this cycle. Implementing additional migrations without a ticket is out-of-scope 
 | `add_extraction_runs` (030)             | 6       | Phase 6. See `PHASE6_PLAN.md` §5.A.                            |
 | `add_extraction_candidates` (031)       | 6       | Phase 6. Renamed from `memory_candidates` per Sprint 0 D2. Phase 8 keeps `memory_candidates` for reflection clusters (distinct concept). |
 | `add_knowledge_cards` (032)             | 6       | Phase 6 catalog. No inline `source_message_version_ids` column — sources live in `card_sources`. |
-| `add_card_sources` (033)                | 6       | Phase 6. FK-normalized card→message_versions link table. `card_relations` deferred to Phase 6.5/7; `card_revisions` deferred to Phase 6.5/9. |
+| `add_card_sources` (033)                | 6       | Phase 6. FK-normalized card→message_versions link table. `card_relations` deferred to Phase 6.5/9; `card_revisions` deferred to Phase 6.5/9. |
 | `add_extraction_decisions` (034)        | 6       | Phase 6 audit trail.                                           |
 | `add_summaries` / `add_summary_sources` | 7       | Phase 7.                                                       |
 | `add_digests` / `add_digest_sections`   | 8       | Phase 8.                                                       |
