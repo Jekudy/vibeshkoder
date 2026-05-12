@@ -438,13 +438,13 @@ Cannot parallelize without gate:
 ### Phase 6 — knowledge cards + admin review
 
 - **Objective:** curated catalog with review and source trace.
-- **Scope:** `memory_items`, `knowledge_cards`, `card_sources`, `card_relations`, review UI.
+- **Scope:** `extraction_runs`, `extraction_candidates`, `knowledge_cards`, `card_sources`, `extraction_decisions`, review UI. (See `PHASE6_PLAN.md` for the ratified Sprint 0 design; `card_revisions` and `card_relations` deferred to Phase 6.5/9.)
 - **Dependencies:** phase 5.
 - **Entry criteria:** candidates with source refs and admin actions.
 - **Exit criteria:** admin can approve cards with citations.
 - **Acceptance:** card cannot become active without source; visibility enforced.
 - **Risks:** extractions becoming "truth" without review.
-- **Rollback:** hide cards via status / flag.
+- **Rollback:** hide cards via status / flag (`card_status='archived'` with `archived_reason`); cascade demote on forget per `PHASE6_PLAN.md` §5.A.5.
 
 ### Phase 7 — daily summaries
 
@@ -717,10 +717,11 @@ this cycle. Implementing additional migrations without a ticket is out-of-scope 
 | `add_observations`                      | 5       | Phase 5.                                                       |
 | `add_reflection_runs`                   | 5       | Phase 5.                                                       |
 | `add_memory_candidates`                 | 5       | Phase 5.                                                       |
-| `add_memory_items`                      | 6       | Phase 6 catalog.                                               |
-| `add_knowledge_cards`                   | 6       | Phase 6 catalog.                                               |
-| `add_card_sources`                      | 6       | Phase 6.                                                       |
-| `add_card_relations`                    | 6       | Phase 6.                                                       |
+| `add_extraction_runs` (030)             | 6       | Phase 6. See `PHASE6_PLAN.md` §5.A.                            |
+| `add_extraction_candidates` (031)       | 6       | Phase 6. Renamed from `memory_candidates` per Sprint 0 D2. Phase 8 keeps `memory_candidates` for reflection clusters (distinct concept). |
+| `add_knowledge_cards` (032)             | 6       | Phase 6 catalog. No inline `source_message_version_ids` column — sources live in `card_sources`. |
+| `add_card_sources` (033)                | 6       | Phase 6. FK-normalized card→message_versions link table. `card_relations` deferred to Phase 6.5/7; `card_revisions` deferred to Phase 6.5/9. |
+| `add_extraction_decisions` (034)        | 6       | Phase 6 audit trail.                                           |
 | `add_summaries` / `add_summary_sources` | 7       | Phase 7.                                                       |
 | `add_digests` / `add_digest_sections`   | 8       | Phase 8.                                                       |
 | `add_graph_sync_runs`                   | 10      | Phase 10.                                                      |
