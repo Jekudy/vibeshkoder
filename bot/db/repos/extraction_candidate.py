@@ -43,14 +43,39 @@ class ExtractionCandidateRepo:
         return list(result.scalars().all())
 
     @staticmethod
+    async def get_by_id(
+        session: AsyncSession,
+        candidate_id: uuid.UUID,
+    ) -> ExtractionCandidate | None:
+        """Plain SELECT (no row lock) on the candidate.
+
+        Used by ``/approve`` step 1a to read ``source_message_version_ids``
+        BEFORE the per-mvid advisory locks are acquired. The actual row
+        lock is taken in step 1c via ``get_by_id_for_update`` — this method
+        exists so step 1a does not over-acquire the row lock outside the
+        serialization point with the forget cascade.
+
+        Returns ``None`` if the candidate does not exist.
+        """
+        stmt = select(ExtractionCandidate).where(
+            ExtractionCandidate.id == candidate_id
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    @staticmethod
     async def get_by_id_for_update(
         session: AsyncSession,
         candidate_id: uuid.UUID,
     ) -> ExtractionCandidate | None:
         """Lock the candidate row for the lifetime of the current transaction.
 
-        Step 1 of the §5.C 8-step protocol — ``SELECT ... FOR UPDATE`` prevents
-        a concurrent admin from racing the same ``/approve`` or ``/reject``.
+        Step 1c of the §5.C 8-step protocol — ``SELECT ... FOR UPDATE``
+        prevents a concurrent admin from racing the same ``/approve`` or
+        ``/reject``. Per Codex round 2 CRITICAL #1, this MUST be called
+        AFTER the per-mvid advisory locks are held (step 1b), otherwise
+        the FOR UPDATE read happens outside the lock-protected region and
+        the H-Cdx-2 race with the forget cascade re-opens.
 
         Returns ``None`` if the candidate does not exist (caller decides
         whether to raise or render a user-facing error).

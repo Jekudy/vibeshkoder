@@ -193,18 +193,36 @@ async def cmd_approve(
 ) -> None:
     """Admin-only atomic candidate → approved card promotion.
 
-    Implements the 8-step §5.C protocol verbatim:
+    Implements PHASE6_PLAN.md §5.C step ordering. Codex round 2 CRITICAL #1
+    rebound the original step 1+2 order — advisory locks MUST land BEFORE
+    the FOR UPDATE on the candidate, otherwise the FOR UPDATE read happens
+    outside the serialization point with the forget cascade and re-opens
+    the H-Cdx-2 race window.
 
-    1. SELECT FOR UPDATE on the candidate row.
-    2. Acquire pg_advisory_xact_lock on every source mvid.
-    3. Re-run deterministic governance check (tombstones + memory_policy +
-       is_redacted). On any failure → R3-block: NO extraction_decisions
-       row, structured log only, transaction rolls back.
-    4. (folded into step 3 via revalidate_sources)
-    5. INSERT knowledge_cards row (card_status='approved').
-    6. INSERT card_sources rows (one per mvid).
-    7. UPDATE extraction_candidates status='approved'.
-    8. INSERT extraction_decisions (action='approved' + audit shadow).
+    Revised step order (closes Codex round 2 CRITICAL #1):
+
+    1a. Plain SELECT on the candidate (no FOR UPDATE) to read
+        ``source_message_version_ids``. Read-only; cannot race the cascade.
+    1b. Acquire ``pg_advisory_xact_lock`` for every source mvid (sorted).
+        First serialization point with the forget-cascade orchestrator.
+    1c. SELECT FOR UPDATE on the candidate to lock the row for the rest of
+        the transaction. Now safe because the mvid-advisory locks are
+        already held: any concurrent forget cascade for the same mvids has
+        either run to completion (and the R3 check in step 3 will see the
+        tombstone) or is blocked on our advisory lock until /approve
+        commits or rolls back.
+    1d. Re-read the mvid set from the FOR UPDATE row. If
+        ``source_message_version_ids`` differs from the pre-lock read,
+        acquire advisory locks for the new mvids before continuing
+        (deterministic sorted order keeps the deadlock-avoidance
+        invariant with the cascade orchestrator).
+    3.  Re-run deterministic governance check (tombstones + memory_policy +
+        is_redacted). On any failure → R3-block: NO extraction_decisions
+        row, structured log only, transaction rolls back.
+    5.  INSERT knowledge_cards row (card_status='approved').
+    6.  INSERT card_sources rows (one per mvid).
+    7.  UPDATE extraction_candidates status='approved'.
+    8.  INSERT extraction_decisions (action='approved' + audit shadow).
     """
     if not _is_admin(message):
         return
@@ -224,11 +242,55 @@ async def cmd_approve(
         )
         return
 
-    # Step 1: lock the candidate row.
+    # Step 1a: plain (NO FOR UPDATE) read of the candidate's source mvids.
+    # This is a minimal read used only to populate the advisory-lock key
+    # set; the actual row lock is taken in step 1c. The read can race a
+    # concurrent /reject — but that's harmless because step 1c re-reads
+    # under FOR UPDATE and checks ``status == 'pending'`` before mutating.
+    initial_cand = await ExtractionCandidateRepo.get_by_id(
+        session, candidate_id
+    )
+    if initial_cand is None:
+        await message.answer(
+            f"❌ Candidate <code>{html.escape(str(candidate_id))}</code> not found.",
+            parse_mode="HTML",
+        )
+        return
+
+    initial_mvids = [
+        int(m) for m in (initial_cand.source_message_version_ids or [])
+    ]
+    if not initial_mvids:
+        await message.answer(
+            "❌ Approval blocked: candidate has empty source set.",
+            parse_mode="HTML",
+        )
+        logger.info(
+            "approve_blocked",
+            extra={
+                "event": "approve_blocked",
+                "candidate_id": str(candidate_id),
+                "admin_user_id": message.from_user.id,
+                "failure_reason": "empty_source_set",
+            },
+        )
+        return
+
+    # Step 1b: acquire per-mvid advisory locks BEFORE the FOR UPDATE on the
+    # candidate. This is the serialization point with the forget cascade
+    # (§5.A.5 step 1). The lock auto-releases on COMMIT/ROLLBACK. Sorted
+    # acquisition order matches the cascade's sort, guaranteeing no
+    # deadlock between the two protocols.
+    await _acquire_mvid_locks(session, initial_mvids)
+
+    # Step 1c: NOW safe to take FOR UPDATE on the candidate row. The mvid
+    # locks above prevent any concurrent forget cascade from mutating the
+    # same mvid set until this transaction commits.
     cand = await ExtractionCandidateRepo.get_by_id_for_update(
         session, candidate_id
     )
     if cand is None:
+        # Vanishingly rare: candidate deleted between 1a and 1c.
         await message.answer(
             f"❌ Candidate <code>{html.escape(str(candidate_id))}</code> not found.",
             parse_mode="HTML",
@@ -245,6 +307,9 @@ async def cmd_approve(
 
     mvids = [int(m) for m in (cand.source_message_version_ids or [])]
     if not mvids:
+        # Defensive: should never happen given 1a returned a non-empty set
+        # and the candidate row's source_message_version_ids is not mutated
+        # post-creation. If it does, treat as the empty-set blocking case.
         await message.answer(
             "❌ Approval blocked: candidate has empty source set.",
             parse_mode="HTML",
@@ -260,9 +325,14 @@ async def cmd_approve(
         )
         return
 
-    # Step 2: acquire advisory locks BEFORE step 3 — closes the H-Cdx-2 race
-    # window. Locks auto-release on COMMIT/ROLLBACK.
-    await _acquire_mvid_locks(session, mvids)
+    # Step 1d: if the canonical mvid set picked up any rows that step 1a
+    # missed, acquire advisory locks for the new mvids too. Sorted across
+    # the union to maintain deadlock-avoidance ordering. The candidate's
+    # source set is normally immutable after creation, so this is a
+    # defence-in-depth path.
+    new_mvids = [m for m in mvids if m not in set(initial_mvids)]
+    if new_mvids:
+        await _acquire_mvid_locks(session, new_mvids)
 
     # Step 3+4: deterministic governance re-validation (NO LLM re-prompt).
     status, payload = await revalidate_sources(session, mvids)
