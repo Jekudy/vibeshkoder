@@ -16,6 +16,10 @@ from pathlib import Path
 
 import pytest
 
+# Single source of truth: LLM_GUARD_HOSTNAMES in tests/evals/_llm_guard.py.
+# Imported here to avoid drift between the runtime guard and the AST check.
+from tests.evals._llm_guard import LLM_GUARD_HOSTNAMES as _LLM_GUARD_HOSTNAMES
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOT_ROOT = REPO_ROOT / "bot"
 
@@ -49,11 +53,6 @@ ALLOWED_LLM_IMPORT_FILES: frozenset[str] = frozenset(
 # are not the only way to call an LLM endpoint: a direct httpx / requests /
 # aiohttp call to a provider hostname would bypass the invariant-#2 contract
 # while passing the import-graph check. This domain list catches that.
-#
-# Single source of truth: LLM_GUARD_HOSTNAMES in tests/evals/_llm_guard.py.
-# Imported here to avoid drift between the runtime guard and the AST check.
-from tests.evals._llm_guard import LLM_GUARD_HOSTNAMES as _LLM_GUARD_HOSTNAMES
-
 LLM_PROVIDER_HOSTNAMES: tuple[str, ...] = tuple(sorted(_LLM_GUARD_HOSTNAMES))
 
 
