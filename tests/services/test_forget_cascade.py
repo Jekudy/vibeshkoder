@@ -1317,3 +1317,162 @@ async def test_cascade_user_target_invariant_no_surviving_cache_row(db_session) 
     rows = (await db_session.execute(sa_select(LlmSynthesisCache.citation_ids))).all()
     for (citation_ids,) in rows:
         assert vid not in (citation_ids or [])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# M-4 FHR carryover: direct target_type='message_hash' sub-case tests
+# Phase 5 FHR M-4: existing tests covered target_type='message' and 'user';
+# target_type='message_hash' branch had no direct sub-case for the two Phase 5
+# cascade functions. These tests close that coverage gap.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def test_cascade_qa_traces_llm_message_hash_subcase_nulls_summary(
+    db_session,
+) -> None:
+    """M-4 direct test: target_type='message_hash' cascade NULLs llm_response_summary.
+
+    Phase 5 FHR carryover M-4: existing cascade tests cover target_type='message'
+    and 'user'. This adds the missing target_type='message_hash' sub-case
+    for _cascade_qa_traces_llm with explicit assertion that llm_response_summary
+    becomes NULL post-cascade. Other audit fields (cost_usd, tokens, latency) are
+    preserved — only the response summary is NULLed.
+    """
+    from bot.db.models import ForgetEvent
+    from bot.db.repos.qa_trace import QaTraceRepo
+    from bot.services.forget_cascade import _cascade_qa_traces_llm
+
+    uid = _next_user()
+    await _make_user_raw(db_session, uid)
+    cm_id, vid = await _make_chat_message_with_v1_for_user(db_session, uid)
+
+    # Read the content_hash assigned to vid (set by _make_chat_message_with_v1_for_user).
+    from bot.db.models import MessageVersion
+    mv = await db_session.get(MessageVersion, vid)
+    content_hash = mv.content_hash
+    assert content_hash is not None
+
+    # Create a trace citing this version with a non-None llm_response_summary.
+    trace = await QaTraceRepo.create(
+        db_session,
+        user_tg_id=uid,
+        chat_id=_next_chat_id(),
+        query="q-mh",
+        evidence_ids=[vid],
+        abstained=False,
+        redact_query=False,
+    )
+    ledger_id = await _make_ledger_row_for_trace(db_session, qa_trace_id=trace.id)
+    await QaTraceRepo.update_llm_fields(
+        db_session,
+        qa_trace_id=trace.id,
+        llm_call_id=ledger_id,
+        llm_response_summary="answer about message_hash target",
+        llm_response_redacted=False,
+        cost_usd=Decimal("0.002"),
+    )
+
+    # Unrelated trace citing a different version — must be preserved.
+    other_trace = await QaTraceRepo.create(
+        db_session,
+        user_tg_id=uid,
+        chat_id=_next_chat_id(),
+        query="q-other-mh",
+        evidence_ids=[99998],
+        abstained=False,
+        redact_query=False,
+    )
+    other_ledger = await _make_ledger_row_for_trace(db_session, qa_trace_id=other_trace.id)
+    await QaTraceRepo.update_llm_fields(
+        db_session,
+        qa_trace_id=other_trace.id,
+        llm_call_id=other_ledger,
+        llm_response_summary="unrelated summary preserved",
+        llm_response_redacted=False,
+        cost_usd=Decimal("0.001"),
+    )
+
+    # Create forget_event with target_type='message_hash', target_id=content_hash.
+    event_id = await _make_pending_forget_event(
+        db_session,
+        target_type="message_hash",
+        target_id=content_hash,
+        tombstone_key=f"message_hash:{content_hash}:m4qa",
+    )
+    event = await db_session.get(ForgetEvent, event_id)
+
+    # Call the layer function directly.
+    rows_affected = await _cascade_qa_traces_llm(db_session, event)
+    await db_session.flush()
+
+    await db_session.refresh(trace)
+    await db_session.refresh(other_trace)
+
+    # Citing trace: llm_response_summary must be NULL after cascade.
+    assert trace.llm_response_summary is None, (
+        "M-4: llm_response_summary should be NULL after message_hash cascade"
+    )
+    # Unrelated trace: summary must be preserved.
+    assert other_trace.llm_response_summary == "unrelated summary preserved"
+    # At least one row was affected.
+    assert rows_affected >= 1
+
+
+async def test_cascade_llm_synthesis_cache_message_hash_subcase(
+    db_session,
+) -> None:
+    """M-4 direct test: target_type='message_hash' cascade invalidates synthesis cache.
+
+    Phase 5 FHR carryover M-4: same coverage gap for _cascade_llm_synthesis_cache.
+    Cache rows with citation_ids referencing a message_version whose content_hash
+    matches the forget_event target_hash MUST be invalidated (hard-deleted, per
+    Phase 5 cascade behaviour — SynthesisCacheRepo.invalidate_by_citation DELETE path).
+    Unrelated cache rows must survive.
+    """
+    from bot.db.models import ForgetEvent, LlmSynthesisCache, MessageVersion
+    from bot.services.forget_cascade import _cascade_llm_synthesis_cache
+    from sqlalchemy import select as sa_select
+
+    uid = _next_user()
+    await _make_user_raw(db_session, uid)
+    cm_id, vid = await _make_chat_message_with_v1_for_user(db_session, uid)
+
+    # Read the content_hash assigned to vid.
+    mv = await db_session.get(MessageVersion, vid)
+    content_hash = mv.content_hash
+    assert content_hash is not None
+
+    # Cache row citing the to-be-forgotten version — must be deleted.
+    target_cache_id = await _make_cache_row(
+        db_session, citation_ids=[vid], answer_text="cached answer for message_hash"
+    )
+    # Unrelated cache row — must survive.
+    unrelated_cache_id = await _make_cache_row(
+        db_session, citation_ids=[88888], answer_text="unrelated cache"
+    )
+
+    # Create forget_event with target_type='message_hash', target_id=content_hash.
+    event_id = await _make_pending_forget_event(
+        db_session,
+        target_type="message_hash",
+        target_id=content_hash,
+        tombstone_key=f"message_hash:{content_hash}:m4cache",
+    )
+    event = await db_session.get(ForgetEvent, event_id)
+
+    # Call the layer function directly.
+    rows_affected = await _cascade_llm_synthesis_cache(db_session, event)
+    await db_session.flush()
+
+    remaining_ids = (
+        await db_session.execute(sa_select(LlmSynthesisCache.id))
+    ).scalars().all()
+
+    # Target cache row must be deleted.
+    assert target_cache_id not in remaining_ids, (
+        "M-4: cache row citing message_hash target must be deleted after cascade"
+    )
+    # Unrelated cache row must survive.
+    assert unrelated_cache_id in remaining_ids
+    # At least one row was deleted.
+    assert rows_affected >= 1
