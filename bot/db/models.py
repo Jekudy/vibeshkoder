@@ -1056,7 +1056,7 @@ class ExtractionCandidate(Base):
     source_message_version_ids: Mapped[list[int]] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),
         nullable=False,
-        server_default=text("'[]'::jsonb"),
+        server_default="'[]'",  # align ORM with migration (PG migration uses ::jsonb cast)
     )
     status: Mapped[str] = mapped_column(Text, nullable=False)
     reviewed_by: Mapped[int | None] = mapped_column(
