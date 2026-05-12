@@ -142,7 +142,7 @@ Promotion to "authorized for implementation" requires:
 Phase 6 is authorized for implementation following Phase 5 closure 2026-05-11.
 Owned by Orchestrator A per the synthesis chain (Phase 5 → 6 → 7 → 8).
 
-Authorized scope (per `prompts/PHASE6_PLAN_DRAFT.md` until promoted to `PHASE6_PLAN.md`):
+Authorized scope (per `docs/memory-system/PHASE6_PLAN.md` (ratified 2026-05-12, see §Sprint 0 closure below)):
 - `extraction_runs` + `extraction_candidates` + `knowledge_cards` + `card_sources` + `extraction_decisions` tables / repos / handlers (`card_revisions` deferred to Phase 6.5/9; see PHASE6_PLAN.md §11)
 - Card extraction pipelines (using Phase 5 `llm_gateway` ONLY — no new LLM entry points)
 - Admin review surface for card approval / rejection

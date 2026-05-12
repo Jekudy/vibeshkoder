@@ -147,7 +147,7 @@ Phase 5 closed 2026-05-11 (commit `c7a10b4`). Phase 11 binding suite is ACTIVE �
 
 ### 5.A. Migrations
 
-Phase 4 used ~018–021 and Phase 5 used 022–025. Phase 6 owns 030–034.
+Phase 4 used ~018–021 and Phase 5 used 022–025. Phase 6 owns 030–034. Migration numbers 026–029 are reserved / intentionally unused — Phase 5 closure landed at 025, and Phase 6 starts at 030 to leave room for any post-Phase-5 hotfix migrations without forcing a renumber. If unused at Phase 6 close, the gap is documented in the Phase 6 closure PR as "reserved, no migrations issued".
 
 **030_add_extraction_runs**
 
@@ -192,7 +192,7 @@ Constraints:
 - `id uuid primary key`
 - `title text not null`
 - `body_markdown text not null` — stored as Telegram MarkdownV2 per Q1.
-- `body_tsv tsvector generated always as (to_tsvector('simple', coalesce(body_markdown, ''))) stored` — `'simple'` config matches Phase 4 hybrid-search baseline (no `russian` stemming dictionary; Q4).
+- `body_tsv tsvector generated always as (to_tsvector('russian', coalesce(body_markdown, ''))) stored` — `'russian'` config matches the Phase 4 baseline (`alembic/versions/020_add_message_versions_fts.py:36`, `021_align_message_versions_search_tsv.py:38,62`, `bot/db/models.py:43`); RU/EN mixed content is handled identically to `message_versions.search_tsv`.
 - `card_status text not null check (card_status in ('draft','approved','archived'))` — `deprecated` collapsed into `archived` per Q3.
 - `archived_reason text` — nullable; populated when `card_status='archived'`.
 - `approved_by_user_id bigint references users(id) on delete set null`
@@ -235,25 +235,27 @@ Rationale (D1): FK-normalized sources satisfy invariant #4 (governance-grade cit
 
 - `id uuid primary key`
 - `candidate_id uuid references extraction_candidates(id) on delete cascade`
-- `action text not null check (action in ('approved','rejected'))`
+- `action text not null check (action in ('approved','rejected'))` — log-only R3-block is NOT a decision (see §5.C / §8); no row is written when re-validation aborts approval.
 - `reason text`
-- `decided_by bigint references users(id) on delete set null`
+- `decided_by bigint references users(id) on delete set null` — soft-delete tolerant.
+- `decided_by_username text not null` — audit shadow, snapshot at decision time.
 - `decided_at timestamptz not null default now()`
 - `created_at timestamptz not null default now()`
+- `UNIQUE (candidate_id)` — exactly one terminal decision per candidate; appeals not in scope (see §11).
 
-Constraints:
-
-- Exactly one terminal decision per candidate unless a later ratified lifecycle adds appeals.
-- `decided_by` is required for human governance unless a system migration is explicitly approved.
+Note: `decided_by` is nullable to survive user soft-delete via `ON DELETE SET NULL`; `decided_by_username` preserves the human-readable audit trail. `UNIQUE(candidate_id)` enforces the single-terminal-decision invariant; if appeals are later required, the migration path is to add a `decision_seq INT` column and switch to a composite `UNIQUE(candidate_id, decision_seq)`.
 
 ### 5.A.5. Cascade extension on forget_events (`_cascade_card_sources_on_forget`)
 
 When a `forget_event` matches a `message_version_id` covered by any `card_sources` row, the cascade:
 
-1. DELETEs every `card_sources` row whose `message_version_id` matches the forgotten version.
-2. For each affected `card_id`, recounts remaining `card_sources` rows.
-3. If remaining count drops to **0**, demote the card: `card_status='archived'`, `archived_reason='all sources forgotten via cascade <forget_event_id>'`, `updated_at=now()`.
-4. If remaining count > 0, leave the card in its current state (the lost source is simply unlinked; card content may now be partially un-attributable — flag for later admin review).
+1. Acquires `SELECT ... FOR UPDATE` on every affected `knowledge_cards` row BEFORE mutating `card_sources` (serializes with concurrent `/approve` transactions; see H-Cdx-2 / §5.C protocol).
+2. DELETEs every `card_sources` row whose `message_version_id` matches the forgotten version.
+3. For each affected `card_id`, recounts remaining `card_sources` rows.
+4. If remaining count drops to **0**, demote the card: `card_status='archived'`, `archived_reason='all sources forgotten via cascade <forget_event_id>'`, `updated_at=now()`.
+5. If remaining count > 0, leave the card in its current state (the lost source is simply unlinked; card content may now be partially un-attributable — flag for later admin review).
+
+Implementation: lives in `bot/services/forget_cascade.py` alongside Phase 5 `_cascade_qa_traces_llm` / `_cascade_llm_synthesis_cache`. Invoked from the same `apply_forget_event(session, forget_event_id)` transaction; runs AFTER `_cascade_qa_traces_llm` (so `qa_traces` are NULL'd before card-source row deletion can affect citation_ids lookup) and BEFORE commit. The row-level lock on `knowledge_cards` in step 1 prevents a concurrent `/approve` from completing on a card whose sources are being cascaded.
 
 **Demote, not hard-delete (R2):** Cards are durable artifacts; demote to `archived` preserves audit trail. This is parallel to Phase 5's `_cascade_llm_synthesis_cache.invalidate_by_citation` but with demote semantics instead of hard-delete (Phase 5 cache rows are ephemeral; Phase 6 cards are not).
 
@@ -293,8 +295,33 @@ Commands (T6-04 + T6-05):
 
 - Runs in one DB transaction.
 - Changes `extraction_candidates.status` to `approved`, inserts `knowledge_cards` row with `card_status='approved'`, inserts one `card_sources` row per `message_version_id` from the candidate's staging `source_message_version_ids`, fills `approved_by_user_id` and `approved_at`, and writes `extraction_decisions.action='approved'`.
-- **Re-validates governance (R3):** for each candidate `message_version_id`, re-runs the deterministic governance filter (SQL only — **no LLM re-prompt**). If ANY source has `memory_policy != 'normal'` OR `is_redacted=true` OR is covered by a `forget_event` tombstone (newer than the candidate's `created_at`) → BLOCK approval with an explicit error message and abort the transaction.
+- **Re-validates governance (R3):** for each candidate `message_version_id`, re-runs the deterministic governance filter (SQL only — **no LLM re-prompt**). If ANY source has `memory_policy != 'normal'` OR `is_redacted=true` OR is covered by ANY matching `forget_event` tombstone (regardless of age) → BLOCK approval; abort the transaction; **NO `extraction_decisions` row is written** (R3-block is a precondition failure, not a decision — see M-Pro-4 below and §8). Structured log only.
 - Must reject promotion if the candidate has no source message versions.
+
+`/approve` transaction protocol:
+
+```
+BEGIN
+SELECT FOR UPDATE FROM extraction_candidates WHERE id = :candidate_id
+-- For each msg_version_id in candidate.source_message_version_ids JSON staging field:
+-- 1. Check forget_events for ANY matching tombstone (drop age filter):
+SELECT 1 FROM forget_events WHERE
+    (target_type='message_version' AND target_id = :mvid) OR
+    (target_type='message_hash' AND target_hash = (SELECT content_hash FROM message_versions WHERE id = :mvid)) OR
+    (target_type='message' AND chat_id = :chat AND message_id = :mid)
+-- ANY hit → ABORT with explicit error (no extraction_decisions row; see §8 + R3-block log-only behavior).
+-- 2. Lock and re-validate message_versions:
+SELECT id FROM message_versions WHERE id IN (:mvids) FOR SHARE
+-- Confirm chat_messages.memory_policy='normal' AND chat_messages.is_redacted=false on each
+-- ANY failure → ABORT.
+-- 3. INSERT knowledge_cards row (status='approved').
+-- 4. INSERT card_sources rows (FK enforced).
+-- 5. UPDATE extraction_candidates SET status='approved', reviewed_by=:admin, reviewed_at=now().
+-- 6. INSERT extraction_decisions (action='approved', decided_by=:admin, decided_by_username=:admin_username).
+COMMIT
+```
+
+R3-block behavior: when re-validation rejects approval, NO row is written to `extraction_decisions`. The candidate's `status` remains `pending`. Failure is logged via structured logger with fields: `event=approve_blocked`, `candidate_id`, `admin_user_id`, `failure_reason` (e.g., `forget_tombstone_match`, `source_redacted`, `source_memory_policy_not_normal`), and `forget_event_id` or `message_version_id` that triggered the block. The admin sees a Telegram error message explaining the block but no permanent state changes occur. The candidate can re-enter `/candidates` only if its governance state changes externally (currently out of scope; see §11 R3 row).
 
 `/edit-card` is **deferred to Phase 6.5** (Q6). T6-04 ships strict `/approve` + `/reject` only.
 
@@ -339,17 +366,29 @@ T6-00 must land **before Wave 1** ships. It closes the Phase 5 FHR MEDIUM carryo
 **M-1 — `synthesize_answer.qa_trace_id` invariant:**
 
 - File: `bot/services/llm_gateway.py:326`.
-- Change: add `assert qa_trace_id is not None, "qa_trace_id REQUIRED — handler must create QaTrace before gateway call"` at the top of the `synthesize_answer` body (after the docstring, before any other logic).
+- Change: add an explicit runtime check at the top of the `synthesize_answer` body (after the docstring, before any other logic):
+
+  ```python
+  if qa_trace_id is None:
+      raise ValueError(
+          "synthesize_answer: qa_trace_id is REQUIRED — handler must create "
+          "QaTrace via QaTraceRepo.create() BEFORE invoking this gateway "
+          "(see bot/handlers/qa.py:312-334 for the only call site contract)."
+      )
+  ```
+
+  `raise ValueError` (not `assert`) is mandatory: `assert` is stripped when Python runs under `python -O` / `PYTHONOPTIMIZE`, which would silently disable the invariant in any future production image that adopts optimization flags.
 - Type annotation stays `qa_trace_id: int` (no relaxation to `int | None`).
-- Reason: single call site verified — `bot/handlers/qa.py:312–334` creates the `QaTrace` via `QaTraceRepo.create` and passes `trace.id` to the gateway. The runtime assert defends the invariant cheaply without leaking a nullable boundary upward.
-- Update `synthesize_answer` docstring §Parameters to call out the `assert` and the single-call-site invariant.
+- Reason: single call site verified — `bot/handlers/qa.py:312–334` creates the `QaTrace` via `QaTraceRepo.create` and passes `trace.id` to the gateway. The runtime check defends the invariant cheaply without leaking a nullable boundary upward.
+- Update `synthesize_answer` docstring §Parameters to call out the `raise ValueError` and the single-call-site invariant.
 
 **M-4 — direct cascade `message_hash` sub-case tests:**
 
-- File(s): extend `tests/services/test_cascade_*.py` (whichever module hosts forget-cascade unit tests).
-- Add a **direct** unit test for `_cascade_qa_traces_llm` with a `message_hash` target (not via the end-to-end forget pipeline).
-- Add a **direct** unit test for `_cascade_llm_synthesis_cache` with a `message_hash` target.
-- Both tests MUST assert `llm_response_summary IS NULL` on the affected `qa_traces` row post-cascade.
+- Test file: `tests/services/test_forget_cascade.py` (extends existing module).
+- Implementations under test: `bot/services/forget_cascade.py::_cascade_qa_traces_llm` and `bot/services/forget_cascade.py::_cascade_llm_synthesis_cache`.
+- Add a **direct** unit test for `_cascade_qa_traces_llm` with `target_type='message_hash'` (not via the end-to-end forget pipeline).
+- Add a **direct** unit test for `_cascade_llm_synthesis_cache` with `target_type='message_hash'`.
+- Both tests MUST assert `qa_traces.llm_response_summary IS NULL` on the affected row post-cascade. Existing direct-case (`target_type='message_version'`) tests are kept.
 
 **L-1 (defer to follow-up, NOT required for T6-00 close):**
 
@@ -384,7 +423,7 @@ T6-00 must land **before Wave 1** ships. It closes the Phase 5 FHR MEDIUM carryo
 | **A** | Schema migrations 030–034 | `extraction_runs`, `extraction_candidates`, `knowledge_cards`, `card_sources`, `extraction_decisions` | T6-00 |
 | **B** | Extractor service skeleton + `llm_gateway.extract_candidates` | `bot/services/extractor.py`, Phase 5 gateway extension | T6-00 |
 
-**T6-03 binding sub-gate:** the LLM gateway `extract_candidates` PR must pass the Phase 11 leakage binding test (`tests/evals/test_leakage.py`) green **before merge**. This is a critical sub-gate because `extract_candidates` is a new LLM entry point and must clear privacy invariants #2 / #3.
+**T6-03 binding sub-gate:** the LLM gateway `extract_candidates` PR must pass the Phase 11 leakage binding suite green **on the T6-03 PR head specifically before merge**. This is a critical sub-gate because `extract_candidates` is a new LLM entry point and must clear privacy invariants #2 / #3. Required cases: L1, L2, L3a, L3b, L3c, L4, L5 in `tests/evals/test_leakage.py::test_leakage_invariants`; plus R1, R2, R3, R4 in `tests/evals/test_refusal.py`. The CI nightly `evals.yml` workflow result alone is NOT sufficient — re-run must be triggered on the T6-03 PR head.
 
 ### Wave 2 — product surfaces (PARALLEL)
 
@@ -421,11 +460,11 @@ Wave 3 (optional):     E
 
 ### T6-00: Phase 5 FHR carryover (M-1 + M-4)
 
-- Scope: `bot/services/llm_gateway.py:326` runtime assert; `synthesize_answer` docstring update; direct `_cascade_qa_traces_llm` + `_cascade_llm_synthesis_cache` `message_hash` sub-case tests with `llm_response_summary IS NULL` assertions.
+- Scope: `bot/services/llm_gateway.py:326` runtime `raise ValueError(...)` guard; `synthesize_answer` docstring update; direct `_cascade_qa_traces_llm` + `_cascade_llm_synthesis_cache` `message_hash` sub-case tests with `llm_response_summary IS NULL` assertions.
 - Acceptance criteria:
-  - `assert qa_trace_id is not None, ...` present at top of `synthesize_answer` body.
+  - `if qa_trace_id is None: raise ValueError(...)` guard present at top of `synthesize_answer` body (NOT `assert`, which is stripped under `python -O` / `PYTHONOPTIMIZE`).
   - `qa_trace_id` annotation remains `int` (not `int | None`).
-  - Docstring §Parameters mentions the assert and the single-call-site invariant.
+  - Docstring §Parameters mentions the `raise ValueError` guard and the single-call-site invariant.
   - Two new direct cascade tests added; both pass; both assert `llm_response_summary IS NULL` post-cascade.
   - Phase 11 binding suite remains green.
 - Dependencies: none (closes Phase 5 FHR carryover).
@@ -444,7 +483,7 @@ Wave 3 (optional):     E
 - Acceptance criteria:
   - All five migrations apply and roll back cleanly on Postgres 16.
   - All checks/FKs/defaults in §5.A are present.
-  - `knowledge_cards.body_tsv` uses `to_tsvector('simple', ...)` and has a GIN index.
+  - `knowledge_cards.body_tsv` uses `to_tsvector('russian', ...)` and has a GIN index.
   - `card_status` CHECK is exactly `('draft','approved','archived')` (no `deprecated`).
   - `card_status='approved'` cannot exist without `approved_by_user_id` + `approved_at`.
   - `card_sources` has `UNIQUE(card_id, message_version_id)` and reverse index on `message_version_id`.
@@ -454,13 +493,21 @@ Wave 3 (optional):     E
 
 ### T6-02: Extractor service pass
 
-- Scope: `bot/services/extractor.py`, `ExtractionResult`, DB reads/writes.
+- Scope: `bot/services/extractor.py`, `ExtractionResult`, DB reads/writes, feature flag wiring, admin window CLI/handler.
 - Acceptance criteria:
   - `run_extraction_pass(session, *, window_start, window_end)` exists.
   - Reads only `chat_messages.memory_policy='normal'` AND `created_at >= phase_6_enabled_at` (forward-only).
   - Writes `extraction_candidates.status='pending'`.
   - Records `extraction_runs.run_status` and `candidate_count`.
   - Refuses to invoke `llm_gateway.extract_candidates` if any source row in the evidence bundle has `memory_policy != 'normal'`.
+  - Feature flag key constant `MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG = 'memory.extraction.scheduler.enabled'` defined alongside the `LLM_SYNTHESIS_FEATURE_FLAG` constant (`bot/handlers/qa.py:LLM_SYNTHESIS_FEATURE_FLAG` pattern).
+  - Extractor scheduler entry-point reads the flag via `await FeatureFlagRepo.get(session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG)`; default behavior (key absent or false) = scheduler disabled. NO alembic data migration to seed the key (forward-only enable).
+  - Unit tests cover flag=False (skip pass), flag=True (run pass), flag=unset (default skip).
+  - Admin-only Telegram handler `/admin/extract --window <ISO8601-start>..<ISO8601-end>` invocable from the admin command surface.
+  - Window string parser validates ISO8601 + range non-empty + window length ≤ 30 days (LLM budget guard).
+  - Calls `run_extraction_pass(session, window_start=..., window_end=...)` directly, bypassing the scheduler flag.
+  - Records an `ExtractionRun` row with explicit operator `user_id` audit marker.
+  - Returns a summary message to the admin (candidates emitted, `run_status`, `llm_usage_ledger` entry id).
 - Dependencies: T6-00, T6-01.
 - Stream: Wave 1 / Stream B.
 
@@ -472,7 +519,7 @@ Wave 3 (optional):     E
   - Every call is associated with the Phase 5 LLM usage ledger.
   - Output schema includes candidate payload and source `message_version_id`s.
   - Forbidden source content cannot be passed to the gateway.
-  - **Phase 11 leakage binding test (`tests/evals/test_leakage.py`) green before merge** — critical sub-gate per §6.
+  - **Phase 11 leakage binding test green on the T6-03 PR head before merge** — critical sub-gate per §6. The sub-gate requires ALL cases L1, L2, L3a, L3b, L3c, L4, L5 in `tests/evals/test_leakage.py::test_leakage_invariants` green, plus R1, R2, R3, R4 refusal cases (`tests/evals/test_refusal.py`) green. The CI nightly `evals.yml` workflow result alone is NOT sufficient — a re-run must be triggered on the T6-03 PR head specifically.
 - Dependencies: Phase 5 gateway/ledger, T6-00, T6-02.
 - Stream: Wave 1 / Stream B.
 
@@ -503,7 +550,7 @@ Wave 3 (optional):     E
 - Scope: `bot/services/search.py`, card FTS query, scoring.
 - Acceptance criteria:
   - `search_messages(..., include_cards=True)` queries both `message_versions` and `knowledge_cards`.
-  - Card FTS uses `to_tsvector('simple', ...)` to match the Phase 4 hybrid baseline.
+  - Card FTS uses `to_tsvector('russian', ...)` to match the Phase 4 baseline.
   - `include_cards=False` preserves Phase 4 behaviour byte-for-byte.
   - Card hits require `card_status='approved'`.
   - Card hits rank slightly above equivalent raw message hits.
@@ -543,6 +590,7 @@ Wave 3 (optional):     E
   - Offrecord/nomem/forgotten sources never produce candidates or cards.
   - **Cascade demote:** a `forget_event` matching the only source `message_version_id` of an approved card demotes the card to `card_status='archived'` with `archived_reason` referencing the `forget_event_id`.
   - **`/approve` re-validation rejection:** a candidate whose source acquired `memory_policy='offrecord'` or a `forget_event` tombstone between extraction and `/approve` is rejected by the deterministic re-validation with an explicit error.
+  - **Concurrent forget+approve race test:** forget_event applied while an admin `/approve` transaction is open must abort approval OR cascade-demote the just-approved card; final state has `card_status='archived'` OR `/approve` returns governance error (no half-approved state).
 - Dependencies: T6-02, T6-04, T6-06, T6-07.
 - Stream: Wave 2 closeout / holistic verification.
 
@@ -556,6 +604,7 @@ Wave 3 (optional):     E
 - Extraction run without LLM usage ledger entry → STOP.
 - `/recall` returning card content to a user without checking `card_status='approved'` → STOP.
 - **Card promotion attempted when any `card_sources` row's `message_version_id` matches a `forget_event` tombstone (per R3 deterministic re-validation) → STOP, governance breach.**
+- **R3 re-validation block during `/approve`:** ABORT the transaction; NO `extraction_decisions` row written; structured log only. Candidate stays `pending` and can re-enter `/candidates` only if its governance state changes externally (currently out of scope; see §11 R3 row).
 
 ---
 
@@ -596,7 +645,7 @@ Sprint 0 ratification commit (this PR) closes the design gate.
 | **Q1** | `body_markdown` stored as Telegram MarkdownV2 (TG-native rendering). |
 | **Q2** | Operator-triggered only. `extraction.scheduler.enabled` feature flag default **false**; cron stub present but disabled. |
 | **Q3** | Collapse `archived` + `deprecated` → single `archived` state with new nullable column `archived_reason text`. `card_status` CHECK becomes `('draft','approved','archived')`. |
-| **Q4** | No `language` field. `knowledge_cards.body_tsv` uses `to_tsvector('simple', ...)` — matches Phase 4 hybrid-search baseline. |
+| **Q4** | No `language` field. `knowledge_cards.body_tsv` uses `to_tsvector('russian', ...)` matching Phase 4 baseline (`alembic/versions/020`, `021`, `bot/db/models.py:43`). RU/EN mixed content handled identically to `message_versions.search_tsv`. |
 | **Q5** | Forward-only extraction. Extractor only processes `chat_messages.created_at >= phase_6_enabled_at`. Historical backfill is operator-explicit `/admin/extract --window` invocation. |
 | **Q6** | Defer `/edit-card` to Phase 6.5. T6-04 ships strict `/approve` + `/reject` only. |
 | **Q7** | Resolved per D3 (no `card_versions` table; `updated_at` overwrite). |
