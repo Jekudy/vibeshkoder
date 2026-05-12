@@ -1027,6 +1027,12 @@ class ExtractionCandidate(Base):
         Index("ix_extraction_candidates_created_at", "created_at"),
     )
 
+    def __init__(self, **kwargs: object) -> None:
+        # Ensure source_message_version_ids is always a list in-memory,
+        # even before a DB round-trip populates the server_default.
+        kwargs.setdefault("source_message_version_ids", [])
+        super().__init__(**kwargs)
+
     id: Mapped[_uuid_module.UUID] = mapped_column(
         Uuid(),
         primary_key=True,
@@ -1050,10 +1056,7 @@ class ExtractionCandidate(Base):
     source_message_version_ids: Mapped[list[int]] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),
         nullable=False,
-        # Default lives in alembic migration 031 (Postgres only:
-        # ``'[]'::jsonb``). The application always supplies a list at
-        # insert time (extractor / promotion); the migration's default
-        # only matters for ad-hoc inserts during ops.
+        server_default=text("'[]'::jsonb"),
     )
     status: Mapped[str] = mapped_column(Text, nullable=False)
     reviewed_by: Mapped[int | None] = mapped_column(

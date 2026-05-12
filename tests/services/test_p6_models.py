@@ -250,6 +250,28 @@ async def test_extraction_decision_tablename(db_session) -> None:
     assert ExtractionDecision.__tablename__ == "extraction_decisions"
 
 
+# ─── ExtractionCandidate: Python-side default for source_message_version_ids ──
+
+
+def test_extraction_candidate_source_mvids_python_default() -> None:
+    """ExtractionCandidate constructed without source_message_version_ids must
+    return [] (empty list) from the Python attribute — not None.
+
+    This guards against tests that create ExtractionCandidate in-memory
+    without a DB round-trip (e.g. unit tests that mock the session) from
+    seeing None where they expect a list.
+
+    Precedent: LlmSynthesisCache.citation_ids uses the same
+    JSON().with_variant(JSONB, 'postgresql') column type pattern.
+    """
+    from bot.db.models import ExtractionCandidate
+
+    cand = ExtractionCandidate(candidate_json={"x": 1}, status="pending")
+    assert cand.source_message_version_ids == [], (
+        f"Expected [] before DB flush, got {cand.source_message_version_ids!r}"
+    )
+
+
 # ─── Cross-model: knowledge_cards.body_tsv is populated by the DB ────────────
 
 
