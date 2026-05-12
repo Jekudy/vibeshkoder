@@ -1052,3 +1052,57 @@ async def test_approve_acquires_advisory_lock_before_select_for_update(
         f"advisory lock at idx {lock_idx} MUST precede SELECT FOR UPDATE at "
         f"idx {for_update_idx}; SQL captured: {captured_sql}"
     )
+
+
+# ─── R3 governance FOR SHARE regression test (Codex round 2 HIGH) ───────────
+
+
+async def test_approve_governance_select_uses_for_share(
+    db_session, fake_admin_message, cmd_factory, monkeypatch
+) -> None:
+    """``revalidate_sources`` query MUST execute with ``FOR SHARE`` to block
+    concurrent writes (forget cascade) until /approve commits (Codex round 2
+    HIGH). Without FOR SHARE the source row's state could be stale between
+    the R3 read and the subsequent ``INSERT card_sources`` — narrowing but
+    not closing the H-Cdx-2 race window.
+    """
+    from bot.db.repos.user import UserRepo
+    from bot.handlers.admin_cards import cmd_approve
+
+    await UserRepo.upsert(
+        db_session,
+        telegram_id=fake_admin_message.from_user.id,
+        username="admin_user",
+        first_name="Admin",
+        last_name=None,
+    )
+    _, mvid, _, _ = await _make_chat_message_with_version(db_session)
+    cid = await _make_candidate(db_session, source_mvids=[mvid])
+
+    captured_sql: list[str] = []
+    original_execute = db_session.execute
+
+    async def spy_execute(stmt, *args, **kwargs):
+        try:
+            sql_text = str(stmt)
+        except Exception:
+            sql_text = repr(stmt)
+        captured_sql.append(sql_text)
+        return await original_execute(stmt, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", spy_execute)
+
+    await cmd_approve(
+        fake_admin_message, cmd_factory(str(cid)), session=db_session
+    )
+
+    # The revalidation query joins src CTE with forget_events. With FOR SHARE,
+    # the rendered SQL contains both "FOR SHARE" and a reference to
+    # message_versions (the locked table).
+    found = any(
+        ("FOR SHARE" in s and "message_versions" in s) for s in captured_sql
+    )
+    assert found, (
+        "revalidate_sources query MUST use FOR SHARE on message_versions to "
+        f"block concurrent forget cascades; captured SQL: {captured_sql}"
+    )
