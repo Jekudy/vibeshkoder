@@ -35,7 +35,9 @@ paragraph).
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import struct
 import uuid as _uuid_module
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,6 +53,52 @@ from bot.db.models import (
 from bot.db.repos.feature_flag import FeatureFlagRepo
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Scheduler-tick advisory lock (Codex HIGH #4) ────────────────────────────
+
+
+def _p6_scheduler_lock_id() -> int:
+    """Derive the Phase 6 scheduler-tick advisory lock id.
+
+    Two concurrent ``extraction_scheduler_tick`` calls would otherwise
+    race on the same window: the SELECT, gateway call, and audit-row
+    writes are not idempotent under concurrency. A
+    ``pg_try_advisory_xact_lock`` keyed by a constant
+    ``p6:extraction_scheduler`` namespace gates the tick — second
+    concurrent tick gets ``False`` from try-lock and short-circuits
+    with ``reason='locked'``.
+
+    The namespace prefix ``"p6:extraction_scheduler"`` is disjoint from
+    the per-mvid ``"p6:mvid:"`` namespace used by /approve + the
+    forget-cascade orchestrator (see
+    ``bot.services.forget_cascade._p6_mvid_advisory_lock_id``), so the
+    scheduler lock cannot collide with an in-flight cascade lock for
+    any numeric id.
+
+    Returns a value in the signed-int64 range expected by
+    ``pg_advisory_xact_lock(bigint)``.
+    """
+    payload = b"p6:extraction_scheduler"
+    digest = hashlib.sha256(payload).digest()
+    (lock_id,) = struct.unpack(">q", digest[:8])
+    return lock_id
+
+
+async def _try_acquire_scheduler_lock(session: AsyncSession) -> bool:
+    """Attempt to acquire the scheduler-tick advisory lock; non-blocking.
+
+    Returns ``True`` if acquired (the current transaction now holds the
+    lock for its remaining lifetime), ``False`` if another transaction
+    already holds it. Skipping on ``False`` keeps semantics simple — the
+    next tick on the next schedule will pick up any pending work.
+    """
+    result = await session.execute(
+        text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
+        {"lock_id": _p6_scheduler_lock_id()},
+    )
+    locked = result.scalar()
+    return bool(locked)
 
 
 # ─── Feature flag key (PHASE6_PLAN.md §7 T6-02) ──────────────────────────────
@@ -673,6 +721,16 @@ async def extraction_scheduler_tick(
         session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG
     ):
         return SchedulerTickResult(skipped=True, reason="flag_disabled")
+
+    # Idempotency gate (Codex HIGH #4): only one tick may run at a time.
+    # Acquired non-blocking so the second concurrent tick exits cleanly
+    # rather than queueing up duplicate gateway calls.
+    if not await _try_acquire_scheduler_lock(session):
+        logger.info(
+            "extraction_scheduler_tick_locked",
+            extra={"reason": "another_tick_in_progress"},
+        )
+        return SchedulerTickResult(skipped=True, reason="locked")
 
     phase_6_enabled_at = await _get_phase_6_enabled_at(session)
     if phase_6_enabled_at is None:
