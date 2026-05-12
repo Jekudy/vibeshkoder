@@ -81,8 +81,18 @@ async def _make_chat_message(
     is_redacted: bool = False,
     text: str = "extraction source content",
     version_is_redacted: bool = False,
+    mv_content_hash: str | None = None,
 ) -> tuple[int, int, int, int]:
     """Insert chat_messages + v1 message_versions row.
+
+    ``mv_content_hash`` is the SHA-like value persisted on
+    ``message_versions.content_hash`` (NOT NULL in the schema). The live
+    persistence path (``bot/db/repos/message.py::MessageRepo.save``)
+    never populates ``chat_messages.content_hash``, so this helper
+    mirrors live behaviour: it leaves ``chat_messages.content_hash``
+    NULL and only sets ``message_versions.content_hash``. Tests asserting
+    ``message_hash:`` tombstone behaviour against a live row must pass
+    ``mv_content_hash`` explicitly.
 
     Returns ``(chat_message_id, message_version_id, chat_id, message_id)``.
     """
@@ -118,7 +128,11 @@ async def _make_chat_message(
         text=text,
         normalized_text=text,
         entities_json={},
-        content_hash=f"h{_uuid_module.uuid4().hex[:16]}",
+        content_hash=(
+            mv_content_hash
+            if mv_content_hash is not None
+            else f"h{_uuid_module.uuid4().hex[:16]}"
+        ),
         is_redacted=version_is_redacted,
     )
     db_session.add(v)
@@ -1058,3 +1072,80 @@ async def test_extraction_scheduler_tick_flag_true_runs_pass(db_session) -> None
     assert result.extraction_result.run_status == "completed"
     # Gateway was invoked.
     assert len(gw.calls) >= 1
+
+
+# ─── Round 3 regression: tombstone via mv.content_hash for live-path messages ─
+
+
+async def test_run_extraction_pass_excludes_live_message_via_mv_content_hash_tombstone(
+    db_session,
+) -> None:
+    """Regression for Codex round 3 CRITICAL.
+
+    Live ChatMessage persist (bot/db/repos/message.py::MessageRepo.save) leaves
+    chat_messages.content_hash NULL — only message_versions.content_hash is
+    populated. Therefore the extractor SELECT tombstone filter MUST check
+    mv.content_hash (joined), NOT c.content_hash, for 'message_hash:<hash>'
+    forget_events.
+    """
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+    window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+    when = window_start + timedelta(minutes=5)
+
+    # Normal message — included.
+    _, ver_normal, _, _ = await _make_chat_message(
+        db_session, when=when, text="alpha normal"
+    )
+
+    # Live-path message: chat_messages.content_hash is NULL, mv.content_hash="X".
+    mv_hash = "live_msg_sha_for_tombstone_test"
+    _, ver_live, _, _ = await _make_chat_message(
+        db_session,
+        when=when,
+        text="DO_NOT_LEAK_LIVE_HASH",
+        mv_content_hash=mv_hash,
+    )
+
+    # Insert forget_event keyed by message_hash matching the MV's content_hash.
+    # If the filter incorrectly uses chat_messages.content_hash (NULL) — the
+    # match fails and ver_live leaks. The fix uses mv.content_hash.
+    await ForgetEventRepo.create(
+        db_session,
+        target_type="message_hash",
+        target_id=mv_hash,
+        actor_user_id=None,
+        authorized_by="admin",
+        tombstone_key=f"message_hash:{mv_hash}",
+    )
+
+    ledger_id = await _make_llm_usage_ledger_row(db_session)
+    gw = FakeGateway(
+        candidates_to_emit=[
+            {
+                "candidate_json": {"title": "ok", "body": "alpha"},
+                "source_message_version_ids": [ver_normal],
+            }
+        ],
+        llm_usage_ledger_id=ledger_id,
+    )
+
+    result = await run_extraction_pass(
+        db_session,
+        window_start=window_start,
+        window_end=window_end,
+        gateway=gw,
+    )
+
+    assert result.run_status == "completed"
+    forwarded_ids = [
+        sv["message_version_id"]
+        for call in gw.calls
+        for sv in call["source_versions"]
+    ]
+    assert ver_live not in forwarded_ids
+    for call in gw.calls:
+        for sv in call["source_versions"]:
+            assert "DO_NOT_LEAK_LIVE_HASH" not in (sv.get("text") or "")
