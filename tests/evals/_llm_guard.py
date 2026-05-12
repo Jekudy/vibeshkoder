@@ -43,8 +43,27 @@ class LLMNetworkCallDetected(AssertionError):
     """
 
 
+def _check_llm_hostname(request: Any, enabled: bool) -> None:
+    """Shared guard logic for both sync and async hooks.
+
+    Raises ``LLMNetworkCallDetected`` when *enabled* and the request targets a
+    known LLM provider hostname.  Returns ``None`` otherwise (safe for both
+    sync and async hook paths).
+    """
+    if not enabled:
+        return None
+    host = urlparse(str(request.url)).hostname or ""
+    if host in LLM_GUARD_HOSTNAMES:
+        raise LLMNetworkCallDetected(
+            f"[eval-guard] Direct httpx call to LLM endpoint blocked: "
+            f"{host!r} — all LLM calls must go through bot.services.llm_gateway. "
+            f"Full URL: {request.url}"
+        )
+    return None
+
+
 def make_llm_guard_hook() -> Any:
-    """Return an httpx event-hook that blocks outbound LLM-endpoint calls.
+    """Return a **synchronous** httpx event-hook for use with ``httpx.Client``.
 
     When ``EVAL_HARNESS_ENABLED`` is absent or falsy the returned callable is
     a no-op (returns ``None`` for every request).  This ensures the production
@@ -54,19 +73,34 @@ def make_llm_guard_hook() -> Any:
     When ``EVAL_HARNESS_ENABLED`` is truthy the hook inspects the request URL
     and raises ``LLMNetworkCallDetected`` for any host in
     ``LLM_GUARD_HOSTNAMES`` before any TCP connection is attempted.
+
+    .. note::
+        ``httpx.Client`` calls ``hook(request)`` (sync call).
+        ``httpx.AsyncClient`` calls ``await hook(request)`` (coroutine required).
+        Use :func:`make_async_llm_guard_hook` for ``AsyncClient`` instances.
     """
     enabled = bool(os.environ.get("EVAL_HARNESS_ENABLED"))
 
     def _hook(request: Any) -> None:
-        if not enabled:
-            return None
-        host = urlparse(str(request.url)).hostname or ""
-        if host in LLM_GUARD_HOSTNAMES:
-            raise LLMNetworkCallDetected(
-                f"[eval-guard] Direct httpx call to LLM endpoint blocked: "
-                f"{host!r} — all LLM calls must go through bot.services.llm_gateway. "
-                f"Full URL: {request.url}"
-            )
-        return None
+        return _check_llm_hostname(request, enabled)
 
     return _hook
+
+
+def make_async_llm_guard_hook() -> Any:
+    """Return an **async** httpx event-hook for use with ``httpx.AsyncClient``.
+
+    ``httpx.AsyncClient`` executes request hooks via ``await hook(request)``.
+    A synchronous function cannot be awaited — returning ``None`` from a sync
+    hook causes ``TypeError: 'NoneType' object can't be awaited`` on any
+    non-LLM async request.  This factory returns a proper ``async def`` hook
+    so that both LLM-blocked and non-LLM (passthrough) paths are safe.
+
+    Same enable/disable semantics as :func:`make_llm_guard_hook`.
+    """
+    enabled = bool(os.environ.get("EVAL_HARNESS_ENABLED"))
+
+    async def _async_hook(request: Any) -> None:
+        return _check_llm_hostname(request, enabled)
+
+    return _async_hook

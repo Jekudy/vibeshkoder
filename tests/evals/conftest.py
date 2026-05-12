@@ -17,7 +17,7 @@ import pytest
 import pytest_asyncio
 
 from tests.evals._llm_guard import LLMNetworkCallDetected  # noqa: F401 (re-exported for tests)
-from tests.evals._llm_guard import make_llm_guard_hook
+from tests.evals._llm_guard import make_async_llm_guard_hook, make_llm_guard_hook
 
 SEED_ID = "golden_recall_v1"
 SEED_VERSION = 1
@@ -51,18 +51,21 @@ def httpx_llm_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """
     import httpx as _httpx
 
-    hook = make_llm_guard_hook()
+    # httpx.Client calls hook(request) synchronously; AsyncClient calls
+    # await hook(request) — a sync hook raises TypeError on non-LLM passthrough.
+    sync_hook = make_llm_guard_hook()
+    async_hook = make_async_llm_guard_hook()
 
     original_client_init = _httpx.Client.__init__
     original_async_client_init = _httpx.AsyncClient.__init__
 
     def _patched_client_init(self: Any, *args: Any, **kwargs: Any) -> None:
         original_client_init(self, *args, **kwargs)
-        self.event_hooks["request"] = [hook] + list(self.event_hooks.get("request", []))
+        self.event_hooks["request"] = [sync_hook] + list(self.event_hooks.get("request", []))
 
     def _patched_async_client_init(self: Any, *args: Any, **kwargs: Any) -> None:
         original_async_client_init(self, *args, **kwargs)
-        self.event_hooks["request"] = [hook] + list(self.event_hooks.get("request", []))
+        self.event_hooks["request"] = [async_hook] + list(self.event_hooks.get("request", []))
 
     monkeypatch.setattr(_httpx.Client, "__init__", _patched_client_init)
     monkeypatch.setattr(_httpx.AsyncClient, "__init__", _patched_async_client_init)

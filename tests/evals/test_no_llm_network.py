@@ -8,10 +8,15 @@ cannot detect at import-time.
 The guard itself lives in ``tests/evals/conftest.py`` as an ``autouse`` session
 fixture.  These tests verify the guard's observable behaviour:
 
-* **Positive test**: code that never calls an LLM hostname passes silently.
-* **Negative test**: code that performs a direct ``httpx.post`` to
+* **Positive sync test**: hook does not raise for a non-LLM URL (via direct
+  hook call — exercises the hook logic without relying on ``httpx.Client.send``
+  being reachable).
+* **Positive async test**: ``httpx.AsyncClient`` with ``MockTransport`` completes
+  a non-LLM request without raising — exercises the full async hook chain.
+* **Negative sync test**: code that performs a direct ``httpx.post`` to
   ``api.anthropic.com`` (or any LLM hostname) is detected and raises
   ``LLMNetworkCallDetected``.
+* **Negative async test**: ``httpx.AsyncClient`` also triggers the guard.
 
 The tests in this file intentionally do NOT depend on any DB fixture; they
 run in every environment where ``EVAL_HARNESS_ENABLED=1`` is set.
@@ -19,12 +24,13 @@ run in every environment where ``EVAL_HARNESS_ENABLED=1`` is set.
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import httpx
 import pytest
 
-from tests.evals._llm_guard import LLMNetworkCallDetected, make_llm_guard_hook
+from tests.evals._llm_guard import LLMNetworkCallDetected, make_async_llm_guard_hook, make_llm_guard_hook
 
 
 # ---------------------------------------------------------------------------
@@ -32,21 +38,43 @@ from tests.evals._llm_guard import LLMNetworkCallDetected, make_llm_guard_hook
 # ---------------------------------------------------------------------------
 
 
-def test_guard_positive_non_llm_call_is_allowed(httpx_llm_guard: None) -> None:
-    """Positive: a request to a non-LLM host is NOT blocked by the guard.
+def test_guard_positive_non_llm_hook_does_not_raise(httpx_llm_guard: None) -> None:
+    """Positive (sync): the sync hook returns None without raising for non-LLM URLs.
 
-    We simply verify that the guard fixture does not interfere with regular
-    (non-provider) httpx usage.  We monkeypatch httpx.Client.send so no real
-    network I/O occurs.
+    Calls the hook factory directly so the test exercises the hook logic through
+    the same code path the fixture uses, without relying on ``httpx.Client.send``
+    being reachable.  This avoids the mock.patch.object pattern that bypasses
+    the event-hook chain entirely.
     """
-    import unittest.mock as mock
+    hook = make_llm_guard_hook()
+    fake_request = httpx.Request("GET", "https://example.com/api")
+    # Must not raise — non-LLM host is allowed.
+    result = hook(fake_request)
+    assert result is None
 
-    # Patch at transport level to avoid real network call.
-    with mock.patch.object(httpx.Client, "send", return_value=httpx.Response(200)):
-        client = httpx.Client()
-        # A call to a non-LLM host must NOT raise LLMNetworkCallDetected.
-        resp = client.get("https://example.com/api")
-        assert resp.status_code == 200
+
+def test_guard_positive_async_non_llm_call_is_allowed(httpx_llm_guard: None) -> None:
+    """Positive (async): AsyncClient with MockTransport completes for non-LLM URLs.
+
+    Uses ``httpx.MockTransport`` (ships with httpx, no extra deps) to intercept
+    at transport level — after hooks have fired.  Confirms that the async hook
+    does NOT raise for a non-LLM host, which would otherwise cause
+    ``LLMNetworkCallDetected`` to propagate.
+    """
+
+    async def _make_call() -> httpx.Response:
+        transport = httpx.MockTransport(
+            handler=lambda request: httpx.Response(200)
+        )
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await client.get("https://example.com/api")
+
+    loop = asyncio.new_event_loop()
+    try:
+        response = loop.run_until_complete(_make_call())
+        assert response.status_code == 200
+    finally:
+        loop.close()
 
 
 def test_guard_negative_direct_httpx_to_llm_hostname_is_detected(
@@ -66,7 +94,6 @@ def test_guard_negative_async_client_to_llm_hostname_is_detected(
     httpx_llm_guard: None,
 ) -> None:
     """Negative (async): async httpx.AsyncClient also triggers the guard."""
-    import asyncio
 
     async def _make_call() -> None:
         async with httpx.AsyncClient() as client:
@@ -88,22 +115,34 @@ def test_guard_negative_google_gemini_hostname_is_detected(
         httpx.get("https://generativelanguage.googleapis.com/v1beta/models")
 
 
-def test_guard_is_disabled_without_eval_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Guard must NOT fire when EVAL_HARNESS_ENABLED is absent/falsy.
+def test_guard_hook_factory_noop_without_eval_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guard hook factory returns a no-op when EVAL_HARNESS_ENABLED is absent.
 
-    This protects production runtime: the gateway *must* be able to call
-    httpx to LLM endpoints in non-eval mode.
+    Directly exercises both the sync and async hook factories in the disabled
+    state — verifies they do not raise even for LLM hostnames.  This protects
+    production runtime: the gateway *must* be able to call httpx to LLM
+    endpoints in non-eval mode.
 
     NOTE: this test does NOT use the ``httpx_llm_guard`` fixture — it
     explicitly verifies the code-path taken when the guard is inactive.
     """
     monkeypatch.delenv("EVAL_HARNESS_ENABLED", raising=False)
 
-    hook = make_llm_guard_hook()
+    sync_hook = make_llm_guard_hook()
+    async_hook = make_async_llm_guard_hook()
 
-    # When EVAL_HARNESS_ENABLED is absent, the hook must be a no-op: calling it
-    # directly should NOT raise even for an LLM hostname.
     fake_request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-    # The hook returns None (no-op) — must not raise.
-    result = hook(fake_request)
+
+    # Sync hook must be a no-op — must not raise.
+    result = sync_hook(fake_request)
     assert result is None
+
+    # Async hook must also be a no-op when awaited.
+    async def _await_hook() -> None:
+        return await async_hook(fake_request)
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_await_hook())
+    finally:
+        loop.close()
