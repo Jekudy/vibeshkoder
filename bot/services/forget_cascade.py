@@ -33,7 +33,9 @@ mirrors the AUTHORIZED_SCOPE pattern for new ingestion-style paths.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import struct
 from typing import Any
 
 from sqlalchemy import select, text, update
@@ -51,6 +53,43 @@ from bot.db.repos.forget_event import ForgetEventRepo
 from bot.db.repos.llm_synthesis_cache import SynthesisCacheRepo
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Phase 6 advisory-lock derivation (T6-01) ────────────────────────────────
+
+
+def _p6_mvid_advisory_lock_id(mvid: int) -> int:
+    """Derive the Phase 6 advisory lock id for a ``message_version_id``.
+
+    Contract (PHASE6_PLAN.md §5.A.5 + §5.C step 2)::
+
+        mvid_lock_id = signed_int64(first 8 bytes (big-endian)
+                                    of sha256(f"p6:mvid:{mvid}"))
+
+    Single source of truth for both call sites:
+
+    * ``apply_forget_event`` orchestrator — acquires
+      ``pg_advisory_xact_lock(mvid_lock_id)`` on every affected
+      ``message_version_id`` as the FIRST operation in the transaction
+      (before the ``forget_events`` INSERT and before any cascade call,
+      including ``_cascade_qa_traces_llm`` and
+      ``_cascade_card_sources_on_forget``).
+    * ``/approve`` transaction protocol — acquires the same lock per
+      candidate ``source_message_version_id`` BEFORE the ``forget_events``
+      check, closing the H-Cdx-2 race window.
+
+    The namespace prefix ``"p6:mvid:"`` keeps this disjoint from
+    ``bot.services.import_chunking._derive_lock_id`` (which hashes raw
+    8-byte ``ingestion_run_id``) so an in-progress ``import_apply`` lock
+    and a P6 lock for the same numeric id cannot collide.
+
+    Returns a value in the signed-int64 range expected by
+    ``pg_advisory_xact_lock(bigint)``.
+    """
+    payload = f"p6:mvid:{mvid}".encode("ascii")
+    digest = hashlib.sha256(payload).digest()
+    (lock_id,) = struct.unpack(">q", digest[:8])
+    return lock_id
 
 # Feature flag key — read by the scheduler tick to decide whether to run the worker.
 CASCADE_WORKER_FLAG = "memory.forget.cascade_worker.enabled"
