@@ -12,10 +12,17 @@ from bot.db.engine import async_session
 from bot.db.models import IntroRefreshTracking
 from bot.db.repos.application import ApplicationRepo
 from bot.db.repos.intro import IntroRepo
+from bot.db.repos.llm_usage_ledger import LedgerRepo
 from bot.db.repos.user import UserRepo
 from bot.html_escape import html_escape
+from bot.services.extractor import extraction_scheduler_tick
 from bot.services.forget_cascade import cascade_worker_tick
 from bot.services.invite_worker import process_invite_outbox
+from bot.services.llm_gateway import (
+    LiveExtractCandidatesGateway,
+    load_gateway_config,
+    resolve_provider,
+)
 from bot.texts import (
     ADMIN_NUDGE_MSG,
     NUDGE_MSG,
@@ -226,6 +233,49 @@ async def sync_google_sheets() -> None:
         logger.exception("Google Sheets sync failed")
 
 
+async def run_extraction_scheduler_tick() -> None:
+    """T6-03 wrapper — wires the Phase 6 extraction tick into apscheduler.
+
+    PHASE6_PLAN.md §5.B + T6-03 design §3-§4:
+
+    * Opens a fresh ``async_session()``.
+    * Builds ``LiveExtractCandidatesGateway`` locally via env-derived config
+      (same pattern as the QA handler at ``bot/handlers/qa.py:332-343``).
+    * Calls ``extraction_scheduler_tick`` from ``bot.services.extractor``,
+      which short-circuits when the feature flag is OFF (default).
+    * Commits on success; logs + ignores any exception so the scheduler
+      keeps running (per Phase 5 invite-outbox precedent).
+
+    The flag default is OFF so this job is a strict no-op until an operator
+    flips ``memory.extraction.scheduler.enabled`` in the ``feature_flags``
+    table. The 15-min interval mirrors ``check_vouch_deadlines``; the
+    actual tick runtime is dominated by gateway HTTP latency (~5-15s) when
+    the flag is on.
+    """
+    try:
+        async with async_session() as session:
+            try:
+                cfg = load_gateway_config()
+                provider = resolve_provider(cfg.provider)
+                gateway = LiveExtractCandidatesGateway(
+                    ledger_repo=LedgerRepo(), provider=provider, config=cfg
+                )
+                await extraction_scheduler_tick(session, gateway=gateway)
+                await session.commit()
+            except Exception:
+                # Rollback the per-tick transaction so the scheduler can
+                # retry on the next fire without poisoning the session.
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception("extraction_scheduler_tick rollback failed")
+                logger.exception("extraction_scheduler_tick crashed")
+    except Exception:
+        # Catch-all — the wrapper must NEVER let an exception propagate to
+        # apscheduler, which would mark the job as failed and stop firing.
+        logger.exception("extraction_scheduler_tick session setup failed")
+
+
 def start_scheduler(bot: Bot) -> None:
     """Configure and start the scheduler."""
     scheduler.add_job(
@@ -273,6 +323,21 @@ def start_scheduler(bot: Bot) -> None:
         "interval",
         seconds=30,
         id="forget_cascade_worker",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    # T6-03: Phase 6 extraction scheduler. Default OFF via flag
+    # ``memory.extraction.scheduler.enabled`` (see bot/services/extractor.py).
+    # 15-min interval mirrors ``check_vouch_deadlines`` — operator-explicit
+    # ``/admin_extract --window`` remains the primary entry point until the
+    # flag is enabled. Strict no-op when flag is OFF.
+    scheduler.add_job(
+        run_extraction_scheduler_tick,
+        "interval",
+        minutes=15,
+        id="extraction_scheduler_tick",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
