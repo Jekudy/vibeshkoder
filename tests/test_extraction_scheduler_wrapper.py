@@ -18,7 +18,6 @@ from __future__ import annotations
 import ast
 import inspect
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
