@@ -1342,3 +1342,268 @@ async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
                     text("DELETE FROM users WHERE id = :tid"),
                     {"tid": user_id},
                 )
+
+
+# ─── Phase 6.5 M-2: gateway_error column propagation (#262 M-2) ─────────────
+
+
+class _GatewayErrorFakeGateway:
+    """FakeGateway that simulates a provider failure by returning gateway_error."""
+
+    def __init__(
+        self,
+        *,
+        llm_usage_ledger_id: int,
+        gateway_error: str,
+    ) -> None:
+        self.llm_usage_ledger_id = llm_usage_ledger_id
+        self.gateway_error = gateway_error
+        self.calls: list[dict[str, Any]] = []
+
+    async def extract_candidates(
+        self,
+        session: Any,
+        *,
+        source_versions: list[dict[str, Any]],
+        prompt_template_version: str = "v0.1.0",
+    ) -> dict[str, Any]:
+        self.calls.append({"source_versions": list(source_versions)})
+        return {
+            "candidates": [],
+            "llm_usage_ledger_id": self.llm_usage_ledger_id,
+            "gateway_error": self.gateway_error,
+        }
+
+
+async def test_run_extraction_pass_persists_gateway_error_on_provider_failure(
+    postgres_engine,
+) -> None:
+    """Regression for GitHub issue #262 M-2.
+
+    When the LLM gateway returns ``gateway_error`` (non-null string), the
+    extractor MUST:
+    1. Set ``run_status='failed'`` on the ExtractionRun row.
+    2. Persist ``gateway_error`` in the corresponding column.
+    3. Still store ``llm_usage_ledger_id`` (cost accounting remains).
+    4. Return zero candidates (run_status='failed').
+
+    Previously: extractor saw a non-None ledger_id, set run_status='completed',
+    and silently masked the provider failure. This test pins the fix.
+    """
+    import uuid
+
+    from sqlalchemy import text as sa_text
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime(2002, 7, 1, tzinfo=timezone.utc)
+    window_end = datetime(2002, 7, 2, tzinfo=timezone.utc)
+    when = datetime(2002, 7, 1, 12, tzinfo=timezone.utc)
+
+    # ── Step 1: committed test data ──────────────────────────────────────────
+    setup_factory = async_sessionmaker(
+        postgres_engine, class_=AsyncSession, expire_on_commit=False
+    )
+
+    user_id = _next_user()
+    chat_id = _next_chat_id()
+    message_id = _next_msg_id()
+
+    async with setup_factory() as setup_s:
+        async with setup_s.begin():
+            await setup_s.execute(
+                sa_text(
+                    "INSERT INTO users (id, username, first_name) "
+                    "VALUES (:tid, :uname, 'Test') ON CONFLICT DO NOTHING"
+                ),
+                {"tid": user_id, "uname": f"u{user_id}"},
+            )
+            await setup_s.execute(
+                sa_text(
+                    "INSERT INTO chat_messages "
+                    "(message_id, chat_id, user_id, text, date, created_at, memory_policy, is_redacted) "
+                    "VALUES (:mid, :cid, :uid, :txt, :dt, :dt, 'normal', false)"
+                ),
+                {
+                    "mid": message_id,
+                    "cid": chat_id,
+                    "uid": user_id,
+                    "txt": "gateway-error-test-msg",
+                    "dt": when,
+                },
+            )
+            cm_row = await setup_s.execute(
+                sa_text(
+                    "SELECT id FROM chat_messages WHERE message_id = :mid AND chat_id = :cid"
+                ),
+                {"mid": message_id, "cid": chat_id},
+            )
+            cm_id = cm_row.scalar_one()
+
+            content_hash = f"h{uuid.uuid4().hex[:16]}"
+            await setup_s.execute(
+                sa_text(
+                    "INSERT INTO message_versions "
+                    "(chat_message_id, version_seq, text, normalized_text, entities_json, content_hash, is_redacted) "
+                    "VALUES (:cm_id, 1, :txt, :txt, '{}', :ch, false)"
+                ),
+                {"cm_id": cm_id, "txt": "gateway-error-test-msg", "ch": content_hash},
+            )
+            mv_row = await setup_s.execute(
+                sa_text(
+                    "SELECT id FROM message_versions WHERE chat_message_id = :cm_id"
+                ),
+                {"cm_id": cm_id},
+            )
+            mv_id = mv_row.scalar_one()
+
+            await setup_s.execute(
+                sa_text(
+                    "UPDATE chat_messages SET current_version_id = :mv_id WHERE id = :cm_id"
+                ),
+                {"mv_id": mv_id, "cm_id": cm_id},
+            )
+
+            # Insert a real llm_usage_ledger row for FK satisfaction.
+            ledger_row = await setup_s.execute(
+                sa_text(
+                    "INSERT INTO llm_usage_ledger "
+                    "(provider, model, prompt_hash) "
+                    "VALUES ('test-fake', 'test-model', NULL) "
+                    "RETURNING id"
+                ),
+            )
+            ledger_id = ledger_row.scalar_one()
+        # committed here
+
+    # ── Step 2: gateway returning gateway_error ──────────────────────────────
+    gw = _GatewayErrorFakeGateway(
+        llm_usage_ledger_id=ledger_id,
+        gateway_error="openai api 503",
+    )
+
+    # ── Step 3: run via middleware session (simulates production path) ────────
+    async with postgres_engine.connect() as mw_conn:
+        mw_tx = await mw_conn.begin()
+        MiddlewareSessionFactory = async_sessionmaker(
+            bind=mw_conn, class_=AsyncSession, expire_on_commit=False
+        )
+        async with MiddlewareSessionFactory() as mw_session:
+            result = await run_extraction_pass(
+                mw_session,
+                window_start=window_start,
+                window_end=window_end,
+                gateway=gw,
+            )
+        await mw_tx.commit()
+
+    # ── Step 4: verify via fresh session ─────────────────────────────────────
+    verify_factory = async_sessionmaker(
+        postgres_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    try:
+        async with verify_factory() as verify_s:
+            run_row = await verify_s.execute(
+                sa_text(
+                    "SELECT run_status, gateway_error, llm_usage_ledger_id "
+                    "FROM extraction_runs "
+                    "WHERE ingestion_window_start = :ws AND ingestion_window_end = :we"
+                ),
+                {"ws": window_start, "we": window_end},
+            )
+            row = run_row.one_or_none()
+            assert row is not None, "ExtractionRun row missing"
+            assert row[0] == "failed", (
+                f"Expected run_status='failed' on gateway_error, got '{row[0]}'"
+            )
+            assert row[1] == "openai api 503", (
+                f"Expected gateway_error='openai api 503', got '{row[1]}'"
+            )
+            assert row[2] == ledger_id, (
+                f"Expected llm_usage_ledger_id={ledger_id}, got {row[2]}"
+            )
+    finally:
+        async with verify_factory() as cleanup_s:
+            async with cleanup_s.begin():
+                await cleanup_s.execute(
+                    sa_text(
+                        "DELETE FROM extraction_runs "
+                        "WHERE ingestion_window_start = :ws AND ingestion_window_end = :we"
+                    ),
+                    {"ws": window_start, "we": window_end},
+                )
+                await cleanup_s.execute(
+                    sa_text(
+                        "DELETE FROM message_versions WHERE chat_message_id = :cm_id"
+                    ),
+                    {"cm_id": cm_id},
+                )
+                await cleanup_s.execute(
+                    sa_text("DELETE FROM chat_messages WHERE id = :cm_id"),
+                    {"cm_id": cm_id},
+                )
+                await cleanup_s.execute(
+                    sa_text("DELETE FROM llm_usage_ledger WHERE id = :lid"),
+                    {"lid": ledger_id},
+                )
+                await cleanup_s.execute(
+                    sa_text("DELETE FROM users WHERE id = :tid"),
+                    {"tid": user_id},
+                )
+                # Also clean up the user inserted by the test (ON CONFLICT DO NOTHING
+                # means no row if already present — safe to delete unconditionally here).
+                await cleanup_s.execute(
+                    sa_text(
+                        "DELETE FROM chat_messages WHERE chat_id = :cid AND message_id = :mid"
+                    ),
+                    {"cid": chat_id, "mid": message_id},
+                )
+
+    assert result.run_status == "failed"
+    assert result.failure_reason == "gateway_error"
+    assert result.candidate_count == 0
+    assert gw.calls  # gateway was invoked
+
+
+async def test_run_extraction_pass_success_path_leaves_gateway_error_null(
+    db_session,
+) -> None:
+    """On a successful gateway response (no gateway_error key), the
+    ExtractionRun row MUST have ``gateway_error IS NULL``.
+
+    This ensures the happy path is not accidentally flagged as failed
+    after the gateway_error propagation logic is added.
+    """
+    from bot.db.models import ExtractionRun
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+    window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+    when = window_start + timedelta(minutes=5)
+    _, ver_id, _, _ = await _make_chat_message(db_session, when=when, text="ok text")
+    ledger_id = await _make_llm_usage_ledger_row(db_session)
+
+    gw = FakeGateway(
+        candidates_to_emit=[
+            {
+                "candidate_json": {"title": "ok", "body": "text"},
+                "source_message_version_ids": [ver_id],
+            }
+        ],
+        llm_usage_ledger_id=ledger_id,
+    )
+
+    result = await run_extraction_pass(
+        db_session,
+        window_start=window_start,
+        window_end=window_end,
+        gateway=gw,
+    )
+
+    assert result.run_status == "completed"
+
+    run_row = await db_session.get(ExtractionRun, result.extraction_run_id)
+    assert run_row is not None
+    assert run_row.run_status == "completed"
+    assert run_row.gateway_error is None
