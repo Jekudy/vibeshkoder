@@ -673,6 +673,48 @@ async def run_extraction_pass(
 
     candidates_raw = gateway_result.get("candidates", []) or []
     llm_usage_ledger_id = gateway_result.get("llm_usage_ledger_id")
+    gateway_error = gateway_result.get("gateway_error")
+
+    # Phase 6.5 M-2 (#262 M-2): gateway-error path.
+    # ``gateway_error`` being non-None means the provider failed but the
+    # ledger row was still written for cost accounting. The run MUST be
+    # marked ``failed`` (not ``completed``) and the error string persisted
+    # so the audit trail captures the failure. We also store the
+    # ``llm_usage_ledger_id`` so cost-accounting remains intact.
+    # This check runs BEFORE the ``llm_usage_ledger_id is None`` guard
+    # below — a provider failure always has a ledger row, so checking
+    # ``gateway_error`` first avoids the wrong code path.
+    if gateway_error is not None:
+        async with _engine_session() as own_s:
+            await own_s.execute(
+                sa_update(ExtractionRun)
+                .where(ExtractionRun.id == run_id)
+                .values(
+                    run_status="failed",
+                    llm_usage_ledger_id=llm_usage_ledger_id,
+                    gateway_error=gateway_error,
+                )
+            )
+            await own_s.commit()
+        logger.warning(
+            "extraction_pass_gateway_error",
+            extra={
+                "extraction_run_id": str(run_id),
+                "llm_usage_ledger_id": llm_usage_ledger_id,
+                # NOT logging gateway_error content — may contain provider
+                # metadata or partial response bodies.
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "operator_user_id": operator_user_id,
+            },
+        )
+        return ExtractionResult(
+            extraction_run_id=run_id,
+            run_status="failed",
+            candidate_count=0,
+            failure_reason="gateway_error",
+            llm_usage_ledger_id=llm_usage_ledger_id,
+        )
 
     # Privacy invariant #4 (PHASE6_PLAN.md §8): an extraction run that
     # actually invoked the gateway MUST be associated with an
