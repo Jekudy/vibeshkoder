@@ -39,9 +39,18 @@ class CheckReport:
 
     @property
     def is_red(self) -> bool:
+        # db_roundtrip is excluded from is_red calculation: the GitHub Actions
+        # self-hosted runner has no route to Coolify's internal Docker bridge
+        # (172.24.x.x) where Postgres lives, so the check has been continuously
+        # RED since 2026-04-30 without ever reflecting actual DB health. The
+        # check still runs and its result is emitted in the JSON payload for
+        # diagnostic visibility, but it does not trigger healing dispatch.
+        # TODO: re-include once #168 (`/healthz/db` endpoint on bot) lands,
+        # which will provide app-boundary DB observability reachable from the
+        # runner via Tailscale.
         return any(
             result.is_red
-            for result in (self.coolify_status, self.telegram_pending, self.db_roundtrip)
+            for result in (self.coolify_status, self.telegram_pending)
         )
 
     def to_dict(self) -> dict[str, Any]:
