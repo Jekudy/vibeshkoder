@@ -143,12 +143,21 @@ For card hits, all three new fields are populated. The "anchor source" is the fi
 
 ### Card branch (new)
 
+The implementation uses four CTEs: `approved_card_hits` (FTS filter), `unforgotten_card_sources`
+(per-source tombstone re-check — belt-and-suspenders), `card_anchors` (lowest-position source),
+`card_source_lists` (full mvid array), and a final `card_hits` CTE that assembles the SELECT.
+
+> **Note:** `approved_card_hits` does NOT select `kc.title`. The `_format_card_item` renderer
+> (T6-07) does not consume card title from the search hit; it renders `card_id` + snippet only.
+> Title selection was removed from the design to avoid drift with the actual SQL.
+
 ```sql
 WITH q AS (
     SELECT plainto_tsquery('russian', :query) AS tsq
 ),
 -- ALL approved cards FTS-matched on body_tsv (GIN index from migration 032).
-card_hits AS (
+-- Does NOT select kc.title — renderer does not consume it from this CTE.
+approved_card_hits AS (
     SELECT
         kc.id AS card_id,
         ts_rank_cd(kc.body_tsv, q.tsq) AS rank,
@@ -161,28 +170,27 @@ card_hits AS (
             ),
             ''
         ) AS snippet,
-        kc.title AS title,
         kc.approved_at AS approved_at
     FROM knowledge_cards AS kc
     CROSS JOIN q
     WHERE kc.card_status = 'approved'
         AND kc.body_tsv @@ q.tsq
         AND NOT EXISTS (
-            -- Defense-in-depth: exclude cards where ANY source mvid is tombstoned.
-            -- §5.A.5 step 5 acknowledges partial-source-loss as a flag-for-review state;
-            -- T6-06 enforces strict exclusion at the search boundary so /recall cannot
-            -- return a card paraphrasing now-forgotten content even before admin review.
+            -- Defense-in-depth #1: exclude card if ANY source is tombstoned
+            -- (forget_event open in pending|processing|completed status).
+            --
+            -- The message_hash: branch MUST filter on mv2.content_hash
+            -- (NOT NULL by schema), NOT on c2.content_hash (nullable; live
+            -- persistence never sets it). Filtering on c2.content_hash silently
+            -- no-op's every message_hash: tombstone for live messages.
             SELECT 1
             FROM card_sources cs2
             JOIN message_versions mv2 ON mv2.id = cs2.message_version_id
             JOIN chat_messages c2 ON c2.id = mv2.chat_message_id
             JOIN forget_events fe2 ON (
-                fe2.tombstone_key = 'message:' || c2.chat_id::text || ':' || c2.message_id::text
+                fe2.tombstone_key
+                    = 'message:' || c2.chat_id::text || ':' || c2.message_id::text
                 OR (
-                    -- content_hash moved from chat_messages to message_versions in PR #257
-                    -- (live MV-only safety). Must use mv2.content_hash, NOT c2.content_hash.
-                    -- c2.content_hash is nullable and NULL for live messages; filtering on it
-                    -- silently no-op's every message_hash: tombstone for live messages.
                     mv2.content_hash IS NOT NULL
                     AND fe2.tombstone_key = 'message_hash:' || mv2.content_hash
                 )
@@ -195,60 +203,103 @@ card_hits AS (
                 AND fe2.status IN ('pending', 'processing', 'completed')
         )
         AND NOT EXISTS (
-            -- Defense-in-depth: exclude cards where ANY source has memory_policy != 'normal'
-            -- OR is_redacted=TRUE (catches manual redaction without forget_event).
+            -- Defense-in-depth #2: exclude card if ANY source has
+            -- memory_policy != 'normal' OR is_redacted=TRUE.
             SELECT 1
             FROM card_sources cs3
             JOIN message_versions mv3 ON mv3.id = cs3.message_version_id
             JOIN chat_messages c3 ON c3.id = mv3.chat_message_id
             WHERE cs3.card_id = kc.id
-                AND (c3.memory_policy <> 'normal' OR c3.is_redacted = TRUE OR mv3.is_redacted = TRUE)
+                AND (
+                    c3.memory_policy <> 'normal'
+                    OR c3.is_redacted = TRUE
+                    OR mv3.is_redacted = TRUE
+                )
+        )
+),
+-- Per-source tombstone re-check (belt-and-suspenders requested by Codex CRITICAL #2).
+-- approved_card_hits excludes cards with ANY tombstoned source; this CTE re-filters at
+-- the individual source level so no tombstoned mvid can appear in the anchor or mvid array
+-- even if a future refactor loosens the approved_card_hits condition.
+unforgotten_card_sources AS (
+    SELECT cs.id AS card_source_id,
+           cs.card_id,
+           cs.message_version_id,
+           cs.position
+    FROM card_sources cs
+    JOIN message_versions mv ON mv.id = cs.message_version_id
+    JOIN chat_messages c ON c.id = mv.chat_message_id
+    WHERE cs.card_id IN (SELECT card_id FROM approved_card_hits)
+        AND NOT EXISTS (
+            SELECT 1
+            FROM forget_events AS fe
+            WHERE (
+                fe.tombstone_key
+                    = 'message:' || c.chat_id::text || ':' || c.message_id::text
+                OR (
+                    mv.content_hash IS NOT NULL
+                    AND fe.tombstone_key = 'message_hash:' || mv.content_hash
+                )
+                OR (
+                    c.user_id IS NOT NULL
+                    AND fe.tombstone_key = 'user:' || c.user_id::text
+                )
+            )
+            AND fe.status IN ('pending', 'processing', 'completed')
         )
 ),
 -- Resolve the anchor source per card (lowest position; deterministic).
+-- Selects c.date AS source_message_date (NOT user_id — cards are author-less).
 card_anchors AS (
-    SELECT DISTINCT ON (cs.card_id)
-        cs.card_id,
+    SELECT DISTINCT ON (ucs.card_id)
+        ucs.card_id,
         mv.id AS message_version_id,
         c.id AS chat_message_id,
         c.chat_id AS chat_id,
         c.message_id AS message_id,
-        c.user_id AS user_id
-    FROM card_sources cs
-    JOIN message_versions mv ON mv.id = cs.message_version_id
+        c.date AS source_message_date
+    FROM unforgotten_card_sources ucs
+    JOIN message_versions mv ON mv.id = ucs.message_version_id
     JOIN chat_messages c ON c.id = mv.chat_message_id
-    WHERE cs.card_id IN (SELECT card_id FROM card_hits)
-    ORDER BY cs.card_id, cs.position ASC, cs.id ASC
+    ORDER BY ucs.card_id, ucs.position ASC, ucs.card_source_id ASC
 ),
--- Aggregate all source mvids per card (T6-07 needs the list).
+-- Aggregate all surviving (unforgotten) source mvids per card (T6-07 needs the list).
 card_source_lists AS (
-    SELECT cs.card_id,
-           ARRAY_AGG(cs.message_version_id ORDER BY cs.position ASC, cs.id ASC) AS mvids
-    FROM card_sources cs
-    WHERE cs.card_id IN (SELECT card_id FROM card_hits)
-    GROUP BY cs.card_id
+    SELECT ucs.card_id,
+           ARRAY_AGG(
+               ucs.message_version_id
+               ORDER BY ucs.position ASC, ucs.card_source_id ASC
+           ) AS mvids
+    FROM unforgotten_card_sources ucs
+    GROUP BY ucs.card_id
+),
+-- Final card branch — assembles the 12-column SELECT matching the message branch.
+card_hits AS (
+    SELECT
+        ca.message_version_id AS message_version_id,
+        ca.chat_message_id AS chat_message_id,
+        ca.chat_id AS chat_id,
+        ca.message_id AS message_id,
+        NULL::bigint AS user_id,                           -- cards are author-less
+        ach.snippet AS snippet,
+        ach.rank * :card_rank_boost AS rank,               -- card hits rank slightly above message hits
+        ach.approved_at AS captured_at,
+        COALESCE(ach.approved_at, ca.source_message_date) AS message_date,
+        'card'::text AS source_type,                       -- AFTER message_date; UNION ALL order must match message branch
+        ach.card_id AS card_id,
+        csl.mvids AS card_source_message_version_ids
+    FROM approved_card_hits ach
+    JOIN card_anchors ca ON ca.card_id = ach.card_id
+    JOIN card_source_lists csl ON csl.card_id = ach.card_id
 )
-SELECT
-    ca.message_version_id AS message_version_id,
-    ca.chat_message_id AS chat_message_id,
-    ca.chat_id AS chat_id,
-    ca.message_id AS message_id,
-    NULL::bigint AS user_id,                           -- cards are author-less
-    ch.snippet AS snippet,
-    ch.rank * :card_rank_boost AS rank,                -- card hits rank slightly above message hits
-    ch.approved_at AS captured_at,
-    COALESCE(ch.approved_at, ca.source_message_date) AS message_date,
-    'card'::text AS source_type,                       -- AFTER message_date; UNION ALL order must match message branch
-    ch.card_id AS card_id,
-    csl.mvids AS card_source_message_version_ids
-FROM card_hits ch
-JOIN card_anchors ca ON ca.card_id = ch.card_id
-JOIN card_source_lists csl ON csl.card_id = ch.card_id
 ```
 <!-- C1: Column order MUST match `bot/services/search.py:_PHASE6_SQL` exactly (UNION ALL requires
      identical types/order in every branch). Update both in lock-step if column order changes.
      The design originally had 'card' AS source_type FIRST; actual code places it AFTER message_date.
-     Fixed 2026-05-13 per Codex C1 finding. -->
+     Fixed 2026-05-13 per Codex C1 finding.
+     M1+M2 fix 2026-05-13: removed kc.title from approved_card_hits (renderer does not consume it);
+     added unforgotten_card_sources CTE; fixed card_anchors to select c.date AS source_message_date
+     instead of c.user_id AS user_id; aligned CTE names with actual _PHASE6_SQL. -->
 
 ### Chat scope for card hits
 
