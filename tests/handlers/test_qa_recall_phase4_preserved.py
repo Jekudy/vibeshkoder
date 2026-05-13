@@ -156,18 +156,38 @@ async def test_abstention_reply_byte_identical_when_llm_flag_off(monkeypatch) ->
 
 
 async def test_non_empty_reply_byte_identical_when_llm_flag_off(monkeypatch) -> None:
-    """Phase 4 non-empty evidence reply MUST match _format_response output
-    byte-for-byte. We construct the expected string by reusing the public
-    _format_response helper itself — that guarantees the test pins the
-    handler against the exact same renderer that Phase 4 used.
+    """Phase 4 non-empty evidence reply MUST match a hardcoded snapshot byte-for-byte.
+
+    Codex H1 finding: the previous version built ``expected`` by calling
+    ``_format_response`` itself, which meant internal drift inside
+    ``_format_response`` would NOT be caught — both sides would drift together.
+
+    This version uses a HARDCODED snapshot captured 2026-05-13 per Codex H1 finding.
+    Do not update unless you have verified the change is intentional and re-blessed
+    by the Phase 11 binding suite (tests/evals/test_leakage.py, test_citations.py).
+
+    ``_format_date`` is patched to a fixed value so the snapshot is TZ-invariant.
     """
     handler = import_module("bot.handlers.qa")
     message = _message()
     session = AsyncMock()
 
     qa_result = _qa_result(abstained=False)
-    users_by_id = {2002: _user(user_id=2002, first_name="Author")}
-    expected = handler._format_response(qa_result.bundle, users_by_id)
+
+    # Patch _format_date to a fixed string so the snapshot is TZ-independent.
+    monkeypatch.setattr(handler, "_format_date", lambda _dt: "2026-04-30 12:00")
+
+    # Phase 4 hardcoded snapshot — captured 2026-05-13.
+    # Inputs: chat_id=-1001234567890 → short "1234567890", message_id=77,
+    #         message_version_id=500, snippet='обсуждали <b>память</b>',
+    #         author first_name="Author" (no last_name), date patched to "2026-04-30 12:00".
+    PHASE4_SNAPSHOT = (
+        "<b>Найденные свидетельства:</b>\n\n"
+        "<blockquote>обсуждали <b>память</b></blockquote>\n"
+        "<i>— Author, 2026-04-30 12:00</i> · "
+        '<a href="https://t.me/c/1234567890/77">сообщение</a> · '
+        "<code>message_version_id:500</code>"
+    )
 
     _patch_persist(handler, monkeypatch)
     monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_off_for_llm())
@@ -184,8 +204,11 @@ async def test_non_empty_reply_byte_identical_when_llm_flag_off(monkeypatch) -> 
 
     message.reply.assert_awaited_once()
     actual = message.reply.call_args.args[0]
-    assert actual == expected, (
-        "Phase 4 byte-identity drift — _format_response output differs from the rendered reply"
+    assert actual == PHASE4_SNAPSHOT, (
+        "Phase 4 byte-identity drift detected!\n"
+        "If _format_response changed intentionally, capture a new snapshot here\n"
+        "and re-run the Phase 11 binding suite to confirm no leakage regression.\n"
+        f"Expected:\n{PHASE4_SNAPSHOT!r}\n\nGot:\n{actual!r}"
     )
     # And the synthesizer was not called.
     handler.synthesize_answer.assert_not_awaited()
