@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -121,7 +122,17 @@ def _coolify_state(app_uuid: str) -> dict[str, Any]:
 
 
 def _last_deployments(app_uuid: str, config: ChunkingConfig) -> Any:
-    payload = _coolify_json(f"/api/v1/applications/{app_uuid}/deployments")
+    try:
+        payload = _coolify_json(f"/api/v1/applications/{app_uuid}/deployments")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            sys.stderr.write(
+                "[ops.healing.context_bundle] Coolify deployments endpoint 404 "
+                f"(app {app_uuid}); emitting empty deployments list and continuing.\n"
+            )
+            sys.stderr.flush()
+            return []
+        raise
     if isinstance(payload, dict) and isinstance(payload.get("data"), list):
         return payload["data"][: config.deployments]
     if isinstance(payload, list):
