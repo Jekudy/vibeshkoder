@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}{{ card.title }} - Knowledge Cards - Vibe Gatekeeper{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center mb-4 gap-3">
+    <a href="/cards" class="btn btn-outline-secondary btn-sm">&larr; Back</a>
+    <h2 class="mb-0">{{ card.title }}</h2>
+    <span class="badge bg-success">approved</span>
+</div>
+
+<div class="mb-3 text-muted small">
+    {% if card.approved_at %}
+    Approved {{ card.approved_at.strftime("%Y-%m-%d %H:%M UTC") }}
+    {% endif %}
+    {% if approved_by %}
+    by {{ approved_by }}
+    {% endif %}
+</div>
+
+<div class="card mb-4">
+    <div class="card-header fw-semibold">Body</div>
+    <div class="card-body">
+        <pre class="mb-0" style="white-space: pre-wrap; word-break: break-word;">{{ card.body_markdown }}</pre>
+    </div>
+</div>
+
+<h5>Sources ({{ sources | length }})</h5>
+{% if sources %}
+<div class="table-responsive">
+    <table class="table table-sm align-middle">
+        <thead class="table-light">
+            <tr>
+                <th>#</th>
+                <th>Message Version ID</th>
+                <th>Memory Policy</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in sources %}
+            <tr>
+                <td>{{ s.position + 1 }}</td>
+                <td>
+                    {% if s.is_redacted or s.mv_is_redacted %}
+                    <span class="text-muted">[redacted]</span>
+                    {% else %}
+                    {{ s.message_version_id }}
+                    {% endif %}
+                </td>
+                <td>{{ s.memory_policy }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<p class="text-muted">No sources attached.</p>
+{% endif %}
+{% endblock %}

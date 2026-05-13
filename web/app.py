@@ -43,6 +43,7 @@ def create_app() -> FastAPI:
 
     # Import and include route modules
     from web.routes.auth import router as auth_router
+    from web.routes.cards import router as cards_router
     from web.routes.dashboard import router as dashboard_router
     from web.routes.health import router as health_router
     from web.routes.members import router as members_router
@@ -51,6 +52,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(dashboard_router)
     app.include_router(members_router)
+    app.include_router(cards_router)
 
     # Root redirect
     @app.get("/")

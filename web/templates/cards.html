@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% block title %}Knowledge Cards - Vibe Gatekeeper{% endblock %}
+
+{% block content %}
+<h2 class="mb-4">Knowledge Cards</h2>
+
+<div class="table-responsive">
+    <table class="table table-hover align-middle">
+        <thead class="table-light">
+            <tr>
+                <th>Title</th>
+                <th>Approved At</th>
+                <th>Approved By</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for c in cards %}
+            <tr>
+                <td>{{ c.title }}</td>
+                <td>
+                    {% if c.approved_at %}
+                    {{ c.approved_at.strftime("%Y-%m-%d %H:%M") }}
+                    {% else %}
+                    <span class="text-muted">-</span>
+                    {% endif %}
+                </td>
+                <td>{{ c.approved_by or "-" }}</td>
+                <td>
+                    <a href="/cards/{{ c.id }}" class="btn btn-sm btn-outline-primary">Open</a>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="4" class="text-center text-muted py-4">No approved cards yet.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<p class="text-muted">Total: {{ cards | length }} card{{ "s" if cards | length != 1 else "" }}</p>
+{% endblock %}
