@@ -328,7 +328,7 @@ async def _create_forget_event_completed(
         target_type="message",
         target_id=str(chat_message_id),
         actor_user_id=None,
-        authorized_by="test",
+        authorized_by="system",
         tombstone_key=tombstone_key,
     )
     await ForgetEventRepo.mark_status(db_session, event.id, status="processing")
@@ -353,7 +353,7 @@ async def test_phase6_full_pipeline_candidate_to_card_to_recall(db_session) -> N
        card_source_message_version_ids non-empty (includes anchor mvid).
     5. EvidenceBundle.evidence_ids includes the anchor mvid.
     """
-    from bot.db.models import ExtractionCandidate, ExtractionRun, KnowledgeCard
+    from bot.db.models import ExtractionRun
     from bot.db.repos.user import UserRepo
     from bot.services.qa import run_qa
     from sqlalchemy import select
@@ -471,7 +471,6 @@ async def test_phase6_cascade_forget_demotes_card_and_excludes_from_recall(
     3. Run cascade worker → card demoted to 'archived' (§5.A.5 step 5).
     4. /recall → card NOT in results (approved filter in card branch).
     """
-    from bot.db.models import KnowledgeCard
     from bot.db.repos.forget_event import ForgetEventRepo
     from bot.db.repos.user import UserRepo
     from bot.services.forget_cascade import run_cascade_worker_once
@@ -521,12 +520,12 @@ async def test_phase6_cascade_forget_demotes_card_and_excludes_from_recall(
 
     # Step 2: create forget_event for the source message (pending so cascade can claim it).
     tombstone_key = f"message:{seed.chat_id}:{seed.message_id}"
-    forget_event = await ForgetEventRepo.create(
+    await ForgetEventRepo.create(
         db_session,
         target_type="message",
         target_id=str(seed.chat_message_id),
         actor_user_id=None,
-        authorized_by="test",
+        authorized_by="system",
         tombstone_key=tombstone_key,
     )
     await db_session.flush()
@@ -642,7 +641,7 @@ async def test_phase6_partial_source_forget_card_approved_but_excluded_from_reca
         target_type="message",
         target_id=str(seed1.chat_message_id),
         actor_user_id=None,
-        authorized_by="test",
+        authorized_by="system",
         tombstone_key=tombstone_key,
     )
     await ForgetEventRepo.mark_status(db_session, event.id, status="processing")
