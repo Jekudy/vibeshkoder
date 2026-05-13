@@ -445,8 +445,19 @@ async def _create_case(
         return SEED_CHAT_ID, "пси-сюжет", {card_id}
 
     if case_id == "L6b":
-        # L6b — 3-source approved card; forget ALL sources. Cascade demotes
-        # the card to archived. Search must still exclude.
+        # L6b — 3-source approved card; forget ALL sources.
+        #
+        # This case verifies SEARCH-SIDE EXCLUSION only: with all forget_events
+        # marked completed, the _PHASE6_SQL NOT-EXISTS subquery must exclude the
+        # card from /recall even though card_status is still 'approved' here
+        # (the cascade worker is not invoked in eval fixtures — it runs async).
+        #
+        # Cascade demotion to 'archived' is verified separately in:
+        # tests/services/test_p6_card_sources_cascade.py::test_card_with_only_forgotten_source_demotes_to_archived
+        #
+        # H4 finding (Codex): previous comment claimed cascade demotion was
+        # exercised here — it is not. Search-side guard and cascade demotion
+        # are independent defenses; both are tested, but in different test modules.
         forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
         sources = []
         for idx in range(3):
