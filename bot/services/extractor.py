@@ -716,21 +716,34 @@ async def run_extraction_pass(
             )
         )
 
-    # Stage 3: UPDATE running → completed, populate stats, then INSERT
-    # candidate rows — all in one own-session so they are durable together.
-    async with _engine_session() as own_s:
-        await own_s.execute(
-            sa_update(ExtractionRun)
-            .where(ExtractionRun.id == run_id)
-            .values(
-                run_status="completed",
-                candidate_count=len(candidate_objs),
-                llm_usage_ledger_id=llm_usage_ledger_id,
-            ),
-        )
-        for cand in candidate_objs:
-            own_s.add(cand)
-        await own_s.commit()
+    # Stage 3: UPDATE running → completed and INSERT candidate rows.
+    # This path uses the caller's session because:
+    # 1. The llm_usage_ledger FK target must be visible (it may be flushed
+    #    but not committed in the same db connection — only the caller's session
+    #    can see it under READ COMMITTED before commit).
+    # 2. On the success path, middleware rollback is NOT triggered (no exception),
+    #    so the completed-status UPDATE does not need its own independent session.
+    # The running→completed status transition is therefore correctly durable
+    # when the caller's transaction commits normally. If the caller's session
+    # is rolled back for some other reason AFTER a successful gateway call,
+    # the 'running' row (committed in Stage 1) remains — but that is an
+    # acceptable edge case: the audit record shows a never-completed extraction
+    # run, which operators can retry. The critical case (gateway exception →
+    # 'running' stuck) is handled by the own-session in Stage 2 above.
+    await session.execute(
+        sa_update(ExtractionRun)
+        .where(ExtractionRun.id == run_id)
+        .values(
+            run_status="completed",
+            candidate_count=len(candidate_objs),
+            llm_usage_ledger_id=llm_usage_ledger_id,
+        ),
+    )
+
+    for cand in candidate_objs:
+        session.add(cand)
+    if candidate_objs:
+        await session.flush()
 
     logger.info(
         "extraction_pass_completed",
