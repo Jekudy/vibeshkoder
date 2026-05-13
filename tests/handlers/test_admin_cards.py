@@ -1167,3 +1167,89 @@ async def test_card_detail_returns_not_found_for_archived(
     assert "archived" not in reply.lower()
     # And positive assertion: the handler explicitly says "not found".
     assert "Card not found" in reply
+
+
+# ─── /approve step 1d — full-union sort regression (M-1 deadlock fix) ─────────
+
+
+def test_acquire_mvid_locks_called_with_full_union_in_step_1d() -> None:
+    """Regression guard for #262 M-1: step 1d MUST pass the full union of
+    mvids (initial ∪ new) to ``_acquire_mvid_locks``, not just the delta.
+
+    Rationale: if two concurrent /approve invocations share a subset of mvids,
+    each calling _acquire_mvid_locks with only their own partial set produces
+    different global orderings and can deadlock. Sorting the FULL union before
+    any second-round acquisition matches the cascade orchestrator's protocol.
+
+    This test patches ``_acquire_mvid_locks`` and verifies the call args
+    include every mvid from both the initial read and the FOR UPDATE read.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    # Simulate: step 1a sees [10, 30], step 1c sees [10, 20, 30] (20 was added).
+    initial_mvids = [10, 30]
+    final_mvids = [10, 20, 30]
+
+    # Build a minimal candidate mock.
+    initial_cand = MagicMock()
+    initial_cand.source_message_version_ids = initial_mvids
+    locked_cand = MagicMock()
+    locked_cand.source_message_version_ids = final_mvids
+    locked_cand.status = "pending"
+
+    lock_calls: list[list[int]] = []
+
+    async def _capture_lock_calls(session, mvids):
+        lock_calls.append(list(mvids))
+
+    async def _run():
+        with (
+            patch(
+                "bot.handlers.admin_cards.ExtractionCandidateRepo.get_by_id",
+                new=AsyncMock(return_value=initial_cand),
+            ),
+            patch(
+                "bot.handlers.admin_cards.ExtractionCandidateRepo.get_by_id_for_update",
+                new=AsyncMock(return_value=locked_cand),
+            ),
+            patch(
+                "bot.handlers.admin_cards._acquire_mvid_locks",
+                side_effect=_capture_lock_calls,
+            ),
+            patch(
+                "bot.handlers.admin_cards.revalidate_sources",
+                new=AsyncMock(return_value=("blocked", {"reason": "test_sentinel"})),
+            ),
+        ):
+            from bot.handlers.admin_cards import cmd_approve
+
+            msg = MagicMock()
+            msg.from_user = MagicMock()
+            msg.from_user.id = 149820031
+            msg.from_user.username = "admin_user"
+            msg.answer = AsyncMock()
+            msg.reply = AsyncMock()
+
+            cmd_obj = MagicMock()
+            cmd_obj.args = str(_uuid_module.uuid4())
+
+            session = MagicMock()
+            await cmd_approve(msg, cmd_obj, session=session)
+
+        return lock_calls
+
+    calls = asyncio.run(_run())
+
+    # Step 1b: initial_mvids were locked first.
+    assert len(calls) >= 2, (
+        f"expected at least 2 _acquire_mvid_locks calls (1b + 1d); got {calls}"
+    )
+
+    # The LAST call (step 1d) MUST include ALL mvids from the full union —
+    # specifically mvid 20 which only appeared in the FOR UPDATE read.
+    last_call = calls[-1]
+    assert set(last_call) == set(initial_mvids + final_mvids), (
+        f"step 1d must pass full union to _acquire_mvid_locks; got {last_call}, "
+        f"expected superset of {initial_mvids + final_mvids}"
+    )
