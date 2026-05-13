@@ -628,9 +628,11 @@ async def cmd_card(
         _format_dt(card.approved_at) if card.approved_at else "—"
     )
 
+    # L-3: 'Status:' line removed — cmd_card is gated on card_status='approved'
+    # (line ~615) so the status is always 'approved' at this point; the line
+    # was redundant and slightly noisy for the admin reader.
     header_lines = [
         f"📄 <b>Card detail</b>  <code>{card.id}</code>",
-        f"Status: <code>{card.card_status}</code>",
         f"Approved: {approved_at} by {approver}",
         f"Title: {html.escape(str(card.title or '—'))}",
     ]

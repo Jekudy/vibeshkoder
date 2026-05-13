@@ -247,16 +247,18 @@ def test_p6_event_lock_id_distinct_from_mvid_lock_id() -> None:
     (``p6:mvid:`` vs ``p6:event:``), so collisions are astronomically
     improbable — this test pins the invariant against a future refactor
     that, say, merges the namespaces or strips a prefix.
-    """
-    import uuid as _uuid_module
 
+    L-4 fix: ``forget_events.id`` is a plain Integer (autoincrement), NOT a UUID.
+    The previous fixture used a UUID object; corrected to Integer to match the
+    production model (see ``bot/db/models.py:ForgetEvent``).
+    """
     from bot.services.forget_cascade import (
         _p6_event_advisory_lock_id,
         _p6_mvid_advisory_lock_id,
     )
 
-    # Use a deterministic UUID for reproducibility.
-    sample_event_id = _uuid_module.UUID("11111111-2222-3333-4444-555555555555")
+    # Use a deterministic integer matching production forget_events.id type.
+    sample_event_id = 111122223333
     event_lock = _p6_event_advisory_lock_id(sample_event_id)
 
     # Compare against a handful of mvid lock ids. None should match.
@@ -278,12 +280,15 @@ async def test_p6_event_lock_blocks_same_event_across_connections(
     FIRST DB action in ``_process_one_event``. Two concurrent transactions
     targeting the same event hash to the same lock_id and serialize at
     this gate before any mvid-level work begins.
-    """
-    import uuid as _uuid_module
 
+    L-4 fix: ``forget_events.id`` is a plain Integer (autoincrement), NOT a UUID.
+    The previous fixture used a UUID object; corrected to Integer to match the
+    production model (see ``bot/db/models.py:ForgetEvent``).
+    """
     from bot.services.forget_cascade import _p6_event_advisory_lock_id
 
-    sample_event_id = _uuid_module.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    # Use a deterministic integer matching production forget_events.id type.
+    sample_event_id = 999888777
     lock_id = _p6_event_advisory_lock_id(sample_event_id)
 
     async with postgres_engine.connect() as conn_a:

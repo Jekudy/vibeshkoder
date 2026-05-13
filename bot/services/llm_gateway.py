@@ -835,7 +835,8 @@ async def _forget_tombstone_check(
     nondeterministic across hash randomisation).
 
     The SQL JOIN intentionally asymmetric vs ``_SOURCE_FILTER_SQL``: this
-    join walks ``chat_messages.content_hash`` and ``chat_messages.user_id``
+    join walks ``message_versions.content_hash`` (PR #257 fix — NOT the
+    nullable ``chat_messages.content_hash``) and ``chat_messages.user_id``
     without the ``current_version_id`` constraint because a tombstone keyed
     on a user or content_hash invalidates EVERY version (not only the
     current one). F10 closure — intentional vs source filter which only
@@ -1272,7 +1273,9 @@ async def extract_candidates(
 class LiveExtractCandidatesGateway:
     """Concrete impl of T6-02 ``ExtractCandidatesGateway`` Protocol.
 
-    Stub for TDD RED phase; real implementation lands as the next commit.
+    Production wrapper that delegates to the module-level ``extract_candidates``
+    function. Accepts the same ``ledger_repo``, ``provider``, and ``config``
+    it was constructed with, forwarding them on each call.
     """
 
     def __init__(

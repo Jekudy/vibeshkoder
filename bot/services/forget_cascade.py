@@ -93,7 +93,12 @@ def _p6_mvid_advisory_lock_id(mvid: int) -> int:
 
 
 def _p6_event_advisory_lock_id(event_id) -> int:
-    """Derive the Phase 6 advisory lock id for a ``forget_event.id`` (UUID).
+    """Derive the Phase 6 advisory lock id for a ``forget_event.id`` (Integer).
+
+    ``forget_events.id`` is a plain auto-increment Integer (not UUID) —
+    see ``bot/db/models.py:ForgetEvent``. The lock payload is
+    ``f"p6:event:{event_id}"`` encoded as ASCII, hashed via SHA-256 →
+    signed int64. Accepts any type that str()-formats to a stable value.
 
     Coarse-grained gate per Codex round 2 CRITICAL #2 fix: the cascade
     orchestrator (``_process_one_event``) takes this lock as the FIRST DB
@@ -107,7 +112,7 @@ def _p6_event_advisory_lock_id(event_id) -> int:
     serialization with /approve remains at the mvid-lock layer, which is
     the contract pinned by the T6-09 collision test.
 
-    Returns a signed-int64 derived from the UUID's hex repr.
+    Returns a signed-int64 derived from the event_id's str representation.
     """
     payload = f"p6:event:{event_id}".encode("ascii")
     digest = hashlib.sha256(payload).digest()
@@ -870,6 +875,16 @@ async def _resolve_affected_mvids(session: AsyncSession, event) -> list[int]:
 
 async def _process_one_event(session: AsyncSession, event) -> None:
     """Run the full cascade for a single (already-claimed) forget_event row.
+
+    **Naming note (issue #260 / PHASE6_PLAN.md §5.A.5):** This function IS the
+    ``apply_forget_event`` orchestrator described in PHASE6_PLAN.md §5.A.5.
+    The name ``_process_one_event`` reflects its role as the inner loop body of
+    ``run_cascade_worker_once`` rather than a public entry point. The advisory lock
+    is acquired HERE (at the cascade worker tick), NOT at the ``forget_events``
+    INSERT, because the H-Cdx-2 closure relies on ``revalidate_sources`` (inside
+    ``_cascade_card_sources_on_forget``) seeing committed ``forget_event`` rows
+    regardless of the cascade-worker lock state — i.e., the lock discipline is
+    "lock before any read that informs cascade work", not "lock at event creation".
 
     Resumes from ``cascade_status``: layers already marked ``completed`` are
     skipped. Each layer's outcome is checkpointed via ``update_cascade_status``
