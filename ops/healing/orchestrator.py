@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -34,13 +35,27 @@ class HealingResult:
 
 
 def _run(command: list[str], input_text: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        input=input_text,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
+    try:
+        return subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        # Surface child output so failures are debuggable in CI logs.
+        # capture_output=True hides stderr by default; without this, callers see
+        # only the parent CalledProcessError frame.
+        sys.stderr.write(
+            f"[ops.healing._run] Child failed (exit={exc.returncode}): {' '.join(command)}\n"
+        )
+        if exc.stdout:
+            sys.stderr.write(f"[ops.healing._run] child stdout:\n{exc.stdout}\n")
+        if exc.stderr:
+            sys.stderr.write(f"[ops.healing._run] child stderr:\n{exc.stderr}\n")
+        sys.stderr.flush()
+        raise
 
 
 def _dry_run_result(scenario: str, config: HealingConfig) -> HealingResult:
