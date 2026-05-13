@@ -1065,9 +1065,28 @@ async def extract_candidates(
 ) -> dict[str, Any]:
     """Single Phase 6 LLM extraction entry point — see T6-03_design.md §1.
 
-    Returns ``{"candidates": [...], "llm_usage_ledger_id": int | None}``
-    matching the ``ExtractCandidatesGateway`` Protocol surface
-    (``bot/services/extractor.py``).
+    Returns one of two shapes:
+
+    Success::
+
+        {"candidates": [...], "llm_usage_ledger_id": int | None}
+
+    Provider failure (#262 M-2)::
+
+        {
+            "candidates": [],
+            "llm_usage_ledger_id": int,   # ledger row written for cost accounting
+            "gateway_error": str,         # truncated provider error message
+        }
+
+    The extractor MUST inspect ``gateway_error`` before acting on
+    ``llm_usage_ledger_id`` — a non-null ``gateway_error`` means the call
+    charged the ledger but produced no valid candidates (run should be
+    ``failed``, not ``completed``).
+
+    ``gateway_error`` is absent (not returned) on the success path.  On
+    the empty-input short-circuit path, the key is also absent (no provider
+    call, no ledger row, no error).
 
     The gateway is the ONLY allowed LLM call site for extraction (HANDOFF
     invariant #2). Privacy is gatekept upstream by ``run_extraction_pass``
@@ -1081,6 +1100,9 @@ async def extract_candidates(
     * MUST NOT log raw ``text`` / ``caption`` / ``normalized_text`` —
       use ``prompt_hash`` + ``message_version_id`` for traceability.
     * MUST NOT include source content in error messages or ledger fields.
+    * ``gateway_error`` is truncated to 2000 chars to avoid DB bloat from
+      giant stack traces. The message is the stringified exception class and
+      message only — no stack frames, no API URLs, no provider response bodies.
 
     Failure semantics (alignment with T6-02 invariant #4):
 
@@ -1088,8 +1110,8 @@ async def extract_candidates(
       returns ``llm_usage_ledger_id=None``. This is the asymmetry T6-02
       handles — "only runs that actually invoked the gateway need a
       ledger row".
-    * All other paths write at least a placeholder ledger row that the
-      extractor's invariant guard sees as non-None.
+    * Provider exceptions → ledger row written (cost accounting) + ``gateway_error``
+      set → extractor sets run_status='failed' and persists the error string.
     """
     # Invariant 1 — empty input short-circuit (no provider, no ledger).
     if not source_versions:
@@ -1164,11 +1186,25 @@ async def extract_candidates(
     # ALL exceptions are caught + translated into ledger error fields so
     # the SAVEPOINT in ``run_extraction_pass`` stays clean and the
     # extractor's invariant #4 (non-None ledger_id) holds.
+    #
+    # Phase 6.5 M-2 (#262 M-2): on provider failure we now include a
+    # ``gateway_error`` key in the return dict so the extractor can
+    # distinguish a "failed-but-charged" call from a successful-but-empty
+    # one. The key is absent on the success path (the extractor reads it
+    # via ``dict.get("gateway_error")`` so a missing key == None).
+    #
+    # ``gateway_error`` is truncated to 2000 chars. Provider exceptions can
+    # embed giant stack traces, API URLs, or partial HTTP bodies. We store
+    # only the short ``type:message`` prefix so the DB column doesn't bloat
+    # and no sensitive provider metadata (API keys, partial response content)
+    # leaks into the audit trail.
+    _GW_ERROR_MAX_LEN = 2000
     started = time.monotonic()
     try:
         provider_result = await provider.call(prompt=prompt, model=config.model)
     except ProviderTransientError as exc:
         latency = int((time.monotonic() - started) * 1000)
+        ledger_error = f"provider_transient:{exc.subtype}"
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
@@ -1178,9 +1214,15 @@ async def extract_candidates(
             tokens_out=0,
             request_id=None,
             latency_ms=latency,
-            error=f"provider_transient:{exc.subtype}",
+            error=ledger_error,
         )
-        return {"candidates": [], "llm_usage_ledger_id": placeholder_row.id}
+        # Truncated for DB safety — no stack frames, no API secrets.
+        gateway_error_msg = str(exc)[:_GW_ERROR_MAX_LEN]
+        return {
+            "candidates": [],
+            "llm_usage_ledger_id": placeholder_row.id,
+            "gateway_error": gateway_error_msg,
+        }
     except ProviderStructuralError as exc:
         logger.error(
             "llm_gateway: extraction structural provider failure subtype=%s",
@@ -1191,6 +1233,7 @@ async def extract_candidates(
 
         observability.emit_stop_signal("llm_provider_structural")
         latency = int((time.monotonic() - started) * 1000)
+        ledger_error = f"provider_structural:{exc.subtype}"
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
@@ -1200,9 +1243,14 @@ async def extract_candidates(
             tokens_out=0,
             request_id=None,
             latency_ms=latency,
-            error=f"provider_structural:{exc.subtype}",
+            error=ledger_error,
         )
-        return {"candidates": [], "llm_usage_ledger_id": placeholder_row.id}
+        gateway_error_msg = str(exc)[:_GW_ERROR_MAX_LEN]
+        return {
+            "candidates": [],
+            "llm_usage_ledger_id": placeholder_row.id,
+            "gateway_error": gateway_error_msg,
+        }
     except Exception as exc:
         logger.error(
             "llm_gateway: extraction unknown provider failure class=%s",
@@ -1210,6 +1258,7 @@ async def extract_candidates(
             exc_info=True,
         )
         latency = int((time.monotonic() - started) * 1000)
+        ledger_error = f"provider_unknown:{type(exc).__name__}"
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
@@ -1219,9 +1268,14 @@ async def extract_candidates(
             tokens_out=0,
             request_id=None,
             latency_ms=latency,
-            error=f"provider_unknown:{type(exc).__name__}",
+            error=ledger_error,
         )
-        return {"candidates": [], "llm_usage_ledger_id": placeholder_row.id}
+        gateway_error_msg = str(exc)[:_GW_ERROR_MAX_LEN]
+        return {
+            "candidates": [],
+            "llm_usage_ledger_id": placeholder_row.id,
+            "gateway_error": gateway_error_msg,
+        }
 
     # Parse JSON envelope + filter for citation conformance.
     candidates_raw = _parse_extraction_response(provider_result.answer_text)
