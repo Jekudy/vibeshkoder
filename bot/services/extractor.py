@@ -43,9 +43,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.db.engine import async_session as _engine_session
 from bot.db.models import (
     ExtractionCandidate,
     ExtractionRun,
@@ -602,43 +603,44 @@ async def run_extraction_pass(
             candidate_count=0,
         )
 
-    # ─── Atomic 3-stage lifecycle (Codex HIGH #3 + round 3 HIGH) ──────────
-    # Stage 1: INSERT ExtractionRun with run_status='running' AND commit
-    # BEFORE the gateway call. Commit is required for crash-safety
-    # (Codex round 3 HIGH): a flushed-but-uncommitted row vanishes if
-    # the process is killed / OOMs / loses its connection mid-gateway,
-    # leaving no audit trail of the attempted pass. ``session.commit()``
-    # makes the row durable; the SAVEPOINT below isolates the gateway
-    # call so a gateway-side exception still leaves the durable
-    # 'running' row in place for the failed-status UPDATE.
+    # ─── Atomic 3-stage lifecycle (Codex HIGH #3 + round 3 HIGH + issue #261) ─
+    # Fix (issue #261, FHR Phase 6 H-2): all durable writes to extraction_runs
+    # MUST go through a dedicated own-session, NOT the caller's middleware
+    # session. The original code called ``session.commit()`` to make the
+    # 'running' row durable, then updated it to 'failed'/'completed' via the
+    # SAME session. In production, middleware rolls back the session on any
+    # unhandled exception — which discards the failed-status UPDATE, leaving a
+    # permanently-stuck 'running' row with no failure audit trail.
     #
-    # The same commit pattern is used by ``bot/services/import_apply.py``
-    # (per-chunk commits inside a longer logical run). It is compatible
-    # with the test fixture's outer-tx rollback semantics
-    # (``bind=conn`` + outer connection-level transaction in
-    # ``tests/conftest.py::db_session``): commits inside the function
-    # land at the connection level and are still unwound by the outer
-    # rollback at fixture teardown.
-    run = ExtractionRun(
-        ingestion_window_start=window_start,
-        ingestion_window_end=window_end,
-        candidate_count=0,
-        run_status="running",
-        operator_user_id=operator_user_id,
-    )
-    session.add(run)
-    await session.flush()
-    # Crash-safety commit. Subsequent ORM access on ``run`` continues to
-    # work because both production (``bot/db/engine.py``) and tests
-    # (``tests/conftest.py``) configure ``expire_on_commit=False`` —
-    # ``run``'s attributes remain attached for the lifecycle UPDATEs.
-    await session.commit()
+    # Pattern: open ``_engine_session()`` (the global async_sessionmaker from
+    # bot.db.engine), write + commit inside it, close it. This matches the
+    # pattern used by bot/services/forget_cascade.py and
+    # bot/services/scheduler.py. Each own-session is independent of the
+    # middleware tx, so no rollback from the caller can undo the audit trail.
+    #
+    # The caller's ``session`` is still used for all READ-ONLY operations
+    # (SELECT, _select_eligible_sources, _bundle_is_clean). Only the durable
+    # audit writes go through own-sessions.
 
-    # Stage 2: gateway call wrapped in a SAVEPOINT. A raised exception
-    # rolls back the savepoint (no half-written candidates) but the
-    # running row inserted above remains visible (and durable) in the
-    # outer transaction, so we can update it to 'failed' and surface the
-    # failure durably in the audit table.
+    # Stage 1: INSERT ExtractionRun('running') in an own-session and commit.
+    # This makes the row durable before the gateway call. A process crash,
+    # OOM, or middleware rollback can no longer erase the audit evidence.
+    async with _engine_session() as own_s:
+        run = ExtractionRun(
+            ingestion_window_start=window_start,
+            ingestion_window_end=window_end,
+            candidate_count=0,
+            run_status="running",
+            operator_user_id=operator_user_id,
+        )
+        own_s.add(run)
+        await own_s.commit()
+        # Capture run.id before the session closes; expire_on_commit=False
+        # (configured in bot/db/engine.py) keeps attributes accessible.
+        run_id = run.id
+
+    # Stage 2: gateway call. Any exception here rolls back the SAVEPOINT
+    # only — the 'running' row above is already durably committed.
     source_payload = [row.to_gateway_payload() for row in rows]
     try:
         async with session.begin_nested():
@@ -648,14 +650,19 @@ async def run_extraction_pass(
                 prompt_template_version=prompt_template_version,
             )
     except Exception as exc:
-        # Update running → failed, then re-raise so the caller knows
-        # the LLM call died. The audit row is intact.
-        run.run_status = "failed"
-        await session.flush()
+        # Update running → failed in its own session so middleware rollback
+        # cannot discard the failed-status audit record (issue #261).
+        async with _engine_session() as own_s:
+            await own_s.execute(
+                sa_update(ExtractionRun)
+                .where(ExtractionRun.id == run_id)
+                .values(run_status="failed"),
+            )
+            await own_s.commit()
         logger.warning(
             "extraction_pass_gateway_crashed",
             extra={
-                "extraction_run_id": str(run.id),
+                "extraction_run_id": str(run_id),
                 "window_start": window_start.isoformat(),
                 "window_end": window_end.isoformat(),
                 "operator_user_id": operator_user_id,
@@ -672,19 +679,24 @@ async def run_extraction_pass(
     # llm_usage_ledger entry. If the gateway returns no ledger id, fail
     # the existing running row in place — no orphan rows.
     if llm_usage_ledger_id is None:
-        run.run_status = "failed"
-        await session.flush()
+        async with _engine_session() as own_s:
+            await own_s.execute(
+                sa_update(ExtractionRun)
+                .where(ExtractionRun.id == run_id)
+                .values(run_status="failed"),
+            )
+            await own_s.commit()
         logger.warning(
             "extraction_pass_aborted",
             extra={
-                "extraction_run_id": str(run.id),
+                "extraction_run_id": str(run_id),
                 "failure_reason": "no_llm_ledger_entry",
                 "window_start": window_start.isoformat(),
                 "window_end": window_end.isoformat(),
             },
         )
         return ExtractionResult(
-            extraction_run_id=run.id,
+            extraction_run_id=run_id,
             run_status="failed",
             candidate_count=0,
             failure_reason="no_llm_ledger_entry",
@@ -695,6 +707,7 @@ async def run_extraction_pass(
     for c in candidates_raw:
         candidate_objs.append(
             ExtractionCandidate(
+                extraction_run_id=run_id,
                 candidate_json=dict(c.get("candidate_json") or {}),
                 source_message_version_ids=list(
                     c.get("source_message_version_ids") or []
@@ -704,22 +717,25 @@ async def run_extraction_pass(
         )
 
     # Stage 3: UPDATE running → completed, populate stats, then INSERT
-    # candidate rows pointing at the now-completed run.
-    run.run_status = "completed"
-    run.candidate_count = len(candidate_objs)
-    run.llm_usage_ledger_id = llm_usage_ledger_id
-    await session.flush()
-
-    for cand in candidate_objs:
-        cand.extraction_run_id = run.id
-        session.add(cand)
-    if candidate_objs:
-        await session.flush()
+    # candidate rows — all in one own-session so they are durable together.
+    async with _engine_session() as own_s:
+        await own_s.execute(
+            sa_update(ExtractionRun)
+            .where(ExtractionRun.id == run_id)
+            .values(
+                run_status="completed",
+                candidate_count=len(candidate_objs),
+                llm_usage_ledger_id=llm_usage_ledger_id,
+            ),
+        )
+        for cand in candidate_objs:
+            own_s.add(cand)
+        await own_s.commit()
 
     logger.info(
         "extraction_pass_completed",
         extra={
-            "extraction_run_id": str(run.id),
+            "extraction_run_id": str(run_id),
             "candidate_count": len(candidate_objs),
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
@@ -729,7 +745,7 @@ async def run_extraction_pass(
     )
 
     return ExtractionResult(
-        extraction_run_id=run.id,
+        extraction_run_id=run_id,
         run_status="completed",
         candidate_count=len(candidate_objs),
         llm_usage_ledger_id=llm_usage_ledger_id,

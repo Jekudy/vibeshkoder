@@ -1149,3 +1149,196 @@ async def test_run_extraction_pass_excludes_live_message_via_mv_content_hash_tom
     for call in gw.calls:
         for sv in call["source_versions"]:
             assert "DO_NOT_LEAK_LIVE_HASH" not in (sv.get("text") or "")
+
+
+# ─── Issue #261: production middleware path — running-row leak on gateway exception ──
+
+
+async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
+    postgres_engine,
+) -> None:
+    """Regression for GitHub issue #261 (FHR Phase 6 finding H-2).
+
+    Production path: middleware owns the session and rolls it back on ANY
+    unhandled exception. The extractor calls ``session.commit()`` to make
+    the 'running' row durable, then the gateway crashes. If the failed-status
+    UPDATE goes through the same middleware session, a subsequent middleware
+    rollback discards that UPDATE — leaving the 'running' row permanently
+    stuck in the DB with no failure audit trail.
+
+    This test simulates the production middleware lifecycle directly:
+    1. Test data is committed via a separate setup session (real committed rows).
+    2. A "middleware session" wraps a connection-level transaction that will be
+       rolled back (simulating what middleware does on exception).
+    3. ``run_extraction_pass`` is called on this middleware session with a
+       crashing gateway.
+    4. After the gateway exception, the middleware session is explicitly rolled
+       back (as middleware would do).
+    5. A fresh verification session reads the ``extraction_runs`` table and
+       asserts the row exists with ``run_status='failed'`` — NOT 'running'.
+
+    The fix must use a separate own-session for the failed-status UPDATE so
+    middleware rollback cannot discard it.
+    """
+    import uuid
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime(2000, 6, 1, tzinfo=timezone.utc)
+    window_end = datetime(2000, 6, 2, tzinfo=timezone.utc)
+    when = datetime(2000, 6, 1, 12, tzinfo=timezone.utc)
+
+    # ── Step 1: set up committed test data (user + chat_message + message_version) ──
+    setup_factory = async_sessionmaker(
+        postgres_engine, class_=AsyncSession, expire_on_commit=False
+    )
+
+    user_id = _next_user()
+    chat_id = _next_chat_id()
+    message_id = _next_msg_id()
+
+    async with setup_factory() as setup_s:
+        async with setup_s.begin():
+            await setup_s.execute(
+                text(
+                    "INSERT INTO users (telegram_id, username, first_name) "
+                    "VALUES (:tid, :uname, 'Test') ON CONFLICT DO NOTHING"
+                ),
+                {"tid": user_id, "uname": f"u{user_id}"},
+            )
+            await setup_s.execute(
+                text(
+                    "INSERT INTO chat_messages "
+                    "(message_id, chat_id, user_id, text, date, created_at, memory_policy, is_redacted) "
+                    "VALUES (:mid, :cid, :uid, :txt, :dt, :dt, 'normal', false)"
+                ),
+                {
+                    "mid": message_id,
+                    "cid": chat_id,
+                    "uid": user_id,
+                    "txt": "prod-path-leak-test-msg",
+                    "dt": when,
+                },
+            )
+            cm_row = await setup_s.execute(
+                text(
+                    "SELECT id FROM chat_messages WHERE message_id = :mid AND chat_id = :cid"
+                ),
+                {"mid": message_id, "cid": chat_id},
+            )
+            cm_id = cm_row.scalar_one()
+
+            content_hash = f"h{uuid.uuid4().hex[:16]}"
+            await setup_s.execute(
+                text(
+                    "INSERT INTO message_versions "
+                    "(chat_message_id, version_seq, text, normalized_text, entities_json, content_hash, is_redacted) "
+                    "VALUES (:cm_id, 1, :txt, :txt, '{}', :ch, false)"
+                ),
+                {"cm_id": cm_id, "txt": "prod-path-leak-test-msg", "ch": content_hash},
+            )
+            mv_row = await setup_s.execute(
+                text("SELECT id FROM message_versions WHERE chat_message_id = :cm_id"),
+                {"cm_id": cm_id},
+            )
+            mv_id = mv_row.scalar_one()
+
+            await setup_s.execute(
+                text(
+                    "UPDATE chat_messages SET current_version_id = :mv_id WHERE id = :cm_id"
+                ),
+                {"mv_id": mv_id, "cm_id": cm_id},
+            )
+        # committed here
+
+    # ── Step 2: crashing gateway ──────────────────────────────────────────────
+    @dataclass
+    class _CrashGw:
+        calls: list = None  # type: ignore[assignment]
+
+        def __post_init__(self) -> None:
+            if self.calls is None:
+                self.calls = []
+
+        async def extract_candidates(
+            self,
+            session: Any,
+            *,
+            source_versions: list[dict[str, Any]],
+            prompt_template_version: str = "v0.1.0",
+        ) -> dict[str, Any]:
+            self.calls.append({"source_versions": list(source_versions)})
+            raise RuntimeError("simulated gateway blip for prod-path test")
+
+    gw = _CrashGw()
+
+    # ── Step 3: simulate middleware-owned session that rolls back on exception ─
+    async with postgres_engine.connect() as mw_conn:
+        mw_tx = await mw_conn.begin()
+        MiddlewareSessionFactory = async_sessionmaker(
+            bind=mw_conn, class_=AsyncSession, expire_on_commit=False
+        )
+        async with MiddlewareSessionFactory() as mw_session:
+            with pytest.raises(RuntimeError, match="simulated gateway blip"):
+                await run_extraction_pass(
+                    mw_session,
+                    window_start=window_start,
+                    window_end=window_end,
+                    gateway=gw,
+                )
+        # Middleware rolls back its outer transaction (as exception handler would)
+        if mw_tx.is_active:
+            await mw_tx.rollback()
+
+    # ── Step 4: verify with a fresh session — 'failed' must survive rollback ──
+    verify_factory = async_sessionmaker(
+        postgres_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    try:
+        async with verify_factory() as verify_s:
+            rows_result = await verify_s.execute(
+                text(
+                    "SELECT run_status FROM extraction_runs "
+                    "WHERE ingestion_window_start = :ws AND ingestion_window_end = :we"
+                ),
+                {"ws": window_start, "we": window_end},
+            )
+            rows = rows_result.fetchall()
+            assert rows, (
+                "No extraction_runs row found — running-row was never committed durably"
+            )
+            statuses = {r[0] for r in rows}
+            assert "failed" in statuses, (
+                f"Expected 'failed' audit row after gateway crash, got statuses={statuses}. "
+                "Bug #261: failed-status UPDATE was discarded by middleware rollback."
+            )
+            assert "running" not in statuses, (
+                f"Stuck 'running' row after middleware rollback — statuses={statuses}. "
+                "Failed-status UPDATE must go through own-session, not middleware session."
+            )
+    finally:
+        # Clean up committed test data
+        async with verify_factory() as cleanup_s:
+            async with cleanup_s.begin():
+                await cleanup_s.execute(
+                    text(
+                        "DELETE FROM extraction_runs "
+                        "WHERE ingestion_window_start = :ws AND ingestion_window_end = :we"
+                    ),
+                    {"ws": window_start, "we": window_end},
+                )
+                await cleanup_s.execute(
+                    text("DELETE FROM message_versions WHERE chat_message_id = :cm_id"),
+                    {"cm_id": cm_id},
+                )
+                await cleanup_s.execute(
+                    text("DELETE FROM chat_messages WHERE id = :cm_id"),
+                    {"cm_id": cm_id},
+                )
+                await cleanup_s.execute(
+                    text("DELETE FROM users WHERE telegram_id = :tid"),
+                    {"tid": user_id},
+                )
