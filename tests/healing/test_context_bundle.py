@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from ops.healing import context_bundle
 
@@ -78,3 +79,33 @@ def test_assemble_contains_all_sections(monkeypatch: Any, tmp_path: Path) -> Non
     assert "## Snapshot reference" in bundle
     assert "BOT_TOKEN" in bundle
     assert "hidden" not in bundle
+
+
+def test_last_deployments_returns_empty_on_404(capsys: pytest.CaptureFixture[str], monkeypatch: Any) -> None:
+    """Sprint 1B: Coolify /deployments endpoint may not exist in current Coolify version.
+
+    Degrade to empty list + stderr marker rather than crashing context_bundle.
+    """
+    def fake_coolify_json(path: str) -> Any:
+        request = httpx.Request("GET", f"http://example/{path}")
+        response = httpx.Response(404, request=request)
+        raise httpx.HTTPStatusError("404", request=request, response=response)
+
+    monkeypatch.setattr(context_bundle, "_coolify_json", fake_coolify_json)
+    result = context_bundle._last_deployments("abc-uuid", context_bundle.ChunkingConfig())
+    assert result == []
+    err = capsys.readouterr().err
+    assert "Coolify deployments endpoint 404" in err
+    assert "abc-uuid" in err
+
+
+def test_last_deployments_propagates_non_404(monkeypatch: Any) -> None:
+    """Non-404 HTTP errors must still propagate — we only mask the missing endpoint."""
+    def fake_coolify_json(path: str) -> Any:
+        request = httpx.Request("GET", f"http://example/{path}")
+        response = httpx.Response(500, request=request)
+        raise httpx.HTTPStatusError("500", request=request, response=response)
+
+    monkeypatch.setattr(context_bundle, "_coolify_json", fake_coolify_json)
+    with pytest.raises(httpx.HTTPStatusError):
+        context_bundle._last_deployments("abc-uuid", context_bundle.ChunkingConfig())
