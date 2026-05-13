@@ -346,6 +346,8 @@ Plus L-1..L-4 cosmetic carryovers (N+1 perf, alembic 025 `import hashlib` placem
 
 **Sprint 0 RATIFIED 2026-05-12.** Plan promoted to `docs/memory-system/PHASE6_PLAN.md`. All 9 tickets merged across Wave 1 (T6-00..T6-03) + Wave 2 Stream C (T6-04, T6-05, T6-09) + Stream D (T6-06, T6-07). T6-08 deferred (optional web cards page; no Phase 5 web scaffold). FHR: Claude product APPROVED + Claude technical APPROVED 2026-05-12. FHR blocker (LLM gateway `_TOMBSTONE_GATE_SQL` `mv.content_hash` path) fixed via PR #259 in same closure cycle. Carryover issues filed: #260 `_process_one_event` rename, #261 extractor running-row leak, #262 MED/LOW + deferred items (Phase 6.5).
 
+**Phase 6.5 closure (2026-05-13):** Carryover bundle resolved — #261 (extractor running-row leak) via PR #265, #260 (_process_one_event rename) + #262 trivial items (UNION ALL comment, column order annotation) via PR #266. MED/LOW items M-1/M-2/M-4 from Codex post-merge audit remain open in #262. T6-06/T6-07 retrospective design docs landed in PR #264 (anomaly: implementation preceded docs). T6-09 broader e2e pipeline test (candidate→card→recall) merged via PR #267 2026-05-13. Codex post-merge follow-ups (SQL drift M1+M2, multi-item snapshot M3, docstring L1+L2) addressed in chore/p6-wave2-closure.
+
 **Owned alembic range:** 030–049 (Wave 1 = 030–035).
 
 | Ticket | Wave | Title | Status | Notes |
@@ -356,22 +358,25 @@ Plus L-1..L-4 cosmetic carryovers (N+1 perf, alembic 025 `import hashlib` placem
 | T6-03 | 1 | Gateway `extract_candidates` endpoint | merged | **Merged via PR #254** 2026-05-12. LLM gateway `extract_candidates` endpoint + router + DI. Phase 11 leakage binding test cleared before merge. Wave 1 complete. |
 | T6-04 | 2 (Stream C) | Admin `/candidates` + `/approve` + `/reject` handlers | merged | **Merged via PR #258** 2026-05-12. Admin candidate review flow with approval/rejection. |
 | T6-05 | 2 (Stream C) | Admin `/cards` handler | merged | **Merged via PR #258** 2026-05-12. Admin cards listing handler. |
-| T6-06 | 2 (Stream D) | Search `include_cards` flag | merged | **Merged via PR #256** 2026-05-12. `/recall` search can include knowledge cards in results. |
-| T6-07 | 2 (Stream D) | `EvidenceItem` `source_type` field | merged | **Merged via PR #256** 2026-05-12. Adds `source_type` discriminator to evidence bundle items. |
+| T6-06 | 2 (Stream D) | Search `include_cards` flag | merged | **Merged via PR #256** 2026-05-12. `/recall` search can include knowledge cards in results. Design doc (retrospective): PR #264 2026-05-13. Codex M1+M2 SQL drift in design doc fixed in chore/p6-wave2-closure. |
+| T6-07 | 2 (Stream D) | `EvidenceItem` `source_type` field | merged | **Merged via PR #256** 2026-05-12. Adds `source_type` discriminator to evidence bundle items. Design doc (retrospective): PR #264 2026-05-13. |
 | T6-08 | — | Web cards page (optional) | deferred | No Phase 5 web scaffold; deferred to Phase 6.5. Carryover tracked in #262. |
-| T6-09 | 2 (Stream C) | Collision test + cascade advisory lock wiring | merged | **Merged via PR #258** 2026-05-12. Closes H-Cdx-2 race window via 3-layer defense (per-mvid advisory lock + event-level coarse lock + FOR SHARE row lock). |
+| T6-09 | 2 (Stream C) | Collision test + cascade advisory lock wiring | merged | **Merged via PR #258** 2026-05-12 (advisory lock wiring + collision regression test). Broader e2e pipeline test (candidate→card→recall) merged via **PR #267** 2026-05-13, commit on main. |
 
 **FHR fix (same closure cycle):**
 | Item | Title | Status | Notes |
 |------|-------|--------|-------|
 | FHR blocker | LLM gateway `_TOMBSTONE_GATE_SQL` uses `mv.content_hash` final path | fixed | **Merged via PR #259** 2026-05-12. |
 
-**Carryover issues (Phase 6.5):**
-| Issue | Title |
-|-------|-------|
-| #260 | `_process_one_event` rename |
-| #261 | Extractor running-row leak |
-| #262 | MED/LOW items + deferred items |
+**Phase 6.5 carryover resolution:**
+| Issue | Title | Resolution |
+|-------|-------|------------|
+| #260 | `_process_one_event` rename | **Fixed PR #266** 2026-05-13. |
+| #261 | Extractor running-row leak | **Fixed PR #265** 2026-05-13. |
+| #262 trivial | UNION ALL comment, column order annotation | **Fixed PR #266** 2026-05-13. |
+| #262 MED M-1 | T6-06 design doc SQL drift (`kc.title`, `card_anchors` columns) | **Fixed chore/p6-wave2-closure** 2026-05-13 (design doc only). |
+| #262 MED M-2 | `card_anchors` CTE column mismatch in design | **Fixed chore/p6-wave2-closure** 2026-05-13 (design doc only). |
+| #262 MED M-4 | (other MED items) | Open — tracked in #262. |
 
 ### Phase 11 follow-ups (#224, #219, #255) — all closed 2026-05-12
 

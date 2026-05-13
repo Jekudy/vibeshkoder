@@ -82,6 +82,16 @@ I1-I4). FHR APPROVE — Phase 5 LLM gateway tombstone fix landed in same closure
 (PR #259). Carryover issues for Phase 6.5: #260 _process_one_event rename, #261
 extractor running-row leak, #262 MED/LOW + deferred items.
 
+**Phase 6 Wave 2 closure (2026-05-13):**
+- T6-09 broader e2e pipeline test (candidate→card→recall) merged via PR #267.
+- Phase 6.5 carryovers: #261 (extractor running-row leak) fixed PR #265; #260
+  (_process_one_event rename) fixed PR #266; #262 trivial items (UNION ALL comment,
+  column order annotation) fixed PR #266. MED/LOW items M-1/M-2/M-4 from Codex
+  audit remain open (tracked in #262).
+- T6-06/T6-07 retrospective design docs landed PR #264 (anomaly: code preceded docs).
+- Codex post-merge follow-ups on PR #266 (M1+M2 SQL drift, M3 multi-item snapshot,
+  L1+L2 docstring) addressed in chore/p6-wave2-closure branch.
+
 **Phase 6 implementation/docs order anomaly (read before any T6-XX work):** T6-06
 (`bot/services/search.py` include_cards: commits `fcb5a3c`, `b5949b2`, `84beecd`,
 `50d1818`, `6f93105`, `2f1ffab`) and T6-07 (`bot/services/evidence.py` discriminator
