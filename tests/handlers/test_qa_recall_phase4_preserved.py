@@ -285,3 +285,110 @@ async def test_reply_kwargs_byte_identical_when_llm_flag_off(monkeypatch) -> Non
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+
+
+def _qa_result_multi() -> object:
+    """Two-item pure-message bundle for the multi-item snapshot test (Codex M3)."""
+    from bot.services.evidence import EvidenceBundle, EvidenceItem
+    from bot.services.qa import QaResult
+
+    items: tuple[EvidenceItem, ...] = (
+        EvidenceItem(
+            message_version_id=500,
+            chat_message_id=50,
+            chat_id=COMMUNITY_CHAT_ID,
+            message_id=77,
+            user_id=2002,
+            snippet="обсуждали <b>память</b>",
+            ts_rank=0.8,
+            captured_at=FIXTURE_NOW,
+            message_date=FIXTURE_NOW,
+        ),
+        EvidenceItem(
+            message_version_id=501,
+            chat_message_id=51,
+            chat_id=COMMUNITY_CHAT_ID,
+            message_id=88,
+            user_id=3003,
+            snippet="другой <b>контекст</b>",
+            ts_rank=0.6,
+            captured_at=FIXTURE_NOW,
+            message_date=FIXTURE_NOW,
+        ),
+    )
+    bundle = EvidenceBundle(
+        query="память",
+        chat_id=COMMUNITY_CHAT_ID,
+        items=items,
+        abstained=False,
+        created_at=FIXTURE_NOW,
+    )
+    return QaResult(bundle=bundle, query_redacted=False)
+
+
+async def test_multi_item_reply_snapshot_when_llm_flag_off(monkeypatch) -> None:
+    """Phase 4 two-item bundle MUST produce the hardcoded separator+order snapshot (Codex M3).
+
+    The single-item snapshot test (test_non_empty_reply_byte_identical_when_llm_flag_off)
+    catches per-item rendering drift but cannot catch multi-item separator/ordering drift
+    (e.g. swapping '\\n\\n' to '\\n', changing item order, dropping a separator).
+    This test adds a SECOND hardcoded snapshot for a 2-item bundle.
+
+    Do not update unless the change is intentional and re-blessed by the Phase 11 binding
+    suite. If _format_response's separator or loop changes, BOTH snapshots must be updated.
+    """
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+
+    qa_result = _qa_result_multi()
+
+    # Patch _format_date to a fixed string so the snapshot is TZ-independent.
+    monkeypatch.setattr(handler, "_format_date", lambda _dt: "2026-04-30 12:00")
+
+    # Phase 4 hardcoded snapshot for a 2-item bundle — captured 2026-05-13 (Codex M3).
+    # Inputs: chat_id=-1001234567890 → short "1234567890"
+    # Item 1: message_id=77, message_version_id=500, snippet='обсуждали <b>память</b>',
+    #         author first_name="Author"
+    # Item 2: message_id=88, message_version_id=501, snippet='другой <b>контекст</b>',
+    #         author first_name="Second"
+    # Separator between items: \n\n (double newline, from "\n\n".join(parts)).
+    PHASE4_MULTI_SNAPSHOT = (
+        "<b>Найденные свидетельства:</b>\n\n"
+        "<blockquote>обсуждали <b>память</b></blockquote>\n"
+        "<i>— Author, 2026-04-30 12:00</i> · "
+        '<a href="https://t.me/c/1234567890/77">сообщение</a> · '
+        "<code>message_version_id:500</code>\n\n"
+        "<blockquote>другой <b>контекст</b></blockquote>\n"
+        "<i>— Second, 2026-04-30 12:00</i> · "
+        '<a href="https://t.me/c/1234567890/88">сообщение</a> · '
+        "<code>message_version_id:501</code>"
+    )
+
+    _patch_persist(handler, monkeypatch)
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_off_for_llm())
+    monkeypatch.setattr(
+        handler.UserRepo,
+        "get",
+        AsyncMock(
+            side_effect=[
+                _user(),               # calling user
+                _user(user_id=2002, first_name="Author"),
+                _user(user_id=3003, first_name="Second"),
+            ]
+        ),
+    )
+    monkeypatch.setattr(handler.QaTraceRepo, "create", AsyncMock())
+    monkeypatch.setattr(handler, "run_qa", AsyncMock(return_value=qa_result))
+    monkeypatch.setattr(handler, "synthesize_answer", AsyncMock())
+
+    await handler.recall_handler(message, _command("память"), session)
+
+    message.reply.assert_awaited_once()
+    actual = message.reply.call_args.args[0]
+    assert actual == PHASE4_MULTI_SNAPSHOT, (
+        "Phase 4 multi-item byte-identity drift detected!\n"
+        "If _format_response separator/order changed intentionally, capture a new snapshot\n"
+        "and re-run the Phase 11 binding suite to confirm no leakage regression.\n"
+        f"Expected:\n{PHASE4_MULTI_SNAPSHOT!r}\n\nGot:\n{actual!r}"
+    )
