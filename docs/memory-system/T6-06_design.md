@@ -261,6 +261,13 @@ Cards are content distilled from messages in the community chat (Phase 6 ingests
 
 If review wants strict chat scoping (mirror message branch's `c.chat_id = :chat_id`), add a JOIN on `card_sources` → `chat_messages` filtered by `c.chat_id = :chat_id` AT LEAST ONE source (EXISTS subquery). Defer to review.
 
+> **L-2 (multi-chat future, issue #262):** The current T6-06 design intentionally does NOT
+> chat-scope card hits — `_PHASE6_SQL` has no `card_id → card_sources → chat_messages WHERE chat_id=:chat_id`
+> filter on the card branch. This is correct for Phase 6 (single-chat community, all card sources
+> share COMMUNITY_CHAT_ID). If multi-chat is added later, the card branch MUST add an
+> `EXISTS (SELECT 1 FROM card_sources cs_scope JOIN chat_messages cm_scope ON ... WHERE cm_scope.chat_id=:chat_id)`
+> subquery so a query against chat A cannot surface cards whose sources are exclusively in chat B.
+
 ### UNION ALL + final ranking
 
 ```sql
@@ -275,7 +282,22 @@ ORDER BY rank DESC, captured_at DESC, message_version_id DESC
 LIMIT :limit
 ```
 
-The message branch SELECT must add NULL placeholders for `card_id` and `card_source_message_version_ids` so UNION ALL column counts match. Use `NULL::uuid AS card_id, ARRAY[]::int[] AS card_source_message_version_ids`.
+The message branch SELECT must add NULL/empty placeholders for the card-specific columns so UNION ALL column counts and types match. The EXACT column order (all 12 columns) in the message branch must match the card branch in lock-step:
+
+1. `message_version_id` (int)
+2. `chat_message_id` (int)
+3. `chat_id` (int)
+4. `message_id` (int)
+5. `user_id` (bigint, nullable)
+6. `snippet` (text)
+7. `rank` (float)
+8. `captured_at` (timestamp)
+9. `message_date` (timestamp)
+10. `source_type` (text) — placeholder: `'message'::text AS source_type`
+11. `card_id` (uuid, nullable) — placeholder: `NULL::uuid AS card_id`
+12. `card_source_message_version_ids` (int[]) — placeholder: `ARRAY[]::int[] AS card_source_message_version_ids`
+
+The card branch also has ALL 12 columns in this same order. Any mismatch causes a Postgres UNION ALL type error. See `bot/services/search.py:_PHASE6_SQL` as the authoritative source; update doc and code in lock-step.
 
 ### Rank boost
 
