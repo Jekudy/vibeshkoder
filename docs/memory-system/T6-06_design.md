@@ -179,8 +179,12 @@ card_hits AS (
             JOIN forget_events fe2 ON (
                 fe2.tombstone_key = 'message:' || c2.chat_id::text || ':' || c2.message_id::text
                 OR (
-                    c2.content_hash IS NOT NULL
-                    AND fe2.tombstone_key = 'message_hash:' || c2.content_hash
+                    -- content_hash moved from chat_messages to message_versions in PR #257
+                    -- (live MV-only safety). Must use mv2.content_hash, NOT c2.content_hash.
+                    -- c2.content_hash is nullable and NULL for live messages; filtering on it
+                    -- silently no-op's every message_hash: tombstone for live messages.
+                    mv2.content_hash IS NOT NULL
+                    AND fe2.tombstone_key = 'message_hash:' || mv2.content_hash
                 )
                 OR (
                     c2.user_id IS NOT NULL
@@ -225,22 +229,26 @@ card_source_lists AS (
     GROUP BY cs.card_id
 )
 SELECT
-    'card' AS source_type,
     ca.message_version_id AS message_version_id,
     ca.chat_message_id AS chat_message_id,
     ca.chat_id AS chat_id,
     ca.message_id AS message_id,
-    NULL::bigint AS user_id,            -- cards are author-less
+    NULL::bigint AS user_id,                           -- cards are author-less
     ch.snippet AS snippet,
-    ch.rank * :card_rank_boost AS rank, -- card hits rank slightly above message hits
+    ch.rank * :card_rank_boost AS rank,                -- card hits rank slightly above message hits
     ch.approved_at AS captured_at,
-    ch.approved_at AS message_date,
+    COALESCE(ch.approved_at, ca.source_message_date) AS message_date,
+    'card'::text AS source_type,                       -- AFTER message_date; UNION ALL order must match message branch
     ch.card_id AS card_id,
     csl.mvids AS card_source_message_version_ids
 FROM card_hits ch
 JOIN card_anchors ca ON ca.card_id = ch.card_id
 JOIN card_source_lists csl ON csl.card_id = ch.card_id
 ```
+<!-- C1: Column order MUST match `bot/services/search.py:_PHASE6_SQL` exactly (UNION ALL requires
+     identical types/order in every branch). Update both in lock-step if column order changes.
+     The design originally had 'card' AS source_type FIRST; actual code places it AFTER message_date.
+     Fixed 2026-05-13 per Codex C1 finding. -->
 
 ### Chat scope for card hits
 
