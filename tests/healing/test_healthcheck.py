@@ -168,19 +168,31 @@ def test_check_report_is_red_excludes_db_roundtrip_when_only_db_red() -> None:
 
 
 def test_check_report_is_red_triggers_on_coolify_or_telegram_red() -> None:
-    """Sprint 1C: coolify_status or telegram_pending RED still triggers is_red."""
+    """Sprint 1C: coolify_status or telegram_pending RED still triggers is_red.
+
+    db_roundtrip state is irrelevant — it's been removed from the is_red gate.
+    """
     from ops.healing.healthcheck import CheckReport, CheckResult
 
     green = CheckResult("x", "green", "", {}, 0)
     red = CheckResult("x", "red", "down", {}, 0)
-    for coolify, telegram in [(red, green), (green, red), (red, red)]:
+    cases = [
+        # (coolify, telegram, db_roundtrip)
+        (red, green, green),
+        (green, red, green),
+        (red, red, green),
+        (red, green, red),
+        (green, red, red),
+        (red, red, red),
+    ]
+    for coolify, telegram, db in cases:
         report = CheckReport(
             generated_at="2026-05-13T00:00:00+00:00",
             coolify_status=coolify,
             telegram_pending=telegram,
-            db_roundtrip=green,
+            db_roundtrip=db,
         )
-        assert report.is_red is True, "real signals must still trigger is_red"
+        assert report.is_red is True, f"real signals must still trigger is_red; case (c,t,d)=({coolify.status},{telegram.status},{db.status})"
 
 
 def test_run_all_writes_state_file(monkeypatch: Any, tmp_path: Path) -> None:
