@@ -1204,7 +1204,7 @@ async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
         async with setup_s.begin():
             await setup_s.execute(
                 text(
-                    "INSERT INTO users (telegram_id, username, first_name) "
+                    "INSERT INTO users (id, username, first_name) "
                     "VALUES (:tid, :uname, 'Test') ON CONFLICT DO NOTHING"
                 ),
                 {"tid": user_id, "uname": f"u{user_id}"},
@@ -1339,6 +1339,6 @@ async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
                     {"cm_id": cm_id},
                 )
                 await cleanup_s.execute(
-                    text("DELETE FROM users WHERE telegram_id = :tid"),
+                    text("DELETE FROM users WHERE id = :tid"),
                     {"tid": user_id},
                 )
