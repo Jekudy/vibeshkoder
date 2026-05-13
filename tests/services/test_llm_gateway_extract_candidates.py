@@ -410,3 +410,74 @@ async def test_live_gateway_adapter_satisfies_protocol_and_delegates() -> None:
     assert len(result["candidates"]) == 1
     assert result["llm_usage_ledger_id"] is not None
     assert len(provider.calls) == 1
+
+
+# ─── Tests: M-4 — LLM-returned duplicate source_message_version_ids ──────────
+
+
+@pytest.mark.asyncio
+async def test_duplicate_source_mvids_in_llm_response_are_deduped() -> None:
+    """Regression guard for #262 M-4: the gateway MUST dedupe
+    source_message_version_ids returned by the LLM before surfacing them to
+    callers, preserving first-occurrence order.
+
+    Without the fix, a response like [100, 100, 101] produces a downstream
+    CardSourceRepo.bulk_create that violates the UNIQUE(card_id,
+    message_version_id) constraint and raises an IntegrityError.
+
+    With the fix, [100, 100, 101] → [100, 101] (first-occurrence order).
+    """
+    ledger = FakeLedgerRepo()
+    # Provider returns mvid 100 twice — simulates the LLM-duplication bug.
+    provider = FakeExtractionProvider(
+        candidates_json=(
+            '[{"candidate_json": {"title": "dedup test"}, '
+            '"source_message_version_ids": [100, 100, 101]}]'
+        )
+    )
+    session = FakeSession(query_results=[[{"sum": 0}], [{"sum": 0}]])
+
+    result = await extract_candidates(
+        session,  # type: ignore[arg-type]
+        source_versions=_make_source_versions((100, 101)),
+        prompt_template_version="v0.1.0",
+        ledger_repo=ledger,
+        provider=provider,
+        config=_config(),
+    )
+
+    assert len(result["candidates"]) == 1
+    source_ids = result["candidates"][0]["source_message_version_ids"]
+    # Duplicates removed, first-occurrence order preserved.
+    assert source_ids == [100, 101], (
+        f"expected deduplicated [100, 101] but got {source_ids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_all_duplicate_source_mvids_keeps_one_entry() -> None:
+    """A candidate whose entire mvid list is duplicate [100, 100] MUST be
+    kept (not dropped) with a single deduplicated entry [100]."""
+    ledger = FakeLedgerRepo()
+    provider = FakeExtractionProvider(
+        candidates_json=(
+            '[{"candidate_json": {"title": "all dups"}, '
+            '"source_message_version_ids": [100, 100]}]'
+        )
+    )
+    session = FakeSession(query_results=[[{"sum": 0}], [{"sum": 0}]])
+
+    result = await extract_candidates(
+        session,  # type: ignore[arg-type]
+        source_versions=_make_source_versions((100,)),
+        prompt_template_version="v0.1.0",
+        ledger_repo=ledger,
+        provider=provider,
+        config=_config(),
+    )
+
+    assert len(result["candidates"]) == 1
+    source_ids = result["candidates"][0]["source_message_version_ids"]
+    assert source_ids == [100], (
+        f"all-duplicate list [100, 100] must reduce to [100]; got {source_ids}"
+    )
