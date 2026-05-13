@@ -115,7 +115,14 @@ def _format_card_item(item: EvidenceItem, short_chat_id: str) -> str:
     date_text = _format_date(item.message_date)  # T6-06 substitutes approved_at here
     snippet = _safe_headline(item.snippet)
     anchor_link = f"https://t.me/c/{short_chat_id}/{item.message_id}"
-    mvid_list = ", ".join(str(m) for m in item.card_source_message_version_ids)
+    # R-07-07: truncate source mvid list at 5; append "+N more" for the remainder.
+    all_mvids = item.card_source_message_version_ids
+    _MVID_DISPLAY_LIMIT = 5
+    if len(all_mvids) > _MVID_DISPLAY_LIMIT:
+        shown = ", ".join(str(m) for m in all_mvids[:_MVID_DISPLAY_LIMIT])
+        mvid_list = f"{shown}, +{len(all_mvids) - _MVID_DISPLAY_LIMIT} more"
+    else:
+        mvid_list = ", ".join(str(m) for m in all_mvids)
     return (
         f"<blockquote>{snippet}</blockquote>\n"
         f"<i>\U0001f4cb Карточка, {date_text}</i> · "

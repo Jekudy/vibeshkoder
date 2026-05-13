@@ -250,3 +250,32 @@ def test_synth_response_answer_text_is_html_escaped() -> None:
 
     assert "<script>x</script>" not in text
     assert "&lt;script&gt;" in text
+
+
+# ─── R-07-07: source truncation at 5 ──────────────────────────────────────────
+
+
+def test_format_response_card_sources_truncated_at_5() -> None:
+    """R-07-07: when card has >5 source mvids, renderer shows first 5 and '+N more'."""
+    item = _card_item(mvids=(10, 20, 30, 40, 50, 60, 70))  # 7 sources
+    qa_handler = import_module("bot.handlers.qa")
+    text = qa_handler._format_response(_bundle((item,)), users_by_id={})
+
+    # First 5 present
+    assert "10, 20, 30, 40, 50" in text
+    # 6th and 7th NOT in the sources list
+    assert "60" not in text
+    assert "70" not in text
+    # Continuation marker for the 2 remaining
+    assert "+2 more" in text
+
+
+def test_format_response_card_exactly_5_sources_no_truncation() -> None:
+    """R-07-07: exactly 5 sources — no '+N more' suffix."""
+    item = _card_item(mvids=(10, 20, 30, 40, 50))  # exactly 5
+    qa_handler = import_module("bot.handlers.qa")
+    text = qa_handler._format_response(_bundle((item,)), users_by_id={})
+
+    assert "10, 20, 30, 40, 50" in text
+    assert "+0 more" not in text
+    assert "more" not in text
