@@ -81,7 +81,8 @@ def _p6_mvid_advisory_lock_id(mvid: int) -> int:
     The namespace prefix ``"p6:mvid:"`` keeps this disjoint from
     ``bot.services.import_chunking._derive_lock_id`` (which hashes raw
     8-byte ``ingestion_run_id``) so an in-progress ``import_apply`` lock
-    and a P6 lock for the same numeric id cannot collide.
+    and a P6 lock for the same numeric id are astronomically unlikely to
+    collide (SHA-256 truncated to signed int64; 2^63 possible values).
 
     Returns a value in the signed-int64 range expected by
     ``pg_advisory_xact_lock(bigint)``.
@@ -107,8 +108,9 @@ def _p6_event_advisory_lock_id(event_id) -> int:
     that informs cascade work" is preserved.
 
     This namespace is DISTINCT from ``_p6_mvid_advisory_lock_id`` (which
-    uses the ``"p6:mvid:"`` prefix) — different mvid and event ids cannot
-    collide. ``/approve`` does NOT take this lock; cross-transaction
+    uses the ``"p6:mvid:"`` prefix) — different mvid and event ids are
+    astronomically unlikely to collide (SHA-256 → int64; birthday bound
+    at ~2^31 items). ``/approve`` does NOT take this lock; cross-transaction
     serialization with /approve remains at the mvid-lock layer, which is
     the contract pinned by the T6-09 collision test.
 

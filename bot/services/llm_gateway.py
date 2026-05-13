@@ -830,6 +830,11 @@ async def _forget_tombstone_check(
 ) -> list[int]:
     """Return message_version_ids whose row matches a tombstone (any of 3 keys).
 
+    Executes ``_TOMBSTONE_GATE_SQL`` — the three-key tombstone lookup
+    (message:, message_hash:, user:) shared with ``bot/services/search.py``
+    and ``bot/services/extractor.py``. Keep all three in lock-step when the
+    tombstone_key convention changes.
+
     Result is sorted for determinism so callers iterating to invalidate cache
     rows do so in a stable order (F9 closure — set iteration was order-
     nondeterministic across hash randomisation).
