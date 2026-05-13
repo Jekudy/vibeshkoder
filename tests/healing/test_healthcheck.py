@@ -148,6 +148,41 @@ def test_check_db_roundtrip_red_on_exception(monkeypatch: Any) -> None:
     assert "database timeout" in result.reason
 
 
+def test_check_report_is_red_excludes_db_roundtrip_when_only_db_red() -> None:
+    """Sprint 1C: db_roundtrip RED alone must not trigger is_red.
+
+    Runner has no route to Coolify-internal Postgres bridge; until #168
+    ('/healthz/db') lands, this check is informational only.
+    """
+    from ops.healing.healthcheck import CheckReport, CheckResult
+
+    green = CheckResult("x", "green", "", {}, 0)
+    red = CheckResult("x", "red", "stale", {}, 0)
+    report = CheckReport(
+        generated_at="2026-05-13T00:00:00+00:00",
+        coolify_status=green,
+        telegram_pending=green,
+        db_roundtrip=red,
+    )
+    assert report.is_red is False, "is_red must not be triggered by db_roundtrip alone"
+
+
+def test_check_report_is_red_triggers_on_coolify_or_telegram_red() -> None:
+    """Sprint 1C: coolify_status or telegram_pending RED still triggers is_red."""
+    from ops.healing.healthcheck import CheckReport, CheckResult
+
+    green = CheckResult("x", "green", "", {}, 0)
+    red = CheckResult("x", "red", "down", {}, 0)
+    for coolify, telegram in [(red, green), (green, red), (red, red)]:
+        report = CheckReport(
+            generated_at="2026-05-13T00:00:00+00:00",
+            coolify_status=coolify,
+            telegram_pending=telegram,
+            db_roundtrip=green,
+        )
+        assert report.is_red is True, "real signals must still trigger is_red"
+
+
 def test_run_all_writes_state_file(monkeypatch: Any, tmp_path: Path) -> None:
     _set_env(monkeypatch)
     monkeypatch.setattr(
