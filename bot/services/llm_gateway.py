@@ -1231,13 +1231,19 @@ async def extract_candidates(
         if not isinstance(source_ids_raw, list):
             continue
         # Drop hallucinated mvids; keep only those present in input set.
+        # Deduplicate while preserving first-occurrence order — the LLM may
+        # return the same mvid multiple times; downstream CardSourceRepo has
+        # UNIQUE(card_id, message_version_id) and would raise IntegrityError
+        # on duplicates (#262 M-4).
         source_ids: list[int] = []
+        _seen_ids: set[int] = set()
         for x in source_ids_raw:
             try:
                 xid = int(x)
             except (TypeError, ValueError):
                 continue
-            if xid in valid_mvid_set:
+            if xid in valid_mvid_set and xid not in _seen_ids:
+                _seen_ids.add(xid)
                 source_ids.append(xid)
         if not source_ids:
             # Invariant: no card without source.
