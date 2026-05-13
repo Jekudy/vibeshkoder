@@ -326,13 +326,18 @@ async def cmd_approve(
         return
 
     # Step 1d: if the canonical mvid set picked up any rows that step 1a
-    # missed, acquire advisory locks for the new mvids too. Sorted across
-    # the union to maintain deadlock-avoidance ordering. The candidate's
-    # source set is normally immutable after creation, so this is a
-    # defence-in-depth path.
-    new_mvids = [m for m in mvids if m not in set(initial_mvids)]
-    if new_mvids:
-        await _acquire_mvid_locks(session, new_mvids)
+    # missed, acquire advisory locks for ALL mvids in the full union (sorted).
+    # Passing only the new delta would produce a different global ordering
+    # from two concurrent /approve callers whose mvid sets overlap — that is
+    # the lock-order inversion that causes deadlock. Passing the full union to
+    # _acquire_mvid_locks (which sorts internally) keeps the acquisition order
+    # identical to the cascade orchestrator's protocol for any subset of mvids.
+    # pg_advisory_xact_lock re-entry is safe: PostgreSQL ignores duplicate
+    # xact-lock requests for a key already held within the same transaction.
+    full_union_mvids = list(set(initial_mvids) | set(mvids))
+    if set(full_union_mvids) != set(initial_mvids):
+        # Only re-acquire when the union differs from what was locked in 1b.
+        await _acquire_mvid_locks(session, full_union_mvids)
 
     # Step 3+4: deterministic governance re-validation (NO LLM re-prompt).
     status, payload = await revalidate_sources(session, mvids)
