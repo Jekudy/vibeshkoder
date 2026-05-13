@@ -31,6 +31,16 @@ def test_run_surfaces_child_stdout_on_failure(capsys: pytest.CaptureFixture[str]
     assert "exit=3" in captured.err
 
 
+def test_run_redacts_command_args_on_failure(capsys: pytest.CaptureFixture[str]) -> None:
+    cmd = [sys.executable, "-c", "import sys; sys.exit(1)", "--signal-json", '{"secret":"xxx"}', "--token", "abc"]
+    with pytest.raises(subprocess.CalledProcessError):
+        _run(cmd)
+    captured = capsys.readouterr()
+    assert '"secret":"xxx"' not in captured.err
+    assert "abc" not in captured.err
+    assert "[+4 args redacted]" in captured.err
+
+
 def test_run_success_does_not_emit_to_stderr(capsys: pytest.CaptureFixture[str]) -> None:
     result = _run([sys.executable, "-c", "print('ok')"])
     captured = capsys.readouterr()

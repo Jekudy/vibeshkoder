@@ -47,8 +47,19 @@ def _run(command: list[str], input_text: str | None = None) -> subprocess.Comple
         # Surface child output so failures are debuggable in CI logs.
         # capture_output=True hides stderr by default; without this, callers see
         # only the parent CalledProcessError frame.
+        # Redact full args from log — some callers pass --signal-json payloads
+        # containing connection details. Show only program path + first 2 non-flag
+        # args (typically `-m module.path`) so debug can identify the failed command
+        # without leaking secret values.
+        cmd_preview_parts = [command[0]] if command else ["<empty>"]
+        for arg in command[1:3]:
+            cmd_preview_parts.append(arg)
+        remaining = max(0, len(command) - 3)
+        cmd_preview = " ".join(cmd_preview_parts)
+        if remaining > 0:
+            cmd_preview += f" [+{remaining} args redacted]"
         sys.stderr.write(
-            f"[ops.healing._run] Child failed (exit={exc.returncode}): {' '.join(command)}\n"
+            f"[ops.healing._run] Child failed (exit={exc.returncode}): {cmd_preview}\n"
         )
         if exc.stdout:
             sys.stderr.write(f"[ops.healing._run] child stdout:\n{exc.stdout}\n")
