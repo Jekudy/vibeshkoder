@@ -984,6 +984,12 @@ class ExtractionRun(Base):
     operator_user_id: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
+    # Provider-level error from llm_gateway.extract_candidates (alembic 036).
+    # NULL on success or empty-bundle short-circuit. Non-NULL means the gateway
+    # returned ``gateway_error`` — extractor sets run_status='failed' and
+    # persists this string for post-hoc debugging. Truncated to 2000 chars in
+    # the gateway to avoid DB bloat from giant stack traces.
+    gateway_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
