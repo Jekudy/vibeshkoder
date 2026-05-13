@@ -70,6 +70,55 @@ class EvidenceItem:
         }
 
 
+_VALID_SOURCE_TYPES: frozenset[str] = frozenset({"message", "card"})
+
+
+def _build_evidence_item(
+    hit: SearchHitLike,
+    valid_source_types: frozenset[str] = _VALID_SOURCE_TYPES,
+) -> EvidenceItem:
+    """Build an ``EvidenceItem`` from a ``SearchHitLike`` hit row.
+
+    L-1 (issue #262): adds a runtime guard on ``source_type`` so a future
+    SQL column change or accidental extension (e.g., ``'web_card'`` before
+    the Literal is updated) raises immediately at the bundle-construction
+    boundary rather than silently propagating an invalid discriminator into
+    handlers and the LLM gateway.
+
+    Rationale: ``Literal['message', 'card']`` is enforced by mypy/pyright
+    statically, but SQL rows return plain ``str`` at runtime — mypy cannot
+    see through the ORM row mapping. The guard closes this runtime gap.
+    """
+    source_type = getattr(hit, "source_type", "message")
+    if source_type not in valid_source_types:
+        raise ValueError(
+            f"SearchHit.source_type={source_type!r} is not a known discriminator "
+            f"(expected one of {sorted(valid_source_types)}). "
+            "If a new source type was added, update VALID_SOURCE_TYPES and "
+            "EvidenceItem.source_type Literal in bot/services/evidence.py."
+        )
+    return EvidenceItem(
+        message_version_id=hit.message_version_id,
+        chat_message_id=hit.chat_message_id,
+        chat_id=hit.chat_id,
+        message_id=hit.message_id,
+        user_id=hit.user_id,
+        snippet=hit.snippet,
+        ts_rank=hit.ts_rank,
+        captured_at=hit.captured_at,
+        message_date=hit.message_date,
+        # T6-07 cross-stream contract: T6-06 ``SearchHit`` exposes
+        # ``source_type`` / ``card_id`` / ``card_source_message_version_ids``;
+        # pre-T6-06 fakes don't have them — ``getattr`` defaults trip
+        # to message-shape values.
+        source_type=source_type,
+        card_id=getattr(hit, "card_id", None),
+        card_source_message_version_ids=tuple(
+            getattr(hit, "card_source_message_version_ids", ())
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)  # type: ignore[call-overload]
 class EvidenceBundle:
     query: str
@@ -86,26 +135,7 @@ class EvidenceBundle:
         hits: Sequence[SearchHitLike],
     ) -> EvidenceBundle:
         items = tuple(
-            EvidenceItem(
-                message_version_id=hit.message_version_id,
-                chat_message_id=hit.chat_message_id,
-                chat_id=hit.chat_id,
-                message_id=hit.message_id,
-                user_id=hit.user_id,
-                snippet=hit.snippet,
-                ts_rank=hit.ts_rank,
-                captured_at=hit.captured_at,
-                message_date=hit.message_date,
-                # T6-07 cross-stream contract: T6-06 ``SearchHit`` exposes
-                # ``source_type`` / ``card_id`` / ``card_source_message_version_ids``;
-                # pre-T6-06 fakes don't have them — ``getattr`` defaults trip
-                # to message-shape values.
-                source_type=getattr(hit, "source_type", "message"),
-                card_id=getattr(hit, "card_id", None),
-                card_source_message_version_ids=tuple(
-                    getattr(hit, "card_source_message_version_ids", ())
-                ),
-            )
+            _build_evidence_item(hit)
             for hit in hits
         )
         return cls(
