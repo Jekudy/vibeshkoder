@@ -82,6 +82,16 @@ I1-I4). FHR APPROVE — Phase 5 LLM gateway tombstone fix landed in same closure
 (PR #259). Carryover issues for Phase 6.5: #260 _process_one_event rename, #261
 extractor running-row leak, #262 MED/LOW + deferred items.
 
+**Phase 6 implementation/docs order anomaly (read before any T6-XX work):** T6-06
+(`bot/services/search.py` include_cards: commits `fcb5a3c`, `b5949b2`, `84beecd`,
+`50d1818`, `6f93105`, `2f1ffab`) and T6-07 (`bot/services/evidence.py` discriminator
++ `bot/handlers/qa.py` renderer: commits `2b89bcd`, `3b34a9f`) **landed on main
+BEFORE** their pre-flight design docs (PR #264, 2026-05-13). The design docs are
+retrospective. Issues #238 and #239 remain OPEN only because the impl commits
+lacked `Closes #` lines — close manually if/when convenient; code is shipped.
+Before starting any new T6-XX impl sprint, `git log --follow <core-file>` first to
+confirm the work isn't already on main.
+
 **Phase 11 follow-ups** all merged 2026-05-12: #224 (High #5 httpx guard PR #243,
 Critical #4 allowlist PR #247, High #1-#4 already on main), #219 seed_v1 quality
 (PR #253), #255 Phase 4 message-branch tombstone (PR #257).
