@@ -4,24 +4,55 @@ T7-03 / Phase 7 Wave 1: produces a structured context bundle for the digest
 LLM synthesis step. The output is fed into `llm_gateway.synthesize_digest`
 (T7-02, separate PR).
 
+Governance filter (all sources):
+- chat_messages.memory_policy = 'normal' (excludes nomem, offrecord, forgotten)
+- message_versions.is_redacted = FALSE   (excludes cascade-redacted rows)
+- NO active forget_event ('pending' / 'processing' / 'completed') targeting
+  this message_version via message_id, user_id, or message_hash. This is the
+  defense-in-depth check that catches forget_events whose cascade hasn't yet
+  flipped is_redacted to TRUE.
+
 PHASE 7.5 CARRYOVER: per PHASE7_PLAN.md §5.C, the forget-events predicate
-should ultimately be extracted into a shared helper used by both this module
+SHOULD eventually be extracted into a shared helper used by both this module
 and `bot/services/forget_cascade.py` (DRY guard against drift). This PR
-relies on the simpler `is_redacted=FALSE` invariant (cascade sets this on
-completion), accepting a narrow defense-in-depth gap when a forget_event is
-in 'pending'/'processing' state during the daily digest window. Cascade
-worker runs every 30s; digest runs once per day; risk is bounded.
+INLINES the predicate (does not extract). The match logic must stay in sync
+with `forget_cascade._resolve_affected_mvids` (forget_cascade.py:812+).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+
+# Forget-event exclusion predicate. Both queries reference this to enforce
+# defense-in-depth: a forget_event in 'pending'/'processing' state would not
+# yet have flipped `is_redacted` to TRUE on the message_version, so the
+# `is_redacted=FALSE` filter alone is insufficient. This predicate covers
+# the three target_type cases that `_cascade_message_versions` matches:
+#   - target_type='message' AND target_id = chat_messages.id (single message)
+#   - target_type='user' AND target_id = users.telegram_id  (all user msgs)
+#   - target_type='message_hash' AND target_id = mv.content_hash  (hash-based)
+# Status filter 'completed' is included because completed events are
+# durable and digests must respect them even after cascade finishes.
+_FORGET_EVENT_NOT_EXISTS = """
+    NOT EXISTS (
+        SELECT 1 FROM forget_events fe
+        WHERE fe.status IN ('pending', 'processing', 'completed')
+          AND (
+              (fe.target_type = 'message' AND fe.target_id = cm.id::text)
+              OR
+              (fe.target_type = 'user' AND fe.target_id = cm.user_id::text)
+              OR
+              (fe.target_type = 'message_hash' AND fe.target_id = mv.content_hash)
+          )
+    )
+"""
 
 
 @dataclass(frozen=True)
@@ -92,7 +123,7 @@ async def build_digest_context(
         raise ValueError(f"T7-03 only supports type='daily', got {type!r}")
 
     # ---- cards-first query ----
-    cards_sql = text("""
+    cards_sql = text(f"""
         SELECT
             kc.id::text AS card_id,
             kc.title,
@@ -109,6 +140,7 @@ async def build_digest_context(
           AND cm.date <  :we
           AND cm.memory_policy = 'normal'
           AND mv.is_redacted = FALSE
+          AND {_FORGET_EVENT_NOT_EXISTS}
         GROUP BY kc.id, kc.title, kc.body_markdown, kc.approved_at
         ORDER BY kc.approved_at DESC NULLS LAST
         LIMIT 30
@@ -135,7 +167,7 @@ async def build_digest_context(
     # ---- raw fallback only when cards too few ----
     messages: list[DigestContextMessage] = []
     if len(cards) < digest_config.min_cards_threshold:
-        raw_sql = text("""
+        raw_sql = text(f"""
             SELECT
                 mv.id AS message_version_id,
                 mv.chat_message_id,
@@ -151,6 +183,7 @@ async def build_digest_context(
               AND cm.date <  :we
               AND cm.memory_policy = 'normal'
               AND mv.is_redacted = FALSE
+              AND {_FORGET_EVENT_NOT_EXISTS}
             ORDER BY cm.date ASC
             LIMIT :top_n
         """)
