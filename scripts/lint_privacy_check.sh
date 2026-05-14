@@ -19,6 +19,13 @@ is_allowed_path() {
   # under docs/memory-system/, not arbitrary docs.
   [[ "$path" =~ ^docs/memory-system/T[0-9]+(-[0-9A-Z]+)+_design\.md$ ]] && return 0
 
+  # Phase plan documents (PHASE5_PLAN.md, PHASE6_PLAN.md, PHASE7_PLAN.md, …)
+  # quote the binding privacy policy by name and freeze the scope contract.
+  # Same rationale as Tn-XX_design.md above. Pre-existing phase plans pass
+  # via baseline-diff; this entry lets new phase plans land cleanly without
+  # a baseline regen step.
+  [[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_PLAN\.md$ ]] && return 0
+
   return 1
 }
 
