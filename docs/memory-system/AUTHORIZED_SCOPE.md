@@ -169,12 +169,79 @@ NOT in Phase 6 scope (defer):
 
 ---
 
+## Authorized: Phase 7 — Daily digests (2026-05-14)
+
+Phase 7 is authorized for implementation following Phase 5 + Phase 6 closure (both
+DONE 2026-05-11 / 2026-05-12) and the Phase 11 binding suite remaining green on
+main. Owned by Orchestrator A per the synthesis chain (Phase 5 → 6 → 7 → 8).
+
+Authorized scope (per `docs/memory-system/PHASE7_PLAN.md`, ratified 2026-05-14 after
+two rounds of dual-model review — Codex technical + Claude product/spec):
+
+- `digests` + `digest_runs` tables / repos (migration `037_add_digests.py`,
+  contingent on Phase 6.5 carryover landing first; downshift to `036_` if not).
+  Schema includes `posting` transient state + `posting_started_at` column for the
+  publisher-vs-redactor race interlock (see PHASE7_PLAN.md §5.A / §5.F / §5.H).
+- `bot/services/digests.py::run_digest` orchestrator with advisory-lock-based
+  idempotency, dedicated Phase-7 cost ceiling (`DIGEST_DAILY_USD_CEILING`,
+  default `Decimal("1.00")`), and `status='cost_exceeded'` short-circuit.
+- `bot/services/digest_context.py::build_digest_context` cards-first +
+  chronological raw-message fallback context builder, governance-filtered via
+  the shared `_forget_excludes_predicate` extracted from `forget_cascade.py`.
+- `bot/services/llm_gateway.py::synthesize_digest` — new gateway method with
+  pre-provider context revalidation (defense-in-depth against forget races) and
+  citation-invariant validation (every bullet ≥1 valid id).
+- `bot/services/digest_publisher.py::publish_digest` — single-transaction
+  `draft → posting → posted` flow holding the row lock across `bot.send_message`,
+  destination guarded by `DIGEST_DESTINATION_CHAT_ID` env var (community chat).
+- `bot/services/digest_renderer.py::render_digest_html` — HTML rendering with
+  truncation-before-escape, tag-balance assertion, citation tokens stripped from
+  public output (audit details exposed via admin handlers only).
+- `bot/services/scheduler.py` extension — daily cron at `DIGEST_HOUR_MSK`
+  (default 09:00 MSK) gated by `memory.digests.daily.enabled` (default OFF) +
+  `digest_stale_posting_reaper_job` every 5 min for orphan recovery.
+- Forget cascade extension in `bot/services/forget_cascade.py` — one merged
+  `digests` layer placed BEFORE `card_sources`, blocking `SELECT FOR UPDATE`
+  with `statement_timeout=5s`, unconditional `bot.edit_message_text` with
+  erratum fallback on `TelegramBadRequest` and admin-notify-only on
+  `TelegramForbiddenError` (acknowledged privacy stop signal §8 of plan).
+- Admin handlers `bot/handlers/digest.py` — `/digest_now [daily]`,
+  `/digest_preview <type> [date]`, `/digest_history`. Admin-only via
+  `_is_admin` Phase 6 helper.
+- Phase 11 binding tests `tests/evals/test_leakage.py::L7a/b`,
+  `tests/evals/test_citations.py::C6`, new
+  `tests/evals/test_digest_forget_cascade.py::I5a/b/c`. Existing 28/28 binding
+  suite preserved → new total 34/34.
+
+Phase 7 implementation must:
+- Sprint 0 (T7-S0): land this scope authorization + PHASE7_PLAN.md commit in one
+  docs-only PR. No code in Sprint 0.
+- Wave 1 (T7-01, T7-02, T7-03): schema + run_digest + context builder.
+- Wave 2 (T7-04, T7-05): scheduler + publisher + forget cascade.
+- Wave 3 (T7-06, T7-07, T7-08): admin handlers + binding tests + closure docs.
+- Final Holistic Review (FHR) required after T7-08 — 8 sprints + privacy
+  invariants binding triggers superflow Rule 9.
+
+NOT in Phase 7 scope (defer to Phase 8+):
+- Weekly digest scheduler / handler / publisher (Phase 8). The `digests.type`
+  enum accepts `'weekly'` for schema readiness only — no Phase 7 code path
+  produces or processes weekly rows.
+- Reflection / observations / `memory_events` / `memory_candidates` (Phase 8).
+- Wiki (Phase 9), graph projection (Phase 10), butler (Phase 12).
+- Per-user opt-out for being mentioned in a digest.
+- Multi-chat digest support (single-chat MVP).
+- Inline citation rendering in public posts (admin-only via `/digest_preview`).
+- Topic clustering / LLM-inferred topic ordering (chronological only in MVP).
+- Reaction-count / reply-count ranking heuristics (columns don't exist on
+  `chat_messages`; adding them is a separate Phase 8 migration ticket).
+
+---
+
 ## NOT authorized (future phases — gates not passed)
 
 Do not start, design, or write speculative code for:
 
 
-- Phase 7 daily summaries — depends on Phase 5 + Phase 6.
 - Phase 8 reflection / observations — depends on Phase 7.
 - Wiki (member or public) implementation — Phase 9, conditionally above.
 - Graph projection (Neo4j / Graphiti) implementation — Phase 10, conditionally above.
