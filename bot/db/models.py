@@ -1293,3 +1293,151 @@ class ExtractionDecision(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class Digest(Base):
+    """One generated digest window (T7-01 / alembic 037).
+
+    Keyed by ``(type, window_start, window_end)`` for idempotent re-runs.
+    ``body_markdown`` is NULL while ``status='running'`` and NOT NULL in all
+    user-visible states (draft, posting, posted, redacted, redacted_edit_failed).
+    ``citations`` is a JSONB array of ``{kind, id, position}`` objects per
+    PHASE7_PLAN.md §5.A — never raw message text.
+
+    Status lifecycle:
+      running → draft → posting → posted
+                     ↘ failed / skipped / cost_exceeded / skipped_no_destination
+    Terminal redaction states: redacted, redacted_edit_failed.
+
+    Constraints (DB-level, see migration 037):
+
+    * ``type IN ('daily','weekly')`` — 'weekly' schema-ready, daily-only runtime.
+    * ``status`` enum — full set including transient 'posting'.
+    * ``status IN (draft,posting,posted,redacted,redacted_edit_failed)``
+      implies ``body_markdown IS NOT NULL``.
+    * ``status='posted'`` implies ``posted_chat_id``, ``posted_message_id``,
+      ``posted_at`` all NOT NULL.
+    """
+
+    __tablename__ = "digests"
+    __table_args__ = (
+        UniqueConstraint(
+            "type",
+            "window_start",
+            "window_end",
+            name="uq_digests_type_window",
+        ),
+        CheckConstraint(
+            "type IN ('daily','weekly')",
+            name="ck_digests_type",
+        ),
+        CheckConstraint(
+            "status IN ('running','draft','posting','posted','failed','skipped',"
+            "'cost_exceeded','skipped_no_destination','redacted','redacted_edit_failed')",
+            name="ck_digests_status",
+        ),
+        CheckConstraint(
+            "status NOT IN ('draft','posting','posted','redacted','redacted_edit_failed')"
+            " OR body_markdown IS NOT NULL",
+            name="ck_digests_body_markdown_not_null_for_visible_statuses",
+        ),
+        CheckConstraint(
+            "status <> 'posted'"
+            " OR (posted_chat_id IS NOT NULL"
+            " AND posted_message_id IS NOT NULL"
+            " AND posted_at IS NOT NULL)",
+            name="ck_digests_posted_fields_required",
+        ),
+        Index(
+            "ix_digests_status_draft",
+            "status",
+            postgresql_where=text("status = 'draft'"),
+        ),
+        Index(
+            "ix_digests_citations_gin",
+            "citations",
+            postgresql_using="gin",
+            postgresql_ops={"citations": "jsonb_path_ops"},
+        ),
+        Index(
+            "ix_digests_posting_started_at",
+            "posting_started_at",
+            postgresql_where=text("status = 'posting'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    body_markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # JSONB on postgres (enables GIN jsonb_path_ops containment for forget cascade);
+    # JSON elsewhere for sqlite test compat.
+    citations: Mapped[list] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        server_default="'[]'",  # align ORM with migration (PG migration uses ::jsonb cast)
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    llm_usage_ledger_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "llm_usage_ledger.id",
+            name="fk_digests_llm_usage_ledger_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    posted_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    posted_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    posting_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DigestRun(Base):
+    """Append-only audit log of one ``run_digest()`` invocation (T7-01 / alembic 037).
+
+    One row per scheduler tick or admin ``/digest_now`` call. ``digest_id`` FK is
+    ON DELETE SET NULL so audit rows survive if the parent digest is manually removed.
+
+    Status lifecycle: running → finished | failed | skipped | cost_exceeded |
+                                skipped_no_destination.
+    """
+
+    __tablename__ = "digest_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running','finished','failed','skipped',"
+            "'cost_exceeded','skipped_no_destination')",
+            name="ck_digest_runs_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    digest_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "digests.id",
+            name="fk_digest_runs_digest_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
