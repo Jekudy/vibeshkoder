@@ -21,13 +21,13 @@ Phase 11 binding suite) are satisfied. Sprint 0 must update `AUTHORIZED_SCOPE.md
 | `llm_gateway.synthesize_answer` | Exists | `bot/services/llm_gateway.py:341`. Phase 7 adds `synthesize_digest` as a new method following the same skeleton, including the **defense-in-depth pre-provider revalidation** pattern (`synthesize_answer` re-checks source visibility at `bot/services/llm_gateway.py:436+` before dispatch). |
 | `llm_gateway.extract_candidates` | Exists | `bot/services/llm_gateway.py:1057`. Closest analog for new non-Q&A gateway method. |
 | `LedgerRepo.record` / `update_placeholder` | Exists | `bot/db/repos/llm_usage_ledger.py:31, :121`. Digest LLM call reuses placeholder → update pattern. `qa_trace_id` nullable — pass `None` for digest calls. |
-| `forget_cascade._process_one_event` | Exists | `bot/services/forget_cascade.py:878`. Layer-based dispatch via `_LAYER_FUNCS` (`:799-809`). Phase 7 adds `digest_sources` + `digests` layers (see §5.F). |
+| `forget_cascade._process_one_event` | Exists | `bot/services/forget_cascade.py:878`. Layer-based dispatch via `_LAYER_FUNCS` (`:799-809`). Phase 7 adds a SINGLE merged `digests` layer (detection + redaction in one transaction; see §5.H — earlier two-layer design was rejected because forget_cascade has no cross-layer payload persistence). |
 | `KnowledgeCard` / `CardSource` | Exists | `bot/db/models.py:1085, :1159`. `card_status='approved'` is canonical filter (`bot/db/repos/knowledge_card.py:60, :84, :107`). `CardSource.message_version_id` FK to `message_versions` is `ON DELETE RESTRICT` — cascade DELETE is handled by `_cascade_card_sources` layer (`:619`). |
 | Admin identity check | Exists | `_is_admin(message)` helper at `bot/handlers/admin_cards.py:58-61` is the canonical Phase 6 pattern. |
 | HTML default parse mode | Exists | All `parse_mode="HTML"` across `bot/handlers/`. `bot/html_escape.py:6` provides `html_escape()` wrapper. |
 | `bot.edit_message_text` | NOT used anywhere | Phase 7 is first consumer. Exception handling pattern from `bot/services/invite.py:6, :45` (`TelegramForbiddenError, TelegramBadRequest`). |
 | `tests/evals/` Phase 11 suite | Exists | 13 test files using pytest-asyncio + real AsyncSession + parametrize. Phase 7 adds digest-specific cases following the same shape. |
-| Migration counter | `035_add_extraction_runs_operator_user_id.py` on main; `036_add_gateway_error_to_extraction_runs.py` reserved by parallel Phase 6.5 carryover branch `chore/p6-codex-h2-h3-followups` (local-only as of 2026-05-14, expected to land before Wave 1). **Phase 7 starts from 037** to avoid collision. If the carryover branch is abandoned, Phase 7 may rebase to 036 — verify alembic head on main at T7-01 implementation time. Numbering gap 026-029 unchanged. |
+| Migration counter | 035 + 036 on main | `035_add_extraction_runs_operator_user_id.py` on main; `036_add_gateway_error_to_extraction_runs.py` landed via PR #281 (Phase 6.5 carryover, merged 2026-05-13). **Phase 7 starts from 037**. T7-01 implementation re-verifies the current alembic head on main and uses `head+1`. Numbering gap 026-029 unchanged. |
 | `digests` / `digest_runs` | DOES NOT EXIST | New Phase 7 tables (migration 037 — see migration counter row above for 036 collision context). |
 
 ---
@@ -798,7 +798,7 @@ async def notify_admins_digest_failure(
 
 ### 5.K. Stale-posting reaper — scheduler job (T7-04 sub-component, Codex F)
 
-**Purpose:** clear orphan `digests.status='posting'` rows that result from a publisher crash between the `draft → posting` transition commit (§5.F step 1) and the terminal status commit (§5.F step 6/7/8).
+**Purpose:** clear orphan `digests.status='posting'` rows that result from a publisher process crash while §5.F's single transaction is open (between `UPDATE ... status='posting'` and the terminal `posted`/`failed` commit). On clean process exit the row reaches a terminal state in one transaction; only an abrupt crash (worker killed, machine reboot, network partition surfacing as `QueryCanceled` partway through) leaves a `posting` row visible to other workers. The reaper handles such orphans on a fixed 5-minute interval.
 
 **Scheduler registration (in `setup_scheduler`, alongside `digest_daily`):**
 
@@ -899,7 +899,7 @@ All 16 decisions locked 2026-05-13.
 | **T7-02** | `bot/services/digests.py::run_digest` + `synthesize_digest` gateway method | B | 1 | L | T7-01 | Wave 1 |
 | **T7-03** | `bot/services/digest_context.py` builder + governance filter + forget_excludes_predicate refactor | B2 | 1 | M | T7-01 | Wave 1 |
 | **T7-04** | Scheduler hook + `digest_daily_job` + config loader | C | 2 | S | T7-02, T7-03 | Wave 2 |
-| **T7-05** | `digest_publisher.py` + `digest_renderer.py` + `digest_redactor.py` + forget cascade `digest_sources`/`digests` layers + admin notify | D | 2 | L | T7-04 | Wave 2 |
+| **T7-05** | `digest_publisher.py` + `digest_renderer.py` + `digest_redactor.py` + forget cascade single merged `digests` layer + admin notify | D | 2 | L | T7-04 | Wave 2 |
 | **T7-06** | Admin handlers `/digest_now` `/digest_preview` `/digest_history` | E | 3 | M | T7-05 | Wave 3 |
 | **T7-07** | Phase 11 binding tests (leakage L7, citation C6, forget-cascade I5) + governance + cost ceiling regression | F | 3 | M | T7-01..T7-06 | Wave 3 |
 | **T7-08** | Operator rollout docs + ratification checklist + IMPLEMENTATION_STATUS update | G | 3 | S | T7-07 | Wave 3 |
