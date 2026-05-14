@@ -6,8 +6,10 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiohttp import web
 
 from bot.config import settings
+from bot.services.health import report
 from bot.handlers import (
     admin,
     admin_cards,
@@ -56,6 +58,48 @@ _ALLOWED_UPDATES: tuple[str, ...] = (
     "chat_member",
     "my_chat_member",
 )
+
+
+async def _healthz_handler(request: web.Request) -> web.Response:
+    """GET /healthz — returns 200 when healthy, 503 otherwise. No secrets in body."""
+    h = await report()
+    status_code = 200 if h.ok else 503
+    return web.json_response(h.to_dict(), status=status_code)
+
+
+async def start_healthz_runner(
+    host: str = "0.0.0.0",
+    port: int = 3000,
+) -> tuple[web.AppRunner, int]:
+    """Set up and start the aiohttp /healthz server.
+
+    Returns ``(runner, bound_port)`` so callers can discover the actual port when
+    port=0 is passed (OS picks a free port — used in tests for isolation).
+    """
+    app = web.Application()
+    app.router.add_get("/healthz", _healthz_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    # Resolve the actual bound port (important when port=0 was passed).
+    bound_port: int = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+    logger.info("healthz_server_started", extra={"port": bound_port})
+    return runner, bound_port
+
+
+async def run_healthz_server(port: int = 3000) -> None:
+    """Start the aiohttp /healthz server and keep running until cancelled.
+
+    Designed to be used in ``asyncio.gather(run_polling(...), run_healthz_server(...))``.
+    On cancellation, runner.cleanup() is called to release the socket.
+    """
+    runner, bound_port = await start_healthz_runner(host="0.0.0.0", port=port)
+    try:
+        # Block until cancelled — asyncio.Event.wait() is cancellation-safe.
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
 
 
 async def _init_db() -> None:
@@ -124,7 +168,7 @@ async def main() -> None:
     # Startup / shutdown hooks
     async def on_startup() -> None:
         from bot.db.engine import async_session
-        from bot.services.health import report, startup_log_lines
+        from bot.services.health import startup_log_lines
         from bot.services.ingestion import get_or_create_live_run
 
         # Cache the live ingestion run id so the RawUpdatePersistenceMiddleware can pass
@@ -166,9 +210,13 @@ async def main() -> None:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # Start polling — see _ALLOWED_UPDATES above for the canonical list.
-    # aiogram expects a list, so materialize the immutable tuple here.
-    await dp.start_polling(bot, allowed_updates=list(_ALLOWED_UPDATES))
+    # Run Telegram polling and the /healthz HTTP server concurrently.
+    # asyncio.gather propagates the first exception to both coroutines and cancels the other,
+    # so a crash in either coroutine brings down the process cleanly.
+    await asyncio.gather(
+        dp.start_polling(bot, allowed_updates=list(_ALLOWED_UPDATES)),
+        run_healthz_server(port=settings.HEALTHZ_PORT),
+    )
 
 
 if __name__ == "__main__":
