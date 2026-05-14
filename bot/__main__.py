@@ -9,7 +9,7 @@ from aiogram.enums import ParseMode
 from aiohttp import web
 
 from bot.config import settings
-from bot.services.health import report
+from bot.services.health import check_db, report
 from bot.handlers import (
     admin,
     admin_cards,
@@ -67,6 +67,22 @@ async def _healthz_handler(request: web.Request) -> web.Response:
     return web.json_response(h.to_dict(), status=status_code)
 
 
+async def _healthz_db_handler(request: web.Request) -> web.Response:
+    """GET /healthz/db — DB-only roundtrip check. Fast, no other checks.
+
+    Returns 200 + {"db": "ok"} when the DB is reachable.
+    Returns 503 + {"db": "fail", "reason": "<exc class>"} when not.
+
+    No secrets are included: check_db() returns only the exception class name,
+    never the full connection string or credentials.
+    Consumed by ops/healing/healthcheck.py after issue #270.
+    """
+    result = await check_db()
+    if result.ok:
+        return web.json_response({"db": "ok"}, status=200)
+    return web.json_response({"db": "fail", "reason": result.reason}, status=503)
+
+
 async def start_healthz_runner(
     host: str = "0.0.0.0",
     port: int = 3000,
@@ -78,6 +94,7 @@ async def start_healthz_runner(
     """
     app = web.Application()
     app.router.add_get("/healthz", _healthz_handler)
+    app.router.add_get("/healthz/db", _healthz_db_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)

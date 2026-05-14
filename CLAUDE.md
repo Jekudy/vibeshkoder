@@ -13,6 +13,7 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 - Coolify is the target runtime manager for product apps.
 - Host-level operator services stay outside Coolify if they need direct VPS control.
 - Bot process exposes `/healthz` on `:3000` via aiohttp for Coolify health_check (added 2026-05-14, issue #168). Env var `HEALTHZ_PORT` overrides the port (default 3000). Post-merge operator step: enable Coolify health_check via `PATCH /api/v1/applications/<id>` with `{"health_check_enabled": true, "health_check_path": "/healthz", "health_check_port": 3000}` — safe to flip only AFTER this release is deployed.
+- `/healthz/db` is a DB-only sub-endpoint (faster, separates DB hiccups from app crashes; consumed by `ops/healing/healthcheck.py` after #270).
 
 ## Environments
 
