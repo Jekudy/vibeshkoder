@@ -26,6 +26,14 @@ is_allowed_path() {
   # a baseline regen step.
   [[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_PLAN\.md$ ]] && return 0
 
+  # Phase 7 digest context module + tests reference the canonical
+  # privacy literals in docstrings and test inputs because their job
+  # is to ENFORCE the policy — they must name the literals to filter
+  # against them. Same rationale as the design docs and phase plans
+  # above; new file added in PR #290 (T7-03).
+  [[ "$path" == "bot/services/digest_context.py" ]] && return 0
+  [[ "$path" == "tests/services/test_digest_context.py" ]] && return 0
+
   return 1
 }
 
