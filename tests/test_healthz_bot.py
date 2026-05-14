@@ -147,3 +147,78 @@ async def test_healthz_concurrent_with_polling_stub(app_env, monkeypatch) -> Non
         assert response.status_code == 200
     finally:
         await runner.cleanup()
+
+
+# ─── /healthz/db tests ───────────────────────────────────────────────────────
+
+
+async def _start_server_for_db(
+    monkeypatch, db_ok: bool
+) -> tuple[str, "web.AppRunner"]:
+    """Start the healthz server with check_db patched. Returns (base_url, runner)."""
+    from bot.services import health as health_module
+
+    async def _fake_check_db():
+        if db_ok:
+            return health_module.CheckResult(ok=True)
+        return health_module.CheckResult(ok=False, reason="OperationalError")
+
+    monkeypatch.setattr("bot.services.health.check_db", _fake_check_db)
+    bot_main = import_module("bot.__main__")
+    monkeypatch.setattr(bot_main, "check_db", _fake_check_db)
+
+    runner, port = await bot_main.start_healthz_runner(host="127.0.0.1", port=0)
+    base_url = f"http://127.0.0.1:{port}"
+    return base_url, runner
+
+
+@pytest.mark.asyncio
+async def test_healthz_db_returns_200_when_db_healthy(app_env, monkeypatch) -> None:
+    """GET /healthz/db → 200 + {db: ok} when check_db is green."""
+    base_url, runner = await _start_server_for_db(monkeypatch, db_ok=True)
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{base_url}/healthz/db")
+        assert response.status_code == 200
+        body = response.json()
+        assert body.get("db") == "ok"
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_healthz_db_returns_503_when_db_down(app_env, monkeypatch) -> None:
+    """GET /healthz/db → 503 + {db: fail, reason: ...} when check_db fails."""
+    base_url, runner = await _start_server_for_db(monkeypatch, db_ok=False)
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{base_url}/healthz/db")
+        assert response.status_code == 503
+        body = response.json()
+        assert body.get("db") == "fail"
+        assert "reason" in body
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_healthz_db_does_not_leak_secrets(app_env, monkeypatch) -> None:
+    """Response body of /healthz/db must contain no BOT_TOKEN, WEB_PASSWORD, or DB password."""
+    base_url, runner = await _start_server_for_db(monkeypatch, db_ok=True)
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{base_url}/healthz/db")
+        body_str = json.dumps(response.json())
+        forbidden = [
+            "123456:test-token",    # BOT_TOKEN
+            "test-pass",            # WEB_PASSWORD
+            "test-session-secret",  # WEB_SESSION_SECRET
+            "changeme",             # DB password
+            "149820031",            # ADMIN_IDS member
+        ]
+        for needle in forbidden:
+            assert needle not in body_str, (
+                f"/healthz/db endpoint leaked secret-shaped string: {needle!r}"
+            )
+    finally:
+        await runner.cleanup()
