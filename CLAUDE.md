@@ -74,8 +74,13 @@ closure PR. Phase 11 (Orch C) binding tests green on main.
 
 **Phase 6 (knowledge cards + admin review) — CLOSED 2026-05-12.** All 9 tickets merged
 across Wave 1 (T6-00..T6-03) + Wave 2 Stream C (T6-04, T6-05, T6-09 + cascade advisory
-lock wiring) + Stream D (T6-06, T6-07). T6-08 deferred (optional web cards page; no
-Phase 5 web scaffold). Forget cascade orchestrator advisory lock wiring closes H-Cdx-2
+lock wiring) + Stream D (T6-06, T6-07). T6-08 (web cards page) originally deferred at
+closure (no Phase 5 web scaffold); **shipped retroactively 2026-05-13 via PR #281**
+(commit `d4b2185`) once a web scaffold (`web/app.py`, `web/auth.py`, `web/routes/*`)
+landed. PR was opened by an autonomous Claude session during healing verification run
+25813274803 with a synthetic SIGNAL_PAYLOAD — not by a human or scoped Phase 6.5
+sprint. Merge by @Jekudy. Follow-up tracked: healing orchestrator needs a
+synthetic-signal / no-real-bug abstention guard (see issue filed 2026-05-14). Forget cascade orchestrator advisory lock wiring closes H-Cdx-2
 race window via 3 layered defenses (per-mvid lock + event-level coarse lock + FOR SHARE
 row lock). Phase 11 binding 28/28 green (L1-L5 + L6a/b/c + C1-C4 + C5a-d + R1-R4 +
 I1-I4). FHR APPROVE — Phase 5 LLM gateway tombstone fix landed in same closure cycle
