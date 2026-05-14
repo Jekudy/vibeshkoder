@@ -307,17 +307,18 @@ Question: do card hits filter by `chat_id`?
 
 Cards are content distilled from messages in the community chat (Phase 6 ingests only `chat_messages.memory_policy='normal'`, which today is COMMUNITY_CHAT_ID). For multi-chat futures, cards may span multiple chats. T6-06 design choice:
 
-- **Recommended:** card hits are NOT filtered by `:chat_id`. Cards are admin-curated canonical knowledge; they may legitimately bridge sources from different chats (future). At T6-06 ship, Phase 6 only ingests from COMMUNITY_CHAT_ID, so all card sources will be in one chat anyway.
-- The anchor source's `chat_id` is reported on the hit; renderers can decide how to display the link.
+**Shipped behaviour:** card hits are NOT filtered by `:chat_id`. Cards are admin-curated canonical knowledge potentially bridging chats. The anchor source's `chat_id` is reported on the hit; renderers can decide how to display the link.
 
-If review wants strict chat scoping (mirror message branch's `c.chat_id = :chat_id`), add a JOIN on `card_sources` → `chat_messages` filtered by `c.chat_id = :chat_id` AT LEAST ONE source (EXISTS subquery). Defer to review.
+**Single-chat assumption (H3 / issue #279, 2026-05-13):** The card branch trusts an upstream invariant: Phase 6 ingestion is single-chat at the application boundary. `bot/handlers/chat_messages.py` only forwards `COMMUNITY_CHAT_ID` messages to the extractor; `_select_eligible_sources` in `bot/services/extractor.py` does NOT accept a `chat_id` parameter and does not filter by it. All card sources therefore share `COMMUNITY_CHAT_ID` in Phase 6, making the missing `:chat_id` filter a no-op.
 
-> **L-2 (multi-chat future, issue #262):** The current T6-06 design intentionally does NOT
-> chat-scope card hits — `_PHASE6_SQL` has no `card_id → card_sources → chat_messages WHERE chat_id=:chat_id`
-> filter on the card branch. This is correct for Phase 6 (single-chat community, all card sources
-> share COMMUNITY_CHAT_ID). If multi-chat is added later, the card branch MUST add an
-> `EXISTS (SELECT 1 FROM card_sources cs_scope JOIN chat_messages cm_scope ON ... WHERE cm_scope.chat_id=:chat_id)`
-> subquery so a query against chat A cannot surface cards whose sources are exclusively in chat B.
+This invariant is documented by an automated test (`test_extractor_eligible_sources_does_not_filter_by_chat_id_invariant` in `tests/services/test_search_cards.py`) that will **intentionally fail** if multi-chat ingestion is added — reminding the implementer to also add chat-scope to the card branch.
+
+**Multi-chat future options (issue #279):**
+
+- **(a)** Add an EXISTS subquery on the card branch: `EXISTS (SELECT 1 FROM card_sources cs_scope JOIN chat_messages cm_scope ON cs_scope.message_version_id = mv_scope.id JOIN message_versions mv_scope ON mv_scope.chat_message_id = cm_scope.id WHERE cs_scope.card_id = kc.id AND cm_scope.chat_id = :chat_id)` — so a query against chat A cannot surface cards whose sources are exclusively in chat B.
+- **(b)** Per-chat card tables — a more complete architectural change.
+
+The decision is deferred to issue #279. Do NOT implement either option without updating the invariant test.
 
 ### UNION ALL + final ranking
 
@@ -368,12 +369,15 @@ No new indexes needed.
 
 ### SQLite test path
 
-`tsvector` / `to_tsvector` / `ts_rank_cd` are Postgres-only. SQLite tests must use a fallback. Two options:
+`tsvector` / `to_tsvector` / `ts_rank_cd` are Postgres-only. Phase 4 SQL (`_PHASE4_SQL`) itself also uses these operators — there is no meaningful SQLite execution path for `search_messages`.
 
-1. **Skip SQLite test path entirely for include_cards=True.** The Phase 4 search itself already mandates Postgres for FTS tests; SQLite tests cover ORM-only paths. Acceptable.
-2. **Dialect-guard the entire card branch.** If `session.bind.dialect.name != 'postgresql'`, return only the message branch (with empty card results). Useful for SQLite-path callers that just want to exercise the `include_cards=True` API without expecting Postgres semantics.
+**Shipped behaviour (H2 / issue #278, 2026-05-13):** `search_messages(include_cards=True)` on a non-Postgres session raises `ValueError` immediately with message:
 
-Recommendation: option 2. The function still returns a coherent result; tests requiring real card FTS run on Postgres. The conditional is a small Python branch before SQL execution.
+> `search_messages(include_cards=True) requires PostgreSQL; SQLite is not supported. Pass include_cards=False explicitly for SQLite test paths.`
+
+This replaces the previous "option 2" design (silently flip `include_cards=False`). The silent flip was misleading: it implied graceful SQLite degradation while the Phase 4 message branch ALSO fails on SQLite. Failing loudly surfaces the Postgres requirement instead of hiding it.
+
+Tests that call `search_messages` on SQLite MUST pass `include_cards=False` explicitly — which still fails at the database layer on Phase 4 SQL, but at least makes the requirement explicit. Production always runs on Postgres.
 
 ---
 
