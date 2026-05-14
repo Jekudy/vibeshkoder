@@ -1,12 +1,14 @@
 """Tests for bot/services/digest_context.py — T7-03.
 
 Governance filter checks: card status, window bounds, is_redacted, memory_policy,
-chat_id isolation, threshold fallback logic.
+chat_id isolation, forget_events exclusion, token-budget trim, threshold
+fallback logic.
 """
 
 from __future__ import annotations
 
 import itertools
+import uuid
 from datetime import datetime, timezone, timedelta
 
 import pytest
@@ -106,9 +108,8 @@ async def _make_approved_card(
     body: str = "Some body text",
     approved_by_uid: int | None = None,
     approved_at: datetime | None = None,
-) -> "uuid.UUID":
+) -> uuid.UUID:
     """Create KnowledgeCard (approved) + CardSource rows. Returns card UUID."""
-    import uuid
     from bot.db.models import KnowledgeCard, CardSource
 
     if approved_by_uid is None:
@@ -306,7 +307,7 @@ async def test_build_context_excludes_offrecord_message(db_session) -> None:
         window_start=ws,
         window_end=we,
         source_chat_id=chat_id,
-        digest_config=DigestConfig(min_cards_threshold=0),  # force raw fallback attempt
+        digest_config=DigestConfig(min_cards_threshold=10),  # force raw fallback attempt
     )
 
     assert ctx.cards == []
@@ -334,7 +335,7 @@ async def test_build_context_excludes_nomem_message(db_session) -> None:
         window_start=ws,
         window_end=we,
         source_chat_id=chat_id,
-        digest_config=DigestConfig(min_cards_threshold=0),
+        digest_config=DigestConfig(min_cards_threshold=10),
     )
 
     assert ctx.cards == []
@@ -432,3 +433,134 @@ async def test_build_context_excludes_different_chat_id(db_session) -> None:
 
     assert ctx.cards == []
     assert ctx.messages == []
+
+
+async def test_build_context_excludes_forgotten_policy(db_session) -> None:
+    """memory_policy='forgotten' (cascade-completed) excluded from both paths."""
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(hours=24)
+    we = now
+    ts = now - timedelta(hours=12)
+
+    _cm_id, mv_id = await _make_msg_and_version(
+        db_session, chat_id=chat_id, ts=ts, memory_policy="forgotten"
+    )
+    await _make_approved_card(db_session, mv_ids=[mv_id])
+
+    ctx = await build_digest_context(
+        db_session,
+        type="daily",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(min_cards_threshold=10),
+    )
+
+    assert ctx.cards == []
+    assert ctx.messages == []
+
+
+async def test_build_context_excludes_active_forget_event(db_session) -> None:
+    """forget_events row in 'pending' state for a message excludes it from
+    both cards and raw fallback, even when memory_policy is still 'normal'
+    and is_redacted is FALSE (defense-in-depth — cascade hasn't run yet)."""
+    from bot.db.models import ForgetEvent
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(hours=24)
+    we = now
+    ts = now - timedelta(hours=12)
+
+    # Normal message with approved card
+    cm_id, mv_id = await _make_msg_and_version(
+        db_session, chat_id=chat_id, ts=ts, memory_policy="normal", is_redacted=False
+    )
+    await _make_approved_card(db_session, mv_ids=[mv_id])
+
+    # Insert forget_event in 'pending' state targeting this chat_message
+    fe = ForgetEvent(
+        target_type="message",
+        target_id=str(cm_id),
+        actor_user_id=None,
+        authorized_by="self",
+        tombstone_key=f"message:{chat_id}:{cm_id}",
+        policy="forgotten",
+        status="pending",
+    )
+    db_session.add(fe)
+    await db_session.flush()
+
+    ctx = await build_digest_context(
+        db_session,
+        type="daily",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(min_cards_threshold=10),
+    )
+
+    assert ctx.cards == [], "active forget_event must exclude card"
+    assert ctx.messages == [], "active forget_event must exclude raw message"
+
+
+async def test_build_context_token_budget_drops_tail(db_session) -> None:
+    """When raw messages exceed token_budget_input, tail is dropped."""
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(hours=24)
+    we = now
+
+    # Each message ~1000 chars → ~285 tokens (1000/3.5).
+    # With token_budget_input=2000, headroom=1000, we fit ~3 messages.
+    big_text = "x" * 1000
+    for i in range(10):
+        ts = ws + timedelta(hours=i)
+        await _make_msg_and_version(
+            db_session, chat_id=chat_id, ts=ts, text=big_text
+        )
+
+    ctx = await build_digest_context(
+        db_session,
+        type="daily",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(
+            min_cards_threshold=10,
+            raw_message_top_n=10,
+            token_budget_input=2000,
+        ),
+    )
+
+    assert len(ctx.messages) > 0, "at least one message should fit"
+    assert len(ctx.messages) < 10, "tail messages must be dropped under budget"
+    # Verify chronological — earliest first.
+    timestamps = [m.ts for m in ctx.messages]
+    assert timestamps == sorted(timestamps), "messages must be chronological"
+
+
+async def test_build_context_rejects_non_daily_type(db_session) -> None:
+    """type != 'daily' raises ValueError (weekly is Phase 8 scope)."""
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(hours=24)
+    we = now
+
+    with pytest.raises(ValueError, match="daily"):
+        await build_digest_context(
+            db_session,
+            type="weekly",  # type: ignore[arg-type]
+            window_start=ws,
+            window_end=we,
+            source_chat_id=chat_id,
+            digest_config=DigestConfig(),
+        )
