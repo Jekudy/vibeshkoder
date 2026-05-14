@@ -320,6 +320,11 @@ unforgotten_card_sources AS (
             AND fe.status IN ('pending', 'processing', 'completed')
         )
 ),
+-- T6-06 chat-scope assumption: card hits are NOT filtered by :chat_id.
+-- Phase 6 ingestion is single-chat (gatekeeper handler enforces
+-- COMMUNITY_CHAT_ID at the boundary). Multi-chat support requires
+-- adding EXISTS card_sources -> chat_messages WHERE chat_id=:chat_id.
+-- See issue #279.
 card_anchors AS (
     SELECT DISTINCT ON (ucs.card_id)
         ucs.card_id,
@@ -397,15 +402,16 @@ async def search_messages(
     ``message_versions.search_tsv`` (and, for cards, ``knowledge_cards.body_tsv``)
     GIN-indexed ``tsvector`` columns. None of those exist in SQLite.
 
-    The dialect guard below flips ``include_cards=False`` on non-Postgres
-    sessions to remove the **card branch** from the SQL — that branch alone
-    references tables and indexes (``knowledge_cards``, ``card_sources``,
-    ``body_tsv``) that ORM-only SQLite tests do not create. The guard does
-    **not** make the Phase 4 SQL itself SQLite-safe. ORM-only SQLite tests
-    that call this function will fail at the database layer; the guard's
-    only contract is "the card-extension does not make Phase 4 callers any
-    less SQLite-compatible than they already were." Production runs on
-    Postgres.
+    Calling ``search_messages(include_cards=True)`` on a non-Postgres
+    session raises ``ValueError`` immediately (H2 / #278 fail-loud guard).
+    Phase 4 SQL itself also requires Postgres, so there is no meaningful
+    SQLite execution path for this function. Tests that call this function
+    on a SQLite session MUST pass ``include_cards=False`` explicitly —
+    which still fails at the database layer on Phase 4 SQL, but at least
+    makes the Postgres requirement visible instead of hiding it behind a
+    silent flip.
+
+    Production always runs on Postgres.
     """
     normalized_query = query.strip()
     if not normalized_query:
@@ -426,18 +432,28 @@ async def search_messages(
         f"MaxWords={headline_max_words},MinWords=10,ShortWord=2,HighlightAll=false"
     )
 
-    # T6-06 dialect guard — SCOPE: card-branch removal only, NOT full
-    # SQLite safety. The Phase 4 SQL underneath still uses
-    # ``plainto_tsquery`` / ``ts_rank_cd`` / ``ts_headline`` which are
-    # Postgres-only; running this on SQLite will fail in the message
-    # branch regardless. The guard's sole purpose is to avoid widening
-    # the SQLite-incompatibility surface by referencing card tables that
-    # ORM-only SQLite tests do not create (``knowledge_cards`` /
-    # ``card_sources`` / ``body_tsv``). Production runs on Postgres.
-    # See the docstring above for the full contract.
+    # H2 (#278): fail-loud on non-Postgres dialects when include_cards=True.
+    #
+    # Phase 4 SQL (_PHASE4_SQL) itself requires Postgres FTS
+    # (plainto_tsquery / ts_rank_cd / ts_headline / tsvector GIN indexes).
+    # Silently flipping include_cards=False on SQLite was misleading: it
+    # implied graceful degradation while the Phase 4 message branch ALSO
+    # fails on SQLite, so there is no meaningful SQLite execution path for
+    # search_messages.
+    #
+    # Callers that need to exercise card API shape on a SQLite test session
+    # MUST pass include_cards=False explicitly — which still fails at the
+    # database layer on Phase 4 SQL, but at least makes the Postgres
+    # requirement visible instead of hiding it behind a silent flip.
+    #
+    # See T6-06_design.md §3 "SQLite test path" (updated 2026-05-13).
     dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
-    if dialect_name != "postgresql":
-        include_cards = False
+    if dialect_name != "postgresql" and include_cards:
+        raise ValueError(
+            "search_messages(include_cards=True) requires PostgreSQL; "
+            "SQLite is not supported. "
+            "Pass include_cards=False explicitly for SQLite test paths."
+        )
 
     if not include_cards:
         stmt = text(_PHASE4_SQL)
