@@ -11,8 +11,9 @@ These tests exercise the ``include_cards=True`` path of the search service:
   for message hits.
 
 All tests require Postgres because the card branch uses Russian-language
-``to_tsvector`` / ``ts_rank_cd`` / ``ts_headline``. SQLite tests cover the
-dialect-guard separately (see ``test_search_cards_sqlite_safe_noop``).
+``to_tsvector`` / ``ts_rank_cd`` / ``ts_headline``. SQLite dialect behaviour
+is tested via ``test_search_messages_sqlite_dialect_raises_when_include_cards_true``
+below (H2: fail-loud guard, closes #278).
 """
 
 from __future__ import annotations
@@ -749,3 +750,86 @@ async def test_card_with_partial_source_forget_no_cascade_yet(db_session) -> Non
     )
 
     assert [h for h in hits if h.source_type == "card"] == []
+
+
+# ─── H2: SQLite fail-loud guard (closes #278) ───────────────────────────────
+
+
+def test_search_messages_sqlite_dialect_raises_when_include_cards_true() -> None:
+    """H2 (#278): search_messages(include_cards=True) on a non-Postgres session
+    MUST raise ValueError immediately instead of silently falling back to the
+    Phase 4 message-only path.
+
+    Rationale: Phase 4 SQL itself requires Postgres FTS (plainto_tsquery /
+    ts_rank_cd / ts_headline). Silently flipping include_cards=False on SQLite
+    was misleading — it implied SQLite was *supported* via graceful degradation
+    when the Phase 4 branch itself will fail on SQLite.  Callers that need to
+    exercise card API shape on a SQLite test session MUST pass
+    include_cards=False explicitly, making the Postgres requirement visible.
+    See T6-06_design.md §3 SQLite test path (updated).
+    """
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from bot.services.search import search_messages
+
+    # Build a fake session whose dialect reports "sqlite".
+    fake_dialect = MagicMock()
+    fake_dialect.name = "sqlite"
+    fake_bind = MagicMock()
+    fake_bind.dialect = fake_dialect
+    fake_session = MagicMock()
+    fake_session.bind = fake_bind
+
+    with pytest.raises(ValueError, match="include_cards=True.*PostgreSQL"):
+        asyncio.run(
+            search_messages(fake_session, "query", chat_id=-1, include_cards=True)
+        )
+
+
+# ─── H3: single-chat ingestion invariant (closes #279) ──────────────────────
+
+
+def test_extractor_eligible_sources_does_not_filter_by_chat_id_invariant() -> None:
+    """H3 (#279): documents the single-chat ingestion assumption.
+
+    ``_select_eligible_sources`` in ``bot/services/extractor.py`` does NOT
+    accept a ``chat_id`` parameter — all card sources can originate from ANY
+    chat with ``memory_policy='normal'``.  The search-side card branch in
+    ``_PHASE6_SQL`` trusts this upstream invariant: Phase 6 ingestion is
+    single-chat at the application boundary (``bot/handlers/chat_messages.py``
+    only forwards COMMUNITY_CHAT_ID to extraction).
+
+    This test asserts via source inspection that:
+    1. ``_select_eligible_sources`` signature has NO ``chat_id`` parameter.
+    2. The ``base_predicate`` SQL literal inside the function does NOT contain
+       a ``c.chat_id = :chat_id`` equality filter (only uses ``c.chat_id`` in
+       the tombstone key construction, not as a row filter).
+
+    If multi-chat ingestion is added later, this test will intentionally fail,
+    reminding the implementer to also add chat-scope to the card branch SQL.
+    See issue #279 for the two future-proofing options:
+      (a) EXISTS subquery on card_sources → chat_messages WHERE chat_id=:chat_id
+      (b) per-chat card tables.
+    """
+    import inspect
+    import re
+
+    from bot.services import extractor
+
+    sig = inspect.signature(extractor._select_eligible_sources)
+    assert "chat_id" not in sig.parameters, (
+        "_select_eligible_sources gained a chat_id parameter — "
+        "if multi-chat ingestion landed, also update the card branch in "
+        "_PHASE6_SQL (see issue #279)."
+    )
+
+    src = inspect.getsource(extractor._select_eligible_sources)
+    # The tombstone key construction uses c.chat_id::text — that is allowed.
+    # What must NOT appear is a WHERE equality filter like "c.chat_id = :chat_id"
+    # or "c.chat_id = :param_chat_id" (whitespace-insensitive).
+    assert not re.search(r"c\.chat_id\s*=\s*:", src), (
+        "_select_eligible_sources now filters by c.chat_id = :param — "
+        "multi-chat ingestion has landed. Update _PHASE6_SQL card branch "
+        "to add EXISTS chat-scope filter (see issue #279)."
+    )
