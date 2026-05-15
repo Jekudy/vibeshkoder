@@ -36,6 +36,8 @@ is_allowed_path() {
   [[ "$path" == "bot/services/digest_redactor.py" ]] && return 0
   [[ "$path" == "tests/services/test_digest_context.py" ]] && return 0
   [[ "$path" == "tests/services/test_digest_publisher.py" ]] && return 0
+  # T7-07: Phase 11 binding tests for digest leakage / citation / forget cascade.
+  [[ "$path" == "tests/evals/test_digest_leakage.py" ]] && return 0
 
   return 1
 }
