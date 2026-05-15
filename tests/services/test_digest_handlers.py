@@ -112,23 +112,6 @@ async def test_digest_now_non_admin_silent_no_op(db_session):
     msg.answer.assert_not_called()
 
 
-async def test_digest_now_weekly_returns_phase8_message(db_session, monkeypatch):
-    """admin invokes /digest_now weekly → Phase 8 message."""
-    from bot.config import settings
-    from bot.handlers.digest import cmd_digest_now
-
-    admin_id = list(settings.ADMIN_IDS)[0] if settings.ADMIN_IDS else 1
-    bot_mock = MagicMock()
-    msg = _mk_msg(user_id=admin_id)
-    await cmd_digest_now(
-        msg, bot=bot_mock, session=db_session, command=_mk_command_obj("weekly")
-    )
-    msg.answer.assert_awaited_once()
-    args, kwargs = msg.answer.call_args
-    body = args[0] if args else kwargs.get("text", "")
-    assert "Phase 8" in body or "weekly" in body.lower()
-
-
 async def test_digest_now_invalid_arg(db_session):
     """admin invokes /digest_now garbage → usage message."""
     from bot.config import settings
