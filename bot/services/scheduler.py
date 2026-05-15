@@ -276,6 +276,133 @@ async def run_extraction_scheduler_tick() -> None:
         logger.exception("extraction_scheduler_tick session setup failed")
 
 
+# ─── T7-04: Phase 7 daily-digest scheduler jobs ─────────────────────────────
+
+
+async def digest_daily_job(bot: Bot) -> None:
+    """Daily digest run trigger — fires at ``DIGEST_HOUR_MSK`` (Europe/Moscow).
+
+    Strict no-op when the ``memory.digests.daily.enabled`` feature flag is
+    OFF. Window is yesterday 00:00 MSK..today 00:00 MSK (stored as UTC).
+
+    Wraps the synthesis pipeline in try/except so apscheduler never stops
+    firing — orchestrator output is persisted to ``digests``/``digest_runs``
+    rows regardless of outcome.
+    """
+    try:
+        async with async_session() as session:
+            from bot.db.repos.feature_flag import FeatureFlagRepo
+
+            flag_enabled = await FeatureFlagRepo.get(
+                session, "memory.digests.daily.enabled"
+            )
+            if not flag_enabled:
+                logger.info("digest_daily_job: flag disabled, skipping")
+                return
+
+            # Compute window from MSK midnight boundaries — stored as UTC.
+            from zoneinfo import ZoneInfo
+
+            from bot.services.digests import load_digest_config, run_digest
+
+            msk = ZoneInfo("Europe/Moscow")
+            now_msk = datetime.now(tz=msk)
+            today_msk_midnight = now_msk.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            yesterday_msk_midnight = today_msk_midnight.replace(
+                day=today_msk_midnight.day
+            )
+            from datetime import timedelta as _td
+
+            yesterday_msk_midnight = today_msk_midnight - _td(days=1)
+            window_start = yesterday_msk_midnight.astimezone(timezone.utc)
+            window_end = today_msk_midnight.astimezone(timezone.utc)
+
+            digest_config = load_digest_config()
+            gateway_config = load_gateway_config()
+            try:
+                digest = await run_digest(
+                    session,
+                    type="daily",
+                    window_start=window_start,
+                    window_end=window_end,
+                    ledger_repo=LedgerRepo(),
+                    provider=resolve_provider(gateway_config.provider),
+                    config=gateway_config,
+                    digest_config=digest_config,
+                )
+                await session.commit()
+                logger.info(
+                    "digest_daily_job: ws=%s we=%s digest_id=%s status=%s",
+                    window_start.isoformat(),
+                    window_end.isoformat(),
+                    digest.id,
+                    digest.status,
+                )
+            except Exception:
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception("digest_daily_job rollback failed")
+                logger.exception("digest_daily_job: run_digest crashed")
+    except Exception:
+        # Catch-all — see precedent in extraction_scheduler_tick.
+        logger.exception("digest_daily_job: session setup failed")
+
+
+async def digest_stale_posting_reaper_job() -> None:
+    """Reap orphan ``digests.status='posting'`` rows from publisher crashes.
+
+    Runs every 5 minutes (NOT gated by feature flag — even after a flag
+    flip-OFF, any in-flight ``posting`` rows must still be cleaned up).
+    Threshold: 2 minutes since ``posting_started_at``.
+
+    Per PHASE7_PLAN.md §5.K — Phase 7 publisher (T7-05) holds the row lock
+    across ``bot.send_message`` in a single transaction. A publisher crash
+    while that transaction is open leaves an orphan ``posting`` row that
+    blocks future cascade redactions and publisher attempts. This reaper
+    transitions the row to ``failed`` so eventual consistency is restored.
+    """
+    try:
+        from sqlalchemy import text as _text
+
+        async with async_session() as session:
+            result = await session.execute(
+                _text("""
+                    UPDATE digests
+                    SET status='failed',
+                        error_text='stale_posting_reaper',
+                        posting_started_at=NULL,
+                        updated_at=now()
+                    WHERE status='posting'
+                      AND posting_started_at < now() - interval '2 minutes'
+                    RETURNING id
+                """)
+            )
+            rows = result.fetchall()
+            if not rows:
+                await session.commit()
+                return
+            for row in rows:
+                await session.execute(
+                    _text(
+                        "INSERT INTO digest_runs "
+                        "(digest_id, status, error_text, started_at, finished_at) "
+                        "VALUES (:id, 'failed', 'stale_posting_reaper', now(), now())"
+                    ),
+                    {"id": row.id},
+                )
+                logger.warning(
+                    "digest_stale_posting_reaper: reaped digest_id=%s", row.id
+                )
+            await session.commit()
+    except Exception:
+        # Reaper must NEVER let an exception propagate — apscheduler would
+        # stop firing the job. Log + continue.
+        logger.exception("digest_stale_posting_reaper crashed")
+
+
 def start_scheduler(bot: Bot) -> None:
     """Configure and start the scheduler."""
     scheduler.add_job(
@@ -338,6 +465,40 @@ def start_scheduler(bot: Bot) -> None:
         "interval",
         minutes=15,
         id="extraction_scheduler_tick",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    # T7-04: Phase 7 daily digest. Cron-MSK, gated by feature flag
+    # ``memory.digests.daily.enabled`` (default OFF). The job body
+    # re-checks the flag and is a strict no-op when disabled, so this
+    # wiring is safe to land in production with the flag off.
+    from zoneinfo import ZoneInfo
+
+    msk = ZoneInfo("Europe/Moscow")
+    digest_hour_msk = int(getattr(settings, "DIGEST_HOUR_MSK", 9))
+    scheduler.add_job(
+        digest_daily_job,
+        "cron",
+        hour=digest_hour_msk,
+        minute=0,
+        args=[bot],
+        id="digest_daily",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=600,
+        timezone=msk,
+    )
+    # T7-04: Phase 7 stale-posting reaper. ALWAYS runs (not flag-gated) so
+    # orphan rows from publisher crashes get reaped even after a flag
+    # flip-OFF. See PHASE7_PLAN.md §5.K.
+    scheduler.add_job(
+        digest_stale_posting_reaper_job,
+        "interval",
+        minutes=5,
+        id="digest_stale_posting_reaper",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
