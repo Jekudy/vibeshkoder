@@ -302,28 +302,39 @@ ALTER TABLE digests DROP CONSTRAINT ck_digests_body_markdown_not_null_for_visibl
 ALTER TABLE digests ADD CONSTRAINT ck_digests_body_markdown_not_null_for_visible_statuses CHECK (
     status NOT IN (
         'draft','posting','posted','redacted','redacted_edit_failed',
-        'awaiting_review','approved_for_publish','rejected_by_admin'
+        'awaiting_review','approved_for_publish','rejected_by_admin',
+        'rejected_by_reaper'
     )
     OR body_markdown IS NOT NULL
 ) NOT VALID;
 ALTER TABLE digests VALIDATE CONSTRAINT ck_digests_body_markdown_not_null_for_visible_statuses;
+-- rejected_by_reaper is included because the reaper may reject a digest that
+-- already has a body (transitioned from awaiting_review where body was required).
+-- Requiring body non-null for this terminal state preserves the audit trail:
+-- the rejected body remains inspectable by admins. NULL body for a rejected
+-- row would hide what content was pending review.
 
 -- ── Group 5: partial index + approval-audit CHECK ─────────────────────
 CREATE INDEX ix_digests_status_awaiting_review
     ON digests (awaiting_review_at)
     WHERE status='awaiting_review';
 
+-- The audit CHECK covers the full admin-approval window: approved_for_publish
+-- (set at /digest_approve time), posting (publisher picked it up), and posted
+-- (Telegram delivery confirmed). All three require admin attribution cols for
+-- weekly digests — they travel together through the approve→posting→posted
+-- pipeline with the same audit cols set at /digest_approve.
 ALTER TABLE digests ADD CONSTRAINT ck_digests_approved_audit CHECK (
-    status NOT IN ('approved_for_publish','posting','posted') OR (
-        type <> 'weekly' OR (
-            published_by_admin_id IS NOT NULL AND approved_at IS NOT NULL
-        )
+    status NOT IN ('approved_for_publish','posting','posted')
+    OR type <> 'weekly'
+    OR (
+        published_by_admin_id IS NOT NULL AND approved_at IS NOT NULL
     )
 ) NOT VALID;
 ALTER TABLE digests VALIDATE CONSTRAINT ck_digests_approved_audit;
 -- Daily digests are exempt: weekly path mandates admin attribution; daily
 -- path is auto-publish and leaves the audit cols NULL forever. The
--- `type <> 'weekly' OR (...)` predicate keeps the constraint type-aware.
+-- `type <> 'weekly'` predicate keeps the constraint type-aware.
 ```
 
 **Downgrade SQL (T8-01 must provide a clean reverse):**
@@ -1628,9 +1639,9 @@ Sprint grid for Phase 8. **L6 wave layout (revised) — Round 1 review correctly
 - `tests/db/test_digests_review_schema.py` asserts:
   - `ck_digests_status` accepts all 14 status values, rejects unknown.
   - **`ck_digest_runs_status` accepts all 11 audit values** (running, finished, failed, skipped, cost_exceeded, skipped_no_destination, awaiting_review, approved_for_publish, rejected_by_admin, rejected_by_reaper, regenerated_by_admin), rejects unknown. (C4: this was missing from the earlier acceptance — explicit test required.)
-  - Body-NOT-NULL invariant extends to `awaiting_review` / `approved_for_publish` / `rejected_by_admin`.
+  - Body-NOT-NULL invariant extends to `awaiting_review` / `approved_for_publish` / `rejected_by_admin` / `rejected_by_reaper`.
   - Partial index `ix_digests_status_awaiting_review` exists.
-  - `ck_digests_approved_audit` rejects `status='approved_for_publish'` rows missing `published_by_admin_id` or `approved_at` when `type='weekly'`, exempts `type='daily'`.
+  - `ck_digests_approved_audit` rejects `status IN ('approved_for_publish','posting','posted')` rows missing `published_by_admin_id` or `approved_at` when `type='weekly'`, exempts `type='daily'`.
 - Downgrade tests:
   - Insert a Phase-8 review-status row on `digests`, attempt downgrade → fails with the expected RAISE EXCEPTION mentioning `PHASE8_ROLLOUT.md`.
   - Insert a Phase-8 audit-status row on `digest_runs`, attempt downgrade → fails with the expected RAISE EXCEPTION for `digest_runs`.

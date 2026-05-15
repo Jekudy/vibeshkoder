@@ -366,9 +366,11 @@ async def test_038_body_markdown_required_for_review_states(
     """status='awaiting_review' / 'approved_for_publish' / 'rejected_by_admin' with body=NULL violates.
 
     The Phase 7 body CHECK covered draft/posting/posted/redacted/redacted_edit_failed.
-    Phase 8 widens it to also include awaiting_review, approved_for_publish, and
-    rejected_by_admin (visible/audit-trail states). rejected_by_reaper is reaper-only
-    bookkeeping and per §5.A is NOT in the widened body-required set.
+    Phase 8 widens it to also include awaiting_review, approved_for_publish,
+    rejected_by_admin, and rejected_by_reaper (all review-bearing states that carry an
+    audit trail).  See §5.A: the reaper terminates a digest that was already in
+    awaiting_review (where body was required), so body_markdown IS NOT NULL on entry
+    to rejected_by_reaper — the CHECK preserves this invariant at the DB layer.
     """
     conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
     try:
@@ -407,6 +409,86 @@ async def test_038_body_markdown_required_for_review_states(
                 VALUES (
                     'weekly','2026-05-04 12:00:00+00','2026-05-11 12:00:00+00',
                     'rejected_by_admin','[]'::jsonb, NULL
+                )
+                """
+            )
+    finally:
+        await conn.close()
+
+
+async def test_038_body_markdown_required_for_rejected_by_reaper(
+    migrated_database_url: str,
+) -> None:
+    """status='rejected_by_reaper' with body=NULL violates ck_digests_body_markdown_not_null.
+
+    rejected_by_reaper transitions FROM awaiting_review (where body was already required).
+    The DB-level CHECK preserves this invariant at the terminal state too — a NULL body
+    would hide what content was pending review from audit inspection.
+    """
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            await conn.execute(
+                """
+                INSERT INTO digests (
+                    type, window_start, window_end, status, citations, body_markdown
+                )
+                VALUES (
+                    'weekly','2026-05-04 13:00:00+00','2026-05-11 13:00:00+00',
+                    'rejected_by_reaper','[]'::jsonb, NULL
+                )
+                """
+            )
+    finally:
+        await conn.close()
+
+
+# ─── Test: approved_audit CHECK covers posting + posted statuses ─────────────
+
+
+async def test_038_approved_audit_check_covers_posting_and_posted(
+    migrated_database_url: str,
+) -> None:
+    """ck_digests_approved_audit rejects weekly 'posting'/'posted' rows missing audit cols.
+
+    The CHECK covers status IN ('approved_for_publish','posting','posted') for weekly
+    digests.  All three travel through the same approve→posting→posted pipeline with
+    the audit cols set at /digest_approve time and carried through unchanged.
+    """
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        # weekly posting with NULL published_by_admin_id → violates
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            await conn.execute(
+                """
+                INSERT INTO digests (
+                    type, window_start, window_end, status, citations, body_markdown,
+                    posting_started_at, published_by_admin_id, approved_at
+                )
+                VALUES (
+                    'weekly','2026-05-04 14:00:00+00','2026-05-11 14:00:00+00',
+                    'posting','[]'::jsonb,'body',
+                    '2026-05-11 09:00:00+00',
+                    NULL,
+                    '2026-05-11 09:00:00+00'
+                )
+                """
+            )
+        # weekly posted with NULL approved_at → violates
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            await conn.execute(
+                """
+                INSERT INTO digests (
+                    type, window_start, window_end, status, citations, body_markdown,
+                    posted_at, posted_chat_id, posted_message_id,
+                    published_by_admin_id, approved_at
+                )
+                VALUES (
+                    'weekly','2026-05-04 15:00:00+00','2026-05-11 15:00:00+00',
+                    'posted','[]'::jsonb,'body',
+                    '2026-05-11 10:00:00+00', -1001234567890, 42,
+                    123456789,
+                    NULL
                 )
                 """
             )
@@ -575,6 +657,76 @@ async def test_038_downgrade_blocks_on_posting_rows_weekly(
     combined = (proc.stdout + proc.stderr).lower()
     assert "posting" in combined
     assert "stale_posting_reaper" in combined
+
+
+# ─── Test: downgrade succeeds after posting row transitions to terminal state ─
+
+
+async def test_038_downgrade_succeeds_after_posting_terminal_transition(
+    temp_database_url: str,
+) -> None:
+    """posting row blocks downgrade; after UPDATE to posted (terminal) downgrade succeeds.
+
+    Validates the operator recovery path documented in §5.A downgrade note: wait for the
+    stale_posting_reaper to move the row from posting → posted, then downgrade proceeds.
+    The test simulates that by manually UPDATE'ing the row to posted with all required
+    cols set (the reaper sets the same cols on Telegram-delivery success).
+    """
+    _run_alembic(temp_database_url, "upgrade", "head")
+
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(temp_database_url)))
+    row_id: int | None = None
+    try:
+        row_id = await conn.fetchval(
+            """
+            INSERT INTO digests (
+                type, window_start, window_end, status, citations,
+                body_markdown, posting_started_at
+            )
+            VALUES (
+                'daily',
+                '2026-05-13 20:00:00+00',
+                '2026-05-14 20:00:00+00',
+                'posting',
+                '[]'::jsonb,
+                'body',
+                '2026-05-13 20:00:00+00'
+            )
+            RETURNING id
+            """
+        )
+    finally:
+        await conn.close()
+
+    # Attempt downgrade while row is still posting → must fail.
+    proc = _run_alembic(temp_database_url, "downgrade", "-1", check=False)
+    assert proc.returncode != 0, (
+        f"expected downgrade to fail on posting row, got rc={proc.returncode}"
+    )
+    combined = (proc.stdout + proc.stderr).lower()
+    assert "posting" in combined
+
+    # Transition the row to posted (simulates stale_posting_reaper completing delivery).
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(temp_database_url)))
+    try:
+        await conn.execute(
+            """
+            UPDATE digests
+            SET status='posted',
+                posted_at='2026-05-13 20:01:00+00',
+                posted_chat_id=-1001234567890,
+                posted_message_id=99
+            WHERE id=$1
+            """,
+            row_id,
+        )
+    finally:
+        await conn.close()
+
+    # Now downgrade must succeed.
+    _run_alembic(temp_database_url, "downgrade", "-1")
+    current = await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version")
+    assert current == "037"
 
 
 # ─── Test: downgrade succeeds on clean Phase-7-only state ────────────────────
