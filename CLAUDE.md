@@ -99,6 +99,20 @@ extractor running-row leak, #262 MED/LOW + deferred items.
 - Codex post-merge follow-ups on PR #266 (M1+M2 SQL drift, M3 multi-item snapshot,
   L1+L2 docstring) addressed in chore/p6-wave2-closure branch.
 
+**Phase 7 (daily summaries) — CLOSED 2026-05-15.** All 8 tickets merged
+(T7-S0 docs ratify #285, T7-01 migration 037 #287, T7-03 digest_context
+#290, T7-02 run_digest + synthesize_digest gateway #293, T7-04 scheduler +
+reaper #294, T7-05 publisher + renderer + redactor + cascade `digests`
+layer #296, T7-06 admin handlers #297, T7-07 Phase 11 binding L7a/b + C6 +
+I5a/b/c #298, T7-08 closure docs in this PR). Phase 11 binding **34/34**
+green (28 prior + 6 new). Flag `memory.digests.daily.enabled` default
+OFF — production rollout playbook in `docs/memory-system/PHASE7_ROLLOUT.md`.
+Phase 7.5 carryovers tracked: #291 (shared forget-events predicate refactor
+between forget_cascade and digest_context), #295 (T7-02 post-merge MED
+items: provider-error categorization, EMPTY_WINDOW ledger error field).
+HIGH item from #295 (citation `position` as bullet index, not token
+ordinal) shipped as part of T7-05.
+
 **Phase 6 implementation/docs order anomaly (read before any T6-XX work):** T6-06
 (`bot/services/search.py` include_cards: commits `fcb5a3c`, `b5949b2`, `84beecd`,
 `50d1818`, `6f93105`, `2f1ffab`) and T6-07 (`bot/services/evidence.py` discriminator

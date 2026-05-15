@@ -447,4 +447,30 @@ After each PR merge into `main`:
    superseded, write `superseded by T#-##` in Notes.
 5. Update `Last updated` at the top.
 
-<!-- updated-by-superflow:2026-05-12 -->
+## Phase 7 — Daily digests (CLOSED 2026-05-15)
+
+**Sprint 0 RATIFIED 2026-05-14.** Plan ratified per `docs/memory-system/PHASE7_PLAN.md`
+after 5 rounds of dual-model review (Codex technical + Claude product/spec). All 8
+implementation tickets merged 2026-05-14..2026-05-15.
+
+| ID | Wave | Description | Status | Notes |
+|----|------|-------------|--------|-------|
+| T7-S0 | 0 | docs ratify + AUTHORIZED_SCOPE | merged | **PR #285** 2026-05-14. Sprint 0 docs-only PR: `PHASE7_PLAN.md` (~1100 lines) + `AUTHORIZED_SCOPE.md` Phase 7 authorization block. |
+| T7-01 | 1A | Migration 037 + ORM `Digest`/`DigestRun` | merged | **PR #287** 2026-05-14. `digests` table (16 cols, idempotency unique, 10 status values incl. `posting`, GIN citations index, partial draft/posting indexes); `digest_runs` audit table. 13 schema tests. |
+| T7-03 | 1B | `digest_context.build_digest_context` | merged | **PR #290** 2026-05-14. Cards-first + chronological raw fallback; governance filter (memory_policy='normal' + is_redacted=FALSE + NOT EXISTS active forget_events). 14 tests. |
+| T7-02 | 1B | `run_digest` orchestrator + `synthesize_digest` gateway extension | merged | **PR #293** 2026-05-15. Advisory-lock idempotency, Phase 7 separate cost bucket, EMPTY_WINDOW sentinel handling, citation invariant. 13 tests. |
+| T7-04 | 2A | Scheduler `digest_daily_job` + stale-posting reaper | merged | **PR #294** 2026-05-15. Cron MSK timezone, `memory.digests.daily.enabled` flag-gated (default OFF), reaper every 5 min (always-on). 5 tests. |
+| T7-05 | 2B | Publisher + renderer + redactor + cascade `digests` layer + bullet-index fix | merged | **PR #296** 2026-05-15. Single-transaction publisher holding row lock across send_message; HTML renderer with truncate-before-escape + tag-balance fallback; redactor with unconditional edit + erratum fallback + admin notify; forget cascade layer placed BEFORE card_sources (handles both `kind='message_version'` and `kind='card_source'` citations); bullet-index fix from #295 HIGH. 13 tests. |
+| T7-06 | 3A | Admin handlers `/digest_now` `/digest_preview` `/digest_history` | merged | **PR #297** 2026-05-15. Admin-gated (silent no-op for non-admins); flag bypass; status-branched replies. 10 tests. |
+| T7-07 | 3B | Phase 11 binding L7a/b + C6 + I5a/b/c | merged | **PR #298** 2026-05-15. Phase 11 binding extension 28 → 34. Forgotten exclusion, citation invariant, cascade redaction e2e, publish revalidation race. 6 tests. |
+| T7-08 | 3C | Closure docs (PHASE7_ROLLOUT, IMPLEMENTATION_STATUS, ROADMAP, CLAUDE, AUTHORIZED_SCOPE) | merged | This PR. Operator rollout playbook + status updates. |
+
+**Phase 11 binding suite: 34/34 green** (L1-L5 + L6a/b/c + L7a/b + C1-C4 + C5a-d + C6 + R1-R4 + I1-I4 + I5a/b/c).
+
+**Carryover issues (Phase 7.5):**
+- **#291** — Extract `_forget_excludes_predicate` shared helper between `forget_cascade._cascade_message_versions` and `digest_context.py` / `llm_gateway._digest_context_is_clean` (DRY guard against drift).
+- **#295** — T7-02 post-merge Codex review items: provider-error categorization (currently falls to `unexpected:*`), EMPTY_WINDOW ledger error field (currently `error=None` on misbehavior). HIGH item (citation `position` as bullet index) already shipped in T7-05.
+
+**Production rollout:** see `docs/memory-system/PHASE7_ROLLOUT.md`.
+
+<!-- updated-by-superflow:2026-05-15 -->

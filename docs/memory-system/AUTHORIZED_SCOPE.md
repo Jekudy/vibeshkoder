@@ -169,11 +169,24 @@ NOT in Phase 6 scope (defer):
 
 ---
 
-## Authorized: Phase 7 — Daily digests (2026-05-14)
+## Authorized: Phase 7 — Daily digests (2026-05-14, **CLOSED 2026-05-15**)
 
-Phase 7 is authorized for implementation following Phase 5 + Phase 6 closure (both
-DONE 2026-05-11 / 2026-05-12) and the Phase 11 binding suite remaining green on
-main. Owned by Orchestrator A per the synthesis chain (Phase 5 → 6 → 7 → 8).
+Phase 7 closed 2026-05-15. All 8 sprints merged across PRs #285 (T7-S0
+docs ratify), #287 (T7-01 migration 037), #290 (T7-03 digest_context),
+#293 (T7-02 run_digest + synthesize_digest), #294 (T7-04 scheduler +
+reaper), #296 (T7-05 publisher + cascade), #297 (T7-06 admin handlers),
+#298 (T7-07 Phase 11 binding), and T7-08 closure docs (this PR).
+
+Feature flag `memory.digests.daily.enabled` default OFF. Production
+rollout playbook: `docs/memory-system/PHASE7_ROLLOUT.md`. Phase 11
+binding **34/34** green. Phase 7.5 carryovers tracked in issues #291
+(shared predicate refactor) and #295 (T7-02 post-merge MED items).
+
+Original authorization (preserved for context): Phase 7 was authorized
+for implementation following Phase 5 + Phase 6 closure (both DONE
+2026-05-11 / 2026-05-12) and the Phase 11 binding suite remaining green
+on main. Owned by Orchestrator A per the synthesis chain (Phase 5 → 6 →
+7 → 8).
 
 Authorized scope (per `docs/memory-system/PHASE7_PLAN.md`, ratified 2026-05-14 after
 two rounds of dual-model review — Codex technical + Claude product/spec):
