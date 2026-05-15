@@ -36,7 +36,59 @@ logger = logging.getLogger(__name__)
 
 
 class DigestPublisherInvalidState(Exception):
-    """Row was not in ``draft`` state when the publisher acquired the lock."""
+    """Publisher trigger guard fired, OR the guarded UPDATE returned
+    rowcount=0 (concurrent race).
+
+    Structured fields mirror ``DigestReviewInvalidState`` (PHASE8_PLAN.md
+    §5.L — R2 HIGH-Cdx-1). Handlers branch on ``current_status`` to
+    render context-aware replies:
+
+      ``digest_id``: int
+      ``current_status``: str | None  — ``None`` ⇒ row was DELETEd
+                                        concurrently (e.g. by
+                                        ``--regenerate`` racing a stale
+                                        approve).
+                                        ``str`` ⇒ row exists in this status
+                                        (e.g. ``'redacted'`` after cascade
+                                        won the race).
+      ``reason``: str                 — free-text explanation.
+    """
+
+    def __init__(
+        self,
+        *args,
+        digest_id: int | None = None,
+        current_status: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        # Support the legacy positional form ``DigestPublisherInvalidState(msg)``
+        # used by Phase 7 baseline so callers in flight (handlers, tests) can
+        # adapt without a flag day. Structured kwargs are the canonical form.
+        if args and digest_id is None and current_status is None and reason is None:
+            self.digest_id = None
+            self.current_status = None
+            self.reason = str(args[0])
+            super().__init__(*args)
+            return
+        self.digest_id = digest_id
+        self.current_status = current_status
+        self.reason = reason or ""
+        super().__init__(
+            f"DigestPublisherInvalidState(digest_id={digest_id}, "
+            f"current_status={current_status!r}, reason={self.reason!r})"
+        )
+
+
+# T8-04 / Phase 8 §5.L — eligible status set for the publisher trigger.
+#
+# Widened from Phase 7's single ``'draft'`` to also accept
+# ``'approved_for_publish'`` — the status set by
+# ``digest_review.approve_digest`` step 3. Daily auto-publish path is
+# unchanged (still passes ``'draft'``, which matches the first tuple entry).
+_PUBLISHER_TRIGGER_STATUSES: tuple[str, ...] = (
+    "draft",
+    "approved_for_publish",
+)
 
 
 async def _digest_revalidate_citations(
@@ -115,9 +167,14 @@ async def publish_digest(
     Single long-lived transaction holding the row lock across send_message.
     Caller MUST commit the session after this returns OR roll back on raise.
     """
-    if digest.status != "draft":
+    if digest.status not in _PUBLISHER_TRIGGER_STATUSES:
         raise DigestPublisherInvalidState(
-            f"expected status='draft', got {digest.status!r}"
+            digest_id=digest.id,
+            current_status=digest.status,
+            reason=(
+                f"publisher trigger requires status in "
+                f"{_PUBLISHER_TRIGGER_STATUSES!r}, found {digest.status!r}"
+            ),
         )
 
     # If no destination, skip publication cleanly.
@@ -181,7 +238,49 @@ async def publish_digest(
         )
         return digest
 
-    # Transition draft → posting (in same transaction). Row remains locked.
+    # T8-04 / Phase 8 §5.L — guarded transition to ``posting``.
+    #
+    # Widened WHERE-clause to accept BOTH ``draft`` (daily auto-publish path)
+    # AND ``approved_for_publish`` (weekly admin-approve path). rowcount=0
+    # follows the canonical §5.E classifier (re-read row; None ⇒ deleted,
+    # str ⇒ wrong state).
+    posting_result = await session.execute(
+        text(
+            "UPDATE digests "
+            "SET status='posting', "
+            "    posting_started_at=now(), "
+            "    updated_at=now() "
+            "WHERE id=:id AND status IN ('draft','approved_for_publish') "
+            "RETURNING id"
+        ),
+        {"id": digest.id},
+    )
+    if posting_result.rowcount == 0:
+        # Race-won concurrent transition (cascade redacted, --regenerate
+        # DELETEd, etc.). Re-read, classify, raise.
+        current = (
+            await session.execute(
+                text("SELECT status FROM digests WHERE id=:id"),
+                {"id": digest.id},
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            raise DigestPublisherInvalidState(
+                digest_id=digest.id,
+                current_status=None,
+                reason="row_deleted_during_transition",
+            )
+        raise DigestPublisherInvalidState(
+            digest_id=digest.id,
+            current_status=current,
+            reason=(
+                "expected status IN ('draft','approved_for_publish'), "
+                f"found {current!r}"
+            ),
+        )
+
+    # Refresh ORM state to reflect the guarded UPDATE so subsequent code
+    # (revalidation, render, send) sees the new status / posting_started_at.
     digest.status = "posting"
     digest.posting_started_at = datetime.now(timezone.utc)
     digest.updated_at = datetime.now(timezone.utc)
