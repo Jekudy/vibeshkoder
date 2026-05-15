@@ -558,3 +558,465 @@ async def test_cascade_digests_layer_redacts_via_cascade_worker(db_session):
         f"got status={row['status']}"
     )
     assert "[REDACTED — забыто]" in row["body_markdown"]
+
+
+# ── T8-04 / Phase 8 — widened allowlists (review-gate states) ───────────────
+
+
+@pytest.mark.parametrize(
+    "review_status",
+    ["awaiting_review", "approved_for_publish", "rejected_by_admin"],
+)
+async def test_redactor_widens_to_review_states(db_session, review_status):
+    """§5.K binding privacy fix C1.
+
+    Redactor MUST accept ``awaiting_review`` / ``approved_for_publish`` /
+    ``rejected_by_admin`` (the new Phase 8 visible/queue statuses). Without
+    this widening the cascade scan selects the row but the redactor's
+    hardcoded allowlist short-circuits it back out — a silent privacy
+    regression where an admin /digest_approve could publish forgotten
+    content.
+    """
+    from bot.db.models import Digest
+    from bot.services.digest_redactor import redact_digest_for_forget
+
+    digest = Digest(
+        type="weekly",
+        window_start=datetime.now(timezone.utc) - timedelta(days=7),
+        window_end=datetime.now(timezone.utc),
+        body_markdown="TL;DR.\n\n- First [[mv:1]]\n- Second [[mv:2]]",
+        citations=[
+            {"kind": "message_version", "id": 1, "position": 0},
+            {"kind": "message_version", "id": 2, "position": 1},
+        ],
+        status=review_status,
+        # ck_digests_approved_audit needs published_by_admin_id + approved_at
+        # for weekly approved_for_publish / posting / posted statuses.
+        published_by_admin_id=(
+            42 if review_status == "approved_for_publish" else None
+        ),
+        approved_at=(
+            datetime.now(timezone.utc)
+            if review_status == "approved_for_publish"
+            else None
+        ),
+        review_notes=(
+            "test reject" if review_status == "rejected_by_admin" else None
+        ),
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    did = digest.id
+
+    await redact_digest_for_forget(
+        db_session,
+        digest_id=did,
+        affected_mvids={1},
+        affected_card_source_ids=set(),
+        bot=None,
+    )
+
+    row = (await db_session.execute(
+        text("SELECT status, body_markdown FROM digests WHERE id = :id"),
+        {"id": did},
+    )).mappings().one()
+    assert row["status"] == "redacted", (
+        f"redactor failed to mask {review_status!r} row: status stayed {row['status']!r} — "
+        f"silent privacy regression"
+    )
+    assert "[REDACTED — забыто]" in row["body_markdown"]
+    assert "First" not in row["body_markdown"]
+    assert "Second" in row["body_markdown"]
+
+
+async def test_redactor_awaiting_review_notifies_admin(db_session, monkeypatch):
+    """§5.D sub-step: when the cascade redacts an `awaiting_review` row, the
+    redactor MUST call `notify_admins_digest_failure` so the admin who was
+    about to approve knows the draft has disappeared from /digest_review.
+    """
+    from bot.db.models import Digest
+    from bot.services.digest_redactor import redact_digest_for_forget
+
+    captured = []
+
+    async def _spy(bot, *, digest_id, status, error_text):
+        captured.append((digest_id, status, error_text))
+
+    monkeypatch.setattr(
+        "bot.services.digest_redactor.notify_admins_digest_failure", _spy
+    )
+
+    digest = Digest(
+        type="weekly",
+        window_start=datetime.now(timezone.utc) - timedelta(days=7),
+        window_end=datetime.now(timezone.utc),
+        body_markdown="TL;DR.\n\n- First [[mv:1]]\n- Second [[mv:2]]",
+        citations=[
+            {"kind": "message_version", "id": 1, "position": 0},
+            {"kind": "message_version", "id": 2, "position": 1},
+        ],
+        status="awaiting_review",
+        awaiting_review_at=datetime.now(timezone.utc),
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    did = digest.id
+
+    bot_mock = MagicMock()
+    await redact_digest_for_forget(
+        db_session,
+        digest_id=did,
+        affected_mvids={1},
+        affected_card_source_ids=set(),
+        bot=bot_mock,
+    )
+
+    assert len(captured) == 1, (
+        f"awaiting_review redaction must notify admin; got {len(captured)} calls"
+    )
+    assert captured[0][0] == did
+    assert captured[0][2] == "forget_redacted_during_review"
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    ["failed", "cost_exceeded", "skipped"],
+)
+async def test_redactor_skips_terminal_no_body_states(db_session, terminal_status):
+    """Terminal states without body content (failed/cost_exceeded/skipped)
+    remain skipped by the redactor — these rows either have no body or
+    are explicitly outside the §5.D scan filter."""
+    from bot.db.models import Digest
+    from bot.services.digest_redactor import redact_digest_for_forget
+
+    digest = Digest(
+        type="daily",
+        window_start=datetime.now(timezone.utc) - timedelta(days=1),
+        window_end=datetime.now(timezone.utc),
+        body_markdown=None,
+        citations=[],
+        status=terminal_status,
+        error_text="test",
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    did = digest.id
+
+    await redact_digest_for_forget(
+        db_session,
+        digest_id=did,
+        affected_mvids={1},
+        affected_card_source_ids=set(),
+        bot=None,
+    )
+
+    row = (await db_session.execute(
+        text("SELECT status FROM digests WHERE id = :id"), {"id": did}
+    )).mappings().one()
+    assert row["status"] == terminal_status
+
+
+async def test_publisher_accepts_approved_for_publish(db_session):
+    """§5.L binding state-machine fix C2.
+
+    The publisher trigger guard MUST accept ``status='approved_for_publish'``
+    (the weekly admin-approve path) alongside ``'draft'`` (the daily
+    auto-publish path).
+    """
+    from bot.db.models import (
+        ChatMessage,
+        Digest,
+        MessageVersion,
+    )
+    from bot.db.repos.user import UserRepo
+    from bot.services.digest_publisher import publish_digest
+    from bot.services.digests import DigestConfig
+
+    chat_id = _next_chat_id()
+    uid = -1 * (5500 + next(_chat_counter))
+    await UserRepo.upsert(
+        db_session, telegram_id=uid, username=f"u{uid}", first_name="T", last_name=None
+    )
+    now = datetime.now(timezone.utc)
+    cm = ChatMessage(
+        message_id=920_000 + next(_chat_counter),
+        chat_id=chat_id,
+        user_id=uid,
+        text="weekly hello",
+        date=now - timedelta(days=2),
+        raw_json={"text": "weekly hello"},
+        memory_policy="normal",
+        is_redacted=False,
+    )
+    db_session.add(cm)
+    await db_session.flush()
+    mv = MessageVersion(
+        chat_message_id=cm.id,
+        version_seq=1,
+        text="weekly hello",
+        normalized_text="weekly hello",
+        entities_json={"entities": []},
+        content_hash=f"hw-{cm.id}",
+        is_redacted=False,
+    )
+    db_session.add(mv)
+    await db_session.flush()
+    cm.current_version_id = mv.id
+    await db_session.flush()
+
+    digest = Digest(
+        type="weekly",
+        window_start=now - timedelta(days=7),
+        window_end=now,
+        body_markdown="TL;DR.\n\n- One bullet about weekly hello.",
+        citations=[{"kind": "message_version", "id": mv.id, "position": 0}],
+        status="approved_for_publish",
+        published_by_admin_id=149820031,
+        approved_at=now,
+    )
+    db_session.add(digest)
+    await db_session.flush()
+
+    cfg = DigestConfig(destination_chat_id=-1001234567890)
+    bot_mock = MagicMock()
+    bot_mock.send_message = AsyncMock()
+    sent_msg = MagicMock()
+    sent_msg.message_id = 778
+    bot_mock.send_message.return_value = sent_msg
+
+    result = await publish_digest(
+        db_session, bot=bot_mock, digest=digest, digest_config=cfg
+    )
+    assert result.status == "posted", (
+        f"publisher rejected approved_for_publish: status={result.status} "
+        f"err={result.error_text}"
+    )
+    assert result.posted_message_id == 778
+
+
+async def test_publisher_invalid_state_has_structured_fields(db_session):
+    """§5.L : DigestPublisherInvalidState exposes structured fields
+    (digest_id, current_status, reason)."""
+    from bot.db.models import Digest
+    from bot.services.digest_publisher import (
+        DigestPublisherInvalidState,
+        publish_digest,
+    )
+    from bot.services.digests import DigestConfig
+
+    digest = Digest(
+        type="daily",
+        window_start=datetime.now(timezone.utc) - timedelta(days=1),
+        window_end=datetime.now(timezone.utc),
+        body_markdown="TL;DR.\n\n- One [[mv:1]]",
+        citations=[{"kind": "message_version", "id": 1, "position": 0}],
+        status="posted",
+        posted_chat_id=-42,
+        posted_message_id=999,
+        posted_at=datetime.now(timezone.utc),
+    )
+    db_session.add(digest)
+    await db_session.flush()
+
+    cfg = DigestConfig(destination_chat_id=-42)
+    bot_mock = MagicMock()
+    with pytest.raises(DigestPublisherInvalidState) as exc_info:
+        await publish_digest(
+            db_session, bot=bot_mock, digest=digest, digest_config=cfg
+        )
+    assert exc_info.value.digest_id == digest.id
+    assert exc_info.value.current_status == "posted"
+    assert "draft" in exc_info.value.reason
+    assert "approved_for_publish" in exc_info.value.reason
+
+
+async def test_publisher_classifier_row_deleted_distinguishes_from_wrong_state(
+    db_session,
+):
+    """§5.L canonical rowcount=0 classifier — deleted-row branch.
+
+    Simulate the race window: between the FOR UPDATE NOWAIT lock attempt
+    (which silently succeeds against a missing row) and the guarded UPDATE
+    to 'posting' (which returns rowcount=0), the row is gone. Classifier
+    must raise DigestPublisherInvalidState with ``current_status=None`` and
+    ``reason='row_deleted_during_transition'``.
+    """
+    from bot.db.models import Digest
+    from bot.services.digest_publisher import (
+        DigestPublisherInvalidState,
+        publish_digest,
+    )
+    from bot.services.digests import DigestConfig
+
+    # Build a normal draft row, hold a detached reference, then delete it
+    # so the publisher's guarded UPDATE finds no row.
+    digest = Digest(
+        type="daily",
+        window_start=datetime.now(timezone.utc) - timedelta(days=1),
+        window_end=datetime.now(timezone.utc),
+        body_markdown="TL;DR.\n\n- One [[mv:1]]",
+        citations=[],
+        status="draft",
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    did = digest.id
+
+    # Race: row DELETEd before publish runs (operator manual cleanup or
+    # --regenerate racing).
+    await db_session.execute(
+        text("DELETE FROM digests WHERE id=:id"), {"id": did}
+    )
+    await db_session.flush()
+
+    # The Python `digest` object still has status='draft' in memory so the
+    # trigger guard passes; the FOR UPDATE NOWAIT against a missing row
+    # returns zero rows but does not error; the guarded UPDATE to 'posting'
+    # then returns rowcount=0 — classifier path.
+    cfg = DigestConfig(destination_chat_id=-1001234567890)
+    bot_mock = MagicMock()
+    bot_mock.send_message = AsyncMock()
+    with pytest.raises(DigestPublisherInvalidState) as exc_info:
+        await publish_digest(
+            db_session, bot=bot_mock, digest=digest, digest_config=cfg
+        )
+    assert exc_info.value.digest_id == did
+    assert exc_info.value.current_status is None
+    assert "row_deleted_during_transition" in exc_info.value.reason
+
+
+async def test_publisher_classifier_wrong_state_after_guard_miss(db_session):
+    """§5.L canonical rowcount=0 classifier — wrong-state branch.
+
+    Simulate cascade-won race: row started as 'draft' (passes trigger
+    guard) but is moved to 'redacted' before the guarded UPDATE to
+    'posting' runs. Classifier raises with ``current_status='redacted'``.
+    """
+    from bot.db.models import Digest
+    from bot.services.digest_publisher import (
+        DigestPublisherInvalidState,
+        publish_digest,
+    )
+    from bot.services.digests import DigestConfig
+
+    digest = Digest(
+        type="daily",
+        window_start=datetime.now(timezone.utc) - timedelta(days=1),
+        window_end=datetime.now(timezone.utc),
+        body_markdown="TL;DR.\n\n- One [[mv:1]]",
+        citations=[],
+        status="draft",
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    did = digest.id
+
+    # Race: row moved to 'redacted' by cascade before publisher's guarded
+    # UPDATE — but the Python `digest` object still says 'draft' so the
+    # trigger guard passes.
+    await db_session.execute(
+        text(
+            "UPDATE digests SET status='redacted', updated_at=now() "
+            "WHERE id=:id"
+        ),
+        {"id": did},
+    )
+    await db_session.flush()
+
+    cfg = DigestConfig(destination_chat_id=-1001234567890)
+    bot_mock = MagicMock()
+    bot_mock.send_message = AsyncMock()
+    with pytest.raises(DigestPublisherInvalidState) as exc_info:
+        await publish_digest(
+            db_session, bot=bot_mock, digest=digest, digest_config=cfg
+        )
+    assert exc_info.value.digest_id == did
+    assert exc_info.value.current_status == "redacted"
+    assert "expected status IN" in exc_info.value.reason
+
+
+async def test_cascade_digests_scans_review_states(db_session):
+    """§5.D + §5.K binding.
+
+    Verify ``_cascade_digests`` selects rows in ``awaiting_review`` /
+    ``approved_for_publish`` / ``rejected_by_admin`` statuses (the new
+    Phase 8 review-queue states), then the redactor processes them
+    end-to-end.
+    """
+    from bot.db.models import (
+        ChatMessage,
+        Digest,
+        ForgetEvent,
+        MessageVersion,
+    )
+    from bot.db.repos.user import UserRepo
+    from bot.services.forget_cascade import run_cascade_worker_once
+
+    chat_id = _next_chat_id()
+    uid = -1 * (8500 + next(_chat_counter))
+    await UserRepo.upsert(
+        db_session, telegram_id=uid, username=f"u{uid}", first_name="T", last_name=None
+    )
+    now = datetime.now(timezone.utc)
+    cm = ChatMessage(
+        message_id=970_000 + next(_chat_counter),
+        chat_id=chat_id,
+        user_id=uid,
+        text="awaiting secret",
+        date=now - timedelta(days=3),
+        raw_json={"text": "awaiting secret"},
+        memory_policy="normal",
+        is_redacted=False,
+    )
+    db_session.add(cm)
+    await db_session.flush()
+    mv = MessageVersion(
+        chat_message_id=cm.id,
+        version_seq=1,
+        text="awaiting secret",
+        normalized_text="awaiting secret",
+        entities_json={"entities": []},
+        content_hash=f"hr-{cm.id}",
+        is_redacted=False,
+    )
+    db_session.add(mv)
+    await db_session.flush()
+    cm.current_version_id = mv.id
+
+    digest = Digest(
+        type="weekly",
+        window_start=now - timedelta(days=7),
+        window_end=now,
+        body_markdown=f"TL;DR.\n\n- Bullet [[mv:{mv.id}]]",
+        citations=[{"kind": "message_version", "id": mv.id, "position": 0}],
+        status="awaiting_review",
+        awaiting_review_at=now,
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    did = digest.id
+
+    # Forget event on the message.
+    fe = ForgetEvent(
+        target_type="message",
+        target_id=str(cm.id),
+        actor_user_id=None,
+        authorized_by="self",
+        tombstone_key=f"message:{chat_id}:{cm.id}:p8-cascade",
+        policy="forgotten",
+        status="pending",
+    )
+    db_session.add(fe)
+    await db_session.flush()
+
+    await run_cascade_worker_once(db_session, batch_size=10)
+
+    row = (await db_session.execute(
+        text("SELECT status, body_markdown FROM digests WHERE id=:id"),
+        {"id": did},
+    )).mappings().one()
+    assert row["status"] in ("redacted", "redacted_edit_failed"), (
+        f"awaiting_review digest must be redacted by cascade — privacy "
+        f"regression: got status={row['status']!r}"
+    )
+    assert "[REDACTED — забыто]" in row["body_markdown"]

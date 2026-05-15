@@ -26,6 +26,31 @@ logger = logging.getLogger(__name__)
 
 REDACTED_BULLET_TEMPLATE = "- [REDACTED — забыто]"
 
+# T8-04 / Phase 8 §5.K — eligible-status allowlist for the redactor.
+#
+# Widened beyond the Phase 7 4-tuple to cover the four new review-gate
+# statuses introduced by migration 038:
+#   awaiting_review        — weekly draft DMed to admins, pending decision
+#   approved_for_publish   — admin approved; publisher transitions to posting
+#   rejected_by_admin      — admin rejected; still visible in /digest_review
+#
+# C1 binding privacy fix: without this widening the forget cascade scan at
+# forget_cascade.py:840 selects the row but the redactor short-circuits it
+# back out, leaving forgotten content visible. An admin /digest_approve
+# could then publish forgotten content to Telegram.
+#
+# MUST mirror forget_cascade._cascade_digests WHERE-status filter EXACTLY.
+_REDACTOR_ELIGIBLE_STATUSES: tuple[str, ...] = (
+    "draft",
+    "awaiting_review",
+    "approved_for_publish",
+    "posting",
+    "posted",
+    "redacted",
+    "redacted_edit_failed",
+    "rejected_by_admin",
+)
+
 
 def _mask_bullets_in_body(body_markdown: str, *, bullet_indices: set[int]) -> str:
     """Replace bullets at the given 0-based indices with REDACTED template.
@@ -102,8 +127,9 @@ async def redact_digest_for_forget(
         return
 
     current_status = digest_row["status"]
-    if current_status not in ("draft", "posted", "redacted", "redacted_edit_failed"):
-        # Terminal states (skipped, failed, cost_exceeded, etc.) — nothing to redact.
+    if current_status not in _REDACTOR_ELIGIBLE_STATUSES:
+        # Terminal-without-body states (skipped, failed, cost_exceeded,
+        # skipped_no_destination, rejected_by_reaper) — nothing to redact.
         return
 
     citations = digest_row["citations"] or []
@@ -129,15 +155,27 @@ async def redact_digest_for_forget(
 
     if not bullet_indices_to_mask:
         # Edge case: cited but position == -1 (TL;DR), or no citations matched.
-        # Still mark redacted to record event.
+        # Still mark redacted to record event. WHERE clause mirrors
+        # _REDACTOR_ELIGIBLE_STATUSES exactly (T8-04 §5.K).
         await session.execute(
             text(
                 "UPDATE digests SET status='redacted', updated_at=now() "
                 "WHERE id = :id AND status IN "
-                "('draft','posted','redacted','redacted_edit_failed')"
+                "('draft','awaiting_review','approved_for_publish','posting',"
+                " 'posted','redacted','redacted_edit_failed','rejected_by_admin')"
             ),
             {"id": digest_id},
         )
+        # T8-04 §5.D sub-step: admin-notify when an awaiting_review draft is
+        # silently redacted by the cascade — the draft disappears from
+        # /digest_review listing, so the admin needs to know.
+        if current_status == "awaiting_review" and bot is not None:
+            await notify_admins_digest_failure(
+                bot,
+                digest_id=digest_id,
+                status="redacted",
+                error_text="forget_redacted_during_review",
+            )
         return
 
     masked = _mask_bullets_in_body(
@@ -160,6 +198,17 @@ async def redact_digest_for_forget(
             "cits": __import__("json").dumps(surviving_citations),
         },
     )
+
+    # T8-04 §5.D sub-step: admin-notify when an awaiting_review draft is
+    # silently redacted by the cascade — same rationale as the no-bullet
+    # branch above; the draft disappears from /digest_review listing.
+    if current_status == "awaiting_review" and bot is not None:
+        await notify_admins_digest_failure(
+            bot,
+            digest_id=digest_id,
+            status="redacted",
+            error_text="forget_redacted_during_review",
+        )
 
     # Telegram side-effect — best effort.
     posted_message_id = digest_row.get("posted_message_id")
