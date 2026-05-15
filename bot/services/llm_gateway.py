@@ -1380,8 +1380,8 @@ class DigestGatewayError(Exception):
 
 
 class DigestContextStaleError(DigestGatewayError):
-    """Pre-provider revalidation found a source that became forgotten /
-    redacted between context build and provider call."""
+    """Pre-provider revalidation found a source that became invalid
+    (redacted or tombstoned) between context build and provider call."""
 
 
 class DigestEmptyWindowError(DigestGatewayError):
@@ -1490,6 +1490,53 @@ def _validate_every_bullet_has_citation(
             )
 
 
+# Inlined revalidation SQL — verbatim NOT EXISTS clause embedded in each
+# query string (no concatenation) so semgrep's text+concat rule doesn't
+# fire. The clause matches the same three forget_events target_types as
+# digest_context.py and forget_cascade._cascade_message_versions. Phase
+# 7.5 issue #291 tracks the proper shared-helper extraction.
+_DIGEST_REVALIDATE_MV_SQL = text("""
+    SELECT mv.id FROM message_versions mv
+    JOIN chat_messages cm ON cm.id = mv.chat_message_id
+    WHERE mv.id = ANY(:mv_ids)
+      AND cm.memory_policy = 'normal'
+      AND mv.is_redacted = FALSE
+      AND NOT EXISTS (
+          SELECT 1 FROM forget_events fe
+          WHERE fe.status IN ('pending', 'processing', 'completed')
+            AND (
+                (fe.target_type = 'message' AND fe.target_id = cm.id::text)
+                OR
+                (fe.target_type = 'user' AND fe.target_id = cm.user_id::text)
+                OR
+                (fe.target_type = 'message_hash' AND fe.target_id = mv.content_hash)
+            )
+      )
+""")
+
+_DIGEST_REVALIDATE_CS_SQL = text("""
+    SELECT cs.id::text FROM card_sources cs
+    JOIN knowledge_cards kc ON kc.id = cs.card_id
+    JOIN message_versions mv ON mv.id = cs.message_version_id
+    JOIN chat_messages cm ON cm.id = mv.chat_message_id
+    WHERE cs.id::text = ANY(:cs_ids)
+      AND kc.card_status = 'approved'
+      AND cm.memory_policy = 'normal'
+      AND mv.is_redacted = FALSE
+      AND NOT EXISTS (
+          SELECT 1 FROM forget_events fe
+          WHERE fe.status IN ('pending', 'processing', 'completed')
+            AND (
+                (fe.target_type = 'message' AND fe.target_id = cm.id::text)
+                OR
+                (fe.target_type = 'user' AND fe.target_id = cm.user_id::text)
+                OR
+                (fe.target_type = 'message_hash' AND fe.target_id = mv.content_hash)
+            )
+      )
+""")
+
+
 async def _digest_context_is_clean(
     session: AsyncSession,
     *,
@@ -1500,30 +1547,9 @@ async def _digest_context_is_clean(
 
     Mirrors digest_context.py's inline NOT EXISTS predicate.
     """
-    forget_pred = """
-        NOT EXISTS (
-            SELECT 1 FROM forget_events fe
-            WHERE fe.status IN ('pending', 'processing', 'completed')
-              AND (
-                  (fe.target_type = 'message' AND fe.target_id = cm.id::text)
-                  OR
-                  (fe.target_type = 'user' AND fe.target_id = cm.user_id::text)
-                  OR
-                  (fe.target_type = 'message_hash' AND fe.target_id = mv.content_hash)
-              )
-        )
-    """
     if messages:
         mv_ids = [m.message_version_id for m in messages]
-        mv_check_sql = text(
-            "SELECT mv.id FROM message_versions mv "
-            "JOIN chat_messages cm ON cm.id = mv.chat_message_id "
-            "WHERE mv.id = ANY(:mv_ids) "
-            "  AND cm.memory_policy = 'normal' "
-            "  AND mv.is_redacted = FALSE "
-            "  AND " + forget_pred
-        )
-        row_ids = {r[0] for r in (await session.execute(mv_check_sql, {"mv_ids": mv_ids})).all()}
+        row_ids = {r[0] for r in (await session.execute(_DIGEST_REVALIDATE_MV_SQL, {"mv_ids": mv_ids})).all()}
         missing = set(mv_ids) - row_ids
         if missing:
             raise DigestContextStaleError(
@@ -1534,18 +1560,7 @@ async def _digest_context_is_clean(
         for c in cards:
             cs_ids.extend(str(s) for s in c.card_source_ids)
         if cs_ids:
-            cs_check_sql = text(
-                "SELECT cs.id::text FROM card_sources cs "
-                "JOIN knowledge_cards kc ON kc.id = cs.card_id "
-                "JOIN message_versions mv ON mv.id = cs.message_version_id "
-                "JOIN chat_messages cm ON cm.id = mv.chat_message_id "
-                "WHERE cs.id::text = ANY(:cs_ids) "
-                "  AND kc.card_status = 'approved' "
-                "  AND cm.memory_policy = 'normal' "
-                "  AND mv.is_redacted = FALSE "
-                "  AND " + forget_pred
-            )
-            row_ids = {r[0] for r in (await session.execute(cs_check_sql, {"cs_ids": cs_ids})).all()}
+            row_ids = {r[0] for r in (await session.execute(_DIGEST_REVALIDATE_CS_SQL, {"cs_ids": cs_ids})).all()}
             missing = set(cs_ids) - row_ids
             if missing:
                 raise DigestContextStaleError(
