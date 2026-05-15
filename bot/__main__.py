@@ -16,6 +16,7 @@ from bot.handlers import (
     admin_extract,
     chat_events,
     chat_messages,
+    digest,
     edited_message,
     forget_me,
     forget_reply,
@@ -173,6 +174,7 @@ async def main() -> None:
         admin.router,
         admin_extract.router,  # T6-03: /admin_extract — Phase 6 backfill (private chat + admin gated)
         admin_cards.router,    # T6-04/T6-05: /candidates /approve /reject /cards /card
+        digest.router,         # T7-06: /digest_now /digest_preview /digest_history
         chat_events.router,
         edited_message.router,  # T1-14: edited_message handler (before chat_messages catch-all)
         forget_me.router,  # T3-03: /forget_me command (DM or in-chat)
