@@ -546,8 +546,8 @@ async def test_build_context_token_budget_drops_tail(db_session) -> None:
     assert timestamps == sorted(timestamps), "messages must be chronological"
 
 
-async def test_build_context_rejects_non_daily_type(db_session) -> None:
-    """type != 'daily' raises ValueError (weekly is Phase 8 scope)."""
+async def test_build_context_rejects_unknown_type(db_session) -> None:
+    """type not in {'daily','weekly'} raises ValueError (Phase 8 widens daily → daily+weekly)."""
     from bot.services.digest_context import build_digest_context, DigestConfig
 
     chat_id = _next_chat_id()
@@ -555,12 +555,321 @@ async def test_build_context_rejects_non_daily_type(db_session) -> None:
     ws = now - timedelta(hours=24)
     we = now
 
-    with pytest.raises(ValueError, match="daily"):
+    with pytest.raises(ValueError, match="daily.*weekly|weekly.*daily|unsupported"):
         await build_digest_context(
             db_session,
-            type="weekly",  # type: ignore[arg-type]
+            type="monthly",  # type: ignore[arg-type]
             window_start=ws,
             window_end=we,
             source_chat_id=chat_id,
             digest_config=DigestConfig(),
         )
+
+
+# ── Phase 8 / T8-03 weekly tests ─────────────────────────────────────────────
+
+
+async def test_build_digest_context_weekly_window_is_7_days(db_session) -> None:
+    """type='weekly' preserves caller-supplied 7-day window bounds on the returned context."""
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=7)
+    we = now
+
+    ctx = await build_digest_context(
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(),
+    )
+
+    assert ctx.type == "weekly"
+    assert ctx.window_start == ws
+    assert ctx.window_end == we
+    assert (ctx.window_end - ctx.window_start) == timedelta(days=7)
+
+
+async def test_build_digest_context_weekly_larger_token_budget(db_session) -> None:
+    """type='weekly' reads weekly_token_budget_input (not the daily one).
+
+    Same raw-message corpus, two calls with the same daily_token=2000 but
+    weekly_token=8000: the weekly path fits strictly more messages.
+    """
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=7)
+    we = now
+
+    # 10 messages × ~1000 chars ≈ ~285 tokens each.
+    # With token_budget_input=2000 (headroom 1000), fits ~3.
+    # With weekly_token_budget_input=8000 (headroom 7000), fits ~10.
+    big_text = "x" * 1000
+    for i in range(10):
+        ts = ws + timedelta(hours=i * 12)
+        await _make_msg_and_version(
+            db_session, chat_id=chat_id, ts=ts, text=big_text
+        )
+
+    cfg = DigestConfig(
+        min_cards_threshold=10,  # daily threshold (forces raw fallback)
+        raw_message_top_n=10,
+        token_budget_input=2000,
+        weekly_min_cards_threshold=10,  # forces raw fallback for weekly path
+        weekly_raw_message_top_n=10,
+        weekly_token_budget_input=8000,
+    )
+
+    ctx_weekly = await build_digest_context(
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=cfg,
+    )
+
+    ctx_daily = await build_digest_context(
+        db_session,
+        type="daily",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=cfg,
+    )
+
+    assert len(ctx_weekly.messages) > len(ctx_daily.messages), (
+        f"weekly budget should fit more messages: "
+        f"weekly={len(ctx_weekly.messages)} daily={len(ctx_daily.messages)}"
+    )
+
+
+async def test_build_digest_context_weekly_min_cards_threshold_default_8(
+    db_session,
+) -> None:
+    """When fewer than weekly_min_cards_threshold (default 8) cards exist in the
+    weekly window, raw fallback kicks in for type='weekly'."""
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=7)
+    we = now
+    ts = now - timedelta(days=1)
+
+    # Create 7 approved cards (< default weekly threshold of 8). And one
+    # additional raw message so the fallback has something to surface.
+    for i in range(7):
+        _cm_id, mv_id = await _make_msg_and_version(
+            db_session, chat_id=chat_id, ts=ts, text=f"card source {i}"
+        )
+        await _make_approved_card(
+            db_session, mv_ids=[mv_id], title=f"Card {i}", body=f"body {i}"
+        )
+    await _make_msg_and_version(
+        db_session, chat_id=chat_id, ts=ts, text="raw fallback message"
+    )
+
+    ctx = await build_digest_context(
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(),  # weekly_min_cards_threshold default 8
+    )
+
+    assert len(ctx.cards) == 7
+    # 7 < 8, fallback fires → raw message included.
+    assert any(m.text == "raw fallback message" for m in ctx.messages)
+
+
+async def test_build_digest_context_weekly_governance_filter_forget_event(
+    db_session,
+) -> None:
+    """Weekly path: active forget_event excludes target from both cards and raw."""
+    from bot.db.models import ForgetEvent
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=7)
+    we = now
+    ts = now - timedelta(days=2)
+
+    cm_id, mv_id = await _make_msg_and_version(
+        db_session, chat_id=chat_id, ts=ts, memory_policy="normal", is_redacted=False
+    )
+    await _make_approved_card(db_session, mv_ids=[mv_id])
+
+    fe = ForgetEvent(
+        target_type="message",
+        target_id=str(cm_id),
+        actor_user_id=None,
+        authorized_by="self",
+        tombstone_key=f"message:{chat_id}:{cm_id}",
+        policy="forgotten",
+        status="pending",
+    )
+    db_session.add(fe)
+    await db_session.flush()
+
+    ctx = await build_digest_context(
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(weekly_min_cards_threshold=10),
+    )
+
+    assert ctx.cards == [], "weekly: active forget_event must exclude card"
+    assert ctx.messages == [], "weekly: active forget_event must exclude raw message"
+
+
+async def test_build_digest_context_weekly_excludes_redacted(db_session) -> None:
+    """Weekly path: message_version.is_redacted=TRUE → excluded from cards and raw."""
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=7)
+    we = now
+    ts = now - timedelta(days=2)
+
+    _cm_id, mv_id = await _make_msg_and_version(
+        db_session, chat_id=chat_id, ts=ts, is_redacted=True
+    )
+    await _make_approved_card(db_session, mv_ids=[mv_id])
+
+    ctx = await build_digest_context(
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(weekly_min_cards_threshold=10),
+    )
+
+    assert ctx.cards == []
+    assert ctx.messages == []
+
+
+async def test_build_digest_context_weekly_excludes_non_normal_memory_policy(
+    db_session,
+) -> None:
+    """Weekly path: chat_messages.memory_policy != 'normal' rows excluded.
+
+    Covers offrecord, nomem, forgotten — all should be filtered out of both
+    the cards source-join and the raw fallback.
+    """
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=7)
+    we = now
+    ts = now - timedelta(days=2)
+
+    for policy in ("offrecord", "nomem", "forgotten"):
+        _cm_id, mv_id = await _make_msg_and_version(
+            db_session,
+            chat_id=chat_id,
+            ts=ts,
+            text=f"policy={policy}",
+            memory_policy=policy,
+        )
+        await _make_approved_card(
+            db_session, mv_ids=[mv_id], title=f"Card-{policy}", body=f"body-{policy}"
+        )
+
+    ctx = await build_digest_context(
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(weekly_min_cards_threshold=10),
+    )
+
+    assert ctx.cards == []
+    assert ctx.messages == []
+
+
+async def test_build_digest_context_weekly_cards_limit_100(db_session) -> None:
+    """Weekly cards SQL uses LIMIT 100 (vs daily 30).
+
+    Create 31 approved cards in the weekly window; daily would cap at 30 by
+    the SQL LIMIT, weekly is bounded by 100 so all 31 should return.
+    """
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=7)
+    we = now
+    ts = now - timedelta(days=2)
+
+    n = 31
+    for i in range(n):
+        _cm_id, mv_id = await _make_msg_and_version(
+            db_session, chat_id=chat_id, ts=ts, text=f"card src {i}"
+        )
+        # Stagger approved_at so ORDER BY approved_at DESC is deterministic.
+        await _make_approved_card(
+            db_session,
+            mv_ids=[mv_id],
+            title=f"Card {i}",
+            body=f"body {i}",
+            approved_at=now - timedelta(seconds=i),
+        )
+
+    ctx_weekly = await build_digest_context(
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(),
+    )
+
+    ctx_daily = await build_digest_context(
+        db_session,
+        type="daily",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(),
+    )
+
+    assert len(ctx_weekly.cards) == n, f"weekly LIMIT 100 should return all {n} cards"
+    assert len(ctx_daily.cards) == 30, "daily LIMIT 30 caps at 30"
+
+
+async def test_build_digest_context_weekly_empty_window(db_session) -> None:
+    """Weekly path with zero candidates → empty cards + empty messages."""
+    from bot.services.digest_context import build_digest_context, DigestConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=7)
+    we = now
+
+    ctx = await build_digest_context(
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        source_chat_id=chat_id,
+        digest_config=DigestConfig(),
+    )
+
+    assert ctx.cards == []
+    assert ctx.messages == []
+    assert ctx.type == "weekly"
+    assert ctx.source_chat_id == chat_id
