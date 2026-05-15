@@ -7,9 +7,7 @@ rendering), §5.H (forget cascade redactor + bullet masking).
 from __future__ import annotations
 
 import itertools
-import uuid
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -194,8 +192,6 @@ async def test_publisher_happy_path_with_clean_citations(db_session):
     from bot.db.models import (
         ChatMessage,
         Digest,
-        KnowledgeCard,
-        CardSource,
         MessageVersion,
     )
     from bot.db.repos.user import UserRepo

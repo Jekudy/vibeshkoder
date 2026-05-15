@@ -187,7 +187,7 @@ async def publish_digest(
     digest.updated_at = datetime.now(timezone.utc)
     await session.flush()
 
-    # Defense-in-depth revalidation — block forgotten-source publish even
+    # Defense-in-depth revalidation — block tombstoned-source publish even
     # if it slipped past gateway-side check.
     if not await _digest_revalidate_citations(session, digest=digest):
         digest.status = "failed"
