@@ -50,6 +50,12 @@ is_allowed_path() {
   [[ "$path" == "tests/services/test_digest_publisher.py" ]] && return 0
   # T7-07: Phase 11 binding tests for digest leakage / citation / forget cascade.
   [[ "$path" == "tests/evals/test_digest_leakage.py" ]] && return 0
+  # T8-07: Phase 11 binding tests for weekly digest review state machine,
+  # cascade widening, redactor widening, publisher trigger guard widening, and
+  # admin-gate refusals. Same rationale as test_digest_leakage.py above —
+  # the file names canonical privacy invariants in docstrings + assertion
+  # messages because the tests ENFORCE the policy by name.
+  [[ "$path" == "tests/evals/test_digest_weekly_review_invariants.py" ]] && return 0
 
   return 1
 }
