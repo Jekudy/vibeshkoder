@@ -38,6 +38,7 @@ import logging
 import struct
 from typing import Any
 
+from aiogram import Bot
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -962,7 +963,7 @@ async def _resolve_affected_mvids(session: AsyncSession, event) -> list[int]:
     return []
 
 
-async def _process_one_event(session: AsyncSession, event) -> None:
+async def _process_one_event(session: AsyncSession, event, bot: Bot | None = None) -> None:
     """Run the full cascade for a single (already-claimed) forget_event row.
 
     **Naming note (issue #260 / PHASE6_PLAN.md §5.A.5):** This function IS the
@@ -999,6 +1000,10 @@ async def _process_one_event(session: AsyncSession, event) -> None:
     outer transaction. Closes H-Cdx-2 race window: ``/approve`` and cascade
     cannot interleave on the same mvid set.
     """
+    # Thread bot through to _cascade_digests → redact_digest_for_forget so the
+    # Telegram edit_message_text side-effect fires in production (F2 fix).
+    event._runtime_bot = bot
+
     # Snapshot current per-layer progress so we can resume.
     cascade_state: dict[str, Any] = dict(event.cascade_status or {})
 
@@ -1135,6 +1140,7 @@ async def _process_one_event(session: AsyncSession, event) -> None:
 async def run_cascade_worker_once(
     session: AsyncSession,
     *,
+    bot: Bot | None = None,
     batch_size: int = 10,
 ) -> dict[str, int]:
     """Process up to ``batch_size`` pending forget_events.
@@ -1148,6 +1154,9 @@ async def run_cascade_worker_once(
     Per-event isolation: a failure in one event's cascade marks ONLY that event
     as ``failed`` and continues with the rest of the batch. The function returns
     normally even if some events failed.
+
+    ``bot`` is threaded through to ``_process_one_event`` so the Telegram
+    redaction side-effect (``bot.edit_message_text``) fires for posted digests.
     """
     pending = await ForgetEventRepo.list_pending(session, limit=batch_size)
     stats = {"claimed": 0, "processed": 0, "failed": 0}
@@ -1169,7 +1178,7 @@ async def run_cascade_worker_once(
         stats["claimed"] += 1
 
         try:
-            await _process_one_event(session, claimed)
+            await _process_one_event(session, claimed, bot=bot)
             stats["processed"] += 1
         except Exception:
             logger.exception(
@@ -1183,6 +1192,7 @@ async def run_cascade_worker_once(
 
 
 async def cascade_worker_tick(
+    bot: Bot | None = None,
     session: AsyncSession | None = None,
     *,
     batch_size: int = 10,
@@ -1199,6 +1209,8 @@ async def cascade_worker_tick(
     - Production: APScheduler tick. ``session`` is None — the function opens
       its own session via ``async_session()`` and commits at the end (same
       pattern as ``process_invite_outbox`` and ``check_intro_refresh``).
+      ``bot`` is the first positional arg to match APScheduler ``args=[bot]``
+      registration so the Telegram redaction side-effect fires in production.
     - Tests: an explicit ``session`` is passed; the function uses it directly
       WITHOUT committing, so outer-tx isolation is preserved.
 
@@ -1208,14 +1220,16 @@ async def cascade_worker_tick(
     if session is not None:
         if not await FeatureFlagRepo.get(session, CASCADE_WORKER_FLAG):
             return {"claimed": 0, "processed": 0, "failed": 0}
-        return await run_cascade_worker_once(session, batch_size=batch_size)
+        return await run_cascade_worker_once(session, bot=bot, batch_size=batch_size)
 
     # Production path: own session + commit on success.
     async with async_session() as own_session:
         if not await FeatureFlagRepo.get(own_session, CASCADE_WORKER_FLAG):
             return {"claimed": 0, "processed": 0, "failed": 0}
         try:
-            stats = await run_cascade_worker_once(own_session, batch_size=batch_size)
+            stats = await run_cascade_worker_once(
+                own_session, bot=bot, batch_size=batch_size
+            )
             await own_session.commit()
             return stats
         except Exception:

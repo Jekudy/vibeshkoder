@@ -1449,7 +1449,9 @@ def _parse_digest_citations(
     """
     citations: list[dict[str, Any]] = []
     dropped: list[str] = []
-    seen_keys: set[tuple[str, str]] = set()
+    # No dedup by (kind, id): the same source may appear in multiple bullets, each
+    # occurrence must produce its own entry with the correct bullet position so the
+    # redactor can mask every affected bullet on forget cascade.
     for match in _CITATION_TOKEN_RE.finditer(body_markdown):
         kind_raw, id_raw = match.group(1), match.group(2)
         token = match.group(0)
@@ -1461,10 +1463,6 @@ def _parse_digest_citations(
             if id_raw not in valid_card_source_ids:
                 dropped.append(token)
                 continue
-            key = ("card_source", id_raw)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
             citations.append(
                 {"kind": "card_source", "id": id_raw, "position": bullet_idx}
             )
@@ -1477,10 +1475,6 @@ def _parse_digest_citations(
             if mv_int not in valid_mv_ids:
                 dropped.append(token)
                 continue
-            key = ("message_version", str(mv_int))
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
             citations.append(
                 {"kind": "message_version", "id": mv_int, "position": bullet_idx}
             )

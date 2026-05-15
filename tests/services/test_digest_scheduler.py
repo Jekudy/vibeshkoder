@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 from datetime import datetime, timezone, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import text
@@ -152,6 +153,116 @@ async def test_digest_daily_job_no_op_when_flag_off(db_session, monkeypatch):
         text("SELECT COUNT(*) FROM digests")
     )).scalar_one()
     assert count_after == count_before
+
+
+async def test_digest_daily_job_calls_publish_when_draft(db_session, monkeypatch):
+    """F1: digest_daily_job must call publish_digest when run_digest returns status='draft'.
+
+    This exercises the full job path via monkeypatching:
+    - async_session() replaced with a context manager yielding db_session
+    - FeatureFlagRepo.get patched to return True
+    - run_digest patched to return a stub draft digest
+    - publish_digest patched to assert it is called
+    """
+    from bot.db.models import Digest as DigestModel
+
+    # A stub digest in 'draft' status
+    stub_digest = DigestModel(
+        type="daily",
+        window_start=datetime.now(timezone.utc) - timedelta(days=1),
+        window_end=datetime.now(timezone.utc),
+        body_markdown="- A [[mv:1]]",
+        citations=[{"kind": "message_version", "id": 1, "position": 0}],
+        status="draft",
+    )
+
+    publish_called = []
+
+    import bot.services.scheduler as scheduler_mod
+
+    # Patch async_session to use our test session
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _fake_async_session():
+        yield db_session
+
+    monkeypatch.setattr(scheduler_mod, "async_session", _fake_async_session)
+    monkeypatch.setattr(
+        "bot.db.repos.feature_flag.FeatureFlagRepo.get",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "bot.services.digests.run_digest",
+        AsyncMock(return_value=stub_digest),
+    )
+
+    async def _fake_publish(session, *, bot, digest, digest_config):
+        publish_called.append(digest)
+        digest.status = "posted"
+        return digest
+
+    monkeypatch.setattr(
+        "bot.services.digest_publisher.publish_digest",
+        _fake_publish,
+    )
+
+    fake_bot = MagicMock()
+    await scheduler_mod.digest_daily_job(fake_bot)
+
+    assert len(publish_called) == 1, (
+        f"publish_digest must be called exactly once when digest is 'draft', got {len(publish_called)} calls"
+    )
+
+
+async def test_digest_daily_job_skips_publish_when_skipped(db_session, monkeypatch):
+    """F1: digest_daily_job must NOT call publish_digest when run_digest returns status='skipped'."""
+    from bot.db.models import Digest as DigestModel
+
+    stub_digest = DigestModel(
+        type="daily",
+        window_start=datetime.now(timezone.utc) - timedelta(days=1),
+        window_end=datetime.now(timezone.utc),
+        body_markdown=None,
+        citations=[],
+        status="skipped",
+    )
+
+    publish_called = []
+
+    import bot.services.scheduler as scheduler_mod
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _fake_async_session():
+        yield db_session
+
+    monkeypatch.setattr(scheduler_mod, "async_session", _fake_async_session)
+    monkeypatch.setattr(
+        "bot.db.repos.feature_flag.FeatureFlagRepo.get",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "bot.services.digests.run_digest",
+        AsyncMock(return_value=stub_digest),
+    )
+
+    async def _fake_publish(session, *, bot, digest, digest_config):
+        publish_called.append(digest)
+        return digest
+
+    monkeypatch.setattr(
+        "bot.services.digest_publisher.publish_digest",
+        _fake_publish,
+    )
+
+    fake_bot = MagicMock()
+    await scheduler_mod.digest_daily_job(fake_bot)
+
+    assert len(publish_called) == 0, (
+        f"publish_digest must NOT be called for skipped digest, got {len(publish_called)} calls"
+    )
 
 
 async def test_digest_daily_job_window_computation():

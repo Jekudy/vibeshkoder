@@ -340,6 +340,28 @@ async def digest_daily_job(bot: Bot) -> None:
                     digest.id,
                     digest.status,
                 )
+
+                # AC #6: auto-post draft digest to destination channel.
+                if digest.status == "draft":
+                    try:
+                        from bot.services.digest_publisher import publish_digest
+
+                        await publish_digest(
+                            session,
+                            bot=bot,
+                            digest=digest,
+                            digest_config=digest_config,
+                        )
+                        await session.commit()
+                    except Exception:
+                        try:
+                            await session.rollback()
+                        except Exception:
+                            logger.exception(
+                                "digest_daily_job: publish rollback failed"
+                            )
+                        logger.exception("digest_daily_job: publish_digest failed")
+
             except Exception:
                 try:
                     await session.rollback()
@@ -449,6 +471,7 @@ def start_scheduler(bot: Bot) -> None:
         cascade_worker_tick,
         "interval",
         seconds=30,
+        args=[bot],  # F2: thread bot through so Telegram redaction side-effect fires
         id="forget_cascade_worker",
         replace_existing=True,
         max_instances=1,

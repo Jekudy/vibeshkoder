@@ -196,6 +196,17 @@ def test_load_digest_config_reads_env_vars(monkeypatch):
     assert cfg.token_budget_input == 4000
 
 
+def test_load_digest_config_raises_when_src_equals_dst(monkeypatch):
+    """F5: src==dst is an echo-loop misconfiguration and must raise ConfigurationError."""
+    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", "-99999")
+    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", "-99999")
+
+    from bot.services.digests import ConfigurationError, load_digest_config
+
+    with pytest.raises(ConfigurationError, match="echo loop"):
+        load_digest_config()
+
+
 def test_parse_citations_drops_card_kind_token():
     from bot.services.llm_gateway import _parse_digest_citations
 
@@ -228,6 +239,29 @@ def test_parse_citations_keeps_valid_mv():
     assert len(citations) == 1
     assert citations[0]["kind"] == "message_version"
     assert citations[0]["id"] == 123
+
+
+def test_parse_citations_preserves_duplicate_positions():
+    """F3: same source cited in two bullets must produce two citation entries with
+    distinct positions — dedup by (kind, id) is a privacy gap for the redactor."""
+    from bot.services.llm_gateway import _parse_digest_citations
+
+    # Same mv:123 cited in two different bullets (positions 0 and 1)
+    body = (
+        "TL;DR text.\n"
+        "\n"
+        "- Bullet A [[mv:123]] first mention\n"
+        "- Bullet B [[mv:123]] second mention\n"
+    )
+    citations, dropped = _parse_digest_citations(
+        body, valid_card_source_ids=frozenset(), valid_mv_ids=frozenset({123})
+    )
+    assert dropped == [], f"unexpected drops: {dropped}"
+    assert len(citations) == 2, (
+        f"Expected 2 citations (one per bullet), got {len(citations)}: {citations}"
+    )
+    positions = {c["position"] for c in citations}
+    assert len(positions) == 2, f"Both citations must have distinct positions: {citations}"
 
 
 def test_validate_every_bullet_has_citation_raises_on_empty():

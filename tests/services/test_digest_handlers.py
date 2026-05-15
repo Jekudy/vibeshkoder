@@ -47,6 +47,59 @@ def _mk_msg(user_id: int) -> MagicMock:
 # ── /digest_now ──────────────────────────────────────────────────────────────
 
 
+async def test_digest_now_posting_status_returns_wait_message(db_session, monkeypatch):
+    """F6: when run_digest returns status='posting', cmd_digest_now must NOT attempt
+    to publish again and must reply with a 'try later' message."""
+    from bot.config import settings
+    from bot.db.models import Digest
+    from bot.handlers.digest import cmd_digest_now
+
+    admin_id = list(settings.ADMIN_IDS)[0] if settings.ADMIN_IDS else 1
+
+    # Insert a digest that is stuck in 'posting' status
+    now = datetime.now(timezone.utc)
+    posting_digest = Digest(
+        type="daily",
+        window_start=now - timedelta(days=1),
+        window_end=now,
+        body_markdown="TL;DR.\n\n- Bullet [[mv:1]]",
+        citations=[{"kind": "message_version", "id": 1, "position": 0}],
+        status="posting",
+    )
+    db_session.add(posting_digest)
+    await db_session.flush()
+
+    publish_called = []
+
+    async def _fake_run_digest(*args, **kwargs):
+        return posting_digest
+
+    async def _fake_publish(*args, **kwargs):
+        publish_called.append(True)
+        return posting_digest
+
+    monkeypatch.setattr("bot.handlers.digest.run_digest", _fake_run_digest)
+    monkeypatch.setattr("bot.handlers.digest.publish_digest", _fake_publish)
+
+    bot_mock = MagicMock()
+    msg = _mk_msg(user_id=admin_id)
+    await cmd_digest_now(
+        msg, bot=bot_mock, session=db_session, command=_mk_command_obj("daily")
+    )
+
+    assert len(publish_called) == 0, "publish_digest must NOT be called when status='posting'"
+    msg.answer.assert_awaited_once()
+    args, kwargs = msg.answer.call_args
+    body = args[0] if args else kwargs.get("text", "")
+    # Must be a friendly "try again" message, NOT the generic error reply (which starts with "❌")
+    assert not body.startswith("❌"), (
+        f"Expected friendly wait-message for 'posting' status, but got error reply: {body!r}"
+    )
+    assert "попробуйте" in body.lower(), (
+        f"Expected 'попробуйте' in reply for posting status, got: {body!r}"
+    )
+
+
 async def test_digest_now_non_admin_silent_no_op(db_session):
     """Non-admin user: handler returns silently — no message.answer call."""
     from bot.handlers.digest import cmd_digest_now
