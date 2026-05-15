@@ -1412,6 +1412,26 @@ class SynthesizeDigestResult:
 _CITATION_TOKEN_RE = re.compile(r"\[\[(cs|mv|card):([^\]]+)\]\]")
 
 
+def _bullet_index_at_offset(body_markdown: str, char_offset: int) -> int:
+    """Return the 0-based index of the bullet that contains ``char_offset``.
+
+    A bullet starts at a line beginning with ``- `` or ``• ``. Text before
+    the first bullet (TL;DR) is indexed as -1. Used by digest renderer +
+    redactor to align citations to bullets (Phase 7.5 issue #295 fix).
+    """
+    idx = -1
+    pos = 0
+    for line in body_markdown.splitlines(keepends=True):
+        line_start = pos
+        line_end = pos + len(line)
+        if line.startswith("- ") or line.startswith("• "):
+            idx += 1
+        if line_start <= char_offset < line_end:
+            return idx
+        pos = line_end
+    return idx
+
+
 def _parse_digest_citations(
     body_markdown: str,
     *,
@@ -1420,15 +1440,20 @@ def _parse_digest_citations(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Parse citation tokens; return (valid_citations, dropped_tokens).
 
+    Each citation's ``position`` is the 0-based BULLET INDEX where the
+    token appears (Phase 7.5 fix per issue #295). The redactor needs this
+    to mask the correct bullet on forget cascade.
+
     Reject ``[[card:UUID]]`` as malformed (cards must be cited via
     card_source ids per plan §5.D). Drop hallucinated ids.
     """
     citations: list[dict[str, Any]] = []
     dropped: list[str] = []
     seen_keys: set[tuple[str, str]] = set()
-    for position, match in enumerate(_CITATION_TOKEN_RE.finditer(body_markdown)):
+    for match in _CITATION_TOKEN_RE.finditer(body_markdown):
         kind_raw, id_raw = match.group(1), match.group(2)
         token = match.group(0)
+        bullet_idx = _bullet_index_at_offset(body_markdown, match.start())
         if kind_raw == "card":
             dropped.append(token)
             continue
@@ -1441,7 +1466,7 @@ def _parse_digest_citations(
                 continue
             seen_keys.add(key)
             citations.append(
-                {"kind": "card_source", "id": id_raw, "position": position}
+                {"kind": "card_source", "id": id_raw, "position": bullet_idx}
             )
         elif kind_raw == "mv":
             try:
@@ -1457,7 +1482,7 @@ def _parse_digest_citations(
                 continue
             seen_keys.add(key)
             citations.append(
-                {"kind": "message_version", "id": mv_int, "position": position}
+                {"kind": "message_version", "id": mv_int, "position": bullet_idx}
             )
     return citations, dropped
 

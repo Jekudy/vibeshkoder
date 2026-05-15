@@ -141,6 +141,12 @@ CASCADE_LAYER_ORDER: tuple[str, ...] = (
     "llm_synthesis_cache",
     "qa_traces_llm",
     "llm_usage_ledger",
+    # Phase 7 / T7-05 layer — PHASE7_PLAN.md §5.H:
+    # ``digests`` MUST run BEFORE ``card_sources`` so card_source ids are
+    # still queryable when the JSONB scan resolves which digests cite each
+    # source. Otherwise the card_sources DELETE that follows would orphan
+    # the references and the redactor wouldn't know which bullets to mask.
+    "digests",
     # Phase 6 / T6-01 layer — PHASE6_PLAN.md §5.A.5 invariant:
     # ``card_sources`` MUST run AFTER ``qa_traces_llm`` so qa_trace summaries
     # are NULL'd before the card_source rows that the citation_ids referenced
@@ -794,6 +800,85 @@ async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
     return deleted_count
 
 
+async def _cascade_digests(session: AsyncSession, event) -> int:
+    """T7-05 / Phase 7 — single merged digests layer.
+
+    Detect digests citing the tombstoned source and redact them in one
+    transaction. Handles both ``kind='message_version'`` and
+    ``kind='card_source'`` citations. Runs BEFORE ``_cascade_card_sources``
+    so the card_source rows still exist when the JSONB scan runs.
+
+    Per-event isolation: on any failure inside redact_digest_for_forget,
+    log + continue (forget event proceeds to next layer). The
+    statement_timeout guard inside the redactor handles the publisher-race
+    case (5s blocking wait then log-and-skip).
+    """
+    from sqlalchemy import bindparam
+    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+    from sqlalchemy.types import BigInteger, String
+
+    mvids = await _resolve_affected_mvids(session, event)
+    if not mvids:
+        return 0
+
+    # Resolve card_source ids whose message_version is in the affected set.
+    # This MUST happen BEFORE the card_sources cascade layer DELETEs the rows.
+    cs_rows = await session.execute(
+        text(
+            "SELECT id::text FROM card_sources WHERE message_version_id = ANY(:mvids)"
+        ).bindparams(bindparam("mvids", type_=PG_ARRAY(BigInteger))),
+        {"mvids": list(mvids)},
+    )
+    affected_cs_ids = {r[0] for r in cs_rows}
+
+    # JSONB scan for digests citing either kind.
+    digest_rows = await session.execute(
+        text(
+            "SELECT d.id FROM digests d "
+            "WHERE d.status IN "
+            "('draft','posting','posted','redacted','redacted_edit_failed') "
+            "  AND EXISTS ("
+            "      SELECT 1 FROM jsonb_array_elements(d.citations) AS elem "
+            "      WHERE ("
+            "          (elem->>'kind') = 'message_version' "
+            "          AND (elem->>'id')::bigint = ANY(:mvids) "
+            "      ) OR ("
+            "          (elem->>'kind') = 'card_source' "
+            "          AND (elem->>'id') = ANY(:cs_ids) "
+            "      ) "
+            "  ) "
+            "ORDER BY d.id"
+        ).bindparams(
+            bindparam("mvids", type_=PG_ARRAY(BigInteger)),
+            bindparam("cs_ids", type_=PG_ARRAY(String)),
+        ),
+        {"mvids": list(mvids), "cs_ids": list(affected_cs_ids)},
+    )
+    affected_digest_ids = [r[0] for r in digest_rows]
+    if not affected_digest_ids:
+        return 0
+
+    from bot.services.digest_redactor import redact_digest_for_forget
+
+    runtime_bot = getattr(event, "_runtime_bot", None)
+    count = 0
+    for digest_id in affected_digest_ids:
+        try:
+            await redact_digest_for_forget(
+                session,
+                digest_id=digest_id,
+                affected_mvids=set(mvids),
+                affected_card_source_ids=affected_cs_ids,
+                bot=runtime_bot,
+            )
+            count += 1
+        except Exception:
+            logger.exception(
+                "_cascade_digests: redact failed for digest_id=%s", digest_id
+            )
+    return count
+
+
 # Map layer name → cascade function. Layers absent from this map are recorded as
 # skipped. When a future phase adds a layer's table, add its function here.
 _LAYER_FUNCS: dict[str, Any] = {
@@ -804,6 +889,8 @@ _LAYER_FUNCS: dict[str, Any] = {
     "llm_synthesis_cache": _cascade_llm_synthesis_cache,
     "qa_traces_llm": _cascade_qa_traces_llm,
     "llm_usage_ledger": _cascade_llm_usage_ledger,
+    # T7-05 Phase 7 layer — PHASE7_PLAN.md §5.H. Runs BEFORE card_sources.
+    "digests": _cascade_digests,
     # T6-01 Phase 6 layer — PHASE6_PLAN.md §5.A.5.
     "card_sources": _cascade_card_sources_on_forget,
 }
