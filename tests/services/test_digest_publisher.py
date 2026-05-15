@@ -299,6 +299,184 @@ async def test_redactor_masks_affected_bullet(db_session):
     assert int(row["citations"][0]["id"]) == 2
 
 
+async def test_idempotency_path_returns_session_attached_digest(db_session):
+    """F4: when run_digest returns a digest via the idempotency path (row already exists),
+    the returned object must be session-attached so mutations to its state persist.
+
+    Previously _row_to_digest() returned a detached Digest() constructed with the
+    primary key from a raw SQL SELECT — SQLAlchemy would NOT track mutations on that
+    object. After the fix (session.get(Digest, id)), the same ORM identity is returned
+    and mutations propagate to the DB on flush.
+    """
+    from decimal import Decimal
+    from bot.db.models import Digest
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.digests import DigestConfig, run_digest
+    from bot.services.llm_gateway import LLMGatewayConfig
+
+    chat_id = _next_chat_id()
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=1)
+    we = now
+
+    # Pre-insert a draft digest for the same window (simulates first run)
+    pre_existing = Digest(
+        type="daily",
+        window_start=ws,
+        window_end=we,
+        body_markdown="TL;DR.\n\n- Pre-existing",
+        citations=[],
+        status="draft",
+    )
+    db_session.add(pre_existing)
+    await db_session.flush()
+    pre_id = pre_existing.id
+
+    # Second call with the same window — must hit idempotency path
+    gateway_config = LLMGatewayConfig(
+        provider="anthropic",
+        model="claude-haiku-4-5-20251001",
+        daily_ceiling_usd=Decimal("10.00"),
+        monthly_ceiling_usd=Decimal("100.00"),
+        prompt_template_version="digest-v0.1.0",
+    )
+    digest_config = DigestConfig(source_chat_id=chat_id)
+    idempotency_digest = await run_digest(
+        db_session,
+        type="daily",
+        window_start=ws,
+        window_end=we,
+        ledger_repo=LedgerRepo(),
+        provider=None,  # not reached — idempotency returns early
+        config=gateway_config,
+        digest_config=digest_config,
+    )
+    assert idempotency_digest.id == pre_id, "idempotency must return same row"
+
+    # Critical: verify the returned object is session-attached.
+    # If it were detached, `session.get(Digest, pre_id)` would return a DIFFERENT
+    # Python object (the identity-map entry) and mutations on `idempotency_digest`
+    # would not be visible. With session.get(), both must be the same object.
+    attached_from_session = await db_session.get(Digest, pre_id)
+    assert attached_from_session is idempotency_digest, (
+        "run_digest idempotency path must return the session-tracked ORM identity, "
+        "not a detached copy. If this fails, state mutations (draft→posting→posted) "
+        "silently do not persist."
+    )
+
+    # Also verify that mutating the returned object does persist to the DB.
+    idempotency_digest.status = "posting"
+    await db_session.flush()
+    row = (await db_session.execute(
+        __import__("sqlalchemy").text("SELECT status FROM digests WHERE id = :id"),
+        {"id": pre_id},
+    )).mappings().one()
+    assert row["status"] == "posting", (
+        f"Mutation on idempotency-returned digest must persist, got {row['status']!r}"
+    )
+
+
+async def test_cascade_worker_with_bot_calls_edit_message_text(db_session):
+    """F2: when bot is threaded through cascade_worker_tick → run_cascade_worker_once
+    → _process_one_event → _cascade_digests → redact_digest_for_forget, the
+    bot.edit_message_text call must happen for a 'posted' digest.
+
+    Without the fix, bot is never passed through the call chain and the
+    Telegram side-effect (_cascade_digests calls redact_digest_for_forget(bot=None))
+    is silently skipped in production.
+    """
+    from bot.db.models import (
+        ChatMessage,
+        Digest,
+        ForgetEvent,
+        MessageVersion,
+    )
+    from bot.db.repos.user import UserRepo
+    from bot.services.forget_cascade import run_cascade_worker_once
+
+    chat_id = _next_chat_id()
+    uid = -1 * (7000 + next(_chat_counter))
+    await UserRepo.upsert(
+        db_session, telegram_id=uid, username=f"u{uid}", first_name="T", last_name=None
+    )
+    now = datetime.now(timezone.utc)
+    cm = ChatMessage(
+        message_id=960_000 + next(_chat_counter),
+        chat_id=chat_id,
+        user_id=uid,
+        text="secret content",
+        date=now - timedelta(hours=6),
+        raw_json={"text": "secret content"},
+        memory_policy="normal",
+        is_redacted=False,
+    )
+    db_session.add(cm)
+    await db_session.flush()
+    mv = MessageVersion(
+        chat_message_id=cm.id,
+        version_seq=1,
+        text="secret content",
+        normalized_text="secret content",
+        entities_json={"entities": []},
+        content_hash=f"h2-{cm.id}",
+        is_redacted=False,
+    )
+    db_session.add(mv)
+    await db_session.flush()
+    cm.current_version_id = mv.id
+
+    # Digest is 'posted' — has a posted_message_id so redactor will try edit_message_text
+    digest = Digest(
+        type="daily",
+        window_start=now - timedelta(days=1),
+        window_end=now,
+        body_markdown=f"TL;DR.\n\n- One bullet [[mv:{mv.id}]]",
+        citations=[{"kind": "message_version", "id": mv.id, "position": 0}],
+        status="posted",
+        posted_chat_id=-1009999999999,
+        posted_message_id=555,
+        posted_at=now - timedelta(minutes=5),
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    did = digest.id
+
+    fe = ForgetEvent(
+        target_type="message",
+        target_id=str(cm.id),
+        actor_user_id=None,
+        authorized_by="self",
+        tombstone_key=f"message:{chat_id}:{cm.id}:b2",
+        policy="forgotten",
+        status="pending",
+    )
+    db_session.add(fe)
+    await db_session.flush()
+
+    # Set up bot mock — edit_message_text must be called
+    bot_mock = MagicMock()
+    bot_mock.edit_message_text = AsyncMock(return_value=MagicMock())
+
+    # Pass bot through the cascade chain
+    await run_cascade_worker_once(db_session, bot=bot_mock, batch_size=10)
+
+    # The bot.edit_message_text call must have happened — proves bot threading works
+    assert bot_mock.edit_message_text.called, (
+        "bot.edit_message_text must be called when bot is threaded through "
+        "run_cascade_worker_once. Without F2 fix, bot is never forwarded and "
+        "the Telegram redaction side-effect is silently skipped."
+    )
+
+    # Verify the digest was also properly redacted in the DB
+    row = (await db_session.execute(
+        __import__("sqlalchemy").text("SELECT status FROM digests WHERE id = :id"),
+        {"id": did},
+    )).mappings().one()
+    assert row["status"] in ("redacted", "redacted_edit_failed"), (
+        f"Digest must be redacted after cascade, got status={row['status']!r}"
+    )
+
+
 async def test_cascade_digests_layer_redacts_via_cascade_worker(db_session):
     """Insert message + digest citing it, fire forget_event on the message,
     run cascade worker → digest redacted, status='redacted'."""

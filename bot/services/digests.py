@@ -24,7 +24,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Literal
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,15 +73,27 @@ class DigestConfig:
         )
 
 
+class ConfigurationError(Exception):
+    """Digest configuration invariant violated."""
+
+
 def load_digest_config() -> DigestConfig:
+    src = int(os.environ.get("DIGEST_SOURCE_CHAT_ID", "0"))
     dest_env = os.environ.get("DIGEST_DESTINATION_CHAT_ID")
+    dst = int(dest_env) if dest_env else None
+    if src and dst is not None and src == dst:
+        raise ConfigurationError(
+            f"DIGEST_SOURCE_CHAT_ID ({src}) must not equal "
+            "DIGEST_DESTINATION_CHAT_ID — digest would post into the same "
+            "chat it summarizes (echo loop)."
+        )
     return DigestConfig(
         daily_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_DAILY_USD_CEILING", "1.00")),
         monthly_cost_ceiling_usd=Decimal(
             os.environ.get("DIGEST_MONTHLY_USD_CEILING", "10.00")
         ),
-        source_chat_id=int(os.environ.get("DIGEST_SOURCE_CHAT_ID", "0")),
-        destination_chat_id=int(dest_env) if dest_env else None,
+        source_chat_id=src,
+        destination_chat_id=dst,
         hour_msk=int(os.environ.get("DIGEST_HOUR_MSK", "9")),
         min_cards_threshold=int(os.environ.get("DIGEST_MIN_CARDS_THRESHOLD", "3")),
         raw_message_top_n=int(os.environ.get("DIGEST_RAW_MESSAGE_TOP_N", "15")),
@@ -182,11 +194,14 @@ async def run_digest(
         )
     ).scalar_one_or_none()
     if existing is not None:
-        result = await session.execute(
-            text("SELECT * FROM digests WHERE id = :id"), {"id": existing}
-        )
-        row = result.mappings().one()
-        return _row_to_digest(row)
+        # Use session.get() so the returned object is session-tracked (identity map).
+        # _row_to_digest() returned a detached Digest() whose state mutations would
+        # NOT propagate to the DB — publisher state transitions (draft→posting→posted)
+        # would silently fail.
+        digest = await session.get(Digest, existing)
+        if digest is None:
+            raise RuntimeError(f"digest {existing} disappeared after FOR UPDATE")
+        return digest
 
     # Step 2 — Phase 7 separate-bucket cost ceiling pre-check.
     if await _cost_ceiling_breached(session, digest_config=digest_config):
@@ -312,20 +327,3 @@ async def run_digest(
     return digest
 
 
-def _row_to_digest(row: Any) -> Digest:
-    """Hydrate an in-flight Digest ORM object from a mappings row."""
-    return Digest(
-        id=row["id"],
-        type=row["type"],
-        window_start=row["window_start"],
-        window_end=row["window_end"],
-        body_markdown=row["body_markdown"],
-        citations=row["citations"],
-        status=row["status"],
-        llm_usage_ledger_id=row.get("llm_usage_ledger_id"),
-        posted_chat_id=row.get("posted_chat_id"),
-        posted_message_id=row.get("posted_message_id"),
-        posted_at=row.get("posted_at"),
-        posting_started_at=row.get("posting_started_at"),
-        error_text=row.get("error_text"),
-    )

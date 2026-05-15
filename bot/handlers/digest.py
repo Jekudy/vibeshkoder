@@ -121,6 +121,23 @@ async def cmd_digest_now(
         return
 
     status = digest.status
+
+    # F6: handle concurrent publish in-flight — reaper will clean up stale
+    # 'posting' rows; admin should retry in a moment rather than re-publishing.
+    if status == "posting":
+        import asyncio
+
+        await asyncio.sleep(1)
+        await session.refresh(digest)
+        status = digest.status
+        if status == "posting":
+            await message.answer(
+                "Дайджест уже публикуется, попробуйте через минуту.",
+                parse_mode="HTML",
+            )
+            return
+        # fall through with refreshed status
+
     if status == "draft":
         try:
             digest = await publish_digest(
