@@ -134,6 +134,38 @@ F5 `load_digest_config()` raises `ConfigurationError` on `src == dst`
 `status='posting'` branch with 1s refresh + polite retry message (Plan
 §5.I). 6 new red-green tests cover each fix. CI green, privacy lint green.
 
+**Phase 8 (weekly editorial digest) — CLOSED 2026-05-15.** All 8 tickets
+merged (T8-S0 docs ratify PR #302 `e1ee542`; T8-01 migration 038 PR #303
+`bdb13c6` + `467cf77`; T8-02 weekly run_digest + synthesize_digest PR #304
+`dbefa1a`; T8-03 weekly build_digest_context PR #305 `733ad8f`; T8-04
+review state machine + cascade/redactor/publisher widening PR #306
+`05cfa88` + `e574ae2`; T8-05 scheduler `digest_weekly_job` Mon 09:15 MSK
++ `digest_stale_review_reaper_job` 48h DM / 7d auto-reject PR #307
+`6225789`; T8-06 admin handlers `/digest_now weekly` / `/digest_review` /
+`/digest_approve` / `/digest_reject` PR #308 `f6568e2`; T8-07 Phase 11
+binding 30 → 42 PR #309 `7a389c1`; T8-08 closure docs in this PR).
+Phase 11 binding **42/42** green (30 prior + 12 new: L8a/b + C7 + I6a +
+I6b.1/.2/.3 + I6c + R5.a/b/c/d). Flag `memory.digests.weekly.enabled`
+default OFF — production rollout playbook in
+`docs/memory-system/PHASE8_ROLLOUT.md`. Three independent cost buckets
+preserved (Phase 5 shared / Phase 7 daily / Phase 8 weekly) per C5; weekly
+ceiling default $5/$20. Migration 038 widens `ck_digests_status` +
+`ck_digest_runs_status` with 5 new audit values (`awaiting_review`,
+`approved_for_publish`, `rejected_by_admin`, `rejected_by_reaper`,
+`regenerated_by_admin`); pre-flight downgrade guard refuses to downshift
+while review-state rows exist. Phase 8.5 carryovers: §5.I renderer
+section-header bolding + weekly footer (out-of-scope for T8-06),
+M6 GIN index dead weight on `_cascade_digests`, #291 shared
+`_forget_excludes_predicate` refactor (T8-03 inlined with TODO),
+R5.a/R5.b handler-layer tightening of admin-gate refusals (service-layer
+contract asserted, handler-layer follow-up). ~3-hour autonomous
+orchestration run with multi-round dual-model review on Sprint 0
+(3 rounds Claude+Codex); per-sprint unified review attempted but partial
+due to reviewer infrastructure stalls — mitigated via inline spot-checks
+on highest-risk surfaces (migration 038 guard semantics, review SM
+transitions, cascade widening) plus strong implementer evidence in PR
+bodies.
+
 **Phase 6 implementation/docs order anomaly (read before any T6-XX work):** T6-06
 (`bot/services/search.py` include_cards: commits `fcb5a3c`, `b5949b2`, `84beecd`,
 `50d1818`, `6f93105`, `2f1ffab`) and T6-07 (`bot/services/evidence.py` discriminator
@@ -234,4 +266,4 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 Issue tracker for memory cycle: **GitHub Issues** (label `phase:0`, `phase:1`, etc.). The
 `nt` (Notion) plugin remains the tracker for non-memory work in this repo if any.
 
-<!-- updated-by-superflow:2026-04-29 -->
+<!-- updated-by-superflow:2026-05-15 -->
