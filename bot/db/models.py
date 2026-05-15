@@ -857,7 +857,9 @@ class LlmUsageLedger(Base):
     response_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
     tokens_in: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     tokens_out: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
-    cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False, server_default=text("0"))
+    cost_usd: Mapped[Decimal] = mapped_column(
+        Numeric(10, 6), nullable=False, server_default=text("0")
+    )
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
@@ -887,9 +889,7 @@ class LlmSynthesisCache(Base):
     """
 
     __tablename__ = "llm_synthesis_cache"
-    __table_args__ = (
-        UniqueConstraint("input_hash", name="uq_llm_synthesis_cache_input_hash"),
-    )
+    __table_args__ = (UniqueConstraint("input_hash", name="uq_llm_synthesis_cache_input_hash"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     input_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
@@ -965,9 +965,7 @@ class ExtractionRun(Base):
     ingestion_window_end: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    candidate_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     run_status: Mapped[str] = mapped_column(Text, nullable=False)
     llm_usage_ledger_id: Mapped[int | None] = mapped_column(
         BigInteger,
@@ -981,9 +979,7 @@ class ExtractionRun(Base):
     # Admin who triggered the pass via /admin_extract (alembic 035).
     # NULL when the pass was scheduler-driven (no operator). Stored as
     # Telegram user id (no FK to users.id — see migration 035 rationale).
-    operator_user_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True
-    )
+    operator_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Provider-level error from llm_gateway.extract_candidates (alembic 036).
     # NULL on success or empty-bundle short-circuit. Non-NULL means the gateway
     # returned ``gateway_error`` — extractor sets run_status='failed' and
@@ -1080,9 +1076,7 @@ class ExtractionCandidate(Base):
         ),
         nullable=True,
     )
-    reviewed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1151,9 +1145,7 @@ class KnowledgeCard(Base):
         ),
         nullable=True,
     )
-    approved_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1220,9 +1212,7 @@ class CardSource(Base):
         ),
         nullable=False,
     )
-    position: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1331,13 +1321,27 @@ class Digest(Base):
             "type IN ('daily','weekly')",
             name="ck_digests_type",
         ),
+        # T8-01 / Phase 8: status enum widened to 14 values. The 4 new entries
+        # (awaiting_review, approved_for_publish, rejected_by_admin,
+        # rejected_by_reaper) cover the weekly editorial review-gate state
+        # machine. See alembic migration 038.
         CheckConstraint(
-            "status IN ('running','draft','posting','posted','failed','skipped',"
-            "'cost_exceeded','skipped_no_destination','redacted','redacted_edit_failed')",
+            "status IN ("
+            "'running','draft','posting','posted','failed','skipped',"
+            "'cost_exceeded','skipped_no_destination','redacted',"
+            "'redacted_edit_failed',"
+            "'awaiting_review','approved_for_publish',"
+            "'rejected_by_admin','rejected_by_reaper'"
+            ")",
             name="ck_digests_status",
         ),
+        # T8-01: body required across the audit-trail review statuses too.
         CheckConstraint(
-            "status NOT IN ('draft','posting','posted','redacted','redacted_edit_failed')"
+            "status NOT IN ("
+            "'draft','posting','posted','redacted','redacted_edit_failed',"
+            "'awaiting_review','approved_for_publish','rejected_by_admin',"
+            "'rejected_by_reaper'"
+            ")"
             " OR body_markdown IS NOT NULL",
             name="ck_digests_body_markdown_not_null_for_visible_statuses",
         ),
@@ -1347,6 +1351,16 @@ class Digest(Base):
             " AND posted_message_id IS NOT NULL"
             " AND posted_at IS NOT NULL)",
             name="ck_digests_posted_fields_required",
+        ),
+        # T8-01: weekly approval audit — when status crosses approve / publish,
+        # admin attribution columns must be set. Daily exempt by predicate
+        # (auto-publish leaves audit cols NULL by design).
+        CheckConstraint(
+            "status NOT IN ('approved_for_publish','posting','posted')"
+            " OR type <> 'weekly'"
+            " OR (published_by_admin_id IS NOT NULL"
+            " AND approved_at IS NOT NULL)",
+            name="ck_digests_approved_audit",
         ),
         Index(
             "ix_digests_status_draft",
@@ -1363,6 +1377,12 @@ class Digest(Base):
             "ix_digests_posting_started_at",
             "posting_started_at",
             postgresql_where=text("status = 'posting'"),
+        ),
+        # T8-01: stale-review reaper drives off this partial index.
+        Index(
+            "ix_digests_status_awaiting_review",
+            "awaiting_review_at",
+            postgresql_where=text("status = 'awaiting_review'"),
         ),
     )
 
@@ -1395,6 +1415,13 @@ class Digest(Base):
         DateTime(timezone=True), nullable=True
     )
     error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # T8-01 / Phase 8: weekly review-gate workflow columns.
+    awaiting_review_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    published_by_admin_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1415,9 +1442,17 @@ class DigestRun(Base):
 
     __tablename__ = "digest_runs"
     __table_args__ = (
+        # T8-01 / Phase 8: 5 new audit values cover the review-gate state
+        # transitions (awaiting_review, approved_for_publish, rejected_by_admin,
+        # rejected_by_reaper) plus operator regeneration audit
+        # (regenerated_by_admin). See alembic migration 038.
         CheckConstraint(
-            "status IN ('running','finished','failed','skipped',"
-            "'cost_exceeded','skipped_no_destination')",
+            "status IN ("
+            "'running','finished','failed','skipped',"
+            "'cost_exceeded','skipped_no_destination',"
+            "'awaiting_review','approved_for_publish',"
+            "'rejected_by_admin','rejected_by_reaper','regenerated_by_admin'"
+            ")",
             name="ck_digest_runs_status",
         ),
     )

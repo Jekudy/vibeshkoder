@@ -125,15 +125,18 @@ async def migrated_database_url(temp_database_url: str) -> AsyncIterator[str]:
     yield temp_database_url
 
 
-# ─── Test 1: head is now 037 ─────────────────────────────────────────────────
+# ─── Test 1: 037 is reachable in the chain ───────────────────────────────────
 
 
-async def test_alembic_head_is_037(migrated_database_url: str) -> None:
-    """After upgrade head, alembic_version reports 037."""
+async def test_alembic_037_in_chain(migrated_database_url: str) -> None:
+    """After upgrade head, alembic_version reports >= 037 (037 stays in the chain)."""
     current = await _fetch_value(
         migrated_database_url, "SELECT version_num FROM alembic_version"
     )
-    assert current == "037"
+    assert current is not None
+    # Heads beyond 037 (e.g. 038) are valid; 037-specific schema assertions in
+    # this file run against the migrated DB regardless of subsequent heads.
+    assert str(current) >= "037"
 
 
 # ─── Test 2: unique constraint on (type, window_start, window_end) ────────────
@@ -353,11 +356,15 @@ async def test_ix_digests_posting_started_at_partial_index_exists(
     assert "posting" in lowered
 
 
-# ─── Test 10: downgrade -1 drops digest_runs then digests ────────────────────
+# ─── Test 10: downgrade to 036 drops digest_runs then digests ────────────────
 
 
 async def test_alembic_downgrade_drops_digest_tables(temp_database_url: str) -> None:
-    """alembic downgrade -1 from 037 drops digest_runs and digests, returns to 036."""
+    """alembic downgrade 036 from head drops digest_runs and digests, returns to 036.
+
+    Uses an explicit revision target instead of ``-1`` so the assertion stays
+    valid as more revisions are added beyond 037 (T8-01 introduced 038).
+    """
     _run_alembic(temp_database_url, "upgrade", "head")
 
     # Verify both tables exist before downgrade
@@ -374,7 +381,7 @@ async def test_alembic_downgrade_drops_digest_tables(temp_database_url: str) -> 
         )
         assert exists is True, f"Expected '{table_name}' to exist before downgrade"
 
-    _run_alembic(temp_database_url, "downgrade", "-1")
+    _run_alembic(temp_database_url, "downgrade", "036")
 
     # Both tables must be gone
     for table_name in ("digests", "digest_runs"):
@@ -398,10 +405,10 @@ async def test_alembic_downgrade_drops_digest_tables(temp_database_url: str) -> 
 
 
 async def test_alembic_037_upgrade_downgrade_upgrade_roundtrip(temp_database_url: str) -> None:
-    """Full roundtrip: upgrade head → downgrade -1 → upgrade head."""
+    """Full roundtrip: upgrade head → downgrade 036 → upgrade 037."""
     _run_alembic(temp_database_url, "upgrade", "head")
-    _run_alembic(temp_database_url, "downgrade", "-1")
-    _run_alembic(temp_database_url, "upgrade", "head")
+    _run_alembic(temp_database_url, "downgrade", "036")
+    _run_alembic(temp_database_url, "upgrade", "037")
 
     current = await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version")
     assert current == "037"
