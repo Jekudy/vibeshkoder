@@ -113,6 +113,27 @@ items: provider-error categorization, EMPTY_WINDOW ledger error field).
 HIGH item from #295 (citation `position` as bullet index, not token
 ordinal) shipped as part of T7-05.
 
+**Phase 7 FHR fix sprint (PR #300, commit `df4bb71`+`0fcd54b`):** Final
+Holistic Review (Claude `deep-product-reviewer` + Codex deep-technical,
+independent) returned NEEDS_FIXES with 4 critical wiring/state-machine
+items + 2 high. All shipped: F1 scheduler `digest_daily_job` now calls
+`publish_digest` on draft (Charter AC #6 was broken — cron created drafts
+but never posted to Telegram); F2 cascade worker threads `Bot` through
+`cascade_worker_tick → run_cascade_worker_once → _process_one_event` with
+`event._runtime_bot = bot`, scheduler reg uses `args=[bot]` (Telegram-side
+forget redaction was dead code in prod — forgotten content stayed visible
+in posted digests); F3 `_parse_digest_citations` no longer dedupes by
+`(kind, id)` so multi-bullet citations to the same source keep all
+`position` values (partial-forget privacy gap — redactor was masking only
+first bullet); F4 idempotency-collision path returns
+`session.get(Digest, existing)` instead of detached `_row_to_digest(row)`
+(publisher's `digest.status='posting'` mutation now actually persists, so
+the guarded `posted` UPDATE no longer leaves untracked Telegram posts);
+F5 `load_digest_config()` raises `ConfigurationError` on `src == dst`
+(echo loop prevention, Plan §8 stop signal); F6 `/digest_now` has
+`status='posting'` branch with 1s refresh + polite retry message (Plan
+§5.I). 6 new red-green tests cover each fix. CI green, privacy lint green.
+
 **Phase 6 implementation/docs order anomaly (read before any T6-XX work):** T6-06
 (`bot/services/search.py` include_cards: commits `fcb5a3c`, `b5949b2`, `84beecd`,
 `50d1818`, `6f93105`, `2f1ffab`) and T6-07 (`bot/services/evidence.py` discriminator
