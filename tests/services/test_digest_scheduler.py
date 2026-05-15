@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import itertools
 from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import text
