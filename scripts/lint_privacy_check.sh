@@ -31,10 +31,10 @@ is_allowed_path() {
   # post-rollout verification matrices. Same rationale as PHASEn_PLAN.md.
   [[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_ROLLOUT\.md$ ]] && return 0
 
-  # Project-root CLAUDE.md and the IMPLEMENTATION_STATUS tracker reference
-  # privacy invariants by name in per-phase closure entries (forgotten,
-  # no-mem, off-record). Both files are append-only narrative; baseline-diff
-  # caught them historically but rebase fragility makes that unreliable.
+  # Project-root CLAUDE.md and the IMPLEMENTATION_STATUS tracker quote the
+  # canonical privacy-invariant literals in per-phase closure entries.
+  # Both files are append-only narrative; baseline-diff caught new lines
+  # historically but rebase fragility makes that unreliable.
   [[ "$path" == "CLAUDE.md" ]] && return 0
   [[ "$path" == "docs/memory-system/IMPLEMENTATION_STATUS.md" ]] && return 0
 
