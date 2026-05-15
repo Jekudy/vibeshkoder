@@ -287,19 +287,21 @@ def test_validate_every_bullet_has_citation_passes_when_all_covered():
 # ── DB-dependent tests ───────────────────────────────────────────────────────
 
 
-async def test_run_digest_rejects_weekly(db_session):
+async def test_run_digest_rejects_unknown_type(db_session):
+    """T8-02 widening: run_digest now accepts both 'daily' and 'weekly'.
+    Other type values are still rejected with a clear ValueError."""
     from bot.services.digests import run_digest
 
     cfg = _make_gateway_config()
     dcfg = _make_digest_config()
-    with pytest.raises(ValueError, match="daily"):
+    with pytest.raises(ValueError, match="unsupported digest type"):
         await run_digest(
             db_session,
-            type="weekly",  # type: ignore[arg-type]
+            type="monthly",  # type: ignore[arg-type]
             window_start=datetime.now(timezone.utc) - timedelta(days=1),
             window_end=datetime.now(timezone.utc),
-            ledger_repo=None,  # not reached
-            provider=None,  # not reached
+            ledger_repo=None,
+            provider=None,
             config=cfg,
             digest_config=dcfg,
         )
