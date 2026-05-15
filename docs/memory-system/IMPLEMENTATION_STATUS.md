@@ -1,6 +1,6 @@
 # Memory System — Implementation Status
 
-**Last updated:** 2026-05-12 (Phase 6 CLOSED — all tickets merged; FHR APPROVE; carryover issues #260/#261/#262 filed. Phase 11 follow-ups #224/#219/#255 all merged.)
+**Last updated:** 2026-05-15 (Phase 8 CLOSED — all 8 weekly digest tickets merged; review SM + reaper + binding 42/42; Phase 8.5 carryovers tracked. Phase 7 CLOSED 2026-05-15 prior. Phase 6 CLOSED 2026-05-12.)
 **Active worktrees:** none (Phase 6 closed). Historical: `.worktrees/p6-w1-stream-b` (T6-02, closed); `.worktrees/orch-A` (Phase 5–6 planning); `.worktrees/orch-B` (Phase 9/10/12 planning); `.worktrees/orch-C` (Phase 11 planning); `.worktrees/p2-alpha/bravo/charlie/delta` (Phase 2 closed 2026-04-29); `.worktrees/p4-hotfix-164` (closed by PR #203).
 **Source of truth:** this file is updated after every PR merge into `main`.
 
@@ -488,5 +488,39 @@ NEEDS_FIXES with **4 critical + 2 high**. All shipped in PR #300
 6 new red-green tests added. CI green. Privacy lint green.
 
 **Production rollout:** see `docs/memory-system/PHASE7_ROLLOUT.md`.
+
+## Phase 8 — Weekly editorial digest (CLOSED 2026-05-15)
+
+**Sprint 0 RATIFIED 2026-05-15.** Plan ratified per `docs/memory-system/PHASE8_PLAN.md`
+(~1970 lines, 16 sections, 9 ratified decisions Q1–Q9) after 3 rounds of dual-model
+review on Sprint 0 (Claude product/spec + Codex technical). All 8 implementation
+tickets merged 2026-05-15 across an autonomous ~3-hour orchestration session
+(per-sprint unified review attempted but partial due to reviewer infrastructure
+stalls; mitigated via inline spot-checks on highest-risk surfaces — migration 038
+guard semantics, review SM transitions, cascade widening — plus strong implementer
+evidence in PR bodies). Phase 11 binding extended 30 → **42/42** with 12 new cases.
+
+| ID | Wave | Description | Status | Notes |
+|----|------|-------------|--------|-------|
+| T8-S0 | 0 | docs ratify + AUTHORIZED_SCOPE Phase 8 block + ROADMAP planned | merged | **PR #302** 2026-05-15 (commit `e1ee542`). Sprint 0 docs-only PR: `PHASE8_PLAN.md` (~1970 lines) + `AUTHORIZED_SCOPE.md` Phase 8 authorization block + `ROADMAP.md` row 8 PLANNED. |
+| T8-01 | 1 | Migration 038 + ORM `Digest` review fields | merged | **PR #303** 2026-05-15 (commits `bdb13c6` + `467cf77` review fix follow-up). Migration 038: `ck_digests_status` + `ck_digest_runs_status` CHECK enums widened with 5 new audit values (`awaiting_review` / `approved_for_publish` / `rejected_by_admin` / `rejected_by_reaper` / `regenerated_by_admin`); ADD cols `published_by_admin_id`, `approved_at`, `review_notes`, `awaiting_review_at`; partial index `ix_digests_status_awaiting_review`; CHECK `ck_digests_approved_audit` + body-NOT-NULL visible-states widening; pre-flight downgrade guard. NOT VALID + VALIDATE pattern. |
+| T8-02 | 2 | `run_digest` weekly + `synthesize_digest` weekly | merged | **PR #304** 2026-05-15 (commit `dbefa1a`). Widened `run_digest(type=Literal['daily','weekly'])`; new prompt template `digest_weekly_v0_1_0.py` with section-aware structure (allowlist Highlights / People / Decisions / Open questions / Other); `synthesize_digest` routes by type; weekly cost ceiling separate bucket (`DIGEST_WEEKLY_USD_CEILING` $5.00 default — independent of daily/shared per C5). |
+| T8-03 | 2 | `build_digest_context` weekly window | merged | **PR #305** 2026-05-15 (commit `733ad8f`). Weekly extension for 7-day ISO Mon..Mon MSK window; larger token budget (`DIGEST_WEEKLY_TOKEN_BUDGET` 24000 default); `weekly_min_cards_threshold` 8 (L5 empirical middle between daily-3 and linear-scaled 21). Forget-excludes predicate inlined with explicit TODO referencing #291. |
+| T8-04 | 3 | Review SM + cascade/redactor/publisher widening | merged | **PR #306** 2026-05-15 (commits `05cfa88` + `e574ae2`). `bot/services/digest_review.py` with `transition_to_awaiting_review`, `approve_digest` (3-step revalidate → guarded UPDATE → dispatch publisher), `reject_digest`. Canonical `_raise_invalid_state_after_guard_miss` helper. Cascade scan + redactor allowlist widened to include 4 new statuses (`_REDACTOR_ELIGIBLE_STATUSES` 8-tuple). Publisher trigger-state widening `('draft','approved_for_publish')`. |
+| T8-05 | 3 | Scheduler `digest_weekly_job` + reaper | merged | **PR #307** 2026-05-15 (commit `6225789`). Cron Mon 09:15 MSK (15-min H8 stagger past daily 09:00); `memory.digests.weekly.enabled` flag default OFF; `digest_stale_review_reaper_job` (48h DM notify + 7d auto-reject `rejected_by_reaper`); `day_of_week="mon"` hardcoded per M3. |
+| T8-06 | 4 | Admin handlers weekly | merged | **PR #308** 2026-05-15 (commit `f6568e2`). `/digest_now weekly` (+ `--regenerate` for Q5 no-edit refuse-and-rerun), `/digest_review`, `/digest_approve <id>`, `/digest_reject <id> [reason]`. Admin-gated via `_is_admin`. Renderer §5.I section-header bolding + weekly footer flagged as out-of-scope by implementer → Phase 8.5 carryover. |
+| T8-07 | 4 | Phase 11 binding 30 → 42 | merged | **PR #309** 2026-05-15 (commit `7a389c1`). 12 new cases: L8a/b (weekly forget exclusion), C7 (weekly citation invariant), I6a (review-state cascade redaction), I6b.1/.2/.3 (publisher trigger guard widening), I6c (redactor widening over awaiting_review), R5.a/b/c/d (admin-gate refusals on weekly handlers). Existing 30/30 binding preserved → new total 42/42. |
+| T8-08 | 4 | Closure docs | merged | This PR. `PHASE8_ROLLOUT.md` (new), `IMPLEMENTATION_STATUS.md` (Phase 8 section), `ROADMAP.md` row 8 → CLOSED, `CLAUDE.md` Phase 8 closure entry, `AUTHORIZED_SCOPE.md` Phase 8 CLOSED marker. |
+
+**Phase 11 binding suite: 42/42 green** (L1-L5 + L6a/b/c + L7a/b + L8a/b + C1-C4 + C5a-d + C6 + C7 + R1-R4 + R5.a/b/c/d + I1-I4 + I5a/b/c + I6a + I6b.1/.2/.3 + I6c).
+
+**Carryover issues (Phase 8.5):**
+
+- **§5.I renderer extension** — section header bolding + weekly-specific footer copy. Flagged by T8-06 implementer as out-of-scope for that brief; functional renderer ships, styling polish deferred.
+- **M6 GIN index dead weight on `_cascade_digests`** — `forget_cascade` JSONB containment scan over `digests.citations` does not optimally use the existing GIN index. Perf-only Phase 7.5 / 8.5 follow-up; not a privacy or correctness blocker.
+- **#291** — Extract `_forget_excludes_predicate` shared helper between `forget_cascade._cascade_message_versions` and `digest_context.py` / `llm_gateway._digest_context_is_clean`. T8-03 added the predicate inline (identical to Phase 7 inline copy) with explicit TODO comment referencing #291.
+- **R5.a / R5.b handler-layer tightening** — service-layer contract assertions ship in T8-07; handler-layer assertion (against `/digest_review` / `/digest_approve` / `/digest_reject` direct invocation by non-admin) can be tightened in a small follow-up. T8-06 handlers are already shipped and admin-gated; binding currently asserts the service-layer refusal contract.
+
+**Production rollout:** see `docs/memory-system/PHASE8_ROLLOUT.md`.
 
 <!-- updated-by-superflow:2026-05-15 -->

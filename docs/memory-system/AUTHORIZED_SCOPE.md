@@ -250,12 +250,26 @@ NOT in Phase 7 scope (defer to Phase 8+):
 
 ---
 
-## Authorized: Phase 8 — Weekly editorial digest (2026-05-15)
+## Authorized: Phase 8 — Weekly editorial digest (2026-05-15, **CLOSED 2026-05-15**)
 
-Phase 8 is authorized for implementation following Phase 7 closure (CLOSED
-2026-05-15) and the Phase 11 binding suite remaining green on `main` at
-the 30/30 baseline (the legacy "34/34" framing was math drift; corrected
-via direct enumeration of `tests/evals/test_*.py` in `PHASE8_PLAN.md` §0/§10).
+Phase 8 closed 2026-05-15. All 8 sprints merged across PRs #302 (T8-S0
+docs ratify), #303 (T8-01 migration 038), #304 (T8-02 weekly orchestrator),
+#305 (T8-03 weekly context), #306 (T8-04 review SM + widenings),
+#307 (T8-05 scheduler + reaper), #308 (T8-06 admin handlers),
+#309 (T8-07 Phase 11 binding 30 → 42), and T8-08 closure docs (this PR).
+
+Feature flag `memory.digests.weekly.enabled` default OFF. Production
+rollout playbook: `docs/memory-system/PHASE8_ROLLOUT.md`. Phase 11
+binding **42/42** green. Phase 8.5 carryovers: §5.I renderer polish,
+M6 GIN index, #291 shared `_forget_excludes_predicate` refactor (T8-03
+inlined with TODO), R5.a/R5.b handler-layer tightening of admin-gate
+refusals.
+
+Original authorization (preserved for context): Phase 8 was authorized
+for implementation following Phase 7 closure (CLOSED 2026-05-15) and the
+Phase 11 binding suite remaining green on `main` at the 30/30 baseline
+(the legacy "34/34" framing was math drift; corrected via direct
+enumeration of `tests/evals/test_*.py` in `PHASE8_PLAN.md` §0/§10).
 
 Authoritative reference: `docs/memory-system/PHASE8_PLAN.md` (this Sprint 0
 ratification PR). Phase 8 = **weekly editorial digest only**.
@@ -533,3 +547,5 @@ By the end of the first sprint (this cycle):
 - Tests covering all of the above.
 
 Everything else is out of scope until phase gates pass.
+
+<!-- updated-by-superflow:2026-05-15 -->
