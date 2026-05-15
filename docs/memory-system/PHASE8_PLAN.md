@@ -1012,7 +1012,8 @@ async def digest_weekly_job(bot: Bot) -> None:
 
             msk = ZoneInfo("Europe/Moscow")
             now_msk = datetime.now(tz=msk)
-            # Find most recent Monday 00:00 MSK (this Monday if fired Mon 09:00).
+            # Find most recent Monday 00:00 MSK (this Monday if fired Mon 09:15;
+            # the staggered weekly cron — daily cron baseline is 09:00, see H8 stagger).
             today_midnight_msk = now_msk.replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
@@ -1495,7 +1496,11 @@ if digest.status != "draft":
 # AFTER (T8-04):
 _PUBLISHER_TRIGGER_STATUSES = ("draft", "approved_for_publish")
 if digest.status not in _PUBLISHER_TRIGGER_STATUSES:
-    raise DigestPublisherInvalidState(digest.status)
+    raise DigestPublisherInvalidState(
+        digest_id=digest.id,
+        current_status=digest.status,
+        reason=f"publisher trigger requires status in {_PUBLISHER_TRIGGER_STATUSES!r}, found {digest.status!r}",
+    )
 ```
 
 The publisher's downstream guarded UPDATE (Phase 7 §5.F step 1) — the one that transitions to `posting` — MUST also widen its WHERE clause. The rowcount=0 handling follows the **canonical pattern from §5.E** (`_raise_invalid_state_after_guard_miss`) — Round 2 HIGH-Cdx-1 — so the publisher distinguishes "row deleted concurrently" (e.g. by `--regenerate` racing a stale `/digest_approve`) from "row in unexpected state" (e.g. cascade redacted it to `'redacted'`). Publisher reuses the same helper or implements an inline mirror with structured `DigestPublisherInvalidState` fields (`digest_id`, `current_status: Optional[str]`, `reason: str`) — both forms are acceptable as long as the classification is the same.
