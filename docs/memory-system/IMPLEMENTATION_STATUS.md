@@ -471,6 +471,22 @@ implementation tickets merged 2026-05-14..2026-05-15.
 - **#291** — Extract `_forget_excludes_predicate` shared helper between `forget_cascade._cascade_message_versions` and `digest_context.py` / `llm_gateway._digest_context_is_clean` (DRY guard against drift).
 - **#295** — T7-02 post-merge Codex review items: provider-error categorization (currently falls to `unexpected:*`), EMPTY_WINDOW ledger error field (currently `error=None` on misbehavior). HIGH item (citation `position` as bullet index) already shipped in T7-05.
 
+**FHR fix sprint (PR #300, 2026-05-15):** Final Holistic Review (Claude
+`deep-product-reviewer` + Codex deep-technical, independent) returned
+NEEDS_FIXES with **4 critical + 2 high**. All shipped in PR #300
+(commits `df4bb71` + `0fcd54b`):
+
+| Fix | Severity | File | Issue → Resolution |
+|-----|----------|------|--------------------|
+| F1 | CRITICAL | `bot/services/scheduler.py` | `digest_daily_job` never called `publish_digest` → Charter AC #6 violated. Fix: post-commit `if status='draft'` → call `publish_digest`. |
+| F2 | CRITICAL | `bot/services/scheduler.py` + `bot/services/forget_cascade.py` | Cascade worker had no `bot` threading → `digest_redactor` skipped `bot.edit_message_text` in prod → forgotten content stayed visible in posted Telegram digests. Fix: thread `Bot` through `cascade_worker_tick → run_cascade_worker_once → _process_one_event`; set `event._runtime_bot = bot`; scheduler uses `args=[bot]`. |
+| F3 | CRITICAL | `bot/services/llm_gateway.py` | `_parse_digest_citations` deduped by `(kind, id)` → multi-bullet citations to same source kept only first `position` → partial-forget left forgotten content in other bullets. Fix: removed `seen_keys` dedup for `mv`/`cs`. |
+| F4 | CRITICAL | `bot/services/digests.py` | Idempotency-collision returned detached `_row_to_digest(row)` → publisher's `digest.status='posting'` mutation didn't persist → guarded `posted` UPDATE failed, leaving untracked Telegram posts. Fix: `await session.get(Digest, existing)` returns session-attached ORM object. |
+| F5 | HIGH | `bot/services/digests.py` | `load_digest_config` didn't compare src vs dst → echo loop possible. Fix: raise `ConfigurationError` on `src == dst`. |
+| F6 | HIGH | `bot/handlers/digest.py` | `/digest_now` had no `posting`-status branch. Fix: 1s refresh + polite Russian retry message. |
+
+6 new red-green tests added. CI green. Privacy lint green.
+
 **Production rollout:** see `docs/memory-system/PHASE7_ROLLOUT.md`.
 
 <!-- updated-by-superflow:2026-05-15 -->
