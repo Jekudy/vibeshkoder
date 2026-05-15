@@ -250,12 +250,93 @@ NOT in Phase 7 scope (defer to Phase 8+):
 
 ---
 
+## Authorized: Phase 8 — Weekly editorial digest (2026-05-15)
+
+Phase 8 is authorized for implementation following Phase 7 closure (CLOSED
+2026-05-15) and the Phase 11 binding suite remaining green on `main` at
+the 30/30 baseline (the legacy "34/34" framing was math drift; corrected
+via direct enumeration of `tests/evals/test_*.py` in `PHASE8_PLAN.md` §0/§10).
+
+Authoritative reference: `docs/memory-system/PHASE8_PLAN.md` (this Sprint 0
+ratification PR). Phase 8 = **weekly editorial digest only**.
+Reflection / observations / `memory_events` / `memory_candidates` /
+`reflection_runs` are explicitly deferred to Phase 9+ (the previously
+proposed `PHASE8_PLAN_DRAFT.md` is superseded by the ratified plan; the
+draft will be archived/flagged in T8-08).
+
+Authorized work in this cycle:
+- Migration 038 (T8-01): extend `ck_digests_status` + `ck_digest_runs_status`
+  CHECK enums (5 new audit values: `awaiting_review`, `approved_for_publish`,
+  `rejected_by_admin`, `rejected_by_reaper`, `regenerated_by_admin`); ADD cols
+  `published_by_admin_id`, `approved_at`, `review_notes`, `awaiting_review_at`;
+  partial index `ix_digests_status_awaiting_review`; CHECK
+  `ck_digests_approved_audit` + body-NOT-NULL visible-states widening;
+  pre-flight downgrade guard against `posting` + 4 new review statuses.
+  NOT VALID + VALIDATE pattern for all CHECK swaps.
+- Weekly orchestrator (T8-02): widen `run_digest(type=Literal['daily','weekly'])`;
+  new prompt template `digest_weekly_v0_1_0.py` with section-aware structure
+  (allowlist: Highlights / People / Decisions / Open questions / Other);
+  `synthesize_digest` routes by type; weekly cost ceiling separate bucket
+  (`DIGEST_WEEKLY_USD_CEILING` $5.00 default; independent of daily — Q7).
+- Weekly context (T8-03): `build_digest_context` extension for 7-day ISO
+  Mon..Mon MSK window; larger token budget (`DIGEST_WEEKLY_TOKEN_BUDGET`
+  24000 default); `weekly_min_cards_threshold` 8.
+- Review state machine (T8-04): `bot/services/digest_review.py` with
+  `transition_to_awaiting_review`, `approve_digest` (3-step: revalidate →
+  guarded UPDATE approve → dispatch publisher), `reject_digest`. Canonical
+  `_raise_invalid_state_after_guard_miss` helper. Cascade scan + redactor
+  allowlist widening to include 4 new statuses
+  (`_REDACTOR_ELIGIBLE_STATUSES` 8-tuple). Publisher trigger-state
+  widening (`('draft', 'approved_for_publish')`).
+- Scheduler (T8-05): `digest_weekly_job` (cron Mon 09:15 MSK — 15-min H8
+  stagger past daily 09:00) + `digest_stale_review_reaper_job` (48h DM
+  notify + 7d auto-reject `rejected_by_reaper`); flag-gated by
+  `memory.digests.weekly.enabled` default OFF.
+- Admin handlers (T8-06): `/digest_now weekly` (+ `--regenerate` flag for
+  Q5 no-edit refuse-and-rerun flow), `/digest_review`, `/digest_approve <id>`,
+  `/digest_reject <id> [reason]`. Admin-gated via existing `_is_admin`.
+- Phase 11 binding extension (T8-07): 12 new cases (L8a/b + C7 + I6a +
+  I6b.1/.2/.3 + I6c + R5.a/b/c/d) → 30/30 baseline + 12 = **42/42 total**.
+- Closure docs (T8-08): `PHASE8_ROLLOUT.md` + `IMPLEMENTATION_STATUS.md` +
+  `ROADMAP.md` row 8 update + `CLAUDE.md` Phase 8 closure block +
+  `AUTHORIZED_SCOPE.md` Phase 8 CLOSED marker + FHR per Rule 9.
+
+Wave layout (per `PHASE8_PLAN.md` §7 + §14, parallelized per L6):
+- Sprint 0 (T8-S0): this PR — `PHASE8_PLAN.md` + scope authorization. No code.
+- Wave 2 (T8-01 sequential): migration 038.
+- Wave 3 (T8-02 ∥ T8-03 parallel): orchestrator + context.
+- Wave 4 (T8-04 ∥ T8-05 parallel): review SM + cascade/redactor/publisher
+  widening + scheduler/reaper.
+- Wave 5 (T8-06 ∥ T8-07 parallel): admin handlers + binding tests.
+- Wave 6 (T8-08): closure + FHR (Rule 9: 8+ sprints + privacy invariants).
+
+NOT in Phase 8 scope (defer to Phase 8.5+ or Phase 9+):
+- Reflection / observations / `memory_events` / `memory_candidates` /
+  `reflection_runs` (Phase 9 or later; superseded `PHASE8_PLAN_DRAFT.md`
+  shifts to Phase 9+ backlog).
+- Admin edit-before-approve (Q5: no edit in v1; `--regenerate` flow only).
+- Multi-admin approval quorum (Q4: single-admin in v1).
+- Per-user opt-out for being mentioned in a digest.
+- Multi-chat weekly digest (single-chat MVP).
+- Reaction-count / reply-count ranking on weekly window.
+- LLM topic clustering / inferred-topic ordering (chronological-by-section
+  in v1; allowlist of 5 section names).
+- Phase 7 carryover #291 (shared `_forget_excludes_predicate` refactor)
+  remains advisory — T8-03 may inline predicate identically to Phase 7
+  with explicit TODO if #291 has not landed.
+- GIN index `ix_digests_citations_gin` performance rewrite — Phase 7.5 /
+  8.5 backlog; not a privacy blocker (M6).
+
+---
+
 ## NOT authorized (future phases — gates not passed)
 
 Do not start, design, or write speculative code for:
 
 
-- Phase 8 reflection / observations — depends on Phase 7.
+- Phase 8 reflection / observations — Phase 9+, the previously-deferred
+  reflection track stays deferred; the new Phase 8 scope is weekly digest
+  per `PHASE8_PLAN.md`.
 - Wiki (member or public) implementation — Phase 9, conditionally above.
 - Graph projection (Neo4j / Graphiti) implementation — Phase 10, conditionally above.
 - Butler / action execution — Phase 12, design-only above.
