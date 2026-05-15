@@ -47,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1371,22 +1372,385 @@ class LiveExtractCandidatesGateway:
         )
 
 
+# ─── Phase 7 / T7-02: synthesize_digest ────────────────────────────────────
+
+
+class DigestGatewayError(Exception):
+    """Base for digest-synthesis errors raised out of the gateway."""
+
+
+class DigestContextStaleError(DigestGatewayError):
+    """Pre-provider revalidation found a source that became forgotten /
+    redacted between context build and provider call."""
+
+
+class DigestEmptyWindowError(DigestGatewayError):
+    """Provider returned ``EMPTY_WINDOW`` sentinel against empty context.
+    Orchestrator marks digest as ``skipped`` (not failed)."""
+
+
+class DigestProviderError(DigestGatewayError):
+    """Provider misbehaved (e.g. EMPTY_WINDOW with non-empty input)."""
+
+
+class DigestCitationValidationError(DigestGatewayError):
+    """Bullet without ≥1 valid citation. HANDOFF I-4 / Charter AC #4 violation."""
+
+
+class LLMBudgetExceededError(DigestGatewayError):
+    """Shared gateway budget exceeded."""
+
+
+@dataclass(frozen=True)
+class SynthesizeDigestResult:
+    body_markdown: str
+    citations: list[dict[str, Any]]
+    llm_usage_ledger_id: int | None
+    cost_usd: Decimal
+
+
+_CITATION_TOKEN_RE = re.compile(r"\[\[(cs|mv|card):([^\]]+)\]\]")
+
+
+def _parse_digest_citations(
+    body_markdown: str,
+    *,
+    valid_card_source_ids: frozenset[str],
+    valid_mv_ids: frozenset[int],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Parse citation tokens; return (valid_citations, dropped_tokens).
+
+    Reject ``[[card:UUID]]`` as malformed (cards must be cited via
+    card_source ids per plan §5.D). Drop hallucinated ids.
+    """
+    citations: list[dict[str, Any]] = []
+    dropped: list[str] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for position, match in enumerate(_CITATION_TOKEN_RE.finditer(body_markdown)):
+        kind_raw, id_raw = match.group(1), match.group(2)
+        token = match.group(0)
+        if kind_raw == "card":
+            dropped.append(token)
+            continue
+        if kind_raw == "cs":
+            if id_raw not in valid_card_source_ids:
+                dropped.append(token)
+                continue
+            key = ("card_source", id_raw)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            citations.append(
+                {"kind": "card_source", "id": id_raw, "position": position}
+            )
+        elif kind_raw == "mv":
+            try:
+                mv_int = int(id_raw)
+            except ValueError:
+                dropped.append(token)
+                continue
+            if mv_int not in valid_mv_ids:
+                dropped.append(token)
+                continue
+            key = ("message_version", str(mv_int))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            citations.append(
+                {"kind": "message_version", "id": mv_int, "position": position}
+            )
+    return citations, dropped
+
+
+def _validate_every_bullet_has_citation(
+    body_markdown: str,
+    valid_citation_tokens: set[str],
+) -> None:
+    """Raise DigestCitationValidationError if any bullet has 0 valid tokens.
+
+    A bullet starts with ``- `` or ``• `` at line start; spans until the
+    next bullet (or end of body).
+    """
+    lines = body_markdown.splitlines()
+    current: list[str] = []
+    bullets: list[str] = []
+    for line in lines:
+        if line.startswith("- ") or line.startswith("• "):
+            if current:
+                bullets.append("\n".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        bullets.append("\n".join(current))
+    for idx, bullet in enumerate(bullets):
+        if not any(tok in bullet for tok in valid_citation_tokens):
+            raise DigestCitationValidationError(
+                f"bullet {idx} has zero valid citation tokens"
+            )
+
+
+async def _digest_context_is_clean(
+    session: AsyncSession,
+    *,
+    cards: list,
+    messages: list,
+) -> None:
+    """Pre-provider revalidation. Raise DigestContextStaleError on any failure.
+
+    Mirrors digest_context.py's inline NOT EXISTS predicate.
+    """
+    forget_pred = """
+        NOT EXISTS (
+            SELECT 1 FROM forget_events fe
+            WHERE fe.status IN ('pending', 'processing', 'completed')
+              AND (
+                  (fe.target_type = 'message' AND fe.target_id = cm.id::text)
+                  OR
+                  (fe.target_type = 'user' AND fe.target_id = cm.user_id::text)
+                  OR
+                  (fe.target_type = 'message_hash' AND fe.target_id = mv.content_hash)
+              )
+        )
+    """
+    if messages:
+        mv_ids = [m.message_version_id for m in messages]
+        mv_check_sql = text(
+            "SELECT mv.id FROM message_versions mv "
+            "JOIN chat_messages cm ON cm.id = mv.chat_message_id "
+            "WHERE mv.id = ANY(:mv_ids) "
+            "  AND cm.memory_policy = 'normal' "
+            "  AND mv.is_redacted = FALSE "
+            "  AND " + forget_pred
+        )
+        row_ids = {r[0] for r in (await session.execute(mv_check_sql, {"mv_ids": mv_ids})).all()}
+        missing = set(mv_ids) - row_ids
+        if missing:
+            raise DigestContextStaleError(
+                f"{len(missing)} message_version(s) failed revalidation"
+            )
+    if cards:
+        cs_ids: list[str] = []
+        for c in cards:
+            cs_ids.extend(str(s) for s in c.card_source_ids)
+        if cs_ids:
+            cs_check_sql = text(
+                "SELECT cs.id::text FROM card_sources cs "
+                "JOIN knowledge_cards kc ON kc.id = cs.card_id "
+                "JOIN message_versions mv ON mv.id = cs.message_version_id "
+                "JOIN chat_messages cm ON cm.id = mv.chat_message_id "
+                "WHERE cs.id::text = ANY(:cs_ids) "
+                "  AND kc.card_status = 'approved' "
+                "  AND cm.memory_policy = 'normal' "
+                "  AND mv.is_redacted = FALSE "
+                "  AND " + forget_pred
+            )
+            row_ids = {r[0] for r in (await session.execute(cs_check_sql, {"cs_ids": cs_ids})).all()}
+            missing = set(cs_ids) - row_ids
+            if missing:
+                raise DigestContextStaleError(
+                    f"{len(missing)} card_source(s) failed revalidation"
+                )
+
+
+async def synthesize_digest(
+    session: AsyncSession,
+    *,
+    context: Any,
+    config: LLMGatewayConfig,
+    ledger_repo: LedgerRepoProtocol,
+    provider: LLMProvider,
+    prompt_template_version: str = "digest-v0.1.0",
+) -> SynthesizeDigestResult:
+    """T7-02 — synthesize daily digest. See PHASE7_PLAN.md §5.D."""
+    await _digest_context_is_clean(session, cards=context.cards, messages=context.messages)
+
+    from bot.services.llm_prompts.digest_v0_1_0 import (
+        SYSTEM_PROMPT,
+        build_user_prompt,
+    )
+
+    user_prompt = build_user_prompt(
+        window_start_msk=context.window_start.isoformat(),
+        window_end_msk=context.window_end.isoformat(),
+        cards=list(context.cards),
+        messages=list(context.messages),
+    )
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+    prompt_hash = _prompt_hash(full_prompt)
+
+    valid_card_source_ids: frozenset[str] = frozenset(
+        str(s) for c in context.cards for s in c.card_source_ids
+    )
+    valid_mv_ids: frozenset[int] = frozenset(
+        int(m.message_version_id) for m in context.messages
+    )
+
+    placeholder_row: Any
+    try:
+        await session.execute(
+            _BUDGET_LOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
+        )
+        over_budget = await _budget_check(session, config, ledger_repo)
+        if over_budget:
+            row = await ledger_repo.record(
+                session,
+                qa_trace_id=None,
+                provider=config.provider,
+                model=config.model,
+                prompt_hash=prompt_hash,
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                cost_usd=Decimal("0"),
+                latency_ms=0,
+                request_id=None,
+                cache_hit=False,
+                error="budget_exceeded",
+            )
+            raise LLMBudgetExceededError(f"gateway budget exceeded; ledger_id={row.id}")
+        placeholder_row = await ledger_repo.record(
+            session,
+            qa_trace_id=None,
+            provider=config.provider,
+            model=config.model,
+            prompt_hash=prompt_hash,
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=Decimal("0"),
+            latency_ms=0,
+            request_id=None,
+            cache_hit=False,
+            error=None,
+        )
+    finally:
+        await session.execute(
+            _BUDGET_UNLOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
+        )
+
+    started = time.monotonic()
+    try:
+        provider_result = await provider.call(prompt=full_prompt, model=config.model)
+    except Exception as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency,
+            error=f"{type(exc).__name__}",
+        )
+        raise
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    body_text = provider_result.answer_text or ""
+    cost_usd = _estimate_cost(
+        config=config,
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+    )
+
+    if body_text.strip() == "EMPTY_WINDOW":
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=cost_usd,
+            response_hash=_response_hash(body_text),
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=provider_result.request_id,
+            latency_ms=latency_ms,
+            error=None,
+        )
+        if not context.cards and not context.messages:
+            raise DigestEmptyWindowError("provider returned EMPTY_WINDOW on empty context")
+        raise DigestProviderError("empty_window_echo_with_nonempty_context")
+
+    citations, dropped = _parse_digest_citations(
+        body_text,
+        valid_card_source_ids=valid_card_source_ids,
+        valid_mv_ids=valid_mv_ids,
+    )
+    if dropped:
+        logger.warning(
+            "synthesize_digest: dropped %d hallucinated/malformed citation tokens "
+            "(prompt_hash=%s, ledger_id=%d)",
+            len(dropped),
+            prompt_hash[:12],
+            placeholder_row.id,
+        )
+
+    valid_tokens: set[str] = set()
+    for cit in citations:
+        if cit["kind"] == "card_source":
+            valid_tokens.add(f"[[cs:{cit['id']}]]")
+        else:
+            valid_tokens.add(f"[[mv:{cit['id']}]]")
+    try:
+        _validate_every_bullet_has_citation(body_text, valid_tokens)
+    except DigestCitationValidationError:
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=cost_usd,
+            response_hash=_response_hash(body_text),
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=provider_result.request_id,
+            latency_ms=latency_ms,
+            error="citation_validation_failed",
+        )
+        raise
+
+    await ledger_repo.update_placeholder(
+        session,
+        llm_call_id=placeholder_row.id,
+        cost_usd=cost_usd,
+        response_hash=_response_hash(body_text),
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+        request_id=provider_result.request_id,
+        latency_ms=latency_ms,
+        error=None,
+    )
+
+    return SynthesizeDigestResult(
+        body_markdown=body_text,
+        citations=citations,
+        llm_usage_ledger_id=placeholder_row.id,
+        cost_usd=cost_usd,
+    )
+
+
 __all__ = [
     "Abstention",
     "AbstentionReason",
     "AnswerWithCitations",
     "DEFAULT_PROMPT_TEMPLATE_VERSION",
+    "DigestCitationValidationError",
+    "DigestContextStaleError",
+    "DigestEmptyWindowError",
+    "DigestGatewayError",
+    "DigestProviderError",
     "LLM_BUDGET_LOCK_ID",
+    "LLMBudgetExceededError",
     "LLMGatewayConfig",
     "LedgerRepoProtocol",
     "LiveExtractCandidatesGateway",
     "MAX_QUERY_LENGTH",
     "SynthesisCacheRepoProtocol",
     "SynthesisResult",
+    "SynthesizeDigestResult",
     "_cache_input_hash",
     "_normalize_query",
     "extract_candidates",
     "load_gateway_config",
     "resolve_provider",
     "synthesize_answer",
+    "synthesize_digest",
 ]
