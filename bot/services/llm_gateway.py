@@ -1411,6 +1411,42 @@ class SynthesizeDigestResult:
 
 _CITATION_TOKEN_RE = re.compile(r"\[\[(cs|mv|card):([^\]]+)\]\]")
 
+# §5.F: section header pattern for weekly digests. Matches lines of the form
+# `## Раздел: <title>` at line-start; title is captured.
+_SECTION_HEADER_RE = re.compile(r"^##\s+Раздел:\s+(.+)$", re.MULTILINE)
+
+
+def _extract_sections(body_markdown: str) -> list[tuple[str, list[str]]]:
+    """Parse `## Раздел: <name>` section headers + their bullets.
+
+    Returns a list of `(section_title, bullet_lines)` tuples in document
+    order. ``bullet_lines`` collects raw ``- `` / ``• `` line-start lines
+    appearing between this header and the next header (or end of body).
+    Lines that are not bullets and not headers are ignored.
+
+    Used by the weekly digest renderer (T8-06) and by the M1 section title
+    allowlist soft-validator in `synthesize_digest`. Returns an empty list
+    for bodies with no `## Раздел: …` headers.
+    """
+    lines = body_markdown.splitlines()
+    sections: list[tuple[str, list[str]]] = []
+    current_title: str | None = None
+    current_bullets: list[str] = []
+    for line in lines:
+        m = _SECTION_HEADER_RE.match(line)
+        if m is not None:
+            if current_title is not None:
+                sections.append((current_title, current_bullets))
+            current_title = m.group(1).strip()
+            current_bullets = []
+            continue
+        if line.startswith("- ") or line.startswith("• "):
+            if current_title is not None:
+                current_bullets.append(line)
+    if current_title is not None:
+        sections.append((current_title, current_bullets))
+    return sections
+
 
 def _bullet_index_at_offset(body_markdown: str, char_offset: int) -> int:
     """Return the 0-based index of the bullet that contains ``char_offset``.
@@ -1594,15 +1630,41 @@ async def synthesize_digest(
     config: LLMGatewayConfig,
     ledger_repo: LedgerRepoProtocol,
     provider: LLMProvider,
-    prompt_template_version: str = "digest-v0.1.0",
+    type: Literal["daily", "weekly"] = "daily",
 ) -> SynthesizeDigestResult:
-    """T7-02 — synthesize daily digest. See PHASE7_PLAN.md §5.D."""
+    """Synthesize a digest body via the LLM gateway.
+
+    Routes by ``type`` (PHASE8_PLAN.md §5.F):
+      - ``daily``  → ``digest_v0_1_0`` (Phase 7 / T7-02 — unchanged).
+      - ``weekly`` → ``digest_weekly_v0_1_0`` (Phase 8 / T8-02 — section-aware
+        editorial recap with five-name section title allowlist as a soft contract).
+
+    Pre-provider revalidation (`_digest_context_is_clean`) and bullet-level
+    citation invariant are identical across both paths. Section headers
+    `## Раздел: …` are inert at parse-time — the bullet tokenizer counts
+    only ``- `` / ``• `` line-starts.
+
+    Soft contract (M1): when the body returned by the provider contains a
+    `## Раздел: …` header whose title is NOT in the weekly module's
+    ``SECTION_NAME_ALLOWLIST``, a structured warning is logged but the run
+    is NOT failed. Hard enforcement is Phase 8.5 backlog.
+    """
     await _digest_context_is_clean(session, cards=context.cards, messages=context.messages)
 
-    from bot.services.llm_prompts.digest_v0_1_0 import (
-        SYSTEM_PROMPT,
-        build_user_prompt,
-    )
+    if type == "weekly":
+        from bot.services.llm_prompts.digest_weekly_v0_1_0 import (
+            PROMPT_VERSION,
+            SECTION_NAME_ALLOWLIST,
+            SYSTEM_PROMPT,
+            build_user_prompt,
+        )
+    else:
+        from bot.services.llm_prompts.digest_v0_1_0 import (
+            PROMPT_VERSION,
+            SYSTEM_PROMPT,
+            build_user_prompt,
+        )
+        SECTION_NAME_ALLOWLIST = None  # daily path has no allowlist; warning skipped
 
     user_prompt = build_user_prompt(
         window_start_msk=context.window_start.isoformat(),
@@ -1612,6 +1674,9 @@ async def synthesize_digest(
     )
     full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
     prompt_hash = _prompt_hash(full_prompt)
+    # PROMPT_VERSION is module-level — keep available for downstream ledger
+    # logging if the gateway grows a template-version field later.
+    _ = PROMPT_VERSION
 
     valid_card_source_ids: frozenset[str] = frozenset(
         str(s) for c in context.cards for s in c.card_source_ids
@@ -1718,6 +1783,21 @@ async def synthesize_digest(
             prompt_hash[:12],
             placeholder_row.id,
         )
+
+    # §5.F M1 — section title allowlist soft check (weekly only). The five-name
+    # allowlist is a soft contract on the LLM prompt; any off-allowlist title
+    # logs a structured warning but does NOT fail the run. Phase 8.5 backlog
+    # item: hard-enforce if drift is observed.
+    if SECTION_NAME_ALLOWLIST is not None:
+        for section_title, _bullets in _extract_sections(body_text):
+            if section_title not in SECTION_NAME_ALLOWLIST:
+                logger.warning(
+                    "synthesize_digest: off-allowlist section title %r "
+                    "(prompt_hash=%s, ledger_id=%d)",
+                    section_title,
+                    prompt_hash[:12],
+                    placeholder_row.id,
+                )
 
     valid_tokens: set[str] = set()
     for cit in citations:
