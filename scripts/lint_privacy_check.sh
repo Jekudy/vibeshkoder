@@ -26,6 +26,11 @@ is_allowed_path() {
   # a baseline regen step.
   [[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_PLAN\.md$ ]] && return 0
 
+  # Phase rollout / closure playbooks (PHASE7_ROLLOUT.md, PHASE8_ROLLOUT.md, …)
+  # name the privacy invariants for operator-facing acceptance checks and
+  # post-rollout verification matrices. Same rationale as PHASEn_PLAN.md.
+  [[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_ROLLOUT\.md$ ]] && return 0
+
   # Phase 7 digest modules + tests reference the canonical
   # privacy literals in docstrings and test inputs because their job
   # is to ENFORCE the policy — they must name the literals to filter
