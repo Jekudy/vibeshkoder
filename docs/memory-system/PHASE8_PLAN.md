@@ -28,7 +28,7 @@ code lands**.
 | `digest_renderer.render_digest_html` | Exists | `bot/services/digest_renderer.py`. Phase 8 extends to recognize `## Раздел: …` Markdown headers and bold them as `<b>` in the HTML output. |
 | `redact_digest_for_forget` + `_cascade_digests` | Exists | `bot/services/digest_redactor.py`; `bot/services/forget_cascade.py:804-880`. **Three coupled allowlists MUST be widened together in T8-04** (C1 in §5.K): (i) `_cascade_digests` JSONB scan filter at `forget_cascade.py:840`; (ii) `redact_digest_for_forget` early-return guard at `digest_redactor.py:105` (`if current_status not in (...): return`); (iii) the no-citation-match status UPDATE at `digest_redactor.py:135-137` (`WHERE id=:id AND status IN (...)`). Widening (i) alone is a silent privacy regression: the cascade selects the row but the redactor short-circuits it back out. See §5.K for the unified allowlist. |
 | `digest_publisher.publish_digest` trigger guard | Exists | `bot/services/digest_publisher.py:118` hardcodes `if digest.status != "draft": raise DigestPublisherInvalidState(...)`. T8-04 (or T8-06) MUST widen this guard to accept `approved_for_publish` so the `digest_review.approve_digest → publish_digest` handoff transitions the row through `posting → posted`. See §5.L. |
-| `digest_daily_job` + `digest_stale_posting_reaper_job` | Exists | `bot/services/scheduler.py:282-425`. T8-05 adds `digest_weekly_job` (cron Mon 09:00 MSK) + `digest_stale_review_reaper_job` (48h DM + 7d auto-reject). |
+| `digest_daily_job` + `digest_stale_posting_reaper_job` | Exists | `bot/services/scheduler.py:282-425`. T8-05 adds `digest_weekly_job` (cron Mon 09:15 MSK — H8 15-min stagger past daily 09:00; see §5.G) + `digest_stale_review_reaper_job` (48h DM + 7d auto-reject). |
 | `bot/handlers/digest.py` `_is_admin` + Phase 7 commands | Exists | `bot/handlers/digest.py`. T8-06 adds `/digest_approve`, `/digest_reject`, `/digest_review` and widens `/digest_now` to accept `weekly`. |
 | `feature_flags` table | Exists | Phase 8 flag `memory.digests.weekly.enabled` default OFF, same shape as Phase 7 daily flag. |
 | `tests/evals/` Phase 11 suite | Exists | **Verified baseline 30/30** by direct enumeration of `tests/evals/test_*.py` (`test_leakage.py`: L1, L2, L3a, L3b, L3c, L4, L5, L6a, L6b, L6c = 10; `test_citations.py`: C1, C2, C3, C4, C5a, C5b, C5c, C5d = 8; `test_refusal.py`: R1, R2, R3a, R3b, R3c, R4 = 6; `test_digest_leakage.py`: L7a, L7b, C6, I5a, I5b, I5c = 6). Earlier "28/28 → 34/34" framing in Phase 7 closure docs was a stale enumeration drift (counted by category, not by parametrize ids). Phase 8 adds **12** new cases (L8a/b + C7 + I6a + I6b.1/2/3 + I6c + R5.a/b/c/d) → **42/42 new total**. The split of I6b into 3 windowed sub-cases and R5 into 4 admin-gate sub-cases is required for binding completeness — see §10. |
@@ -335,15 +335,31 @@ ALTER TABLE digests VALIDATE CONSTRAINT ck_digests_approved_audit;
 -- to docs/memory-system/PHASE8_ROLLOUT.md "downgrade" runbook section.)
 DO $$
 BEGIN
+    -- R2 HIGH-Cdx-2: the pre-flight MUST also block `posting` rows. The
+    -- `posting` status itself is Phase 7 (in the narrower restored CHECK),
+    -- so it survives the constraint swap — but a row stuck in `posting`
+    -- represents an in-transit publish for either daily OR weekly. A
+    -- weekly publish in `posting` was triggered by admin /digest_approve
+    -- and is mid-`bot.send_message`; downgrading underneath drops the
+    -- audit columns the publisher relies on, races the stale-posting
+    -- reaper, and may surface as a "publish silently lost" incident.
+    -- Blocking ALL `posting` rows (daily + weekly) is the safer default
+    -- — neither flavor is acceptable to drop schema cols underneath.
     IF EXISTS (
         SELECT 1 FROM digests WHERE status IN (
             'awaiting_review','approved_for_publish',
-            'rejected_by_admin','rejected_by_reaper'
+            'rejected_by_admin','rejected_by_reaper',
+            'posting'  -- R2 HIGH-Cdx-2
         )
     ) THEN
-        RAISE EXCEPTION 'cannot downgrade: digests rows in Phase 8 review states exist '
-                        '— manually transition or DELETE them per PHASE8_ROLLOUT.md '
-                        '"downgrade" runbook section before re-running downgrade';
+        RAISE EXCEPTION 'cannot downgrade: digests rows in Phase 8 review states '
+                        '(awaiting_review/approved_for_publish/rejected_by_admin/'
+                        'rejected_by_reaper) OR in-transit `posting` state exist '
+                        '— wait for in-flight publishes to terminate '
+                        '(stale_posting_reaper runs every 5 min) then manually '
+                        'transition or DELETE Phase-8 review rows per '
+                        'PHASE8_ROLLOUT.md "downgrade" runbook section before '
+                        're-running downgrade';
     END IF;
     IF EXISTS (
         SELECT 1 FROM digest_runs WHERE status IN (
@@ -391,7 +407,11 @@ ALTER TABLE digests ADD CONSTRAINT ck_digests_status CHECK (
 ALTER TABLE digests VALIDATE CONSTRAINT ck_digests_status;
 ```
 
-**Downgrade safety contract:** the pre-flight `DO $$ ... $$` block above raises `MigrationError` (Python wrapper) when any row exists in a Phase-8-only status. This protects against silent data corruption when an operator downgrades after weekly digests have entered the review queue. Phase 7's `posted` / `redacted` rows are preserved (their statuses remain valid under the narrower restored CHECK). Operator path: per `PHASE8_ROLLOUT.md` "downgrade" section, either manually transition `awaiting_review`/`approved_for_publish` rows to `rejected_by_admin` (then DELETE) or DELETE outright — weekly digest data is non-critical recap content.
+**Downgrade safety contract:** the pre-flight `DO $$ ... $$` block above raises `MigrationError` (Python wrapper) when:
+1. Any row exists in a Phase-8-only status (`awaiting_review`, `approved_for_publish`, `rejected_by_admin`, `rejected_by_reaper`).
+2. **Any row exists in `posting`** (R2 HIGH-Cdx-2): both daily and weekly `posting` rows block. `posting` is a Phase 7 status (survives the constraint swap) but represents an in-flight publish that may be writing to Telegram while the downgrade runs. Dropping `published_by_admin_id` / `approved_at` / `review_notes` under an in-flight WEEKLY publish breaks the publisher's terminal `UPDATE` (the `RETURNING` clause references columns the publisher reads); dropping under an in-flight DAILY publish is technically safe (daily never writes the new audit cols) but the conservative default is to block both since `posting` is by design short-lived (publisher's 30s statement_timeout + `stale_posting_reaper` 2-min sweep). The operator just waits up to ~5 minutes for the reaper, then re-runs.
+
+This protects against silent data corruption when an operator downgrades after weekly digests have entered the review queue or while ANY publish is in flight. Phase 7's `posted` / `redacted` rows are preserved (their statuses remain valid under the narrower restored CHECK). Operator path: per `PHASE8_ROLLOUT.md` "downgrade" section, either manually transition `awaiting_review`/`approved_for_publish` rows to `rejected_by_admin` (then DELETE) or DELETE outright — weekly digest data is non-critical recap content. For `posting` blocks, just wait for the reaper.
 
 **ORM additions in `bot/db/models.py`:**
 
@@ -596,11 +616,106 @@ class ApproveResult:
 
 
 class DigestReviewInvalidState(Exception):
-    """Approval/reject attempted from a non-awaiting_review state."""
+    """Approval/reject attempted from a non-awaiting_review state, OR a guarded
+    UPDATE returned rowcount=0 because the row was deleted or its status moved
+    out from under us between revalidation and commit.
+
+    Structured fields (NOT positional Exception args) so handlers can render
+    context-aware admin replies — required by Round 2 HIGH-Cdx-1:
+
+        digest_id:        int                — always populated.
+        current_status:   str | None         — None ⇒ row was DELETEd
+                                                concurrently (e.g. by
+                                                /digest_now --regenerate or
+                                                operator manual cleanup);
+                                                str  ⇒ row exists in this
+                                                status (e.g. 'redacted',
+                                                'rejected_by_admin', 'posted').
+        reason:           str                — free-text explanation for logs
+                                                + admin reply, e.g.
+                                                "expected status='awaiting_review',
+                                                found 'redacted'" or
+                                                "row_deleted_during_transition".
+    """
+
+    def __init__(
+        self,
+        *,
+        digest_id: int,
+        current_status: str | None,
+        reason: str,
+    ) -> None:
+        self.digest_id = digest_id
+        self.current_status = current_status
+        self.reason = reason
+        super().__init__(
+            f"DigestReviewInvalidState(digest_id={digest_id}, "
+            f"current_status={current_status!r}, reason={reason!r})"
+        )
 
 
 class DigestReviewNotFound(Exception):
-    """Digest id does not exist."""
+    """Digest id was never found by the pre-flight SELECT in step 2 of
+    approve_digest / reject_digest. Distinct from
+    DigestReviewInvalidState(current_status=None), which fires only AFTER a
+    guarded UPDATE rowcount=0 race when the re-read confirms the row has
+    since been DELETEd."""
+
+
+# ─── Canonical rowcount=0 handler (R2 HIGH-Cdx-1) ─────────────────────────
+# Every guarded UPDATE in this module — and the publisher trigger transition
+# in §5.L — MUST use this exact pattern. Distinguishes "row deleted
+# concurrently" (current=None) from "row in unexpected state"
+# (current=<some other status>). Both raise DigestReviewInvalidState with
+# structured fields so the handler layer renders a context-aware admin reply
+# without re-querying.
+
+async def _raise_invalid_state_after_guard_miss(
+    session: AsyncSession,
+    *,
+    digest_id: int,
+    expected_status: str | tuple[str, ...],
+) -> None:
+    """Call ONLY after a guarded UPDATE returned rowcount=0. Re-reads the
+    current status (or detects DELETE) and raises DigestReviewInvalidState
+    with structured fields.
+    """
+    current = (
+        await session.execute(
+            select(Digest.status).where(Digest.id == digest_id)
+        )
+    ).scalar_one_or_none()
+    if current is None:
+        raise DigestReviewInvalidState(
+            digest_id=digest_id,
+            current_status=None,
+            reason="row_deleted_during_transition",
+        )
+    raise DigestReviewInvalidState(
+        digest_id=digest_id,
+        current_status=current,
+        reason=f"expected status={expected_status!r}, found {current!r}",
+    )
+
+
+# Canonical guarded UPDATE pattern — every transition in this module uses
+# this exact shape. Reference this block from §5.L (publisher trigger
+# transition) — DO NOT duplicate the pattern there.
+#
+#     result = await session.execute(
+#         update(Digest)
+#         .where(Digest.id == digest_id, Digest.status == expected_status)
+#         .values(status=new_status, ...other_fields...)
+#         .returning(Digest.id)
+#     )
+#     if result.rowcount == 0:
+#         # Concurrent transition won; classify and raise.
+#         await _raise_invalid_state_after_guard_miss(
+#             session,
+#             digest_id=digest_id,
+#             expected_status=expected_status,
+#         )
+#     # rowcount == 1: commit path continues.
 
 
 async def transition_to_awaiting_review(
@@ -624,10 +739,16 @@ async def transition_to_awaiting_review(
           AND type='weekly'
         RETURNING id
 
-    Rowcount=0 → re-read the row to learn the current status and raise
-    DigestReviewInvalidState(current_status). Idempotency: if current
-    status is already 'awaiting_review', this is a no-op (no exception,
-    no second digest_runs insert).
+    Rowcount=0 → call the canonical handler
+    `_raise_invalid_state_after_guard_miss(session, digest_id=digest_id,
+    expected_status='draft')` which re-reads, distinguishes deleted-row
+    (`current_status=None`) from wrong-status, and raises
+    DigestReviewInvalidState with structured fields. Idempotency caveat:
+    if the current status is already 'awaiting_review' (a benign re-call),
+    the canonical handler raises `DigestReviewInvalidState(current_status=
+    'awaiting_review', reason=...)`; the caller (digest_weekly_job's match
+    block in §5.G) catches this specific case and treats it as a no-op
+    log line, NOT an error.
 
     On rowcount=1: INSERT digest_runs(digest_id=:id, status='awaiting_review',
     started_at=now()). Commit. Caller (digest_weekly_job) then DMs admins.
@@ -648,14 +769,17 @@ async def approve_digest(
 
     1. Begin transaction; statement_timeout 30s (mirrors §5.F publisher).
     2. SELECT digests.* WHERE id=:digest_id (NO FOR UPDATE — read-only
-       inspection; the actual transition at step 4 is a guarded UPDATE
-       that handles concurrency atomically).
-       - Not found → raise DigestReviewNotFound.
-       - status != 'awaiting_review' → raise DigestReviewInvalidState(status).
-       - type != 'weekly' → raise DigestReviewInvalidState('not_weekly').
+       inspection; the actual transitions at steps 3 and 4 are guarded
+       UPDATEs that handle concurrency atomically).
+       - Not found → raise DigestReviewNotFound (pre-flight SELECT miss —
+         no race window has opened yet).
+       - status != 'awaiting_review' → raise DigestReviewInvalidState(
+         digest_id=:id, current_status=status, reason='not_awaiting_review').
+       - type != 'weekly' → raise DigestReviewInvalidState(
+         digest_id=:id, current_status=status, reason='not_weekly').
     3. Re-run defense-in-depth context revalidation. Re-query every citation
        source id; if any source is now forgotten/redacted/missing → guarded
-       UPDATE:
+       UPDATE (canonical pattern from top of this module):
 
            UPDATE digests
            SET status='failed',
@@ -664,10 +788,16 @@ async def approve_digest(
            WHERE id=:digest_id AND status='awaiting_review'
            RETURNING id
 
-       Rowcount=0 means a forget-cascade already won (row is now in
-       'redacted' status — exercised by I6b.2). Commit, admin notify,
-       raise DigestReviewInvalidState('citations_stale').
-    4. Guarded approval transition:
+       Rowcount=0 → call `_raise_invalid_state_after_guard_miss(session,
+       digest_id=:id, expected_status='awaiting_review')`. The handler
+       distinguishes "row deleted concurrently" (current_status=None ⇒
+       reason='row_deleted_during_transition') from "cascade redact won"
+       (current_status='redacted' ⇒ reason="expected status=
+       'awaiting_review', found 'redacted'"). I6b.2 exercises the
+       latter. Rowcount=1 → commit, admin notify, raise
+       DigestReviewInvalidState(digest_id=:id, current_status='failed',
+       reason='citations_stale_at_approval').
+    4. Guarded approval transition (canonical pattern):
 
            UPDATE digests
            SET status='approved_for_publish',
@@ -677,11 +807,14 @@ async def approve_digest(
            WHERE id=:digest_id AND status='awaiting_review'
            RETURNING id
 
-       Rowcount=0 → another transition won (cascade redact or concurrent
-       /digest_reject or another /digest_approve). Re-read the row, log
-       structured, raise DigestReviewInvalidState(current_status). On
-       rowcount=1: INSERT digest_runs(status='approved_for_publish',
-       started_at=now()). Commit (releases the row lock).
+       Rowcount=0 → call `_raise_invalid_state_after_guard_miss(session,
+       digest_id=:id, expected_status='awaiting_review')`. Possible
+       race winners: cascade redact (current='redacted'), concurrent
+       /digest_reject (current='rejected_by_admin'), another concurrent
+       /digest_approve (current='approved_for_publish' or further), or
+       --regenerate DELETE (current=None). Rowcount=1 → INSERT
+       digest_runs(status='approved_for_publish', started_at=now()).
+       Commit (releases the row lock).
     5. Call digest_publisher.publish_digest(session, bot=bot, digest=digest,
        digest_config=digest_config). The publisher's own transaction acquires
        FOR UPDATE NOWAIT and its guarded UPDATE accepts 'approved_for_publish'
@@ -713,7 +846,7 @@ async def reject_digest(
 
         reason = (reason or "no reason given")[:1000]
 
-    Then a single guarded UPDATE:
+    Then a single guarded UPDATE (canonical pattern from top of this module):
 
         UPDATE digests
         SET status='rejected_by_admin',
@@ -723,9 +856,11 @@ async def reject_digest(
         WHERE id=:digest_id AND status='awaiting_review'
         RETURNING id
 
-    Rowcount=0 → re-read, raise DigestReviewInvalidState(current_status).
-    Rowcount=1 → INSERT digest_runs(status='rejected_by_admin',
-    error_text=:reason, started_at=now(), finished_at=now()). Commit.
+    Rowcount=0 → call `_raise_invalid_state_after_guard_miss(session,
+    digest_id=:id, expected_status='awaiting_review')` — same classifier
+    as approve_digest steps 3/4. Rowcount=1 → INSERT digest_runs(
+    status='rejected_by_admin', error_text=:reason, started_at=now(),
+    finished_at=now()). Commit.
 
     No publish. No Telegram side-effect. Admin can re-run with
     `/digest_now weekly --regenerate` (§5.H) to produce a fresh draft
@@ -741,9 +876,16 @@ async def reject_digest(
 - `reject_digest` → single transaction.
 
 **Error types:**
-- `DigestReviewNotFound` → caller (handler) replies "Дайджест #id не найден".
-- `DigestReviewInvalidState(status)` → caller replies "Дайджест уже в статусе `{status}`" with context-aware variants for `posted`, `rejected_by_admin`, `rejected_by_reaper`, `redacted`, `citations_stale`, `not_weekly`.
-- All other exceptions → caller replies generic error + logs structured.
+- `DigestReviewNotFound` → caller (handler) replies "Дайджест #id не найден". Pre-flight SELECT miss only — no guarded-update race involved.
+- `DigestReviewInvalidState(digest_id, current_status, reason)` → caller renders a context-aware admin reply by branching on `current_status`:
+  - `current_status is None` (`reason='row_deleted_during_transition'`) → "Дайджест #id удалён в процессе (вероятно, --regenerate или ручная очистка). Перезапустите /digest_now weekly."
+  - `current_status='redacted'` → "Дайджест #id отредактирован после forget-события. Опубликовать нельзя; используйте /digest_now weekly --regenerate."
+  - `current_status='posted'` → "Дайджест #id уже опубликован." + t.me link.
+  - `current_status='rejected_by_admin' | 'rejected_by_reaper'` → "Дайджест #id отклонён. Используйте /digest_now weekly --regenerate."
+  - `current_status='approved_for_publish'` → "Дайджест #id уже одобрен другим админом, ожидает публикации."
+  - `current_status='failed'` (when reason='citations_stale_at_approval') → "Цитаты дайджеста #id устарели. Используйте /digest_now weekly --regenerate."
+  - any other status → generic "Дайджест #id в неожиданном статусе `{current_status}`: {reason}".
+- All other exceptions → caller replies generic error + logs structured (digest_id, exc_info).
 
 ### 5.F. `bot/services/llm_prompts/digest_weekly_v0_1_0.py` (T8-02) — NEW prompt template
 
@@ -1356,10 +1498,15 @@ if digest.status not in _PUBLISHER_TRIGGER_STATUSES:
     raise DigestPublisherInvalidState(digest.status)
 ```
 
-The publisher's downstream guarded UPDATE (Phase 7 §5.F step 1) — the one that transitions to `posting` — MUST also widen its WHERE clause:
+The publisher's downstream guarded UPDATE (Phase 7 §5.F step 1) — the one that transitions to `posting` — MUST also widen its WHERE clause. The rowcount=0 handling follows the **canonical pattern from §5.E** (`_raise_invalid_state_after_guard_miss`) — Round 2 HIGH-Cdx-1 — so the publisher distinguishes "row deleted concurrently" (e.g. by `--regenerate` racing a stale `/digest_approve`) from "row in unexpected state" (e.g. cascade redacted it to `'redacted'`). Publisher reuses the same helper or implements an inline mirror with structured `DigestPublisherInvalidState` fields (`digest_id`, `current_status: Optional[str]`, `reason: str`) — both forms are acceptable as long as the classification is the same.
 
 ```python
 # Per Codex H3 / Phase 7 publisher pattern — guarded transition.
+# Rowcount=0 handler follows §5.E canonical pattern (R2 HIGH-Cdx-1):
+# re-read, distinguish deleted-row from wrong-status, raise with
+# structured fields. expected_status here is the 2-tuple
+# ('draft','approved_for_publish'); the §5.E helper accepts a tuple
+# and renders it correctly in the reason string.
 result = await session.execute(
     text(
         "UPDATE digests "
@@ -1370,11 +1517,45 @@ result = await session.execute(
     {"id": digest.id},
 )
 if result.rowcount == 0:
-    # Concurrent cascade redacted the row, or stale-approved reaper failed it,
-    # or another worker already won the publish. Re-read to determine.
+    # Canonical rowcount=0 classifier (§5.E):
+    #   - row deleted concurrently (--regenerate during stale /digest_approve)
+    #     → DigestPublisherInvalidState(current_status=None,
+    #                                    reason='row_deleted_during_transition')
+    #   - cascade redacted (status='redacted') or stale-approved-reaper
+    #     failed (status='failed') or another worker posted (status IN
+    #     ('posting','posted'))
+    #     → DigestPublisherInvalidState(current_status=<status>,
+    #         reason=f"expected status IN ('draft','approved_for_publish'), "
+    #                f"found {current!r}")
+    # The publisher invokes the §5.E helper with
+    # expected_status=('draft','approved_for_publish') and re-raises as
+    # DigestPublisherInvalidState — daily flow's existing handler at
+    # bot/services/digests.py:digest_daily_job continues to catch
+    # DigestPublisherInvalidState the same way.
+    current = (
+        await session.execute(
+            text("SELECT status FROM digests WHERE id=:id"),
+            {"id": digest.id},
+        )
+    ).scalar_one_or_none()
     await session.rollback()
-    raise DigestPublisherInvalidState("publisher_status_mismatch")
+    if current is None:
+        raise DigestPublisherInvalidState(
+            digest_id=digest.id,
+            current_status=None,
+            reason="row_deleted_during_transition",
+        )
+    raise DigestPublisherInvalidState(
+        digest_id=digest.id,
+        current_status=current,
+        reason=(
+            "expected status IN ('draft','approved_for_publish'), "
+            f"found {current!r}"
+        ),
+    )
 ```
+
+> **`DigestPublisherInvalidState` signature extension** (T8-04 mirrors the §5.E pattern): `digest_publisher.py` extends the exception to accept the same three structured kwargs (`digest_id: int`, `current_status: Optional[str]`, `reason: str`). Phase 7 callsites that raised positional `DigestPublisherInvalidState(status)` adapt to the keyword form; the daily callsite's `except DigestPublisherInvalidState as e:` block continues to work — it just gains the structured fields for richer logging.
 
 **Daily flow unaffected:** the daily callsite (`digest_daily_job` after `run_digest` returns `status='draft'`) still passes a `draft` row to `publish_digest`, which matches the first entry of the widened tuple. The guarded UPDATE `WHERE status IN ('draft','approved_for_publish')` is a strict superset of the Phase 7 `WHERE status='draft'`; daily-path behavior is byte-for-byte preserved. Regression covered by Phase 11 binding suite L7a/b + C6 + I5a/b/c.
 
@@ -1390,7 +1571,7 @@ All 9 ratification questions locked 2026-05-15.
 |---|---|---|---|---|
 | Q1 | Phase 8 scope | **WEEKLY DIGEST ONLY.** Reflection/observations re-scoped to Phase 9+. `PHASE8_PLAN_DRAFT.md` superseded; flagged for archival in T8-08 closure. | Reflection runs and `memory_events`/`memory_candidates` are an entirely separate axis (LLM passive observation about a member). Mixing them with weekly digest doubles surface area + delays the high-value editorial recap. ROADMAP row 8 says "weekly digest" explicitly. | (a) Ship both in one phase — rejected: scope creep, 2× FHR risk, no shared code. (b) Ship reflection first, weekly second — rejected: digest builds on Phase 7 closure (one cohesive arc), reflection needs more upstream design (Phase 9 prerequisite). |
 | Q2 | Section schema | **JSONB inline in `body_markdown` as Markdown `## Раздел: …` headers + bullets.** No `digest_sections` table. Renderer bolds the header as `<b>…</b>`. | KISS. No migration scope creep (one CHECK ALTER vs new table + FK + indexes + ORM). Sections are a presentation concern of the body text, not a separate data axis. Forget cascade is unchanged — sections are just text. | (a) Separate `digest_sections` table — rejected: doubles migration size, adds FK from `digest_sections.digest_id → digests.id` + cascade DELETE semantics + new ORM + ix_digest_sections_* indexes, all for a presentational concern. (b) JSONB column on `digests` with structured sections — rejected: makes citations-per-section impossible without a third query layer; current citations are already a flat JSONB list keyed by `position` which can index into the body. |
-| Q3 | Window | **ISO week Mon 00:00 MSK..next Mon 00:00 MSK (exclusive-end).** Cron fires Mon 09:00 MSK so the most-recently-completed ISO week is processed. | Closed-week — edits/forgets settle within the week. Mon 09:00 = same hour as daily, easy to remember. ISO weeks are standard; isoweekday() returns 1 for Mon. | (a) Calendar week (varying first-day-of-week per locale) — rejected: surprise risk with mixed conventions. (b) Sun→Sat — rejected: less common in EU/RU community context. (c) Rolling 7d ending Mon 00:00 — equivalent to ISO if fired Mon, but ambiguous if fired any other day; cron locks the day. |
+| Q3 | Window | **ISO week Mon 00:00 MSK..next Mon 00:00 MSK (exclusive-end).** Cron fires **Mon 09:15 MSK** (H8 15-min stagger past daily 09:00; see §5.G + AC1 in §13) so the most-recently-completed ISO week is processed without colliding with the daily cron. | Closed-week — edits/forgets settle within the week. Mon 09:15 = 15-min offset from daily, easy to remember, no LLM gateway pressure overlap. ISO weeks are standard; isoweekday() returns 1 for Mon. | (a) Calendar week (varying first-day-of-week per locale) — rejected: surprise risk with mixed conventions. (b) Sun→Sat — rejected: less common in EU/RU community context. (c) Rolling 7d ending Mon 00:00 — equivalent to ISO if fired Mon, but ambiguous if fired any other day; cron locks the day. (d) Mon 09:00 sharp (no stagger) — rejected per H8: would collide with daily cron on every Monday. |
 | Q4 | Approval flow | **Single-admin approval triggers publish.** No quorum, no two-admin gate in v1. | KISS for v1; the community is small enough that one admin's judgment is acceptable. Phase 8.5 backlog item: quorum if false-positive publishes occur. | (a) Two-admin quorum — rejected: blocks publish on admin availability gap (common in small admin team); v1 over-engineering. (b) Auto-publish after 48h with no admin action — rejected: violates ROADMAP "no auto-publish" gate. |
 | Q5 | Admin edit pre-approval | **NO edit in v1.** Admin uses `/digest_reject + /digest_now weekly --regenerate` to produce a fresh draft. | Preserves citation invariant (admin-edited text could lose ids → break C7). Implementation cost of pre-approval edit is high (rich-text editor, citation-aware validator, audit trail). | (a) Free-text edit before approval — rejected: defeats citation invariant; admin could insert prose without ids. (b) Comment/annotation on bullets but no body edit — rejected: still surfaces v1.5 complexity (comments storage, UI); doesn't improve quality enough to justify. |
 | Q6 | Stale-review reaper | **48h admin DM notify + 7d auto-reject** (`rejected_by_reaper` terminal, distinct from `rejected_by_admin`). Configurable via `DIGEST_REVIEW_DEADLINE_HOURS` (default 168) and `DIGEST_REVIEW_48H_NOTIFY_HOURS` (default 48). | Bounded queue size. 7d aligns with weekly cadence — by the time the next weekly fires, last week's review is cleared. Two-tier (notify→reject) reduces silent ignores. | (a) No reaper, drafts pile forever — rejected: queue bloat + admin guilt. (b) 24h notify + 7d reject — rejected: too aggressive; community admins sometimes need a day's slack. (c) Single 7d reject without notify — rejected: silent timeout, no escalation. |
@@ -1448,6 +1629,7 @@ Sprint grid for Phase 8. **L6 wave layout (revised) — Round 1 review correctly
 - Downgrade tests:
   - Insert a Phase-8 review-status row on `digests`, attempt downgrade → fails with the expected RAISE EXCEPTION mentioning `PHASE8_ROLLOUT.md`.
   - Insert a Phase-8 audit-status row on `digest_runs`, attempt downgrade → fails with the expected RAISE EXCEPTION for `digest_runs`.
+  - **R2 HIGH-Cdx-2:** insert a row with `status='posting'` (with both `type='daily'` and `type='weekly'` covered), attempt downgrade → fails with the expected RAISE EXCEPTION mentioning the `posting` in-transit block. After UPDATE'ing the row to a terminal state (e.g. `posted`), re-attempt downgrade → succeeds.
 
 **T8-02 acceptance:**
 - `run_digest(type='weekly', ...)` returns existing digest by `(type='weekly', ws, we)` without LLM call on re-run (idempotency).
@@ -1561,7 +1743,7 @@ A Phase 8 stream must STOP and surface immediately if any fire:
 - **Stale-review reaper triggered (7d pass).** Any rejection event indicates an admin gap. Admin-notify fires per rejected row. Operator MUST investigate: admin availability, alert routing, training on the review commands.
 - **Stale-approved reaper triggered (5 min pass).** Indicates a crash between `approve_digest` step 4 commit and step 5 publisher dispatch. Operator MUST inspect logs for the gap; fail-forward by manually re-running `/digest_now weekly --regenerate` (idempotency returns the now-`failed` row; regenerate replaces it).
 - Concurrent daily + weekly forget event handling (I6c) shows partial redaction (one row redacted, the other not) → STOP, race not isolated correctly. The per-row redaction loop in `_cascade_digests` (`forget_cascade.py:865-879`) must complete the loop or fail loudly.
-- **Daily 34/34 Phase 11 binding suite regresses** → STOP, the weekly extensions broke a daily invariant. Re-run T8-07 baseline before any other Wave 3 work.
+- **Phase 11 daily/baseline binding suite regresses** (the verified 30/30 from §0/§10 — earlier "34/34" framing was a math drift corrected in Round 1) → STOP, the weekly extensions broke a daily invariant. Re-run T8-07 baseline before any other Wave 3+ work.
 
 ---
 
@@ -1751,7 +1933,7 @@ Each PR:
 ## 15. Glossary (Phase 8-specific)
 
 - **Weekly digest:** a derived Markdown editorial recap for a completed ISO week, section-organized. Reviewed by admin before publish.
-- **ISO week:** Mon 00:00 MSK..next Mon 00:00 MSK (exclusive-end), stored as UTC. Cron fires Mon 09:00 MSK.
+- **ISO week:** Mon 00:00 MSK..next Mon 00:00 MSK (exclusive-end), stored as UTC. Cron fires **Mon 09:15 MSK** (H8 15-min stagger past daily 09:00; canonical schedule definition in §5.G).
 - **Review queue:** the set of `digests` rows with `type='weekly' AND status='awaiting_review'`. Listed via `/digest_review`.
 - **`awaiting_review`:** terminal state of the auto-pipeline; admin action required to advance.
 - **`approved_for_publish`:** transient state set by `/digest_approve` immediately before publisher dispatch.
