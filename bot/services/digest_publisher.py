@@ -309,10 +309,15 @@ async def publish_digest(
         )
         return digest
 
-    # Render + send.
+    # Render + send. Weekly digests need ``window_end_utc`` for the week-range
+    # footer and the ``## Раздел: …`` section-header bolding (Phase 8 §5.I /
+    # FHR HIGH-5). Daily passes only the start so the Phase 7 single-day
+    # footer is preserved byte-for-byte.
     body_html = render_digest_html(
         digest.body_markdown or "",
         window_start_utc=digest.window_start,
+        digest_type=digest.type,
+        window_end_utc=digest.window_end if digest.type == "weekly" else None,
     )
     try:
         sent = await bot.send_message(

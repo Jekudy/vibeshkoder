@@ -1005,3 +1005,207 @@ def test_validate_every_bullet_has_citation_passes_with_section_headers():
     _validate_every_bullet_has_citation(
         body, valid_citation_tokens={"[[mv:1]]", "[[mv:2]]"}
     )  # no raise
+
+
+# ── 8. FHR HIGH-1: provider exception under type='weekly' updates ledger ─────
+# ──    (NOT raises TypeError because `type` kwarg shadows builtin)            ─
+
+
+async def test_synthesize_digest_provider_exception_updates_ledger_weekly(
+    db_session,
+):
+    """FHR HIGH-1: ``synthesize_digest(type='weekly')`` whose provider raises
+    must update the placeholder ledger row with the provider error class name
+    and re-raise the provider exception — NOT ``TypeError: 'str' object is
+    not callable`` from ``type(exc).__name__`` where ``type`` is the kwarg.
+
+    The bug surfaced at lines ~1633 (kwarg ``type: Literal['daily','weekly']``
+    shadows the builtin) + ~1745 (``error=f"{type(exc).__name__}"`` in the
+    except branch). After fix, the exception path computes the class name
+    via ``exc.__class__.__name__`` (no shadowing concern).
+    """
+    from sqlalchemy import text as _text
+
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.digest_context import DigestContext, DigestContextMessage
+    from bot.services.llm_gateway import synthesize_digest
+
+    chat_id = _next_chat_id()
+    _cm_id, mv_id = await _make_msg_and_version(
+        db_session,
+        chat_id=chat_id,
+        ts=datetime.now(timezone.utc) - timedelta(days=3),
+    )
+    await db_session.flush()
+
+    now = datetime.now(timezone.utc)
+    ctx = DigestContext(
+        type="daily",  # T8-03 widens later; routing reads explicit kwarg
+        window_start=now - timedelta(days=7),
+        window_end=now,
+        source_chat_id=chat_id,
+        cards=[],
+        messages=[
+            DigestContextMessage(
+                message_version_id=mv_id,
+                chat_message_id=_cm_id,
+                author_display="Alice",
+                text="weekly recap",
+                ts=now - timedelta(days=3),
+            )
+        ],
+    )
+
+    class _ConnectionError(RuntimeError):
+        """Synthetic provider failure — name distinct enough that we can
+        verify the ledger error_text carries it (and NOT 'TypeError')."""
+
+    class _FailingProvider:
+        async def call(self, *, prompt: str, model: str):
+            raise _ConnectionError("upstream unreachable")
+
+    cfg = _make_gateway_config()
+
+    with pytest.raises(_ConnectionError):
+        await synthesize_digest(
+            db_session,
+            context=ctx,
+            config=cfg,
+            ledger_repo=LedgerRepo(),
+            provider=_FailingProvider(),
+            type="weekly",
+        )
+    await db_session.flush()
+
+    # The placeholder ledger row MUST have been updated. Pull the most recent
+    # row in this test session.
+    row = (
+        await db_session.execute(
+            _text(
+                "SELECT id, error FROM llm_usage_ledger "
+                "ORDER BY id DESC LIMIT 1"
+            )
+        )
+    ).mappings().one_or_none()
+    assert row is not None, "placeholder ledger row missing"
+    # Must NOT be 'TypeError' (that's the bug signature) and MUST be the
+    # provider exception class name.
+    assert row["error"] == "_ConnectionError", (
+        f"expected ledger.error='_ConnectionError', got {row['error']!r}"
+    )
+
+
+async def test_synthesize_digest_provider_exception_updates_ledger_daily(
+    db_session,
+):
+    """FHR HIGH-1 regression-guard: same fix must keep type='daily' (default)
+    path correct — Phase 7 byte-for-byte preserved."""
+    from sqlalchemy import text as _text
+
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.digest_context import DigestContext, DigestContextMessage
+    from bot.services.llm_gateway import synthesize_digest
+
+    chat_id = _next_chat_id()
+    _cm_id, mv_id = await _make_msg_and_version(
+        db_session,
+        chat_id=chat_id,
+        ts=datetime.now(timezone.utc) - timedelta(hours=6),
+    )
+    await db_session.flush()
+
+    now = datetime.now(timezone.utc)
+    ctx = DigestContext(
+        type="daily",
+        window_start=now - timedelta(days=1),
+        window_end=now,
+        source_chat_id=chat_id,
+        cards=[],
+        messages=[
+            DigestContextMessage(
+                message_version_id=mv_id,
+                chat_message_id=_cm_id,
+                author_display="Bob",
+                text="hi",
+                ts=now - timedelta(hours=6),
+            )
+        ],
+    )
+
+    class _DailyProviderError(RuntimeError):
+        pass
+
+    class _FailingProvider:
+        async def call(self, *, prompt: str, model: str):
+            raise _DailyProviderError("transient")
+
+    cfg = _make_gateway_config()
+
+    with pytest.raises(_DailyProviderError):
+        await synthesize_digest(
+            db_session,
+            context=ctx,
+            config=cfg,
+            ledger_repo=LedgerRepo(),
+            provider=_FailingProvider(),
+            type="daily",
+        )
+    await db_session.flush()
+
+    row = (
+        await db_session.execute(
+            _text(
+                "SELECT error FROM llm_usage_ledger ORDER BY id DESC LIMIT 1"
+            )
+        )
+    ).mappings().one_or_none()
+    assert row is not None
+    assert row["error"] == "_DailyProviderError"
+
+
+# ── 9. FHR HIGH-4: DigestConfig.to_context_config() forwards weekly fields ───
+
+
+def test_digest_config_to_context_config_forwards_weekly_fields():
+    """FHR HIGH-4: ``DigestConfig.to_context_config()`` must forward the
+    weekly-specific tunables (``weekly_min_cards_threshold``,
+    ``weekly_raw_message_top_n``, ``weekly_token_budget_input``) so operator
+    env-var overrides actually reach ``build_digest_context``.
+
+    Before the fix the helper only forwarded daily fields, so
+    ``_weekly_overrides`` in ``digest_context.py`` always read the dataclass
+    defaults — env overrides silently ignored.
+    """
+    cfg = _make_digest_config(
+        weekly_min_cards_threshold=11,
+        weekly_raw_message_top_n=77,
+        weekly_token_budget_input=32000,
+    )
+    ctx_cfg = cfg.to_context_config()
+    assert ctx_cfg.weekly_min_cards_threshold == 11
+    assert ctx_cfg.weekly_raw_message_top_n == 77
+    assert ctx_cfg.weekly_token_budget_input == 32000
+    # Daily fields still forwarded too.
+    assert ctx_cfg.min_cards_threshold == cfg.min_cards_threshold
+    assert ctx_cfg.raw_message_top_n == cfg.raw_message_top_n
+    assert ctx_cfg.token_budget_input == cfg.token_budget_input
+
+
+def test_load_digest_config_weekly_env_reaches_context_config(monkeypatch):
+    """End-to-end env-var → DigestConfig → DigestCtxConfig forwarding.
+
+    Sets DIGEST_WEEKLY_* env vars, loads config, asserts the to_context_config
+    bridge surfaces the same values. Verifies the operator-tuning path
+    (HIGH-4 root scenario) is no longer broken.
+    """
+    monkeypatch.setenv("DIGEST_WEEKLY_TOKEN_BUDGET", "32000")
+    monkeypatch.setenv("DIGEST_WEEKLY_MIN_CARDS_THRESHOLD", "15")
+    monkeypatch.setenv("DIGEST_WEEKLY_RAW_MESSAGE_TOP_N", "99")
+
+    from bot.services.digests import load_digest_config
+
+    cfg = load_digest_config()
+    ctx_cfg = cfg.to_context_config()
+    assert ctx_cfg.weekly_token_budget_input == 32000
+    assert ctx_cfg.weekly_min_cards_threshold == 15
+    assert ctx_cfg.weekly_raw_message_top_n == 99

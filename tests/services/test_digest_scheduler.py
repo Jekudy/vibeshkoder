@@ -5,11 +5,14 @@ Covers:
 - digest_daily_job: flag-ON runs run_digest (empty window → skipped)
 - digest_stale_posting_reaper_job: reaps row with old posting_started_at
 - digest_stale_posting_reaper_job: leaves fresh posting row alone
+- digest_stale_posting_reaper_job: ALSO reaps stale ``approved_for_publish``
+  rows (FHR HIGH-2 — PHASE8_PLAN.md §5.G stale-approved reaper extension)
 """
 
 from __future__ import annotations
 
 import itertools
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
@@ -328,3 +331,169 @@ async def test_digest_daily_job_registers_in_scheduler(monkeypatch):
                 scheduler_mod.scheduler.remove_job(jid)
             except Exception:
                 pass
+
+
+# ── FHR HIGH-2: stale ``approved_for_publish`` reaper gap ──────────────────
+
+
+def _fake_session_ctx(db_session):
+    """Patch ``async_session()`` to yield the test session."""
+
+    @asynccontextmanager
+    async def _ctx():
+        yield db_session
+
+    return _ctx
+
+
+async def test_reaper_reaps_stale_approved_for_publish(db_session, monkeypatch):
+    """FHR HIGH-2 / PHASE8_PLAN.md §5.G — the existing
+    ``digest_stale_posting_reaper_job`` MUST also catch rows stuck in
+    ``status='approved_for_publish'`` older than 5 minutes (publisher crash
+    window between approve commit and posting transition).
+
+    Without this, a weekly digest stays in ``approved_for_publish`` forever —
+    admin re-running ``/digest_approve <id>`` hits the pre-flight guard and
+    the only escape is manual DB intervention.
+    """
+    from bot.db.models import Digest
+
+    now = datetime.now(timezone.utc)
+    digest = Digest(
+        type="weekly",
+        window_start=now - timedelta(days=14),
+        window_end=now - timedelta(days=7),
+        body_markdown="weekly draft",
+        citations=[],
+        status="approved_for_publish",
+        approved_at=now - timedelta(minutes=6),
+        published_by_admin_id=149820031,
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    digest_id = digest.id
+
+    import bot.services.scheduler as scheduler_mod
+
+    monkeypatch.setattr(
+        scheduler_mod, "async_session", _fake_session_ctx(db_session)
+    )
+
+    await scheduler_mod.digest_stale_posting_reaper_job()
+
+    refreshed = await db_session.execute(
+        text(
+            "SELECT status, error_text FROM digests WHERE id = :id"
+        ),
+        {"id": digest_id},
+    )
+    row = refreshed.mappings().one()
+    assert row["status"] == "failed", (
+        f"stale approved_for_publish must be reaped to failed; "
+        f"got {row['status']!r}"
+    )
+    assert row["error_text"] == "stale_approved_reaper", (
+        f"expected error_text='stale_approved_reaper'; "
+        f"got {row['error_text']!r}"
+    )
+
+    # digest_runs audit row must be inserted with matching error_text.
+    audit = (
+        await db_session.execute(
+            text(
+                "SELECT status, error_text FROM digest_runs "
+                "WHERE digest_id = :id "
+                "ORDER BY id DESC LIMIT 1"
+            ),
+            {"id": digest_id},
+        )
+    ).mappings().one_or_none()
+    assert audit is not None
+    assert audit["status"] == "failed"
+    assert audit["error_text"] == "stale_approved_reaper"
+
+
+async def test_reaper_skips_fresh_approved_for_publish(db_session, monkeypatch):
+    """FHR HIGH-2: a recently approved row (< 5 min) MUST stay untouched.
+
+    Mirror of the existing posting-row freshness test — the 5-min threshold
+    for ``approved_for_publish`` is wider than posting's 2-min because the
+    approve-then-publish handoff normally completes in <30s; 5 min handles
+    network hiccups + Telegram retries.
+    """
+    from bot.db.models import Digest
+
+    now = datetime.now(timezone.utc)
+    digest = Digest(
+        type="weekly",
+        window_start=now - timedelta(days=14),
+        window_end=now - timedelta(days=7),
+        body_markdown="weekly draft",
+        citations=[],
+        status="approved_for_publish",
+        approved_at=now - timedelta(minutes=1),
+        published_by_admin_id=149820031,
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    digest_id = digest.id
+
+    import bot.services.scheduler as scheduler_mod
+
+    monkeypatch.setattr(
+        scheduler_mod, "async_session", _fake_session_ctx(db_session)
+    )
+
+    await scheduler_mod.digest_stale_posting_reaper_job()
+
+    refreshed = await db_session.execute(
+        text("SELECT status FROM digests WHERE id = :id"),
+        {"id": digest_id},
+    )
+    row = refreshed.mappings().one()
+    assert row["status"] == "approved_for_publish", (
+        "fresh approved_for_publish row must NOT be reaped"
+    )
+
+
+async def test_reaper_still_reaps_stale_posting_after_widening(
+    db_session, monkeypatch
+):
+    """Regression guard: extending the reaper to handle
+    ``approved_for_publish`` MUST NOT break the existing posting-row reaping
+    (Phase 7 §5.K baseline preserved byte-for-byte)."""
+    from bot.db.models import Digest
+
+    now = datetime.now(timezone.utc)
+    digest = Digest(
+        type="daily",
+        window_start=now - timedelta(days=1),
+        window_end=now,
+        body_markdown="draft body",
+        citations=[],
+        status="posting",
+        posting_started_at=now - timedelta(minutes=3),
+    )
+    db_session.add(digest)
+    await db_session.flush()
+    digest_id = digest.id
+
+    import bot.services.scheduler as scheduler_mod
+
+    monkeypatch.setattr(
+        scheduler_mod, "async_session", _fake_session_ctx(db_session)
+    )
+
+    await scheduler_mod.digest_stale_posting_reaper_job()
+
+    refreshed = await db_session.execute(
+        text(
+            "SELECT status, error_text, posting_started_at "
+            "FROM digests WHERE id = :id"
+        ),
+        {"id": digest_id},
+    )
+    row = refreshed.mappings().one()
+    assert row["status"] == "failed"
+    assert row["error_text"] == "stale_posting_reaper"
+    assert row["posting_started_at"] is None
