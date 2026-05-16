@@ -1,4 +1,4 @@
-"""HTML rendering for daily digests — T7-05.
+"""HTML rendering for daily + weekly digests — T7-05 baseline + T8-06 §5.I.
 
 Converts the LLM-produced Markdown body (with `[[cs:UUID]]` / `[[mv:INT]]`
 citation tokens) into Telegram HTML for the publisher. Citation tokens are
@@ -14,12 +14,27 @@ Key invariants (per PHASE7_PLAN.md §5.G):
 - Tag-balance assertion: if `<b>` / `<i>` open/close counts diverge after
   conversion, strip ALL formatting and fall back to plain-escaped text
   (better dumb-but-valid than malformed-and-silently-dropped).
+
+Phase 8 / §5.I extension (T8-06 sub-component, FHR HIGH-5):
+- New ``digest_type: Literal['daily','weekly']`` kwarg. Default ``'daily'``
+  preserves Phase 7 byte-for-byte.
+- ``digest_type='weekly'``:
+  - Recognizes ``## Раздел: <name>`` Markdown headers and bolds them as
+    ``<b>Раздел: <name></b>`` (per the weekly prompt module's
+    ``SECTION_NAME_ALLOWLIST`` contract).
+  - Switches the footer to "Еженедельный дайджест за {ws} – {we}." using
+    the inclusive week range (we - 1 second).
+- ``digest_type='daily'`` keeps the Phase 7 single-day footer and does NOT
+  apply the section-header bolding (daily prompt template does not emit
+  section headers; the regression-guard test in
+  ``test_digest_renderer_weekly.py`` documents this).
 """
 
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from bot.html_escape import html_escape
@@ -29,6 +44,13 @@ _MAX_BODY_CHARS_BEFORE_HTML = 3800  # leaves 296 chars for HTML overhead + foote
 _TELEGRAM_HARD_LIMIT = 4096
 _BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
 _ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
+# Phase 8 §5.I — weekly section header pattern. Applied AFTER html_escape so
+# the input is the literal escaped text "## Раздел: <name>"; we wrap the
+# title in <b>…</b>. Single-line guarantee: regex ends at $ (MULTILINE) so
+# no multi-line <b> spans are introduced; tag-balance assertion still passes.
+_WEEKLY_SECTION_HEADER_RE = re.compile(
+    r"^##\s+Раздел:\s+(.+)$", flags=re.MULTILINE
+)
 
 
 def _strip_citation_tokens(body: str) -> str:
@@ -92,6 +114,8 @@ def render_digest_html(
     *,
     window_start_utc: datetime,
     timezone_name: str = "Europe/Moscow",
+    digest_type: Literal["daily", "weekly"] = "daily",
+    window_end_utc: datetime | None = None,
 ) -> str:
     """Render a digest body for Telegram HTML output.
 
@@ -100,25 +124,75 @@ def render_digest_html(
     2. Truncate plain Markdown.
     3. html_escape (covers LLM-emitted `<`, `>`, `&`).
     4. Convert minimal MD to HTML.
-    5. Append footer with date + admin breadcrumb.
+    4b. (weekly only) Bold ``## Раздел: <name>`` section headers — Phase 8
+       §5.I. The substitution runs AFTER ``html_escape`` so the input pattern
+       matches the escaped text; the wrapped ``<b>…</b>`` is on a single line
+       (regex anchored to ``$`` with MULTILINE) so the tag-balance assertion
+       in step 6 still passes.
+    5. Append footer with date(s) + admin breadcrumb.
+       - daily  → "Дайджест за DD.MM.YYYY."
+       - weekly → "Еженедельный дайджест за DD.MM.YYYY – DD.MM.YYYY."
+         using the inclusive week range (``window_end_utc - 1s``).
     6. Tag-balance assertion; strip formatting on imbalance.
     7. Hard-cap to Telegram limit.
 
-    The output is a single string ready for `bot.send_message(parse_mode='HTML')`.
+    The output is a single string ready for ``bot.send_message(parse_mode='HTML')``.
+
+    Args:
+        body_markdown: LLM-produced body (with citation tokens stripped here).
+        window_start_utc: inclusive lower bound of the digest window (UTC).
+        timezone_name: target timezone for footer formatting (default MSK).
+        digest_type: ``'daily'`` (Phase 7 baseline) or ``'weekly'`` (Phase 8
+            §5.I extension). Default ``'daily'`` keeps the call signature
+            backward-compatible.
+        window_end_utc: required when ``digest_type='weekly'`` — the
+            exclusive upper bound of the week. The inclusive label is
+            ``window_end_utc - 1 second`` so the range reads as
+            Mon..Sun rather than Mon..Mon. Optional for daily; ignored.
     """
     stripped = _strip_citation_tokens(body_markdown).strip()
     truncated = _truncate_plain_markdown(stripped, max_chars=_MAX_BODY_CHARS_BEFORE_HTML)
     escaped = html_escape(truncated)
     converted = _convert_minimal_markdown(escaped)
 
+    # §5.I step 4b — weekly section header bolding. Daily path is byte-for-
+    # byte unchanged (no substitution applied).
+    if digest_type == "weekly":
+        converted = _WEEKLY_SECTION_HEADER_RE.sub(
+            r"<b>Раздел: \1</b>", converted
+        )
+
     # Footer in target timezone.
     tz = ZoneInfo(timezone_name)
     window_local = window_start_utc.astimezone(tz)
-    footer = (
-        "\n\n<i>Дайджест за "
-        f"{window_local.strftime('%d.%m.%Y')}. "
-        "Полный список источников: /digest_history</i>"
-    )
+    if digest_type == "weekly":
+        if window_end_utc is None:
+            # Defensive: weekly mode requires the end window. Fall back to
+            # the daily footer so we never raise from the publisher path;
+            # log via the renderer call-site if this ever fires.
+            footer = (
+                "\n\n<i>Дайджест за "
+                f"{window_local.strftime('%d.%m.%Y')}. "
+                "Полный список источников: /digest_history</i>"
+            )
+        else:
+            # Inclusive end label: subtract 1s so Mon..Mon-exclusive reads as
+            # Mon..Sun.
+            end_inclusive_local = (
+                window_end_utc - timedelta(seconds=1)
+            ).astimezone(tz)
+            footer = (
+                "\n\n<i>Еженедельный дайджест за "
+                f"{window_local.strftime('%d.%m.%Y')} – "
+                f"{end_inclusive_local.strftime('%d.%m.%Y')}. "
+                "Полный список источников: /digest_history</i>"
+            )
+    else:
+        footer = (
+            "\n\n<i>Дайджест за "
+            f"{window_local.strftime('%d.%m.%Y')}. "
+            "Полный список источников: /digest_history</i>"
+        )
 
     body_with_footer = converted + footer
 

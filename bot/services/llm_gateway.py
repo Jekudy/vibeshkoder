@@ -1733,6 +1733,11 @@ async def synthesize_digest(
         provider_result = await provider.call(prompt=full_prompt, model=config.model)
     except Exception as exc:
         latency = int((time.monotonic() - started) * 1000)
+        # FHR HIGH-1 fix: ``type`` is a kwarg in this function ('daily'|'weekly')
+        # — it shadows the builtin, so ``type(exc).__name__`` raises
+        # ``TypeError: 'str' object is not callable`` and masks the real provider
+        # error AND skips the ledger placeholder update. Use ``exc.__class__``
+        # to avoid the shadow (same pattern as ``run_digest`` in ``digests.py``).
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
@@ -1742,7 +1747,7 @@ async def synthesize_digest(
             tokens_out=0,
             request_id=None,
             latency_ms=latency,
-            error=f"{type(exc).__name__}",
+            error=f"{exc.__class__.__name__}",
         )
         raise
 

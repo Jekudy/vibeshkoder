@@ -253,6 +253,219 @@ async def test_digest_now_weekly_regenerate_after_rejected_by_admin(
     assert str(old_id) not in body or body.count(str(new.id)) >= 1
 
 
+async def test_digest_now_weekly_regenerate_race_state_changed_post_lock(
+    db_session, monkeypatch
+):
+    """FHR HIGH-3: in the regenerate path, the lock MUST be acquired BEFORE
+    reading the existing row's status. If the row's status changes between
+    the (broken) pre-check SELECT and the lock — e.g. another admin queues
+    a regenerate, drains the row, and a new awaiting_review row lands —
+    the second caller's stale view would proceed to audit-insert + DELETE
+    on a row that no longer matches ``rejected_*``.
+
+    After the fix, the lock is held BEFORE the state read. We simulate the
+    "concurrent admin won the race" outcome by monkeypatching
+    ``_acquire_idempotency_lock`` to flip the row's status inside the lock
+    body (representing the prior holder's effect committed before this
+    waiter got its lock). The handler MUST then refuse to DELETE / audit /
+    rerun and surface the new status to the admin.
+    """
+    from bot.config import settings
+    from bot.handlers.digest import cmd_digest_now
+
+    admin_id = list(settings.ADMIN_IDS)[0] if settings.ADMIN_IDS else 1
+
+    rejected = await _make_weekly_digest(
+        db_session,
+        status="rejected_by_admin",
+        published_by_admin_id=admin_id,
+        review_notes="off-topic",
+    )
+    rejected_id = rejected.id
+
+    # Patch the lock to flip status mid-call — simulates "the other
+    # regenerate transaction committed between my pre-check and my lock
+    # acquire". The handler must NOT proceed to DELETE / audit / rerun
+    # on this stale view.
+    import bot.handlers.digest as digest_mod
+
+    real_lock = digest_mod._acquire_idempotency_lock
+    flipped = {"done": False}
+
+    async def _flipping_lock(session, *, type, window_start, window_end):
+        await real_lock(
+            session, type=type, window_start=window_start, window_end=window_end
+        )
+        if not flipped["done"]:
+            # Simulate: the prior regenerate holder finished — the rejected
+            # row is gone and a new awaiting_review row exists.
+            await session.execute(
+                text(
+                    "UPDATE digests SET status='awaiting_review', "
+                    "awaiting_review_at=now() WHERE id=:id"
+                ),
+                {"id": rejected_id},
+            )
+            await session.flush()
+            flipped["done"] = True
+
+    monkeypatch.setattr(
+        "bot.handlers.digest._acquire_idempotency_lock", _flipping_lock
+    )
+
+    run_called = []
+
+    async def _fake_run_digest(*args, **kwargs):  # pragma: no cover
+        run_called.append(True)
+        raise AssertionError(
+            "run_digest must NOT be called when state changed under lock"
+        )
+
+    monkeypatch.setattr("bot.handlers.digest.run_digest", _fake_run_digest)
+
+    bot_mock = MagicMock()
+    msg = _mk_msg(user_id=admin_id)
+    await cmd_digest_now(
+        msg,
+        bot=bot_mock,
+        session=db_session,
+        command=_mk_command_obj("weekly --regenerate"),
+    )
+
+    # run_digest must NOT have been invoked — the under-lock re-read should
+    # have caught the state change and aborted before delete/rerun.
+    assert run_called == [], (
+        "run_digest must NOT run when the under-lock re-read sees a "
+        "non-rejected status (state changed between pre-check and lock)"
+    )
+
+    # Row must NOT have been deleted (it's now awaiting_review — outside
+    # the regenerate scope).
+    row = (
+        await db_session.execute(
+            text("SELECT status FROM digests WHERE id=:id"),
+            {"id": rejected_id},
+        )
+    ).mappings().one_or_none()
+    assert row is not None, (
+        "the (now-awaiting-review) row must NOT have been deleted by a "
+        "stale regenerate path"
+    )
+    assert row["status"] == "awaiting_review"
+
+    # No regenerated_by_admin audit row inserted — the race-loser must not
+    # leave a trail referencing a state that no longer applies.
+    audit_count = (
+        await db_session.execute(
+            text(
+                "SELECT COUNT(*) FROM digest_runs "
+                "WHERE digest_id=:id AND status='regenerated_by_admin'"
+            ),
+            {"id": rejected_id},
+        )
+    ).scalar_one()
+    assert audit_count == 0, (
+        "race-loser must NOT audit-insert when state already changed"
+    )
+
+    # User-facing reply must surface that the state changed (or that
+    # regenerate is no longer applicable).
+    msg.answer.assert_awaited_once()
+    args, kwargs = msg.answer.call_args
+    body = args[0] if args else kwargs.get("text", "")
+    # Reply text mentions current status or the regenerate-blocked hint.
+    assert ("awaiting_review" in body) or (
+        "regenerate" in body.lower() or "--regenerate" in body
+    ) or ("rejected" not in body.lower()), (
+        f"reply must reflect state change; got: {body!r}"
+    )
+
+
+async def test_digest_now_weekly_regenerate_row_deleted_under_lock(
+    db_session, monkeypatch
+):
+    """FHR HIGH-3 corollary: if the row is DELETED between the (pre-fix)
+    SELECT and the lock acquire — i.e. another regenerate concurrently
+    drained it — the post-fix path MUST treat it as "no existing row"
+    and reply with the hint to run without --regenerate, NOT crash on the
+    audit insert (which FKs digest_id to digests.id)."""
+    from bot.config import settings
+    from bot.handlers.digest import cmd_digest_now
+
+    admin_id = list(settings.ADMIN_IDS)[0] if settings.ADMIN_IDS else 1
+
+    rejected = await _make_weekly_digest(
+        db_session,
+        status="rejected_by_admin",
+        published_by_admin_id=admin_id,
+        review_notes="off-topic",
+    )
+    rejected_id = rejected.id
+
+    import bot.handlers.digest as digest_mod
+
+    real_lock = digest_mod._acquire_idempotency_lock
+    deleted = {"done": False}
+
+    async def _deleting_lock(session, *, type, window_start, window_end):
+        await real_lock(
+            session, type=type, window_start=window_start, window_end=window_end
+        )
+        if not deleted["done"]:
+            # Simulate: prior regenerate holder DELETEd before our lock.
+            await session.execute(
+                text("DELETE FROM digests WHERE id=:id"),
+                {"id": rejected_id},
+            )
+            await session.flush()
+            deleted["done"] = True
+
+    monkeypatch.setattr(
+        "bot.handlers.digest._acquire_idempotency_lock", _deleting_lock
+    )
+
+    run_called = []
+
+    async def _fake_run_digest(*args, **kwargs):  # pragma: no cover
+        run_called.append(True)
+        raise AssertionError(
+            "run_digest must NOT be called when row deleted under lock"
+        )
+
+    monkeypatch.setattr("bot.handlers.digest.run_digest", _fake_run_digest)
+
+    bot_mock = MagicMock()
+    msg = _mk_msg(user_id=admin_id)
+    await cmd_digest_now(
+        msg,
+        bot=bot_mock,
+        session=db_session,
+        command=_mk_command_obj("weekly --regenerate"),
+    )
+
+    assert run_called == []
+
+    # No audit row inserted (would FK-fail anyway since the parent row is gone
+    # — but ON DELETE SET NULL would silently leave a dangling audit which
+    # is worse than the explicit refusal).
+    audit_count = (
+        await db_session.execute(
+            text(
+                "SELECT COUNT(*) FROM digest_runs "
+                "WHERE status='regenerated_by_admin' "
+                "  AND error_text LIKE :pat"
+            ),
+            {"pat": f"%admin {admin_id}%"},
+        )
+    ).scalar_one()
+    assert audit_count == 0, (
+        "race-loser must NOT audit-insert when row was deleted under lock"
+    )
+
+    # Reply surfaces the absent state hint.
+    msg.answer.assert_awaited_once()
+
+
 async def test_digest_now_weekly_regenerate_rejects_non_rejected_status(
     db_session, monkeypatch
 ):

@@ -377,14 +377,29 @@ async def digest_stale_posting_reaper_job() -> None:
     """Reap orphan ``digests.status='posting'`` rows from publisher crashes.
 
     Runs every 5 minutes (NOT gated by feature flag — even after a flag
-    flip-OFF, any in-flight ``posting`` rows must still be cleaned up).
-    Threshold: 2 minutes since ``posting_started_at``.
+    flip-OFF, any in-flight ``posting`` / ``approved_for_publish`` rows
+    must still be cleaned up).
 
-    Per PHASE7_PLAN.md §5.K — Phase 7 publisher (T7-05) holds the row lock
-    across ``bot.send_message`` in a single transaction. A publisher crash
-    while that transaction is open leaves an orphan ``posting`` row that
-    blocks future cascade redactions and publisher attempts. This reaper
-    transitions the row to ``failed`` so eventual consistency is restored.
+    Two reaping branches in a single UPDATE (PHASE8_PLAN.md §5.G stale-approved
+    reaper extension — kept in this single job rather than a new scheduler
+    entry):
+
+    1. ``status='posting'`` rows older than ``posting_started_at`` + 2 min
+       (Phase 7 §5.K baseline — publisher crash window between row-lock
+       acquisition and ``bot.send_message`` completion).
+    2. ``status='approved_for_publish'`` rows older than ``approved_at`` +
+       5 min (FHR HIGH-2 / Phase 8 §5.G — orchestrator crash window between
+       ``approve_digest`` commit and ``publish_digest`` dispatch). Without
+       this branch, the weekly digest is stuck forever and admin
+       ``/digest_approve <id>`` retries are blocked by the pre-flight guard.
+
+    The 5-min approved threshold is wider than posting's 2-min because the
+    approve-then-publish sequence normally completes in <30s; 5 min handles
+    network hiccups + Telegram retries.
+
+    Per row, ``error_text`` is set to ``stale_posting_reaper`` or
+    ``stale_approved_reaper`` depending on the source status (the RETURNING
+    branch reads it back).
     """
     try:
         from sqlalchemy import text as _text
@@ -394,12 +409,20 @@ async def digest_stale_posting_reaper_job() -> None:
                 _text("""
                     UPDATE digests
                     SET status='failed',
-                        error_text='stale_posting_reaper',
+                        error_text=CASE
+                          WHEN status='posting' THEN 'stale_posting_reaper'
+                          WHEN status='approved_for_publish'
+                              THEN 'stale_approved_reaper'
+                        END,
                         posting_started_at=NULL,
                         updated_at=now()
-                    WHERE status='posting'
-                      AND posting_started_at < now() - interval '2 minutes'
-                    RETURNING id
+                    WHERE
+                        (status='posting'
+                         AND posting_started_at < now() - interval '2 minutes')
+                        OR
+                        (status='approved_for_publish'
+                         AND approved_at < now() - interval '5 minutes')
+                    RETURNING id, error_text
                 """)
             )
             rows = result.fetchall()
@@ -407,16 +430,21 @@ async def digest_stale_posting_reaper_job() -> None:
                 await session.commit()
                 return
             for row in rows:
+                # ``error_text`` was set by the CASE expression in the UPDATE;
+                # use the same value for the audit row so the trail matches.
                 await session.execute(
                     _text(
                         "INSERT INTO digest_runs "
                         "(digest_id, status, error_text, started_at, finished_at) "
-                        "VALUES (:id, 'failed', 'stale_posting_reaper', now(), now())"
+                        "VALUES (:id, 'failed', :err, now(), now())"
                     ),
-                    {"id": row.id},
+                    {"id": row.id, "err": row.error_text},
                 )
                 logger.warning(
-                    "digest_stale_posting_reaper: reaped digest_id=%s", row.id
+                    "digest_stale_posting_reaper: reaped digest_id=%s "
+                    "error_text=%s",
+                    row.id,
+                    row.error_text,
                 )
             await session.commit()
     except Exception:

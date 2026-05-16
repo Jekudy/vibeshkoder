@@ -322,42 +322,61 @@ async def _handle_weekly_digest_now(
 
     if regenerate:
         # H3 — single-transaction lock+audit+delete+rerun.
-        # Pre-check: must find an existing row in rejected_* status.
-        existing_id_status = (
-            await session.execute(
-                text(
-                    "SELECT id, status FROM digests "
-                    "WHERE type='weekly' AND window_start=:ws AND window_end=:we "
-                    "ORDER BY id DESC LIMIT 1"
-                ),
-                {"ws": window_start, "we": window_end},
-            )
-        ).mappings().one_or_none()
-        if existing_id_status is None:
-            await message.answer(
-                "Нет существующего weekly-дайджеста для этого окна — "
-                "не нужен <code>--regenerate</code>; запустите без флага.",
-                parse_mode="HTML",
-            )
-            return
-        if existing_id_status["status"] not in ("rejected_by_admin", "rejected_by_reaper"):
-            await message.answer(
-                f"⚠️ <code>--regenerate</code> доступен только для "
-                "<code>rejected_by_admin</code> / <code>rejected_by_reaper</code>. "
-                f"Текущий статус digest #<code>{existing_id_status['id']}</code>: "
-                f"<code>{html_escape(existing_id_status['status'])}</code>.",
-                parse_mode="HTML",
-            )
-            return
-
-        old_id = int(existing_id_status["id"])
-        old_status = existing_id_status["status"]
-
-        # H3 single-transaction: lock → audit → DELETE → run_digest.
+        #
+        # FHR HIGH-3: the lock MUST be acquired BEFORE reading the row state.
+        # Without the lock-first ordering, two parallel ``--regenerate`` calls
+        # can both pass the pre-check (both see the row in ``rejected_*``)
+        # then race on the lock; the second caller would audit-insert + DELETE
+        # on a row that no longer matches the expected status, OR FK-violate
+        # if the prior caller already DELETEd it.
+        #
+        # Post-fix flow:
+        #   1. Acquire ``_acquire_idempotency_lock`` — blocks until exclusive.
+        #   2. Re-read the row UNDER lock — state is now authoritative.
+        #   3. If status NOT in ``rejected_*`` (or row missing): refuse and
+        #      surface to the admin. No audit / no DELETE / no rerun.
+        #   4. Insert audit + DELETE + ``run_digest`` (advisory lock is
+        #      re-entrant within the same session, so ``run_digest``'s own
+        #      call to ``_acquire_idempotency_lock`` is a no-op).
         try:
             await _acquire_idempotency_lock(
                 session, type="weekly", window_start=window_start, window_end=window_end
             )
+            # Re-read state UNDER lock — this is the authoritative view.
+            existing_id_status = (
+                await session.execute(
+                    text(
+                        "SELECT id, status FROM digests "
+                        "WHERE type='weekly' AND window_start=:ws AND window_end=:we "
+                        "ORDER BY id DESC LIMIT 1"
+                    ),
+                    {"ws": window_start, "we": window_end},
+                )
+            ).mappings().one_or_none()
+            if existing_id_status is None:
+                await message.answer(
+                    "Нет существующего weekly-дайджеста для этого окна — "
+                    "не нужен <code>--regenerate</code>; запустите без флага.",
+                    parse_mode="HTML",
+                )
+                return
+            if existing_id_status["status"] not in (
+                "rejected_by_admin",
+                "rejected_by_reaper",
+            ):
+                await message.answer(
+                    f"⚠️ <code>--regenerate</code> доступен только для "
+                    "<code>rejected_by_admin</code> / "
+                    "<code>rejected_by_reaper</code>. "
+                    f"Текущий статус digest "
+                    f"#<code>{existing_id_status['id']}</code>: "
+                    f"<code>{html_escape(existing_id_status['status'])}</code>.",
+                    parse_mode="HTML",
+                )
+                return
+
+            old_id = int(existing_id_status["id"])
+            old_status = existing_id_status["status"]
             now = datetime.now(timezone.utc)
             await session.execute(
                 text(
