@@ -180,6 +180,36 @@ confirm the work isn't already on main.
 Critical #4 allowlist PR #247, High #1-#4 already on main), #219 seed_v1 quality
 (PR #253), #255 Phase 4 message-branch tombstone (PR #257).
 
+**Phase 9 (wiki / community catalog) + Phase 10 (graph projection / Neo4j) —
+AUTHORIZED 2026-05-17.** Canonical plans `docs/memory-system/PHASE9_PLAN.md`
+(8 sprints T9-01..T9-08, migrations 050-054, member-internal wiki via web
+roles split into WEB_ADMIN_PASSWORD + WEB_MEMBER_PASSWORD — closes
+self-typed-user_id privilege escalation hole — admin publication gate
+via `/wiki_publish` with FOR UPDATE prior_pe capture + advisory
+mvid locks, server-side renderer with bleach allowlist + batched
+citation revalidation, forget cascade integration inserting
+`wiki_pages` + `wiki_revisions` layers between `digests` and
+`card_sources`, page lifecycle draft→reviewed→stale→archived,
+`[CONTENT_REDACTED: forget_event_id={n}]` mask format for forgotten
+revision body_markdown, ~18-21 new Phase 11 binding tests
+L9a-e/C8a-b/I7a-f/R6.a-g/G1) + `docs/memory-system/PHASE10_PLAN.md`
+(9 sprints T10-01..T10-09, migrations 060-064 inc. ledger call_type,
+Neo4j 5.x Community Edition in docker-compose `--profile graph` dev-only
+initially, **async graph_purge_worker + pending-purge read-block per
+RFC-001:415 conditional approval — replaces earlier synchronous-purge
+proposal that violated RFC condition**, replay-only `full_rebuild` from
+stored Postgres triples — no LLM re-extraction, ontology split with
+`knowledge_cards` → CONCEPT nodes + LLM triples vs `message_versions` →
+provenance/event nodes only, 3 separate feature flags
+`memory.graph.projection.enabled` / `memory.graph.query.enabled` /
+`memory.graph.write_pending.paused` all default OFF, graph-only cost
+ceiling `GRAPH_PROJECTION_DAILY_USD_CEILING` $2/day + per-run $0.50
+abort, ~15-16 new Phase 11 binding tests L10a-c/C9/I8a-e/R7.a-d/G2).
+Both ratified after dual-model spec review (Claude product +
+Codex technical) with revision passes addressing 2 BLOCKER + 7-9 HIGH +
+4 MEDIUM audit findings per phase. Phase 11 binding suite expected to
+grow from 42 → 75+ at closure of both phases.
+
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
 
