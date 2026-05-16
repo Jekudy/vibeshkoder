@@ -20,6 +20,8 @@ dependencies = [
     "itsdangerous>=2.0",
     "httpx>=0.28",
     "python-multipart>=0.0.9",
+    "neo4j>=5.0,<6",
+    "networkx>=3.0,<4",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +37,7 @@ dev = [
     # PyYAML — dev-only — used by tests/evals/* to parse seed_meta.yaml baseline thresholds.
     "PyYAML>=6.0",
     "types-PyYAML>=6.0",
+    "testcontainers[neo4j]>=4.0",
 ]
 ops = [
     "telethon>=1.39",
@@ -55,6 +58,9 @@ include = ["bot*", "web*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+markers = [
+    "graph_unit: unit tests for graph adapter using NetworkXAdapter (no real Neo4j required)",
+]
 
 [tool.ruff]
 line-length = 100
