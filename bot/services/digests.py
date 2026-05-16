@@ -82,10 +82,19 @@ class DigestConfig:
     weekly_token_budget_input: int = 24000
 
     def to_context_config(self) -> _DigestCtxConfig:
+        # FHR HIGH-4 fix: forward weekly tunables so operator env-var overrides
+        # (``DIGEST_WEEKLY_TOKEN_BUDGET`` / ``DIGEST_WEEKLY_MIN_CARDS_THRESHOLD``
+        # / ``DIGEST_WEEKLY_RAW_MESSAGE_TOP_N``) actually reach
+        # ``_weekly_overrides`` in ``digest_context.py``. Before the fix only
+        # daily fields were forwarded, so weekly overrides were silently
+        # ignored and the dataclass defaults always won.
         return _DigestCtxConfig(
             min_cards_threshold=self.min_cards_threshold,
             raw_message_top_n=self.raw_message_top_n,
             token_budget_input=self.token_budget_input,
+            weekly_min_cards_threshold=self.weekly_min_cards_threshold,
+            weekly_raw_message_top_n=self.weekly_raw_message_top_n,
+            weekly_token_budget_input=self.weekly_token_budget_input,
         )
 
 
