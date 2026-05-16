@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     # Note: postgres is required regardless of DEV_MODE (T0-02). See docs/memory-system/DEV_SETUP.md.
     HEALTHZ_PORT: int = 3000  # aiohttp /healthz server port (issue #168). Matches EXPOSE 3000 in Dockerfile.bot.
 
+    # ── Neo4j (Phase 10 graph projection) ────────────────────────────────────
+    # Production MUST set NEO4J_AUTH_PASSWORD to a 32+ char rotated value.
+    # Production MUST use bolt+s:// (TLS). Dev default is plaintext bolt://.
+    NEO4J_BOLT_URI: str = "bolt://neo4j:7687"
+    NEO4J_AUTH_USER: str = "neo4j"
+    NEO4J_AUTH_PASSWORD: str = "test_password_min_32_chars_for_neo4j_5"  # dev default
+    NEO4J_DATABASE: str = "neo4j"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     @model_validator(mode="after")

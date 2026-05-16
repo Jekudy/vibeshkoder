@@ -29,5 +29,25 @@ services:
       timeout: 3s
       retries: 5
 
+  neo4j-dev:
+    image: neo4j:5-community
+    container_name: shkoder-neo4j-dev
+    ports:
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7474:7474"
+    volumes:
+      - shkoder-neo4j-dev:/data
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-test_password_min_32_chars_for_neo4j_5}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p $${NEO4J_PASSWORD:-test_password_min_32_chars_for_neo4j_5} 'RETURN 1' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
 volumes:
   shkoder-postgres-dev:
+  shkoder-neo4j-dev:

@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from bot.services.graph_adapter import NetworkXAdapter
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -108,6 +110,12 @@ async def postgres_engine():
         yield engine
     finally:
         await engine.dispose()
+
+
+@pytest.fixture()
+def graph_adapter_fake() -> NetworkXAdapter:
+    """Return a fresh NetworkXAdapter for unit tests (no real Neo4j required)."""
+    return NetworkXAdapter()
 
 
 @pytest_asyncio.fixture()
