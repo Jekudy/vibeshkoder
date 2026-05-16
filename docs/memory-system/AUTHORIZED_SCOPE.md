@@ -122,18 +122,143 @@ Authorized scope:
 
 ---
 
-## Conditionally authorized: Phase 9, Phase 10 (gated)
+## Authorized: Phase 9 — Wiki / Community Catalog (2026-05-17)
 
-Phase 9 (wiki) and Phase 10 (graph projection) are NOT yet authorized for runtime
-implementation. Orchestrator B may:
-- Refine `PHASE9_PLAN_DRAFT.md` and `PHASE10_PLAN_DRAFT.md` into `_PLAN.md` artifacts.
-- Sketch schema designs (no migrations until ratified).
-- Build read-only experiments in `.worktrees/orch-B-experiments/` (NOT pushed to main).
+Phase 9 authorized for implementation following Phase 8 closure 2026-05-15.
+Owned by Orchestrator B per `ORCHESTRATOR_REGISTRY.md §2`. Canonical plan:
+`docs/memory-system/PHASE9_PLAN.md` (ratified 2026-05-17 after dual-model spec
+review — Claude product + Codex technical — with 2 BLOCKER + 7 HIGH audit
+findings addressed in revision passes).
 
-Promotion to "authorized for implementation" requires:
-- Orchestrator A confirms Phase 6 (cards) closed (Phase 9 + 10 both depend on stable
-  cards / relations).
-- AUTHORIZED_SCOPE.md updated by human or Orchestrator A's closing PR.
+Authorized scope:
+- 5 tables (migrations 050–054): `wiki_pages`, `wiki_revisions`,
+  `wiki_publication_log`, `wiki_page_card_sources`,
+  `wiki_page_message_sources`. FK-normalized source tables replace JSONB
+  arrays. `wiki_pages.body_tsv` GIN-indexed for wiki-only FTS
+  (separate from `bot/services/search.py` canonical evidence).
+- Server-side renderer `bot/services/wiki_render.py` (Markdown → sanitized
+  HTML via bleach allowlist; single batched SQL for direct + transitive
+  citation validation).
+- Governance validator `bot/services/wiki_governance.py` enforcing
+  visibility-view chain `mv → message_versions.chat_message_id →
+  chat_messages.memory_policy='normal' + is_redacted=false + NOT EXISTS
+  forget_events (3 tombstone key shapes) + transitive card_sources path`.
+- Web routes under `web/routes/wiki.py`: `/wiki` index, `/wiki/{slug}`
+  page view, `/wiki/search`, `/wiki/public/{slug}` (404 unless
+  `public_enabled=true`, mandatory `Cache-Control: no-store,
+  max-age=0, must-revalidate`), `/robots.txt` per-page-aware.
+- Web auth role expansion (`web/auth.py`): TWO separate passwords
+  `WEB_ADMIN_PASSWORD` + `WEB_MEMBER_PASSWORD`; role derived from
+  password match; NO user_id self-claim (closes privilege escalation
+  hole). Legacy cookie grace window for one max-age period.
+- Admin Telegram handlers: `/wiki_publish`, `/wiki_unpublish`,
+  `/wiki_robots`. Single-admin + audit log via `wiki_publication_log`.
+- Forget cascade extension: `_cascade_wiki_pages` + `_cascade_wiki_revisions`
+  inserted in `CASCADE_LAYER_ORDER` between `digests` and `card_sources`.
+  Wiki revisions body_markdown redacted to `[CONTENT_REDACTED:
+  forget_event_id={n}]` on forget event hitting cited mv_id.
+- Page lifecycle: `draft → reviewed → stale → archived`. `stale` forces
+  `public_enabled=false` + drops from search.
+- Feature flag: `memory.wiki.enabled` default OFF. Per-page
+  `public_enabled` default `false`.
+- 8 sprints T9-01..T9-08. Per-PR PAR (Claude product + Codex technical).
+  FHR mandatory at end of phase.
+- Phase 11 binding suite expansion: ~18–21 new tests (L9a-e, C8a/b,
+  I7a-f, R6.a-g, G1 no-graph-imports AST), raising baseline from 42 → 60+.
+
+NOT in Phase 9 scope (deferred to Phase 9.5 candidates per
+`PHASE9_PLAN.md §15`):
+- Multilingual support (Russian + English content)
+- Static export (HTML archive)
+- Two-admin publish quorum
+- Web create/edit UI for wiki_pages
+- `card_revisions` infrastructure (was deferred from Phase 6.5)
+- Edit-conflict resolution (currently last-writer-wins by `revision_seq`)
+- Page tagging / categories
+- Content moderation flow (offensive-but-not-offrecord pages)
+- Member-account-compromise runbook
+- `#291` shared `_forget_excludes_predicate` refactor (currently
+  inline-duplicated with TODO)
+
+---
+
+## Authorized: Phase 10 — Graph Projection / Neo4j (2026-05-17)
+
+Phase 10 authorized for implementation following Phase 8 closure 2026-05-15
+and Phase 6 (cards) closure 2026-05-12. Owned by Orchestrator B.
+Canonical plan: `docs/memory-system/PHASE10_PLAN.md` (ratified
+2026-05-17 after dual-model spec review with 2 BLOCKER + 9 HIGH +
+4 MEDIUM audit findings addressed across two revision passes).
+
+Authorized scope:
+- 4 Postgres side-tables (migrations 060–063): `graph_projection_runs`,
+  `graph_provenance`, `graph_edges`, `graph_purge_pending`. Migration
+  064 adds `llm_usage_ledger.call_type` column with backfill mapping
+  existing rows to `qa_synthesis` / `digest` based on
+  `qa_trace_id` / `llm_usage_ledger_id` joins.
+- `bot/services/graph_projector.py` with modes `dry_run`,
+  `incremental`, `full_rebuild` (replay-only from Postgres triples —
+  NO LLM re-extraction; ensures deterministic rebuild per RFC-001
+  conditional approval), `repair`.
+- `bot/services/graph_query.py` read-only traversal API. Admin-only
+  in Phase 10 (R7.a Phase-10 stance; member/butler access deferred).
+- Neo4j 5.x Community Edition in `docker-compose.yml --profile graph`
+  (dev only initially). Production deployment gated on HARD
+  CHECKLIST (healthcheck, password rotation, backup/restore runbook,
+  memory limits, monitoring, Bolt SSL via `bolt+s://`, version
+  upgrade policy, APOC plugin explicitly NOT used per security
+  review surface minimization).
+- LLM gateway extension: new method
+  `llm_gateway.extract_graph_triples()` flowing through existing
+  gateway with `call_type='graph_projection'` discriminator.
+- Async cascade integration (RFC-001:415 strict pattern, replaces
+  earlier synchronous-purge proposal that violated RFC condition):
+  `_cascade_graph_provenance` atomically enqueues
+  `graph_purge_pending` rows in Postgres transaction;
+  `graph_purge_worker` (extension of `cascade_worker_tick`) drives
+  Neo4j bolt DELETE asynchronously; `graph_query.py` fails-closed
+  (`abstained=True`) on any pending-purge node via read-block.
+- Ontology split (HIGH E from audit): `knowledge_cards` → semantic
+  CONCEPT nodes + LLM-extracted triples; `message_versions` →
+  provenance/event nodes only (no LLM extraction). Avoids
+  double-counting since cards already derive from messages.
+- Entity resolution priority: `knowledge_cards.id` → `users.id` →
+  `UNKNOWN_{md5(name)[:8]}` placeholder → refuse-on-UNKNOWN (drop
+  triple).
+- Scheduler: nightly batch cron at 03:30 MSK
+  (`digest_weekly_job`-style). Concurrent admin invocation
+  serialization via `pg_advisory_lock` + unique partial index
+  on `graph_projection_runs (mode) WHERE status='running'`.
+- 3 feature flags all default OFF:
+  `memory.graph.projection.enabled` (writer),
+  `memory.graph.query.enabled` (reader),
+  `memory.graph.write_pending.paused` (kill-switch for purge worker).
+- Cost ceilings (separate from shared `LLM_DAILY_USD_CEILING $5`):
+  `GRAPH_PROJECTION_DAILY_USD_CEILING` `Decimal("2.00")` (filtered
+  by `call_type='graph_projection'` in ledger),
+  `GRAPH_PROJECTION_RUN_USD_CEILING` `Decimal("0.50")` (per-run
+  dry-run abort before any provider call),
+  `GRAPH_PROJECTION_MAX_SOURCES_PER_RUN` 200,
+  `GRAPH_PROJECTION_MAX_TOKENS_PER_SOURCE` 2000.
+- Test infrastructure: `bot/services/graph_adapter.py` Protocol +
+  `Neo4jAdapter` (prod) + `NetworkXAdapter` (unit test fake);
+  `testcontainers[neo4j]` dev dep for integration tests; Neo4j
+  service block added to `.github/workflows/evals.yml` (gated by
+  `EVAL_HARNESS_ENABLED`).
+- 9 sprints T10-01..T10-09. Per-PR PAR. FHR mandatory.
+- Phase 11 binding suite expansion: ~15–16 new tests (L10a/b/c, C9,
+  I8a/b/c/d/e Jaccard rebuild eval, R7.a/b/c/d pending-purge
+  read-block, G2 drift hash sub-cases).
+
+NOT in Phase 10 scope (deferred to Phase 10.5+ or separate phases):
+- Real-time projection hooks (currently scheduled batch only)
+- Member-facing graph queries (admin-only in Phase 10)
+- Public graph surface (admin-only audit)
+- Expertise pages / person catalog
+- APOC procedures (explicit security review surface minimization)
+- Cross-graph-store migration (Apache AGE / Graphiti / NetworkX
+  benchmarked in RFC-001; Neo4j chosen definitively — AGE was 3500x
+  slower per benchmark)
 
 ---
 

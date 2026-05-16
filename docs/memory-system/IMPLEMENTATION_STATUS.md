@@ -523,4 +523,117 @@ evidence in PR bodies). Phase 11 binding extended 30 → **42/42** with 12 new c
 
 **Production rollout:** see `docs/memory-system/PHASE8_ROLLOUT.md`.
 
-<!-- updated-by-superflow:2026-05-15 -->
+---
+
+## Phase 9 — Wiki / Community Catalog (AUTHORIZED 2026-05-17, in progress)
+
+**Status:** Sprint 0c complete (plan ratified). Sprint 0d implementation
+waves dispatching.
+
+**Plan:** `docs/memory-system/PHASE9_PLAN.md` (1550+ lines, ratified
+2026-05-17 after dual-model spec review — Claude product + Codex technical
+— with 2 BLOCKER + 7 HIGH audit findings addressed across revision passes).
+
+**Authorized scope:**
+- 5 tables, migrations 050-054
+- Web routes under `web/routes/wiki.py` + role expansion in `web/auth.py`
+  (TWO passwords: `WEB_ADMIN_PASSWORD` + `WEB_MEMBER_PASSWORD`; closes
+  privilege escalation hole)
+- Server-side `wiki_render.py` + `wiki_governance.py` validator
+- Admin Telegram handlers `/wiki_publish`, `/wiki_unpublish`, `/wiki_robots`
+- Forget cascade extension: `_cascade_wiki_pages` + `_cascade_wiki_revisions`
+  inserted between `digests` and `card_sources` in `CASCADE_LAYER_ORDER`
+- Page lifecycle: `draft → reviewed → stale → archived` (stale forces
+  `public_enabled=false`)
+- Feature flag `memory.wiki.enabled` default OFF
+
+**Sprint queue (8 tickets):**
+- T9-01: schema migrations + ORM + constraints
+- T9-02: governance validator with visibility view (mv → chat_message_id →
+  memory_policy + transitive card_sources path + 3 forget tombstone keys)
+- T9-03: web auth role expansion (2-password model)
+- T9-04: server-side Markdown renderer with bleach allowlist + batched
+  citation validation
+- T9-05: member web routes with transitive offrecord bullet suppression
+- T9-06: admin `/wiki_publish` with FOR UPDATE prior_pe capture + advisory
+  mvid locks + audit log
+- T9-07: forget cascade integration (wiki_pages + wiki_revisions layers)
+  with `[CONTENT_REDACTED: forget_event_id={n}]` masking + N=50 bulk scale
+  AC
+- T9-08: Phase 11 binding tests (5 new test files + AST no-graph-imports
+  + drift simulator) — 18-21 new test IDs; total target 60-63
+
+**Phase 9.5 carryovers** (deferred):
+- Multilingual, static export, two-admin quorum, edit-conflict resolution,
+  page tagging, content moderation flow, member-compromise runbook, #291
+  shared predicate refactor
+
+---
+
+## Phase 10 — Graph Projection / Neo4j (AUTHORIZED 2026-05-17, in progress)
+
+**Status:** Sprint 0c complete (plan ratified). Sprint 0d implementation
+waves dispatching.
+
+**Plan:** `docs/memory-system/PHASE10_PLAN.md` (1593 lines, ratified
+2026-05-17 after dual-model spec review with 2 BLOCKER + 9 HIGH + 4 MEDIUM
+audit findings addressed across revision passes — including critical
+sync→async cascade FLIP per RFC-001:415 conditional Neo4j approval).
+
+**Authorized scope:**
+- 4 Postgres tables, migrations 060-063: `graph_projection_runs`,
+  `graph_provenance`, `graph_edges`, `graph_purge_pending`. Migration 064
+  adds `llm_usage_ledger.call_type` discriminator with backfill.
+- Neo4j 5.x Community Edition via docker-compose `--profile graph` (dev
+  only initially; prod gated on hard ops checklist incl. Bolt SSL,
+  password rotation, backup runbook, healthcheck, memory limits).
+- Services: `graph_projector.py`, `graph_query.py`, `graph_adapter.py`
+  (Protocol with `Neo4jAdapter` prod + `NetworkXAdapter` unit-test fake),
+  `graph_purge_worker.py`.
+- LLM gateway extension: `extract_graph_triples()` with `call_type=
+  'graph_projection'` ledger column.
+- Async cascade integration (RFC-001:415 strict pattern): forget cascade
+  atomically enqueues `graph_purge_pending` rows in Postgres transaction;
+  separate `graph_purge_worker` drives Neo4j bolt DELETE asynchronously;
+  `graph_query.py` fails-closed via pending-purge read-block during async
+  window. Replaces an earlier synchronous-purge proposal that violated
+  RFC-001 condition.
+- Ontology split: cards → semantic CONCEPT nodes + LLM triples;
+  message_versions → provenance/event nodes only (no LLM extraction;
+  avoids double-counting).
+- Cost ceilings (separate from shared `LLM_DAILY_USD_CEILING` $5/day):
+  `GRAPH_PROJECTION_DAILY_USD_CEILING` $2/day,
+  `GRAPH_PROJECTION_RUN_USD_CEILING` $0.50/run, max 200 sources/run.
+- 3 feature flags default OFF: `memory.graph.projection.enabled`,
+  `memory.graph.query.enabled`, `memory.graph.write_pending.paused`.
+
+**Sprint queue (9 tickets):**
+- T10-01: docker-compose Neo4j service + graph_adapter Protocol +
+  Neo4jAdapter + NetworkXAdapter + testcontainers dev dep
+- T10-02: source eligibility contract + governance pre-filter helpers
+- T10-03: schema migrations 060-064 (projection_runs + provenance +
+  edges + purge_pending + ledger call_type backfill) + repos
+- T10-04: `llm_gateway.extract_graph_triples()` + entity registry
+  (cards.id → users.id → UNKNOWN refuse-on-UNKNOWN)
+- T10-05: `graph_projector.py` modes (dry_run, incremental, full_rebuild
+  replay-only no LLM, repair) + dry-run cost estimate
+- T10-06: forget cascade integration — async layer
+  (`_cascade_graph_provenance` enqueues purge_pending) + `graph_purge_worker`
+  in cascade_worker_tick + read-block in graph_query
+- T10-07: `graph_query.py` read-only API with role/visibility filters
+  + provenance-required output + parameterized Cypher (no string
+  interpolation)
+- T10-08: admin Telegram handlers `/graph_project_now` (advisory lock
+  serialization), `/graph_stats`, `/graph_query` + scheduler nightly
+  03:30 MSK + PHASE10_ROLLOUT.md ops checklist
+- T10-09: Phase 11 binding tests (6 new test files + Neo4j CI service
+  block in evals.yml) — 15-16 new test IDs; total target 57-58
+
+**Phase 10.5 carryovers** (deferred):
+- Real-time projection hooks
+- Member-facing graph queries
+- Public graph surface
+- Expertise pages
+- APOC procedures (security review surface)
+
+<!-- updated-by-superflow:2026-05-17 -->
