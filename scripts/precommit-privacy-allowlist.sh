@@ -19,6 +19,10 @@ is_allowed_path() {
   # under docs/memory-system/, not arbitrary docs.
   [[ "$path" =~ ^docs/memory-system/T[0-9]+(-[0-9A-Z]+)+_design\.md$ ]] && return 0
 
+  # Phase 9 wiki migrations (050-059) implement/enforce the forget-cascade
+  # policy and must name the canonical privacy literals in docstrings.
+  [[ "$path" =~ ^alembic/versions/05[0-9]_.*\.py$ ]] && return 0
+
   return 1
 }
 
