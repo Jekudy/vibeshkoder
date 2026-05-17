@@ -57,6 +57,13 @@ is_allowed_path() {
   # messages because the tests ENFORCE the policy by name.
   [[ "$path" == "tests/evals/test_digest_weekly_review_invariants.py" ]] && return 0
 
+  # Phase 9 wiki migrations + cascade-binding tests reference the canonical
+  # privacy literals in docstrings because they implement / enforce the policy
+  # (e.g. wiki_revisions.revision_status='forgotten_redacted' explicitly names
+  # the forget-cascade invariant). Same rationale as the digest_* allowlist
+  # above. Pattern matches the Phase 9 migration window 050-059.
+  [[ "$path" =~ ^alembic/versions/05[0-9]_.*\.py$ ]] && return 0
+
   return 1
 }
 
