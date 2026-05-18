@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -7,7 +8,9 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from web.auth import get_user_from_cookie
+from web.auth import get_user_from_cookie, create_session_cookie, _cookie_fingerprint, _insert_legacy_grace_audit
+
+logger = logging.getLogger(__name__)
 
 _WEB_DIR = Path(__file__).resolve().parent
 
@@ -37,9 +40,34 @@ def create_app() -> FastAPI:
         if not user:
             return RedirectResponse(url="/login", status_code=302)
 
+        is_legacy = user.pop("legacy", False)
+
+        if is_legacy:
+            # Legacy cookie without 'role' field: treat as admin for this request
+            # and refresh cookie on the response.
+            fingerprint = _cookie_fingerprint(cookie)
+            logger.warning(
+                "legacy session cookie promoted to admin: %s", fingerprint
+            )
+            # Best-effort audit insert (failure is caught inside _insert_legacy_grace_audit)
+            _insert_legacy_grace_audit()
+
         # Attach user to request state for use in routes
         request.state.user = user
-        return await call_next(request)
+        response = await call_next(request)
+
+        if is_legacy:
+            # Refresh cookie with explicit role='admin'
+            refreshed = create_session_cookie(role="admin")
+            response.set_cookie(
+                key="session",
+                value=refreshed,
+                max_age=7 * 24 * 60 * 60,
+                httponly=True,
+                samesite="lax",
+            )
+
+        return response
 
     # Import and include route modules
     from web.routes.auth import router as auth_router

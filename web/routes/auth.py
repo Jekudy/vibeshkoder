@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import RedirectResponse
 
 from web.app import TEMPLATES
-from web.auth import verify_password, create_session_cookie
+from web.auth import derive_role, create_session_cookie
 
 router = APIRouter()
 
@@ -20,8 +20,13 @@ async def login_page(request: Request, error: str = ""):
 
 @router.post("/login")
 async def login_submit(request: Request, password: str = Form(...)):
-    """Verify password, set session cookie, redirect to dashboard."""
-    if not verify_password(password):
+    """Verify password, derive role, set session cookie, redirect to dashboard.
+
+    user_id is intentionally NOT accepted as a form field — role is derived
+    solely from password match (R6.e: no user_id self-claim escalation).
+    """
+    role = derive_role(password)
+    if role is None:
         return TEMPLATES.TemplateResponse(
             request=request,
             name="login.html",
@@ -31,7 +36,7 @@ async def login_submit(request: Request, password: str = Form(...)):
             },
         )
 
-    cookie_value = create_session_cookie()
+    cookie_value = create_session_cookie(role=role)
 
     response = RedirectResponse(url="/dashboard", status_code=302)
     response.set_cookie(
