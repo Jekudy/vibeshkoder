@@ -17,7 +17,7 @@ _WEB_DIR = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
 
 # Paths that don't require authentication
-_PUBLIC_PATHS = {"/login", "/docs", "/openapi.json", "/healthz"}
+_PUBLIC_PATHS = {"/login", "/docs", "/openapi.json", "/healthz", "/robots.txt"}
 
 # Path prefixes accessible to members AND admins (T9-05 wiki member routes).
 # Everything else is admin-only. Members reaching admin-only paths get 403.
@@ -98,6 +98,7 @@ def create_app() -> FastAPI:
     from web.routes.health import router as health_router
     from web.routes.members import router as members_router
     from web.routes.wiki import router as wiki_router
+    from web.routes.wiki import robots_router as wiki_robots_router
 
     app.include_router(health_router)
     app.include_router(auth_router)
@@ -105,6 +106,7 @@ def create_app() -> FastAPI:
     app.include_router(members_router)
     app.include_router(cards_router)
     app.include_router(wiki_router)
+    app.include_router(wiki_robots_router)
 
     # Root redirect
     @app.get("/")

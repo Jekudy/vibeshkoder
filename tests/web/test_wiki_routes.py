@@ -452,3 +452,52 @@ def test_non_reviewed_page_status_returns_404(monkeypatch) -> None:
     client = _make_client(session_cookie=_member_cookie())
     response = client.get("/wiki/stale-slug", follow_redirects=False)
     assert response.status_code == 404
+
+
+# ── Test 17: /robots.txt — wiki variant (AC#9 HIGH F) ─────────────────────────
+
+
+def test_robots_txt_disabled_returns_disallow_all(monkeypatch) -> None:
+    """When memory.wiki.enabled=False → robots.txt disallows everything."""
+    wiki_routes = import_module("web.routes.wiki")
+    monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_false())
+
+    client = _make_client()
+    response = client.get("/robots.txt")
+    assert response.status_code == 200
+    assert "Disallow: /" in response.text
+    assert "Allow:" not in response.text
+    assert response.headers["cache-control"] == "no-store, max-age=0, must-revalidate"
+
+
+def test_robots_txt_enabled_lists_public_indexable_slugs(monkeypatch) -> None:
+    """When enabled, robots.txt lists Allow: lines for indexable public pages."""
+    wiki_routes = import_module("web.routes.wiki")
+    monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
+    monkeypatch.setattr(
+        wiki_routes,
+        "_list_robots_allowed_slugs",
+        lambda session: _async_list(["intro", "house-rules"]),
+    )
+
+    client = _make_client()
+    response = client.get("/robots.txt")
+    assert response.status_code == 200
+    body = response.text
+    assert "User-agent: *" in body
+    assert "Allow: /wiki/public/intro" in body
+    assert "Allow: /wiki/public/house-rules" in body
+    assert "Disallow: /" in body
+    # Default-deny line must be LAST so explicit Allow lines win precedence.
+    assert body.rstrip().endswith("Disallow: /")
+    assert response.headers["cache-control"] == "no-store, max-age=0, must-revalidate"
+
+
+def test_robots_txt_anonymous_access_allowed(monkeypatch) -> None:
+    """/robots.txt is in _PUBLIC_PATHS — no login redirect for anonymous crawlers."""
+    wiki_routes = import_module("web.routes.wiki")
+    monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_false())
+
+    client = _make_client()  # no session cookie
+    response = client.get("/robots.txt", follow_redirects=False)
+    assert response.status_code == 200  # NOT 302 to /login
