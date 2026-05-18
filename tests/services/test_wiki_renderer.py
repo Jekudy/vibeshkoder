@@ -64,15 +64,34 @@ async def _make_message_version(
     chat_message_id: int,
     content_hash: str | None = None,
     is_redacted: bool = False,
+    version_seq: int | None = None,
 ) -> int:
+    """Create a MessageVersion. Auto-assigns version_seq when not supplied
+    so callers can make multiple revisions of the same chat_message without
+    hitting uq_message_versions_chat_message_seq.
+    """
+    from sqlalchemy import text as _text
     from bot.db.models import MessageVersion
 
     if content_hash is None:
         content_hash = f"h-{uuid.uuid4().hex[:16]}"
 
+    if version_seq is None:
+        # Next free version_seq for this chat_message_id.
+        existing = (
+            await session.execute(
+                _text(
+                    "SELECT COALESCE(MAX(version_seq), 0) + 1 FROM message_versions "
+                    "WHERE chat_message_id = :cmid"
+                ),
+                {"cmid": chat_message_id},
+            )
+        ).scalar()
+        version_seq = int(existing or 1)
+
     mv = MessageVersion(
         chat_message_id=chat_message_id,
-        version_seq=1,
+        version_seq=version_seq,
         text="test content",
         normalized_text="test content",
         entities_json={},
@@ -232,54 +251,80 @@ async def test_valid_mv_token_renders_as_citation_link(db_session) -> None:
 
 
 async def test_invalid_mv_suppressed_for_member(db_session) -> None:
-    """AC3 member: [^mv:N] with redacted mv → suppressed; in suppressed_citations."""
+    """AC3 member: invalid [^mv:N] among valid sources → suppressed (not archived).
+
+    Page has one valid mv (good_mv) AND one invalid mv (bad_mv, redacted).
+    Per-citation suppression applies; page_archived stays False because at
+    least one source is valid. (When every source is invalid, AC#7 escalates
+    to page_archived=True — covered by test_all_sources_failing_*.)
+    """
     from bot.services.wiki_renderer import render_wiki_page
 
     uid = await _make_user(db_session)
     cm = await _make_chat_message(db_session, user_id=uid)
-    mv_id = await _make_message_version(db_session, chat_message_id=cm.id, is_redacted=True)
+    good_mv = await _make_message_version(db_session, chat_message_id=cm.id)
+    bad_mv = await _make_message_version(
+        db_session, chat_message_id=cm.id, is_redacted=True
+    )
 
-    page_id = await _make_wiki_page(db_session, body_markdown=f"See [^mv:{mv_id}] here.")
-    await _link_mv(db_session, page_id=page_id, message_version_id=mv_id)
+    body = f"Good [^mv:{good_mv}] and bad [^mv:{bad_mv}] here."
+    page_id = await _make_wiki_page(db_session, body_markdown=body)
+    await _link_mv(db_session, page_id=page_id, message_version_id=good_mv, position=0)
+    await _link_mv(db_session, page_id=page_id, message_version_id=bad_mv, position=1)
 
     result = await render_wiki_page(
         db_session,
         page_id=page_id,
         role="member",
-        body_markdown=f"See [^mv:{mv_id}] here.",
+        body_markdown=body,
     )
 
     assert result.page_archived is False
-    assert mv_id in result.suppressed_citations
-    assert f"[^mv:{mv_id}]" not in result.html_body
+    assert bad_mv in result.suppressed_citations
+    assert good_mv not in result.suppressed_citations
+    assert f"[^mv:{bad_mv}]" not in result.html_body
     assert "SOURCE UNAVAILABLE" not in result.html_body
+    # Member-suppress post-pass collapses "and bad ." → "and bad."
+    assert "  " not in result.html_body  # no double-space gap
 
 
 # ── AC3 admin: invalid mv → [⚠ SOURCE UNAVAILABLE] shown ─────────────────────
 
 
 async def test_invalid_mv_shown_as_unavailable_for_admin(db_session) -> None:
-    """AC3 admin: [^mv:N] with redacted mv → [⚠ SOURCE UNAVAILABLE]; in admin_unavailable_markers."""
+    """AC3 admin: invalid [^mv:N] among valid sources → '[⚠ SOURCE UNAVAILABLE]'.
+
+    Same fixture shape as the member test — one good mv + one bad mv. Admin
+    sees a visible marker instead of silent suppression.
+    """
     from bot.services.wiki_renderer import render_wiki_page
 
     uid = await _make_user(db_session)
     cm = await _make_chat_message(db_session, user_id=uid)
-    mv_id = await _make_message_version(db_session, chat_message_id=cm.id, is_redacted=True)
+    good_mv = await _make_message_version(db_session, chat_message_id=cm.id)
+    bad_mv = await _make_message_version(
+        db_session, chat_message_id=cm.id, is_redacted=True
+    )
 
-    page_id = await _make_wiki_page(db_session, body_markdown=f"See [^mv:{mv_id}] here.")
-    await _link_mv(db_session, page_id=page_id, message_version_id=mv_id)
+    body = f"Good [^mv:{good_mv}] and bad [^mv:{bad_mv}] here."
+    page_id = await _make_wiki_page(db_session, body_markdown=body)
+    await _link_mv(db_session, page_id=page_id, message_version_id=good_mv, position=0)
+    await _link_mv(db_session, page_id=page_id, message_version_id=bad_mv, position=1)
 
     result = await render_wiki_page(
         db_session,
         page_id=page_id,
         role="admin",
-        body_markdown=f"See [^mv:{mv_id}] here.",
+        body_markdown=body,
     )
 
     assert result.page_archived is False
-    assert mv_id in result.admin_unavailable_markers
+    assert bad_mv in result.admin_unavailable_markers
+    assert good_mv not in result.admin_unavailable_markers
     assert "SOURCE UNAVAILABLE" in result.html_body
-    assert f"[^mv:{mv_id}]" not in result.html_body
+    assert f"[^mv:{bad_mv}]" not in result.html_body
+    # good_mv still renders as citation
+    assert f'href="#mv-{good_mv}"' in result.html_body
 
 
 # ── AC4 (L9b): archived card → page_archived=True, html_body='' ───────────────
@@ -377,6 +422,42 @@ async def test_all_sources_failing_governance_sets_page_archived(db_session) -> 
     assert result.html_body == ""
 
 
+# ── Codex HIGH fix: unlinked mv token never rendered as citation ──────────────
+
+
+async def test_unlinked_mv_token_treated_as_invalid(db_session) -> None:
+    """Codex HIGH fix: body referencing an mv NOT linked to the page must
+    NOT render as a valid citation. validate_sources returns invalid_mvids
+    only for LINKED sources; the renderer must also block unknown tokens.
+    """
+    from bot.services.wiki_renderer import render_wiki_page
+
+    uid = await _make_user(db_session)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    # Linked good source for the page (so the page isn't fully invalid).
+    linked_mv = await _make_message_version(db_session, chat_message_id=cm.id)
+    # Unlinked mv — exists in DB but never tied to this page.
+    unlinked_mv = await _make_message_version(db_session, chat_message_id=cm.id)
+
+    body = f"Linked [^mv:{linked_mv}] and unlinked [^mv:{unlinked_mv}]."
+    page_id = await _make_wiki_page(db_session, body_markdown=body)
+    await _link_mv(db_session, page_id=page_id, message_version_id=linked_mv)
+
+    result = await render_wiki_page(
+        db_session,
+        page_id=page_id,
+        role="admin",
+        body_markdown=body,
+    )
+
+    # Unlinked mv should be in admin_unavailable_markers (treated as invalid).
+    assert unlinked_mv in result.admin_unavailable_markers
+    # Linked good mv still renders as a real citation.
+    assert f'href="#mv-{linked_mv}"' in result.html_body
+    # Unlinked mv must NOT appear as a wiki-citation anchor.
+    assert f'href="#mv-{unlinked_mv}"' not in result.html_body
+
+
 # ── AC8 (G1 lint): no LLM/graph imports in wiki_renderer.py ──────────────────
 
 
@@ -392,13 +473,24 @@ def test_no_llm_or_graph_imports_in_wiki_renderer() -> None:
         / "wiki_renderer.py"
     ).read_text()
     tree = ast.parse(source)
+    forbidden_prefixes = ("neo4j",)
+    forbidden_substrings = ("graph_", "llm_")
+
+    def _check(name: str) -> None:
+        for p in forbidden_prefixes:
+            assert not name.startswith(p), f"Forbidden import: {name}"
+        for s in forbidden_substrings:
+            assert s not in name, f"Forbidden import: {name}"
+
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            else:
-                names = [node.module or ""]
-            for name in names:
-                assert not name.startswith("neo4j"), f"Forbidden import: {name}"
-                assert "graph_" not in name, f"Forbidden import: {name}"
-                assert "llm_" not in name, f"Forbidden import: {name}"
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                _check(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            _check(module)
+            # Also catch `from bot.services import llm_gateway` style — alias name
+            # carries the forbidden symbol.
+            for alias in node.names:
+                _check(alias.name)
+                _check(f"{module}.{alias.name}")
