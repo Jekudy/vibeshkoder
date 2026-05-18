@@ -40,7 +40,13 @@ async def _make_user(session) -> int:
     return uid
 
 
-async def _make_chat_message(session, *, user_id: int, memory_policy: str = "normal") -> int:
+async def _make_chat_message(session, *, user_id: int, memory_policy: str = "normal"):
+    """Create a ChatMessage row and return the full ORM instance.
+
+    Tests access ``.id`` for FK linking and ``.chat_id`` / ``.message_id`` when
+    constructing forget_events.tombstone_key for message-type tombstones
+    (``'message:' || chat_id || ':' || message_id``).
+    """
     from bot.db.models import ChatMessage
 
     cm = ChatMessage(
@@ -55,7 +61,7 @@ async def _make_chat_message(session, *, user_id: int, memory_policy: str = "nor
     )
     session.add(cm)
     await session.flush()
-    return cm.id
+    return cm
 
 
 async def _make_message_version(
@@ -204,7 +210,8 @@ async def test_valid_page_returns_valid_true(db_session) -> None:
     from bot.services.wiki_governance import validate_sources
 
     uid = await _make_user(db_session)
-    cm_id = await _make_chat_message(db_session, user_id=uid)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    cm_id = cm.id
     mv_id = await _make_message_version(db_session, chat_message_id=cm_id)
     card_id = await _make_knowledge_card(db_session, admin_user_id=uid)
     await _make_card_source(db_session, card_id=card_id, message_version_id=mv_id)
@@ -251,7 +258,8 @@ async def test_redacted_mv_returns_invalid(db_session) -> None:
     from bot.services.wiki_governance import validate_sources
 
     uid = await _make_user(db_session)
-    cm_id = await _make_chat_message(db_session, user_id=uid)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    cm_id = cm.id
     mv_id = await _make_message_version(db_session, chat_message_id=cm_id, is_redacted=True)
 
     page_id = await _make_wiki_page(db_session)
@@ -272,7 +280,8 @@ async def test_offrecord_mv_returns_invalid(db_session) -> None:
     from bot.services.wiki_governance import validate_sources
 
     uid = await _make_user(db_session)
-    cm_id = await _make_chat_message(db_session, user_id=uid, memory_policy="offrecord")
+    cm = await _make_chat_message(db_session, user_id=uid, memory_policy="offrecord")
+    cm_id = cm.id
     mv_id = await _make_message_version(db_session, chat_message_id=cm_id)
 
     page_id = await _make_wiki_page(db_session)
@@ -293,15 +302,17 @@ async def test_forgotten_mv_returns_invalid(db_session) -> None:
     from bot.services.wiki_governance import validate_sources
 
     uid = await _make_user(db_session)
-    cm_id = await _make_chat_message(db_session, user_id=uid)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    cm_id = cm.id
     mv_id = await _make_message_version(db_session, chat_message_id=cm_id)
 
-    # Create active forget_event for the parent chat_message
+    # Create active forget_event keyed by the canonical message tombstone format.
+    # target_id is deliberately NULL — the validator must rely on tombstone_key.
     await _make_forget_event(
         db_session,
-        tombstone_key=f"message:test:{cm_id}",
+        tombstone_key=f"message:{cm.chat_id}:{cm.message_id}",
         target_type="message",
-        target_id=str(cm_id),
+        target_id=None,
         status="pending",
     )
 
@@ -312,7 +323,7 @@ async def test_forgotten_mv_returns_invalid(db_session) -> None:
 
     assert result.valid is False
     assert mv_id in result.invalid_mvids
-    assert "forgotten" in result.reasons[f"mvid:{mv_id}"]
+    assert result.reasons[f"mvid:{mv_id}"] == "forgotten"
 
 
 # ── AC 6: all card_sources forgotten → valid=False ───────────────────────────
@@ -323,17 +334,19 @@ async def test_card_all_sources_forgotten_returns_invalid(db_session) -> None:
     from bot.services.wiki_governance import validate_sources
 
     uid = await _make_user(db_session)
-    cm_id = await _make_chat_message(db_session, user_id=uid)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    cm_id = cm.id
     mv_id = await _make_message_version(db_session, chat_message_id=cm_id)
     card_id = await _make_knowledge_card(db_session, admin_user_id=uid)
     await _make_card_source(db_session, card_id=card_id, message_version_id=mv_id)
 
-    # Forget the transitive source
+    # Forget the transitive source via canonical message tombstone format.
+    # target_id is deliberately NULL — the validator must rely on tombstone_key.
     await _make_forget_event(
         db_session,
-        tombstone_key=f"message:test:{cm_id}",
+        tombstone_key=f"message:{cm.chat_id}:{cm.message_id}",
         target_type="message",
-        target_id=str(cm_id),
+        target_id=None,
         status="completed",
     )
 
@@ -354,7 +367,8 @@ async def test_transitive_forget_through_card_sources_returns_invalid(db_session
     from bot.services.wiki_governance import validate_sources
 
     uid = await _make_user(db_session)
-    cm_id = await _make_chat_message(db_session, user_id=uid, memory_policy="offrecord")
+    cm = await _make_chat_message(db_session, user_id=uid, memory_policy="offrecord")
+    cm_id = cm.id
     mv_id = await _make_message_version(db_session, chat_message_id=cm_id)
     card_id = await _make_knowledge_card(db_session, admin_user_id=uid, card_status="approved")
     await _make_card_source(db_session, card_id=card_id, message_version_id=mv_id)
@@ -377,17 +391,19 @@ async def test_message_hash_tombstone_returns_invalid(db_session) -> None:
     from bot.services.wiki_governance import validate_sources
 
     uid = await _make_user(db_session)
-    cm_id = await _make_chat_message(db_session, user_id=uid)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    cm_id = cm.id
     content_hash = f"hash-{uuid.uuid4().hex}"
     mv_id = await _make_message_version(
         db_session, chat_message_id=cm_id, content_hash=content_hash
     )
 
+    # target_id=NULL — proves match is via tombstone_key prefix only.
     await _make_forget_event(
         db_session,
         tombstone_key=f"message_hash:{content_hash}",
         target_type="message_hash",
-        target_id=content_hash,
+        target_id=None,
         status="pending",
     )
 
@@ -398,8 +414,7 @@ async def test_message_hash_tombstone_returns_invalid(db_session) -> None:
 
     assert result.valid is False
     assert mv_id in result.invalid_mvids
-    key = f"mvid:{mv_id}"
-    assert "tombstone:message_hash" in result.reasons[key] or "forgotten" in result.reasons[key]
+    assert result.reasons[f"mvid:{mv_id}"] == "tombstone:message_hash"
 
 
 # ── AC 9: user tombstone (L9e) ───────────────────────────────────────────────
@@ -410,14 +425,16 @@ async def test_user_tombstone_returns_invalid(db_session) -> None:
     from bot.services.wiki_governance import validate_sources
 
     uid = await _make_user(db_session)
-    cm_id = await _make_chat_message(db_session, user_id=uid)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    cm_id = cm.id
     mv_id = await _make_message_version(db_session, chat_message_id=cm_id)
 
+    # target_id=NULL — proves match is via tombstone_key prefix only.
     await _make_forget_event(
         db_session,
         tombstone_key=f"user:{uid}",
         target_type="user",
-        target_id=str(uid),
+        target_id=None,
         status="pending",
     )
 
@@ -428,8 +445,7 @@ async def test_user_tombstone_returns_invalid(db_session) -> None:
 
     assert result.valid is False
     assert mv_id in result.invalid_mvids
-    key = f"mvid:{mv_id}"
-    assert "tombstone:user" in result.reasons[key] or "forgotten" in result.reasons[key]
+    assert result.reasons[f"mvid:{mv_id}"] == "tombstone:user"
 
 
 # ── AC 10/11: single batched SQL + join chain ─────────────────────────────────
@@ -502,3 +518,57 @@ def test_no_graph_imports_in_wiki_governance() -> None:
             for name in names:
                 assert not name.startswith("neo4j"), f"Forbidden import: {name}"
                 assert "graph_" not in name, f"Forbidden import: {name}"
+
+
+# ── Codex review fix #1: nonexistent page must raise ─────────────────────────
+
+
+async def test_nonexistent_page_raises(db_session) -> None:
+    """validate_sources must raise WikiPageNotFoundError for a non-existent id.
+
+    Previously the validator silently returned valid=True for empty result sets,
+    making it indistinguishable from a typo / stale id. The page-existence check
+    is the first thing the validator does.
+    """
+    from bot.services.wiki_governance import (
+        WikiPageNotFoundError,
+        validate_sources,
+    )
+
+    bogus_id = uuid.uuid4()
+    with pytest.raises(WikiPageNotFoundError):
+        await validate_sources(db_session, page_id=bogus_id)
+
+
+# ── Codex review fix #2: tombstone match relies on tombstone_key, not target_id ─
+
+
+async def test_tombstone_match_uses_tombstone_key_not_target_id(db_session) -> None:
+    """A forget_event with the correct tombstone_key but a DIVERGENT target_id
+    must still be detected by the validator. This proves the SQL matches via
+    tombstone_key prefix, not via the auxiliary target_id column.
+    """
+    from bot.services.wiki_governance import validate_sources
+
+    uid = await _make_user(db_session)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    mv_id = await _make_message_version(db_session, chat_message_id=cm.id)
+
+    # tombstone_key matches mv author; target_id is intentionally a NON-matching
+    # bogus value to ensure the validator cannot resolve it via target_id.
+    await _make_forget_event(
+        db_session,
+        tombstone_key=f"user:{uid}",
+        target_type="user",
+        target_id="99999999",  # divergent — different from uid
+        status="pending",
+    )
+
+    page_id = await _make_wiki_page(db_session)
+    await _link_mv(db_session, page_id=page_id, message_version_id=mv_id)
+
+    result = await validate_sources(db_session, page_id=page_id)
+
+    assert result.valid is False
+    assert mv_id in result.invalid_mvids
+    assert result.reasons[f"mvid:{mv_id}"] == "tombstone:user"

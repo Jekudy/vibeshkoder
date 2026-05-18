@@ -64,6 +64,13 @@ is_allowed_path() {
   # above. Pattern matches the Phase 9 migration window 050-059.
   [[ "$path" =~ ^alembic/versions/05[0-9]_.*\.py$ ]] && return 0
 
+  # T9-02 wiki governance validator + tests enforce the 7 invalid-source
+  # conditions by canonical literals (same rationale as digest_* and
+  # design-doc allowlists above — the file's job is to ENFORCE the privacy
+  # policy, so it must name the literals to filter against them).
+  [[ "$path" == "bot/services/wiki_governance.py" ]] && return 0
+  [[ "$path" == "tests/services/test_wiki_governance.py" ]] && return 0
+
   return 1
 }
 
