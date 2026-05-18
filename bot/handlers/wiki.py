@@ -197,11 +197,10 @@ async def cmd_wiki_publish(
                 },
             )
 
-    except Exception as exc:
+    except Exception:
         logger.exception("cmd_wiki_publish: transaction failed for slug=%s", slug)
         await message.answer(
-            f"❌ Ошибка публикации: <code>{html_escape(str(exc)[:300])}</code>",
-            parse_mode="HTML",
+            "❌ Внутренняя ошибка публикации. Детали в server logs.",
         )
         return
 
@@ -300,11 +299,10 @@ async def cmd_wiki_unpublish(
                 },
             )
 
-    except Exception as exc:
+    except Exception:
         logger.exception("cmd_wiki_unpublish: transaction failed for slug=%s", slug)
         await message.answer(
-            f"❌ Ошибка снятия с публикации: <code>{html_escape(str(exc)[:300])}</code>",
-            parse_mode="HTML",
+            "❌ Внутренняя ошибка снятия с публикации. Детали в server logs.",
         )
         return
 
@@ -415,11 +413,12 @@ async def cmd_wiki_robots(
                 },
             )
 
-    except Exception as exc:
-        logger.exception("cmd_wiki_robots: transaction failed for slug=%s policy=%s", slug, new_rp)
+    except Exception:
+        logger.exception(
+            "cmd_wiki_robots: transaction failed for slug=%s policy=%s", slug, new_rp
+        )
         await message.answer(
-            f"❌ Ошибка: <code>{html_escape(str(exc)[:300])}</code>",
-            parse_mode="HTML",
+            "❌ Внутренняя ошибка изменения robots policy. Детали в server logs.",
         )
         return
 
