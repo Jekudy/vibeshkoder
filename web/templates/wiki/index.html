@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}Wiki - Vibe Gatekeeper{% endblock %}
+
+{% block content %}
+<h2 class="mb-4">Community Wiki</h2>
+
+<p class="mb-3">
+    <a href="/wiki/search" class="btn btn-outline-secondary btn-sm">Search</a>
+</p>
+
+<div class="list-group">
+    {% for page in pages %}
+    <a href="/wiki/{{ page.slug }}" class="list-group-item list-group-item-action">
+        {{ page.title }}
+    </a>
+    {% else %}
+    <div class="list-group-item text-muted">No reviewed pages yet.</div>
+    {% endfor %}
+</div>
+
+<p class="text-muted mt-3">Total: {{ pages | length }} page{{ "s" if pages | length != 1 else "" }}</p>
+{% endblock %}

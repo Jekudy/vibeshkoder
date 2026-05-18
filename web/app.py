@@ -28,7 +28,10 @@ def _is_admin_only_path(path: str) -> bool:
     """True iff the path requires role='admin'."""
     if path in _PUBLIC_PATHS or path.startswith("/static") or path == "/":
         return False
-    return not any(path.startswith(p) for p in _MEMBER_READABLE_PREFIXES)
+    # /wiki (catalog root) and /wiki/* (sub-paths) are member-readable.
+    if path == "/wiki" or any(path.startswith(p) for p in _MEMBER_READABLE_PREFIXES):
+        return False
+    return True
 
 
 def create_app() -> FastAPI:
@@ -42,8 +45,8 @@ def create_app() -> FastAPI:
     async def auth_middleware(request: Request, call_next):
         path = request.url.path
 
-        # Allow public paths and static files
-        if path in _PUBLIC_PATHS or path.startswith("/static"):
+        # Allow public paths, static files, and the wiki public prefix (T9-05).
+        if path in _PUBLIC_PATHS or path.startswith("/static") or path.startswith("/wiki/public/"):
             return await call_next(request)
 
         cookie = request.cookies.get("session")
@@ -94,12 +97,14 @@ def create_app() -> FastAPI:
     from web.routes.dashboard import router as dashboard_router
     from web.routes.health import router as health_router
     from web.routes.members import router as members_router
+    from web.routes.wiki import router as wiki_router
 
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(dashboard_router)
     app.include_router(members_router)
     app.include_router(cards_router)
+    app.include_router(wiki_router)
 
     # Root redirect
     @app.get("/")

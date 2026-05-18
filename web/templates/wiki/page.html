@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page.title }} - Wiki - Vibe Gatekeeper{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="mb-3">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/wiki">Wiki</a></li>
+        <li class="breadcrumb-item active">{{ page.title }}</li>
+    </ol>
+</nav>
+
+<h2 class="mb-4">{{ page.title }}</h2>
+
+<div class="wiki-body mb-4">
+    {{ html_body | safe }}
+</div>
+
+{% if sources %}
+<section class="wiki-citations mt-4 border-top pt-3">
+    <h5>Sources</h5>
+    <ul class="list-unstyled">
+        {% for src in sources %}
+        <li class="text-muted small">
+            {% if src.mv_id %}
+            <span>Message version: {{ src.mv_id }}</span>
+            {% elif src.card_id %}
+            <span>Card: {{ src.card_id }}</span>
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+</section>
+{% endif %}
+
+{% endblock %}
