@@ -555,7 +555,7 @@ async def test_038_downgrade_blocks_on_review_state_rows(
     finally:
         await conn.close()
 
-    proc = _run_alembic(temp_database_url, "downgrade", "-1", check=False)
+    proc = _run_alembic(temp_database_url, "downgrade", "037", check=False)
     assert proc.returncode != 0, (
         f"expected downgrade to fail on review-state row, "
         f"got rc={proc.returncode} stderr={proc.stderr!r}"
@@ -579,7 +579,7 @@ async def test_038_downgrade_blocks_on_runs_audit_rows(
     finally:
         await conn.close()
 
-    proc = _run_alembic(temp_database_url, "downgrade", "-1", check=False)
+    proc = _run_alembic(temp_database_url, "downgrade", "037", check=False)
     assert proc.returncode != 0
     combined = (proc.stdout + proc.stderr).lower()
     assert "digest_runs" in combined
@@ -614,7 +614,7 @@ async def test_038_downgrade_blocks_on_posting_rows_daily(
     finally:
         await conn.close()
 
-    proc = _run_alembic(temp_database_url, "downgrade", "-1", check=False)
+    proc = _run_alembic(temp_database_url, "downgrade", "037", check=False)
     assert proc.returncode != 0
     combined = (proc.stdout + proc.stderr).lower()
     assert "posting" in combined
@@ -658,7 +658,7 @@ async def test_038_downgrade_blocks_on_posting_rows_weekly(
     finally:
         await conn.close()
 
-    proc = _run_alembic(temp_database_url, "downgrade", "-1", check=False)
+    proc = _run_alembic(temp_database_url, "downgrade", "037", check=False)
     assert proc.returncode != 0
     combined = (proc.stdout + proc.stderr).lower()
     assert "posting" in combined
@@ -705,7 +705,7 @@ async def test_038_downgrade_succeeds_after_posting_terminal_transition(
         await conn.close()
 
     # Attempt downgrade while row is still posting → must fail.
-    proc = _run_alembic(temp_database_url, "downgrade", "-1", check=False)
+    proc = _run_alembic(temp_database_url, "downgrade", "037", check=False)
     assert proc.returncode != 0, (
         f"expected downgrade to fail on posting row, got rc={proc.returncode}"
     )
@@ -730,7 +730,7 @@ async def test_038_downgrade_succeeds_after_posting_terminal_transition(
         await conn.close()
 
     # Now downgrade must succeed.
-    _run_alembic(temp_database_url, "downgrade", "-1")
+    _run_alembic(temp_database_url, "downgrade", "037")
     current = await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version")
     assert current == "037"
 
@@ -760,7 +760,7 @@ async def test_038_downgrade_succeeds_when_clean(temp_database_url: str) -> None
     finally:
         await conn.close()
 
-    _run_alembic(temp_database_url, "downgrade", "-1")
+    _run_alembic(temp_database_url, "downgrade", "037")
 
     current = await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version")
     assert current == "037"
