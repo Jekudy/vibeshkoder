@@ -976,40 +976,65 @@ async def _cascade_wiki_pages(session: AsyncSession, event) -> int:
     if not all_page_ids:
         return 0
 
+    # Import locally to avoid module-level circular import (governance imports models
+    # which are also pulled by this module).
+    import uuid as _uuid
+    from bot.services.wiki_governance import validate_sources
+
     modified_count = 0
     for page_id_str in all_page_ids:
-        # Determine new page_status: archived if no valid sources remain; stale otherwise.
-        # Check direct sources not in the forgotten set.
-        remaining_direct = await session.execute(
+        # Idempotency guard (Codex CRITICAL #1 second-half fix): if an
+        # audit revision row for THIS forget event already exists on this
+        # page, skip — re-running the cascade for the same event must NOT
+        # duplicate revision rows or counter increments.
+        existing_audit = await session.execute(
             text(
-                "SELECT 1 FROM wiki_page_message_sources "
+                "SELECT 1 FROM wiki_revisions "
                 "WHERE wiki_page_id = CAST(:pid AS uuid) "
-                "AND message_version_id != ALL(:mvids) "
+                "  AND redacted_by_forget_event_id = :event_id "
+                "  AND edit_reason = 'forget_cascade' "
                 "LIMIT 1"
-            ).bindparams(
-                bindparam("mvids", type_=_ARRAY_BIGINT)
             ),
-            {"pid": page_id_str, "mvids": list(mvids)},
+            {"pid": page_id_str, "event_id": int(event.id)},
         )
-        has_remaining_direct = remaining_direct.scalar() is not None
+        if existing_audit.scalar() is not None:
+            continue
 
-        # Check transitive sources (cards whose card_sources are not all forgotten).
-        remaining_transitive = await session.execute(
+        # Governance-aware status decision (Codex MED #6 fix): consult
+        # validate_sources to determine TRULY-remaining-valid sources.
+        # This accounts for prior forgets, redactions, offrecord policies,
+        # and transitive card invalidity — not just "mvid not in current
+        # event's target set". An mvid already redacted from a prior event
+        # is still "invalid" for surviving-source purposes; the old
+        # mvid-counting query missed that and could leave page_status='stale'
+        # when it should have been 'archived'.
+        page_uuid = _uuid.UUID(page_id_str)
+        gov = await validate_sources(session, page_id=page_uuid)
+
+        # Totals: count direct and transitive (card-linked) sources.
+        direct_total_row = await session.execute(
             text(
-                "SELECT 1 FROM wiki_page_card_sources wpcs "
-                "JOIN card_sources cs ON cs.card_id = wpcs.card_id "
-                "WHERE wpcs.wiki_page_id = CAST(:pid AS uuid) "
-                "AND cs.message_version_id != ALL(:mvids) "
-                "LIMIT 1"
-            ).bindparams(
-                bindparam("mvids", type_=_ARRAY_BIGINT)
+                "SELECT count(*) FROM wiki_page_message_sources "
+                "WHERE wiki_page_id = CAST(:pid AS uuid)"
             ),
-            {"pid": page_id_str, "mvids": list(mvids)},
+            {"pid": page_id_str},
         )
-        has_remaining_transitive = remaining_transitive.scalar() is not None
+        direct_total = int(direct_total_row.scalar_one() or 0)
+        card_total_row = await session.execute(
+            text(
+                "SELECT count(*) FROM wiki_page_card_sources "
+                "WHERE wiki_page_id = CAST(:pid AS uuid)"
+            ),
+            {"pid": page_id_str},
+        )
+        card_total = int(card_total_row.scalar_one() or 0)
 
+        # Direct mvids that survive: those NOT in gov.invalid_mvids.
+        surviving_direct = direct_total - len(set(gov.invalid_mvids))
+        surviving_cards = card_total - len(set(gov.invalid_card_ids))
+        # archived when every cited source is invalid (or there are none).
         new_status = (
-            "stale" if (has_remaining_direct or has_remaining_transitive) else "archived"
+            "archived" if (surviving_direct <= 0 and surviving_cards <= 0) else "stale"
         )
 
         # Capture current body_markdown for the revision snapshot.
@@ -1019,11 +1044,14 @@ async def _cascade_wiki_pages(session: AsyncSession, event) -> int:
         )
         current_body = current_row.scalar_one_or_none() or ""
 
-        # UPDATE wiki_pages: set page_status and public_enabled=false.
+        # UPDATE wiki_pages: set page_status, public_enabled=false, AND robots
+        # policy back to 'noindex' (Codex MED #6 fix part b — cascade flip
+        # without robots reset left crawlers seeing the prior indexable hint).
         await session.execute(
             text(
                 "UPDATE wiki_pages "
-                "SET page_status = :status, public_enabled = false, updated_at = now() "
+                "SET page_status = :status, public_enabled = false, "
+                "    robots_policy = 'noindex', updated_at = now() "
                 "WHERE id = CAST(:pid AS uuid)"
             ),
             {"status": new_status, "pid": page_id_str},
@@ -1045,16 +1073,18 @@ async def _cascade_wiki_pages(session: AsyncSession, event) -> int:
                 "INSERT INTO wiki_revisions "
                 "(id, wiki_page_id, revision_seq, body_markdown, revision_status, "
                 " source_message_version_ids_snapshot, source_card_ids_snapshot, "
-                " edit_reason, edited_at, created_at) "
+                " edit_reason, edited_at, created_at, "
+                " redacted_by_forget_event_id) "
                 "VALUES "
                 "(gen_random_uuid(), CAST(:pid AS uuid), :seq, :body, 'active', "
                 " '[]'::jsonb, '[]'::jsonb, "
-                " 'forget_cascade', now(), now())"
+                " 'forget_cascade', now(), now(), :event_id)"
             ),
             {
                 "pid": page_id_str,
                 "seq": next_seq,
                 "body": current_body,
+                "event_id": int(event.id),
             },
         )
 
