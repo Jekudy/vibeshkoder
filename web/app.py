@@ -46,6 +46,14 @@ def create_app() -> FastAPI:
         path = request.url.path
 
         # Allow public paths, static files, and the wiki public prefix (T9-05).
+        # Defense-in-depth: reject paths containing '..' or '%2e%2e' before
+        # the /wiki/public/ bypass — Starlette doesn't strip dot-segments
+        # from the decoded request.url.path, so `/wiki/public/../dashboard`
+        # would technically match startswith("/wiki/public/") without this
+        # guard (Codex LOW finding).
+        raw_path = request.scope.get("raw_path", b"").decode("latin-1", errors="replace")
+        if ".." in path or ".." in raw_path or "%2e%2e" in raw_path.lower():
+            return JSONResponse(status_code=400, content={"detail": "bad_path"})
         if path in _PUBLIC_PATHS or path.startswith("/static") or path.startswith("/wiki/public/"):
             return await call_next(request)
 

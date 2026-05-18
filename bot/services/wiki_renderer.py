@@ -88,16 +88,23 @@ _CARD_TOKEN_RE = re.compile(
 
 # ── Linked-source queries ─────────────────────────────────────────────────────
 #
-# Returns the SET of message_version_ids actually linked to the page —
-# directly (via wiki_page_message_sources) OR transitively via
-# wiki_page_card_sources → card_sources. Used to distinguish "linked but
-# governance-blocked" mv tokens from "unknown / unlinked" tokens (the latter
-# must also be suppressed/marked, never rendered as valid citations).
-_LINKED_MVIDS_QUERY = """
+# Direct linked mvids — those declared via wiki_page_message_sources. A body
+# token referring to one of these is "valid" iff the mv itself is not in
+# governance.invalid_mvids.
+_LINKED_DIRECT_MVIDS_QUERY = """
 SELECT message_version_id AS mv_id FROM wiki_page_message_sources
 WHERE wiki_page_id = :pid
-UNION
-SELECT cs.message_version_id AS mv_id
+"""
+
+# Transitive linked mvids — those reachable via wiki_page_card_sources →
+# card_sources. A body token referring to one of these is "valid" iff (a)
+# the mv itself is not invalid AND (b) the parent card is not invalid.
+# Returns (mv_id, card_id) pairs so the renderer can apply both checks.
+# Required to close the Codex HIGH gap: a card flagged transitive_forget
+# by governance does NOT add its source mvids to invalid_mvids — they
+# must be re-validated against invalid_card_set when computing valid_mv_set.
+_LINKED_TRANSITIVE_MVIDS_QUERY = """
+SELECT cs.message_version_id AS mv_id, wpcs.card_id AS card_id
 FROM wiki_page_card_sources wpcs
 JOIN card_sources cs ON cs.card_id = wpcs.card_id
 WHERE wpcs.wiki_page_id = :pid
@@ -186,23 +193,56 @@ async def render_wiki_page(
     invalid_mv_set: set[int] = set(gov.invalid_mvids)
     invalid_card_set: set[uuid.UUID] = set(gov.invalid_card_ids)
 
-    # ── Step 2b: fetch the page's LINKED source IDs ──────────────────────────
-    # A body mv token must be linked to the page (directly OR transitively
-    # through a cited card) AND not in invalid_mv_set to render as a valid
-    # citation. Tokens referring to unlinked mvids are unknown — must NOT
-    # be rendered as citations (Codex HIGH fix).
-    linked_mvid_rows = (
-        await session.execute(text(_LINKED_MVIDS_QUERY), {"pid": str(page_id)})
+    # ── Step 2b: fetch the page's LINKED source IDs (direct + transitive) ───
+    # A body mv token is "valid" iff it's linked to the page AND not
+    # governance-blocked. Two paths:
+    #   - direct: in wiki_page_message_sources, not in invalid_mvids
+    #   - transitive: in wiki_page_card_sources → card_sources, not in
+    #     invalid_mvids, AND parent card not in invalid_card_set.
+    # The transitive card check is critical (Codex HIGH fix): governance
+    # flags a card with all-offrecord sources as transitive_forget, but
+    # does NOT add the underlying mvids to invalid_mvids. Without the
+    # parent-card check here, body [^mv:N] for such an mv would render
+    # as a valid citation.
+    direct_mvid_rows = (
+        await session.execute(
+            text(_LINKED_DIRECT_MVIDS_QUERY), {"pid": str(page_id)}
+        )
     ).fetchall()
-    linked_mv_set: set[int] = {int(r.mv_id) for r in linked_mvid_rows}
+    direct_linked_mv_set: set[int] = {int(r.mv_id) for r in direct_mvid_rows}
+
+    transitive_mvid_rows = (
+        await session.execute(
+            text(_LINKED_TRANSITIVE_MVIDS_QUERY), {"pid": str(page_id)}
+        )
+    ).fetchall()
+    # mv_id → set of parent card_ids that link to it
+    transitive_mv_parents: dict[int, set[uuid.UUID]] = {}
+    for r in transitive_mvid_rows:
+        mv_id_t = int(r.mv_id)
+        card_id_t = uuid.UUID(str(r.card_id))
+        transitive_mv_parents.setdefault(mv_id_t, set()).add(card_id_t)
 
     linked_card_rows = (
         await session.execute(text(_LINKED_CARD_IDS_QUERY), {"pid": str(page_id)})
     ).fetchall()
     linked_card_set: set[uuid.UUID] = {uuid.UUID(str(r.card_id)) for r in linked_card_rows}
 
-    valid_mv_set: set[int] = linked_mv_set - invalid_mv_set
     valid_card_set: set[uuid.UUID] = linked_card_set - invalid_card_set
+
+    # Direct valid: linked directly AND not invalid.
+    valid_mv_set: set[int] = direct_linked_mv_set - invalid_mv_set
+    # Transitive valid: ALSO requires at least one parent card that is valid.
+    # If every parent card linking this mv is invalid, the mv is NOT
+    # citation-eligible through this page (its content is governance-blocked).
+    for mv_id_t, parent_cards in transitive_mv_parents.items():
+        if mv_id_t in invalid_mv_set:
+            continue
+        if parent_cards & valid_card_set:
+            valid_mv_set.add(mv_id_t)
+
+    # (No combined linked_mv_set needed downstream — Step 3 reads direct +
+    # transitive sets separately.)
 
     # ── Step 3: decide page_archived ─────────────────────────────────────────
     page_archived = False

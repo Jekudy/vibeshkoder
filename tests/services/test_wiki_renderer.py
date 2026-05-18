@@ -458,6 +458,54 @@ async def test_unlinked_mv_token_treated_as_invalid(db_session) -> None:
     assert f'href="#mv-{unlinked_mv}"' not in result.html_body
 
 
+# ── Codex L9c integration: transitive offrecord mv blocked from rendering ────
+
+
+async def test_transitive_offrecord_mv_token_not_rendered_as_citation(db_session) -> None:
+    """Codex HIGH (T9-05 PAR): body [^mv:N] where N is a transitive source of an
+    invalid card MUST NOT render as a valid citation.
+
+    Setup: page cites card C via wiki_page_card_sources. C has card_source
+    pointing to mv_offrecord (chat_message memory_policy='offrecord').
+    Governance flags C as transitive_forget but does NOT add mv_offrecord
+    to invalid_mvids. Renderer must still treat [^mv:mv_offrecord] as
+    invalid/unknown because every parent card linking that mv is invalid.
+    """
+    from bot.services.wiki_renderer import render_wiki_page
+
+    uid = await _make_user(db_session)
+    cm = await _make_chat_message(db_session, user_id=uid, memory_policy="offrecord")
+    mv_offrecord = await _make_message_version(db_session, chat_message_id=cm.id)
+    card_id = await _make_knowledge_card(db_session, admin_user_id=uid, card_status="approved")
+    await _make_card_source(db_session, card_id=card_id, message_version_id=mv_offrecord)
+
+    # Direct valid mv so the page isn't fully invalid (would archive).
+    cm_clean = await _make_chat_message(db_session, user_id=uid)
+    mv_clean = await _make_message_version(db_session, chat_message_id=cm_clean.id)
+
+    body = f"Good [^mv:{mv_clean}] and offrecord [^mv:{mv_offrecord}] here."
+    page_id = await _make_wiki_page(db_session, body_markdown=body)
+    await _link_card(db_session, page_id=page_id, card_id=card_id)
+    await _link_mv(db_session, page_id=page_id, message_version_id=mv_clean)
+
+    # Admin role to make the marker observable (member role would suppress silently).
+    result = await render_wiki_page(
+        db_session,
+        page_id=page_id,
+        role="admin",
+        body_markdown=body,
+    )
+
+    # The page isn't archived overall (mv_clean keeps a valid source AND the
+    # card-token itself isn't in the body so AC#4 / AC#7 don't apply).
+    assert result.page_archived is False
+    # Clean mv renders as a citation; offrecord transitive mv does not.
+    assert f'href="#mv-{mv_clean}"' in result.html_body
+    assert f'href="#mv-{mv_offrecord}"' not in result.html_body
+    # And the offrecord mv lands in admin_unavailable_markers.
+    assert mv_offrecord in result.admin_unavailable_markers
+
+
 # ── AC8 (G1 lint): no LLM/graph imports in wiki_renderer.py ──────────────────
 
 
