@@ -13,9 +13,9 @@
 <h2 class="mb-4">{{ page.title }}</h2>
 
 <div class="wiki-body mb-4">
-    {# nosemgrep: python.flask.security.xss.audit.template-unescaped-with-safe.template-unescaped-with-safe #}
-    {# html_body is pre-sanitized by bot/services/wiki_renderer.py via bleach
-       with a strict tag/attribute/protocol allowlist — see BLEACH_ALLOWED_*. #}
+    <!-- html_body is pre-sanitized by bot/services/wiki_renderer.py via bleach
+         with a strict tag/attribute/protocol allowlist — see BLEACH_ALLOWED_*. -->
+    <!-- nosemgrep: python.flask.security.xss.audit.template-unescaped-with-safe.template-unescaped-with-safe -->
     {{ html_body | safe }}
 </div>
 
