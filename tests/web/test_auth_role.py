@@ -224,11 +224,9 @@ def test_legacy_cookie_without_role_treated_as_admin(app_env, monkeypatch) -> No
 
 def test_expired_legacy_cookie_redirects_to_login(app_env) -> None:
     """I7d.b: cookie that has exceeded max_age → 302 to /login."""
-    web_auth = import_module("web.auth")
     from itsdangerous import URLSafeTimedSerializer
-    # Sign with a very old timestamp by using a negative max_age
     # We can't fake the timestamp directly; instead test that SignatureExpired → redirect
-    # Create a cookie signed by a different secret (BadSignature) to simulate expiry path
+    # by signing with a different secret (BadSignature) — same redirect path.
     s = URLSafeTimedSerializer("different-secret-key")
     expired_cookie = s.dumps({"authenticated": True})
 
