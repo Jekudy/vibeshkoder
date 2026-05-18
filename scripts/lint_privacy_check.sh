@@ -82,6 +82,12 @@ is_allowed_path() {
   [[ "$path" == "web/routes/wiki.py" ]] && return 0
   [[ "$path" == "tests/web/test_wiki_routes.py" ]] && return 0
 
+  # T9-07 wiki cascade layer tests — test the forget cascade behavior and
+  # redaction invariants (edit_reason='forget_cascade',
+  # revision_status='forgotten_redacted', body_markdown mask format). The
+  # file's job is to ENFORCE the privacy cascade contract.
+  [[ "$path" == "tests/services/test_wiki_cascade.py" ]] && return 0
+
   return 1
 }
 

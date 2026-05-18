@@ -36,6 +36,7 @@ from bot.config import settings
 from bot.db.repos.feature_flag import FeatureFlagRepo
 from bot.filters.chat_type import PrivateChatFilter
 from bot.html_escape import html_escape
+from bot.services.forget_cascade import _p6_mvid_advisory_lock_id
 from bot.services.wiki_governance import (
     WikiSourcesMissingError,
     assert_publishable,
@@ -95,11 +96,13 @@ async def cmd_wiki_publish(
     4. SELECT wiki_pages FOR UPDATE — lock the row.
     5. Require page_status='reviewed'.
     6. assert_publishable — require at least one source.
-    7. validate_sources — require all sources to be clean.
-    8. Capture prior_pe, prior_rp from the locked row (plan §5.E step 6a).
-    9. UPDATE public_enabled=true.
-    10. INSERT wiki_publication_log(action='publish', …).
-    11. Reply success.
+    7. validate_sources — preliminary source check.
+    8. Acquire per-mvid advisory xact locks (sorted — deadlock-safe).
+    9. Re-run validate_sources inside the lock window (TOCTOU close).
+    10. Capture prior_pe, prior_rp from the locked row (plan §5.E step 6a).
+    11. UPDATE public_enabled=true.
+    12. INSERT wiki_publication_log(action='publish', …).
+    13. Reply success.
     """
     # 1. Admin gate (R6.a)
     if not _is_admin(message):
@@ -156,17 +159,66 @@ async def cmd_wiki_publish(
                 await message.answer("Нет источников.")
                 return
 
-            # 7. validate_sources — all sources must be clean (R6.c)
+            # 7. validate_sources — preliminary source check (R6.c)
             result = await validate_sources(session, page_id=page_uuid)
             if not result.valid:
                 await message.answer(_format_source_check_summary(result))
                 return
 
-            # 8. Capture prior values from the FOR UPDATE-locked row (plan §5.E step 6a)
+            # 8. Acquire per-mvid advisory xact locks to close the TOCTOU window
+            # between the initial validate_sources and the UPDATE.
+            # Uses the same lock namespace as the cascade worker (_p6_mvid_advisory_lock_id)
+            # so publish and cascade cannot interleave on the same mvid set.
+            # Locks are acquired in sorted order to preserve deadlock-avoidance
+            # discipline (mirrors _process_one_event in forget_cascade.py).
+            # pg_advisory_xact_lock releases automatically on transaction commit/rollback.
+            if (
+                session.bind is not None
+                and session.bind.dialect.name == "postgresql"
+            ):
+                # Resolve direct mvids for this page.
+                direct_mvid_rows = await session.execute(
+                    text(
+                        "SELECT message_version_id FROM wiki_page_message_sources "
+                        "WHERE wiki_page_id = CAST(:pid AS uuid)"
+                    ),
+                    {"pid": page_id},
+                )
+                direct_mvids = [r[0] for r in direct_mvid_rows]
+
+                # Resolve transitive mvids via card_sources.
+                transitive_mvid_rows = await session.execute(
+                    text(
+                        "SELECT cs.message_version_id "
+                        "FROM wiki_page_card_sources wpcs "
+                        "JOIN card_sources cs ON cs.card_id = wpcs.card_id "
+                        "WHERE wpcs.wiki_page_id = CAST(:pid AS uuid)"
+                    ),
+                    {"pid": page_id},
+                )
+                transitive_mvids = [r[0] for r in transitive_mvid_rows]
+
+                all_mvids = set(direct_mvids) | set(transitive_mvids)
+                for lock_id in sorted(_p6_mvid_advisory_lock_id(m) for m in all_mvids):
+                    await session.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                        {"lock_id": lock_id},
+                    )
+
+                # 9. Re-run validate_sources inside the lock window (TOCTOU close).
+                # A forget event that completed between step 7 and step 8 would have
+                # released its mvid locks before we acquired them — we now see its
+                # committed state and can detect any invalidated sources.
+                result = await validate_sources(session, page_id=page_uuid)
+                if not result.valid:
+                    await message.answer(_format_source_check_summary(result))
+                    return
+
+            # 10. Capture prior values from the FOR UPDATE-locked row (plan §5.E step 6a)
             prior_pe: bool = bool(row["public_enabled"])
             prior_rp: str = str(row["robots_policy"])
 
-            # 9. UPDATE public_enabled=true (robots_policy unchanged by /wiki_publish)
+            # 11. UPDATE public_enabled=true (robots_policy unchanged by /wiki_publish)
             await session.execute(
                 text(
                     "UPDATE wiki_pages SET public_enabled = true, updated_at = now() "
@@ -175,7 +227,7 @@ async def cmd_wiki_publish(
                 {"page_id": page_id},
             )
 
-            # 10. INSERT audit log
+            # 12. INSERT audit log
             source_check_json = json.dumps(result.to_dict())
             await session.execute(
                 text(
@@ -204,7 +256,7 @@ async def cmd_wiki_publish(
         )
         return
 
-    # 11. Reply success
+    # 13. Reply success
     await message.answer(
         f"Опубликовано: /wiki/public/{html_escape(slug)}",
         parse_mode="HTML",

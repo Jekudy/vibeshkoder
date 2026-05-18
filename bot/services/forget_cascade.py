@@ -148,6 +148,16 @@ CASCADE_LAYER_ORDER: tuple[str, ...] = (
     # source. Otherwise the card_sources DELETE that follows would orphan
     # the references and the redactor wouldn't know which bullets to mask.
     "digests",
+    # Phase 9 / T9-07 layers — PHASE9_PLAN.md §T9-07 (I7c order binding):
+    # ``wiki_pages`` MUST run AFTER ``digests`` so digest redaction of any
+    # wiki-cited sources has already occurred. ``wiki_pages`` transitions
+    # page_status and inserts an audit wiki_revisions row.
+    # ``wiki_revisions`` MUST run AFTER ``wiki_pages`` and BEFORE
+    # ``card_sources``: the page row is already stale/archived before the
+    # revision body is masked, and card_source FKs still exist when the
+    # wiki_revisions JSONB snapshot is inspected.
+    "wiki_pages",
+    "wiki_revisions",
     # Phase 6 / T6-01 layer — PHASE6_PLAN.md §5.A.5 invariant:
     # ``card_sources`` MUST run AFTER ``qa_traces_llm`` so qa_trace summaries
     # are NULL'd before the card_source rows that the citation_ids referenced
@@ -179,6 +189,12 @@ _LAYER_APPLICABLE_TARGET_TYPES: dict[str, frozenset[str]] = {
     # message-level layers apply. user-level forget propagates because
     # card_sources can reference any message_version owned by the user.
     "card_sources": frozenset({"message", "message_hash", "user"}),
+    # Phase 9 / T9-07 (PHASE9_PLAN.md §T9-07): wiki_pages and wiki_revisions
+    # cite message_versions via wiki_page_message_sources and
+    # wiki_page_card_sources → card_sources. All three target_types propagate
+    # (L9d: message_hash; L9e: user).
+    "wiki_pages": frozenset({"message", "message_hash", "user"}),
+    "wiki_revisions": frozenset({"message", "message_hash", "user"}),
 }
 
 
@@ -887,6 +903,235 @@ async def _cascade_digests(session: AsyncSession, event) -> int:
     return count
 
 
+# ─── Phase 9 / T9-07 cascade layers (PHASE9_PLAN.md §T9-07) ──────────────────
+
+
+async def _cascade_wiki_pages(session: AsyncSession, event) -> int:
+    """Mark wiki pages stale/archived when a forget event covers their cited sources.
+
+    For every wiki page that directly or transitively references a message_version_id
+    covered by this forget event:
+
+    1. Set ``page_status='stale'`` (or ``'archived'`` if no valid sources remain).
+    2. Set ``public_enabled=false``.
+    3. INSERT a ``wiki_revisions`` row with ``edit_reason='forget_cascade'``.
+
+    Returns count of wiki_pages rows modified.
+
+    Run-order invariant: MUST run AFTER ``digests`` and BEFORE ``wiki_revisions``
+    (see CASCADE_LAYER_ORDER). The ``wiki_revisions`` layer that follows masks the
+    body_markdown of any revision snapshot that overlaps the forgotten mvids.
+
+    Target type semantics:
+
+    * ``message`` — resolve chat_message → current_version_id → affected pages.
+    * ``message_hash`` — resolve every mv with matching content_hash → affected pages.
+    * ``user`` — resolve every mv owned by user → affected pages.
+
+    Privacy invariant: ``edit_reason`` carries only the string literal
+    ``'forget_cascade'`` — never quoted body content from the forgotten message.
+    """
+    if event.target_id is None:
+        raise ValueError(
+            f"forget_event target_type={event.target_type!r} requires non-None target_id"
+        )
+
+    from sqlalchemy import bindparam
+    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+    from sqlalchemy.types import BigInteger
+
+    _ARRAY_BIGINT = PG_ARRAY(BigInteger)
+
+    mvids = await _resolve_affected_mvids(session, event)
+    if not mvids:
+        return 0
+
+    # Find all wiki pages that directly cite any of the affected mvids.
+    direct_rows = await session.execute(
+        text(
+            "SELECT DISTINCT wiki_page_id::text FROM wiki_page_message_sources "
+            "WHERE message_version_id = ANY(:mvids)"
+        ).bindparams(
+            bindparam("mvids", type_=_ARRAY_BIGINT)
+        ),
+        {"mvids": list(mvids)},
+    )
+    direct_page_ids: set[str] = {r[0] for r in direct_rows}
+
+    # Find wiki pages that cite any card whose card_sources include an affected mvid.
+    transitive_rows = await session.execute(
+        text(
+            "SELECT DISTINCT wpcs.wiki_page_id::text "
+            "FROM wiki_page_card_sources wpcs "
+            "JOIN card_sources cs ON cs.card_id = wpcs.card_id "
+            "WHERE cs.message_version_id = ANY(:mvids)"
+        ).bindparams(
+            bindparam("mvids", type_=_ARRAY_BIGINT)
+        ),
+        {"mvids": list(mvids)},
+    )
+    transitive_page_ids: set[str] = {r[0] for r in transitive_rows}
+
+    all_page_ids = direct_page_ids | transitive_page_ids
+    if not all_page_ids:
+        return 0
+
+    modified_count = 0
+    for page_id_str in all_page_ids:
+        # Determine new page_status: archived if no valid sources remain; stale otherwise.
+        # Check direct sources not in the forgotten set.
+        remaining_direct = await session.execute(
+            text(
+                "SELECT 1 FROM wiki_page_message_sources "
+                "WHERE wiki_page_id = CAST(:pid AS uuid) "
+                "AND message_version_id != ALL(:mvids) "
+                "LIMIT 1"
+            ).bindparams(
+                bindparam("mvids", type_=_ARRAY_BIGINT)
+            ),
+            {"pid": page_id_str, "mvids": list(mvids)},
+        )
+        has_remaining_direct = remaining_direct.scalar() is not None
+
+        # Check transitive sources (cards whose card_sources are not all forgotten).
+        remaining_transitive = await session.execute(
+            text(
+                "SELECT 1 FROM wiki_page_card_sources wpcs "
+                "JOIN card_sources cs ON cs.card_id = wpcs.card_id "
+                "WHERE wpcs.wiki_page_id = CAST(:pid AS uuid) "
+                "AND cs.message_version_id != ALL(:mvids) "
+                "LIMIT 1"
+            ).bindparams(
+                bindparam("mvids", type_=_ARRAY_BIGINT)
+            ),
+            {"pid": page_id_str, "mvids": list(mvids)},
+        )
+        has_remaining_transitive = remaining_transitive.scalar() is not None
+
+        new_status = (
+            "stale" if (has_remaining_direct or has_remaining_transitive) else "archived"
+        )
+
+        # Capture current body_markdown for the revision snapshot.
+        current_row = await session.execute(
+            text("SELECT body_markdown FROM wiki_pages WHERE id = CAST(:pid AS uuid)"),
+            {"pid": page_id_str},
+        )
+        current_body = current_row.scalar_one_or_none() or ""
+
+        # UPDATE wiki_pages: set page_status and public_enabled=false.
+        await session.execute(
+            text(
+                "UPDATE wiki_pages "
+                "SET page_status = :status, public_enabled = false, updated_at = now() "
+                "WHERE id = CAST(:pid AS uuid)"
+            ),
+            {"status": new_status, "pid": page_id_str},
+        )
+
+        # Derive next revision_seq for this page.
+        seq_row = await session.execute(
+            text(
+                "SELECT COALESCE(MAX(revision_seq), 0) + 1 "
+                "FROM wiki_revisions WHERE wiki_page_id = CAST(:pid AS uuid)"
+            ),
+            {"pid": page_id_str},
+        )
+        next_seq = seq_row.scalar_one()
+
+        # INSERT audit revision row.
+        await session.execute(
+            text(
+                "INSERT INTO wiki_revisions "
+                "(id, wiki_page_id, revision_seq, body_markdown, revision_status, "
+                " source_message_version_ids_snapshot, source_card_ids_snapshot, "
+                " edit_reason, edited_at, created_at) "
+                "VALUES "
+                "(gen_random_uuid(), CAST(:pid AS uuid), :seq, :body, 'active', "
+                " '[]'::jsonb, '[]'::jsonb, "
+                " 'forget_cascade', now(), now())"
+            ),
+            {
+                "pid": page_id_str,
+                "seq": next_seq,
+                "body": current_body,
+            },
+        )
+
+        modified_count += 1
+
+    await session.flush()
+    return modified_count
+
+
+async def _cascade_wiki_revisions(session: AsyncSession, event) -> int:
+    """Mask ``wiki_revisions.body_markdown`` for revisions citing forgotten mvids.
+
+    For every ``wiki_revisions`` row whose
+    ``source_message_version_ids_snapshot`` JSONB overlaps the affected mvids:
+
+    1. Set ``body_markdown = '[CONTENT_REDACTED: forget_event_id={n}]'``.
+    2. Set ``revision_status = 'forgotten_redacted'``.
+    3. Set ``redacted_at = now()``.
+    4. Set ``redacted_by_forget_event_id = event.id``.
+    5. Set ``revision_sources_resolved_at = now()``.
+
+    Returns count of wiki_revisions rows modified.
+
+    Run-order invariant: MUST run AFTER ``wiki_pages`` and BEFORE ``card_sources``
+    (see CASCADE_LAYER_ORDER). Running after ``wiki_pages`` ensures the page row
+    has already been transitioned to stale/archived before revisions are masked.
+
+    Target type semantics: same as ``_cascade_wiki_pages`` — resolved via
+    ``_resolve_affected_mvids``.
+
+    Privacy invariant: the redact string uses only ``forget_event_id`` (an
+    integer) — never any user-readable body content.
+    """
+    if event.target_id is None:
+        raise ValueError(
+            f"forget_event target_type={event.target_type!r} requires non-None target_id"
+        )
+
+    from sqlalchemy import bindparam
+    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+    from sqlalchemy.types import BigInteger
+
+    _ARRAY_BIGINT = PG_ARRAY(BigInteger)
+
+    mvids = await _resolve_affected_mvids(session, event)
+    if not mvids:
+        return 0
+
+    redact_text = f"[CONTENT_REDACTED: forget_event_id={event.id}]"
+
+    result = await session.execute(
+        text(
+            "UPDATE wiki_revisions "
+            "SET body_markdown = :redact_text, "
+            "    revision_status = 'forgotten_redacted', "
+            "    redacted_at = now(), "
+            "    redacted_by_forget_event_id = :event_id, "
+            "    revision_sources_resolved_at = now() "
+            "WHERE source_message_version_ids_snapshot @> ANY("
+            "    SELECT jsonb_build_array(v::bigint) "
+            "    FROM unnest(CAST(:mvids AS bigint[])) AS v"
+            ")"
+        ).bindparams(
+            bindparam("mvids", type_=_ARRAY_BIGINT)
+        ),
+        {
+            "redact_text": redact_text,
+            "event_id": event.id,
+            "mvids": list(mvids),
+        },
+    )
+    count = result.rowcount or 0
+    if count:
+        await session.flush()
+    return count
+
+
 # Map layer name → cascade function. Layers absent from this map are recorded as
 # skipped. When a future phase adds a layer's table, add its function here.
 _LAYER_FUNCS: dict[str, Any] = {
@@ -899,6 +1144,9 @@ _LAYER_FUNCS: dict[str, Any] = {
     "llm_usage_ledger": _cascade_llm_usage_ledger,
     # T7-05 Phase 7 layer — PHASE7_PLAN.md §5.H. Runs BEFORE card_sources.
     "digests": _cascade_digests,
+    # T9-07 Phase 9 layers — PHASE9_PLAN.md §T9-07. Runs AFTER digests, BEFORE card_sources.
+    "wiki_pages": _cascade_wiki_pages,
+    "wiki_revisions": _cascade_wiki_revisions,
     # T6-01 Phase 6 layer — PHASE6_PLAN.md §5.A.5.
     "card_sources": _cascade_card_sources_on_forget,
 }
