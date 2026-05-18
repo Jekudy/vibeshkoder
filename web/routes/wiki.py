@@ -34,7 +34,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +44,12 @@ from bot.services.wiki_renderer import WikiRenderResult, render_wiki_page
 from web.app import TEMPLATES
 
 router = APIRouter(prefix="/wiki", tags=["wiki"])
+
+# Separate router (no prefix) for /robots.txt — must live at site root for
+# crawler convention. Same Cache-Control invariant as /wiki/public/{slug}
+# so that toggling public_enabled or unpublishing a page propagates to
+# crawlers without intermediary caching.
+robots_router = APIRouter(tags=["wiki"])
 
 # ── Feature flag key ─────────────────────────────────────────────────────────
 
@@ -103,6 +109,25 @@ async def _get_public_page_by_slug(session: AsyncSession, slug: str) -> Any | No
         {"slug": slug},
     )
     return result.fetchone()
+
+
+async def _list_robots_allowed_slugs(session: AsyncSession) -> list[str]:
+    """Return slugs of reviewed pages with public_enabled=true AND robots_policy='index'.
+
+    Each row's slug becomes an explicit `Allow:` line in /robots.txt. Pages
+    with robots_policy='noindex' OR public_enabled=false are excluded — the
+    default `Disallow: /` covers them.
+    """
+    result = await session.execute(
+        text(
+            "SELECT slug FROM wiki_pages "
+            "WHERE page_status = 'reviewed' "
+            "  AND public_enabled = true "
+            "  AND robots_policy = 'index' "
+            "ORDER BY slug"
+        )
+    )
+    return [str(r.slug) for r in result.fetchall()]
 
 
 async def _get_page_sources(session: AsyncSession, page_id: uuid.UUID) -> list[Any]:
@@ -333,3 +358,36 @@ async def wiki_page(slug: str, request: Request) -> Response:
             "user": getattr(request.state, "user", {}),
         },
     )
+
+
+# ── /robots.txt — wiki variant (AC#9 HIGH F) ─────────────────────────────────
+
+
+@robots_router.get("/robots.txt", response_class=PlainTextResponse)
+async def wiki_robots() -> Response:
+    """Wiki robots.txt — anonymous, no-store.
+
+    Per Plan §T9-05 AC#9: every response carries
+    ``Cache-Control: no-store, max-age=0, must-revalidate`` so crawlers
+    re-fetch immediately after admin /wiki_unpublish or robots_policy flip.
+
+    When ``memory.wiki.enabled=false`` the file disallows everything.
+    Otherwise: explicit ``Allow:`` line per page where
+    ``public_enabled=true AND robots_policy='index' AND page_status='reviewed'``,
+    followed by default-deny ``Disallow: /`` so crawlers don't index admin
+    routes, the auth surface, drafts, or non-public wiki content.
+    """
+    headers = {"Cache-Control": _NO_STORE}
+    async with async_session() as session:
+        if not await _wiki_enabled(session):
+            return PlainTextResponse(
+                "User-agent: *\nDisallow: /\n",
+                headers=headers,
+            )
+        allowed_slugs = await _list_robots_allowed_slugs(session)
+
+    lines = ["User-agent: *"]
+    for slug in allowed_slugs:
+        lines.append(f"Allow: /wiki/public/{slug}")
+    lines.append("Disallow: /")
+    return PlainTextResponse("\n".join(lines) + "\n", headers=headers)
