@@ -331,6 +331,56 @@ async def test_publish_success_inserts_log_and_flips_pe(db_session) -> None:
     assert page["public_enabled"] is True
 
 
+async def test_republish_already_public_logs_prior_pe_true(db_session) -> None:
+    """Plan §5.E step 6a "Critical" — a second /wiki_publish on an already
+    public page must log prior_public_enabled=true (not hardcoded false).
+
+    Regression guard against accidentally hardcoding `prior_pe=False` in
+    the INSERT — code reads from the FOR UPDATE-locked row's actual value.
+    """
+    from sqlalchemy import text as _text
+    handler = import_module("bot.handlers.wiki")
+
+    await _ensure_admin_user(db_session)
+    page_id, slug = await _make_wiki_page(db_session, page_status="reviewed")
+    uid = await _make_user(db_session)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    mv_id = await _make_message_version(db_session, chat_message_id=cm.id)
+    await _link_mv(db_session, page_id=page_id, mv_id=mv_id)
+
+    msg = _message(user_id=_ADMIN_ID, text=f"/wiki_publish {slug}")
+    cmd = _command(slug)
+
+    # First publish — initial prior_pe=False.
+    with patch.object(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True)):
+        await handler.cmd_wiki_publish(msg, db_session, cmd)
+    # Second publish — page already public; prior_pe MUST be True.
+    msg2 = _message(user_id=_ADMIN_ID, text=f"/wiki_publish {slug}")
+    cmd2 = _command(slug)
+    with patch.object(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True)):
+        await handler.cmd_wiki_publish(msg2, db_session, cmd2)
+
+    rows = (
+        await db_session.execute(
+            _text(
+                "SELECT prior_public_enabled, new_public_enabled FROM wiki_publication_log "
+                "WHERE wiki_page_id = :pid AND action = 'publish' ORDER BY created_at"
+            ),
+            {"pid": str(page_id)},
+        )
+    ).fetchall()
+    assert len(rows) == 2
+    # First row: prior=False, new=True.
+    assert rows[0].prior_public_enabled is False
+    assert rows[0].new_public_enabled is True
+    # Second row: prior=True (the §5.E step 6a critical invariant), new=True.
+    assert rows[1].prior_public_enabled is True, (
+        "prior_public_enabled must reflect the FOR UPDATE-locked row's actual "
+        "value, not be hardcoded false"
+    )
+    assert rows[1].new_public_enabled is True
+
+
 async def test_publish_pe_log_atomicity(db_session) -> None:
     """UPDATE and INSERT must be in one transaction — simulate INSERT failure rollback."""
     handler = import_module("bot.handlers.wiki")
