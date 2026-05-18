@@ -88,6 +88,15 @@ is_allowed_path() {
   # file's job is to ENFORCE the privacy cascade contract.
   [[ "$path" == "tests/services/test_wiki_cascade.py" ]] && return 0
 
+  # forget_cascade.py — the canonical enforcer of the forget policy across
+  # all cascade layers (chat_messages, message_versions, digests, wiki_pages,
+  # wiki_revisions, card_sources, llm_synthesis_cache, qa_traces_llm). The
+  # file's docstrings and SQL strings legitimately reference the canonical
+  # privacy literals because the file IS the policy. Same rationale as the
+  # digest_redactor.py / digest_publisher.py / digest_context.py allowlist
+  # entries above.
+  [[ "$path" == "bot/services/forget_cascade.py" ]] && return 0
+
   return 1
 }
 

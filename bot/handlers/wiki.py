@@ -128,55 +128,49 @@ async def cmd_wiki_publish(
 
     try:
         async with session.begin_nested():
-            # 4. SELECT … FOR UPDATE
-            row = (
+            # CODEX HIGH FIX (lock-order inversion): acquire per-mvid advisory
+            # locks BEFORE the wiki_pages FOR UPDATE so we match the cascade
+            # worker's lock order (mvid lock → wiki_pages UPDATE). The inverse
+            # order (FOR UPDATE → mvid lock) opened a deadlock window when
+            # publish on page P1 holds P1's row lock while cascade for mvid
+            # M1 holds M1's mvid lock — both wait forever.
+            #
+            # Sequence:
+            #   1) light SELECT to resolve slug → page_id (no row lock)
+            #   2) compute cited mvids (direct + transitive)
+            #   3) pg_advisory_xact_lock per mvid (sorted, deadlock-safe)
+            #   4) SELECT FOR UPDATE on the resolved page_id
+            #   5) validate_sources inside the lock window
+            #   6) UPDATE + INSERT
+            #
+            # The two-phase SELECT is safe because wiki_page_*_sources tables
+            # have no write paths from concurrent admin commands today.
+
+            # 4a. Light SELECT to resolve slug → page_id.
+            pre_row = (
                 await session.execute(
-                    text(
-                        "SELECT id, page_status, public_enabled, robots_policy "
-                        "FROM wiki_pages WHERE slug = :slug FOR UPDATE"
-                    ),
+                    text("SELECT id FROM wiki_pages WHERE slug = :slug"),
                     {"slug": slug},
                 )
             ).mappings().one_or_none()
 
-            if row is None:
-                await message.answer(f"Страница не найдена: <code>{html_escape(slug)}</code>.", parse_mode="HTML")
+            if pre_row is None:
+                await message.answer(
+                    f"Страница не найдена: <code>{html_escape(slug)}</code>.",
+                    parse_mode="HTML",
+                )
                 return
 
-            page_id = str(row["id"])
-
-            # 5. Require page_status='reviewed' (R6.b)
-            if row["page_status"] != "reviewed":
-                await message.answer("Страница не прошла ревью.")
-                return
-
-            # 6. assert_publishable — at least one source (R6.c precondition)
+            page_id = str(pre_row["id"])
             import uuid as _uuid_module
             page_uuid = _uuid_module.UUID(page_id)
-            try:
-                await assert_publishable(session, page_id=page_uuid)
-            except WikiSourcesMissingError:
-                await message.answer("Нет источников.")
-                return
 
-            # 7. validate_sources — preliminary source check (R6.c)
-            result = await validate_sources(session, page_id=page_uuid)
-            if not result.valid:
-                await message.answer(_format_source_check_summary(result))
-                return
-
-            # 8. Acquire per-mvid advisory xact locks to close the TOCTOU window
-            # between the initial validate_sources and the UPDATE.
-            # Uses the same lock namespace as the cascade worker (_p6_mvid_advisory_lock_id)
-            # so publish and cascade cannot interleave on the same mvid set.
-            # Locks are acquired in sorted order to preserve deadlock-avoidance
-            # discipline (mirrors _process_one_event in forget_cascade.py).
-            # pg_advisory_xact_lock releases automatically on transaction commit/rollback.
+            # 4b. Acquire per-mvid advisory locks BEFORE FOR UPDATE on the page row.
+            # Mirrors cascade-worker lock order — deadlock-safe.
             if (
                 session.bind is not None
                 and session.bind.dialect.name == "postgresql"
             ):
-                # Resolve direct mvids for this page.
                 direct_mvid_rows = await session.execute(
                     text(
                         "SELECT message_version_id FROM wiki_page_message_sources "
@@ -185,8 +179,6 @@ async def cmd_wiki_publish(
                     {"pid": page_id},
                 )
                 direct_mvids = [r[0] for r in direct_mvid_rows]
-
-                # Resolve transitive mvids via card_sources.
                 transitive_mvid_rows = await session.execute(
                     text(
                         "SELECT cs.message_version_id "
@@ -197,7 +189,6 @@ async def cmd_wiki_publish(
                     {"pid": page_id},
                 )
                 transitive_mvids = [r[0] for r in transitive_mvid_rows]
-
                 all_mvids = set(direct_mvids) | set(transitive_mvids)
                 for lock_id in sorted(_p6_mvid_advisory_lock_id(m) for m in all_mvids):
                     await session.execute(
@@ -205,14 +196,42 @@ async def cmd_wiki_publish(
                         {"lock_id": lock_id},
                     )
 
-                # 9. Re-run validate_sources inside the lock window (TOCTOU close).
-                # A forget event that completed between step 7 and step 8 would have
-                # released its mvid locks before we acquired them — we now see its
-                # committed state and can detect any invalidated sources.
-                result = await validate_sources(session, page_id=page_uuid)
-                if not result.valid:
-                    await message.answer(_format_source_check_summary(result))
-                    return
+            # 4c. NOW take the wiki_pages row lock — under mvid locks already held.
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT id, page_status, public_enabled, robots_policy "
+                        "FROM wiki_pages WHERE id = CAST(:pid AS uuid) FOR UPDATE"
+                    ),
+                    {"pid": page_id},
+                )
+            ).mappings().one_or_none()
+
+            if row is None:
+                # Race: page was deleted between 4a and 4c. Treat as not found.
+                await message.answer(
+                    f"Страница не найдена: <code>{html_escape(slug)}</code>.",
+                    parse_mode="HTML",
+                )
+                return
+
+            # 5. Require page_status='reviewed' (R6.b)
+            if row["page_status"] != "reviewed":
+                await message.answer("Страница не прошла ревью.")
+                return
+
+            # 6. assert_publishable — at least one source (R6.c precondition)
+            try:
+                await assert_publishable(session, page_id=page_uuid)
+            except WikiSourcesMissingError:
+                await message.answer("Нет источников.")
+                return
+
+            # 7. validate_sources — under mvid+row locks (TOCTOU window closed).
+            result = await validate_sources(session, page_id=page_uuid)
+            if not result.valid:
+                await message.answer(_format_source_check_summary(result))
+                return
 
             # 10. Capture prior values from the FOR UPDATE-locked row (plan §5.E step 6a)
             prior_pe: bool = bool(row["public_enabled"])
