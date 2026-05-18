@@ -74,7 +74,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_web_password(self) -> Settings:
         # Backward-compat alias: WEB_PASSWORD → WEB_ADMIN_PASSWORD if admin not set.
-        if self.WEB_PASSWORD is not None and self.WEB_ADMIN_PASSWORD is None:
+        # Empty string is treated as unset (falls through to "neither set" branch
+        # which preserves the original WEB_PASSWORD-named error for deployers).
+        if self.WEB_PASSWORD and self.WEB_ADMIN_PASSWORD is None:
             warnings.warn(
                 "WEB_PASSWORD is deprecated; set WEB_ADMIN_PASSWORD instead. "
                 "WEB_PASSWORD will be removed in a future release.",
@@ -87,10 +89,10 @@ class Settings(BaseSettings):
             )
             self.WEB_ADMIN_PASSWORD = self.WEB_PASSWORD
 
-        # If neither WEB_ADMIN_PASSWORD nor WEB_PASSWORD was set, keep legacy behaviour:
-        # WEB_PASSWORD gets an ephemeral dev value (for backward compat with existing code
-        # that reads settings.WEB_PASSWORD directly).
-        if self.WEB_ADMIN_PASSWORD is None and self.WEB_PASSWORD is None:
+        # If neither WEB_ADMIN_PASSWORD nor WEB_PASSWORD was set (None OR empty
+        # string), keep legacy behaviour: WEB_PASSWORD gets an ephemeral dev
+        # value, OR prod raises with the WEB_PASSWORD-named error preserved.
+        if not self.WEB_ADMIN_PASSWORD and not self.WEB_PASSWORD:
             if self.DEV_MODE:
                 logging.warning("WEB_PASSWORD is not set; generated an ephemeral dev password")
                 self.WEB_PASSWORD = secrets.token_urlsafe(16)
