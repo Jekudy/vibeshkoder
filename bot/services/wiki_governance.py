@@ -3,27 +3,34 @@
 Public API
 ----------
 validate_sources(session, *, page_id) -> SourceCheckResult
+assert_publishable(session, *, page_id) -> None
+WikiPageNotFoundError, WikiSourcesMissingError
 
 Pure read-only service. No DB writes.
 
 All invalid-source conditions are resolved in a **single batched SQL** that
 covers both direct mv citations (wiki_page_message_sources) and transitive
-mvids that flow through wiki_page_card_sources → card_sources.
+mvids that flow through wiki_page_card_sources → card_sources. Tombstone
+matching is done inside the SQL via `forget_events.tombstone_key` prefix
+comparison — matching the project-wide read-side convention used in
+search.py / extractor.py / llm_gateway.py / governance_revalidation.py.
 
 Invalid conditions checked (7 total):
 1. card_status != 'approved'        → reason "archived"
 2. message_version.is_redacted      → reason "redacted"
 3. chat_messages.memory_policy = 'offrecord' or 'forgotten'
                                     → reason "offrecord"
-4. active forget_event by chat_message_id / message_version parent
+4. active forget_event tombstone_key 'message:<chat_id>:<message_id>'
                                     → reason "forgotten"
-5. active forget_event message_hash tombstone matching mv.content_hash
+5. active forget_event tombstone_key 'message_hash:<content_hash>'
                                     → reason "tombstone:message_hash"
-6. active forget_event user tombstone matching mv author (chat_messages.user_id)
+6. active forget_event tombstone_key 'user:<chat_messages.user_id>'
                                     → reason "tombstone:user"
 7. transitive: card whose every card_sources mv triggers conditions 2-6
                                     → reason "transitive_forget"
    (surfaced on the card citation, not on the underlying mv)
+8. card cited but card_sources_count = 0 (all sources have been deleted)
+                                    → reason "transitive_forget"
 
 Join chain used: message_versions.chat_message_id → chat_messages.id
 (NOT message_versions.message_id — that column does not exist on the table).
@@ -33,25 +40,41 @@ G1 lint: this file must NEVER import neo4j or bot.services.graph_* modules.
 
 from __future__ import annotations
 
-import logging
 import uuid
 from dataclasses import dataclass, field
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-logger = logging.getLogger(__name__)
+# ── Page existence check ──────────────────────────────────────────────────────
+_PAGE_EXISTS_QUERY_SQL = "SELECT 1 FROM wiki_pages WHERE id = :page_id"
 
-# ── Active forget-event status set ────────────────────────────────────────────
-# Mirrors the semantics from forget_cascade.py: any event that is not 'failed'
-# is considered "active" and blocks publication.
-_ACTIVE_FORGET_STATUSES = ("pending", "processing", "completed")
+# ── Cards SQL — with card_sources count folded in to eliminate N+1 ─────────────
+#
+# Returns every card cited by the page along with its current status and the
+# total count of card_sources rows that still exist. A card with cs_count=0
+# means every source has been deleted by the forget cascade (or never had
+# any) — the card must be flagged as transitive_forget.
+_CARDS_QUERY_SQL = """
+SELECT
+    kc.id           AS card_id,
+    kc.card_status  AS card_status,
+    (SELECT count(*) FROM card_sources cs WHERE cs.card_id = kc.id) AS cs_count
+FROM wiki_page_card_sources wpcs
+JOIN knowledge_cards kc ON kc.id = wpcs.card_id
+WHERE wpcs.wiki_page_id = :page_id
+"""
 
-# ── Batched SQL ───────────────────────────────────────────────────────────────
+# ── Batched MVID query ────────────────────────────────────────────────────────
 #
 # A single query that, given a wiki_page_id, returns one row per mv that is
 # directly cited by the wiki page (via wiki_page_message_sources) OR
 # transitively referenced via wiki_page_card_sources → card_sources.
+#
+# Tombstone matching is performed IN-SQL via three EXISTS subqueries against
+# forget_events.tombstone_key — matching the canonical read-side convention.
+# We deliberately do NOT consult forget_events.target_id; nothing in the
+# schema guarantees target_id is consistent with tombstone_key on read.
 #
 # Columns returned:
 #   mv_id            BIGINT  — message_versions.id
@@ -59,9 +82,9 @@ _ACTIVE_FORGET_STATUSES = ("pending", "processing", "completed")
 #   card_id          UUID    — non-null only for source_kind='transitive'
 #   mv_is_redacted   BOOL
 #   cm_memory_policy TEXT    — chat_messages.memory_policy
-#   cm_user_id       BIGINT  — chat_messages.user_id (for user-tombstone check)
-#   mv_content_hash  TEXT    — message_versions.content_hash (for hash-tombstone)
-#   cm_id            INT     — chat_messages.id (for message-tombstone check)
+#   fe_msg_active    BOOL    — tombstone_key 'message:<chat>:<msg>' is active
+#   fe_hash_active   BOOL    — tombstone_key 'message_hash:<hash>' is active
+#   fe_user_active   BOOL    — tombstone_key 'user:<user_id>' is active
 #
 # The join chain uses message_versions.chat_message_id → chat_messages.id
 # (NOT message_versions.message_id, which is not a column on that table).
@@ -99,35 +122,24 @@ SELECT
     a.card_id,
     mv.is_redacted          AS mv_is_redacted,
     cm.memory_policy        AS cm_memory_policy,
-    cm.user_id              AS cm_user_id,
-    mv.content_hash         AS mv_content_hash,
-    cm.id                   AS cm_id
+    EXISTS (
+        SELECT 1 FROM forget_events fe
+        WHERE fe.status IN ('pending','processing','completed')
+          AND fe.tombstone_key = 'message:' || cm.chat_id::text || ':' || cm.message_id::text
+    )                       AS fe_msg_active,
+    EXISTS (
+        SELECT 1 FROM forget_events fe
+        WHERE fe.status IN ('pending','processing','completed')
+          AND fe.tombstone_key = 'message_hash:' || mv.content_hash
+    )                       AS fe_hash_active,
+    EXISTS (
+        SELECT 1 FROM forget_events fe
+        WHERE fe.status IN ('pending','processing','completed')
+          AND fe.tombstone_key = 'user:' || cm.user_id::text
+    )                       AS fe_user_active
 FROM all_mvids a
 JOIN message_versions mv ON mv.id = a.mv_id
 JOIN chat_messages cm ON cm.id = mv.chat_message_id
-"""
-
-# Query to fetch all card citations and their statuses for the page.
-_CARDS_QUERY_SQL = """
-SELECT
-    kc.id           AS card_id,
-    kc.card_status  AS card_status
-FROM wiki_page_card_sources wpcs
-JOIN knowledge_cards kc ON kc.id = wpcs.card_id
-WHERE wpcs.wiki_page_id = :page_id
-"""
-
-# Query to fetch active forget_events that might match a set of mvids.
-# Returns rows grouped by the tombstone type so callers can classify the reason.
-_FORGET_EVENTS_QUERY_SQL = """
-SELECT
-    fe.tombstone_key,
-    fe.target_type,
-    fe.target_id,
-    fe.status
-FROM forget_events fe
-WHERE fe.status IN ('pending', 'processing', 'completed')
-  AND fe.target_type IN ('message', 'message_hash', 'user')
 """
 
 
@@ -145,7 +157,9 @@ class SourceCheckResult:
         reasons:         Mapping from "card:<uuid>" or "mvid:<id>" to a short
                          reason string: "archived", "redacted", "offrecord",
                          "forgotten", "tombstone:message_hash", "tombstone:user",
-                         "transitive_forget".
+                         "transitive_forget" (covers both "card with no clean
+                         transitive source remaining" AND "card with zero
+                         card_sources rows left after cascade").
     """
 
     valid: bool
@@ -188,6 +202,11 @@ async def validate_sources(
     -------
     SourceCheckResult
         ``valid=True`` iff all source conditions pass.
+
+    Raises
+    ------
+    WikiPageNotFoundError
+        If no ``wiki_pages`` row exists with the supplied ``page_id``.
     """
     if isinstance(page_id, int):
         # Accept UUID.int for test convenience — convert back to UUID
@@ -199,59 +218,42 @@ async def validate_sources(
     invalid_mvids: list[int] = []
     reasons: dict[str, str] = {}
 
-    # ── Step 1: fetch card statuses ───────────────────────────────────────────
+    # ── Step 0: page must exist ───────────────────────────────────────────────
+    page_exists = (
+        await session.execute(
+            text(_PAGE_EXISTS_QUERY_SQL), {"page_id": page_id_str}
+        )
+    ).scalar()
+    if not page_exists:
+        raise WikiPageNotFoundError(f"wiki_page {page_id} does not exist")
+
+    # ── Step 1: fetch card statuses + card_sources counts ─────────────────────
     card_rows = (
         await session.execute(text(_CARDS_QUERY_SQL), {"page_id": page_id_str})
     ).fetchall()
 
-    # card_id → status
-    card_statuses: dict[uuid.UUID, str] = {}
+    # card_id → (status, cs_count)
+    card_info: dict[uuid.UUID, tuple[str, int]] = {}
     for row in card_rows:
         cid = uuid.UUID(str(row.card_id))
-        card_statuses[cid] = row.card_status
+        card_info[cid] = (row.card_status, int(row.cs_count))
 
     # Cards that are not 'approved' are immediately invalid
-    for cid, status in card_statuses.items():
+    for cid, (status, _cs) in card_info.items():
         if status != "approved":
             invalid_card_ids.append(cid)
             reasons[f"card:{cid}"] = "archived"
 
-    # ── Step 2: fetch all mvids (direct + transitive) in a single batched query
+    # ── Step 2: fetch all mvids (direct + transitive) — single batched SQL ────
+    # Each row carries per-mv tombstone-active booleans evaluated in-SQL via
+    # forget_events.tombstone_key prefix matching (not target_id).
     mv_rows = (
         await session.execute(text(BATCHED_QUERY_SQL), {"page_id": page_id_str})
     ).fetchall()
 
-    if not mv_rows and not card_rows:
-        # Empty page — no sources at all. Return valid=True (no constraints violated).
-        return SourceCheckResult(valid=True)
-
-    # ── Step 3: load active forget_events once ────────────────────────────────
-    fe_rows = (
-        await session.execute(text(_FORGET_EVENTS_QUERY_SQL))
-    ).fetchall()
-
-    # Build lookup structures for O(1) matching per mv row.
-    # message-type events: target_id is chat_message_id (as stored in target_id field)
-    forgotten_cm_ids: set[str] = set()
-    # message_hash-type events: target_id is the content_hash
-    forgotten_hashes: set[str] = set()
-    # user-type events: target_id is the telegram user_id
-    forgotten_user_ids: set[str] = set()
-
-    for fe in fe_rows:
-        if fe.target_type == "message" and fe.target_id is not None:
-            forgotten_cm_ids.add(str(fe.target_id))
-        elif fe.target_type == "message_hash" and fe.target_id is not None:
-            forgotten_hashes.add(str(fe.target_id))
-        elif fe.target_type == "user" and fe.target_id is not None:
-            forgotten_user_ids.add(str(fe.target_id))
-
-    # ── Step 4: evaluate each mv row ─────────────────────────────────────────
+    # ── Step 3: evaluate each mv row ─────────────────────────────────────────
     # Track which transitive card ids have ANY valid source remaining.
-    # We start by assuming all transitive cards have no valid source;
-    # then we clear the flag when we find at least one clean mv for a card.
     transitive_card_ids: set[uuid.UUID] = set()
-    # card_id → bool: True means at least one source is clean
     card_has_clean_source: dict[uuid.UUID, bool] = {}
 
     for row in mv_rows:
@@ -265,17 +267,12 @@ async def validate_sources(
             if card_id not in card_has_clean_source:
                 card_has_clean_source[card_id] = False  # pessimistic default
 
-        # Determine invalid reason for this mv
         mv_reason = _classify_mv(
-            mv_id=mv_id,
             mv_is_redacted=bool(row.mv_is_redacted),
             cm_memory_policy=str(row.cm_memory_policy),
-            cm_user_id=str(row.cm_user_id),
-            mv_content_hash=str(row.mv_content_hash),
-            cm_id=str(row.cm_id),
-            forgotten_cm_ids=forgotten_cm_ids,
-            forgotten_hashes=forgotten_hashes,
-            forgotten_user_ids=forgotten_user_ids,
+            fe_msg_active=bool(row.fe_msg_active),
+            fe_hash_active=bool(row.fe_hash_active),
+            fe_user_active=bool(row.fe_user_active),
         )
 
         if mv_reason is None:
@@ -290,41 +287,23 @@ async def validate_sources(
             # For transitive: do NOT flag the mv directly; flag the card instead
             # (handled below after we know all sources)
 
-    # ── Step 5: evaluate transitive card validity ─────────────────────────────
+    # ── Step 4: flag cards whose transitive sources are all tainted ──────────
     for cid in transitive_card_ids:
-        # Skip cards already marked invalid via card_status check
         if cid in {c for c in invalid_card_ids}:
             continue
         if not card_has_clean_source.get(cid, False):
-            # All sources for this card are tainted
             if cid not in invalid_card_ids:
                 invalid_card_ids.append(cid)
                 reasons[f"card:{cid}"] = "transitive_forget"
 
-    # ── Step 6: check "all card_sources forgotten" for directly-cited cards ───
-    # A card may be approved and not flagged by transitive check above if it has
-    # NO card_sources rows at all, or if all its sources are forgotten but it
-    # wasn't picked up in mv_rows (e.g., card_sources rows have been deleted).
-    # Check via a targeted subquery for each cited card.
-    for cid in list(card_statuses.keys()):
+    # ── Step 5: flag cards whose card_sources_count = 0 (no rows reachable) ──
+    # Read the count from the cards query result — no extra round-trip.
+    for cid, (_status, cs_count) in card_info.items():
         if cid in {c for c in invalid_card_ids}:
-            continue  # already flagged
-        if cid in transitive_card_ids:
-            continue  # handled above
-        # Card is cited but has no (transitive) mvids in our result — either no
-        # card_sources exist or all were deleted. Count remaining card_sources
-        # for this card to decide.
-        cs_count_row = (
-            await session.execute(
-                text("SELECT count(*) FROM card_sources WHERE card_id = :cid"),
-                {"cid": str(cid)},
-            )
-        ).scalar()
-        if cs_count_row == 0:
-            # No sources remain — check if there are any active forget events
-            # that would have caused deletion (or just flag as all-sources-forgotten)
+            continue
+        if cs_count == 0:
             invalid_card_ids.append(cid)
-            reasons[f"card:{cid}"] = "all_sources_forgotten"
+            reasons[f"card:{cid}"] = "transitive_forget"
 
     valid = not invalid_card_ids and not invalid_mvids
 
@@ -341,20 +320,19 @@ async def validate_sources(
 
 def _classify_mv(
     *,
-    mv_id: int,
     mv_is_redacted: bool,
     cm_memory_policy: str,
-    cm_user_id: str,
-    mv_content_hash: str,
-    cm_id: str,
-    forgotten_cm_ids: set[str],
-    forgotten_hashes: set[str],
-    forgotten_user_ids: set[str],
+    fe_msg_active: bool,
+    fe_hash_active: bool,
+    fe_user_active: bool,
 ) -> str | None:
     """Return the first invalid reason for this mv, or None if clean.
 
     Priority order: redacted → offrecord → forgotten (message) →
     tombstone:message_hash → tombstone:user.
+
+    All tombstone booleans come from the BATCHED_QUERY_SQL EXISTS clauses,
+    which match against forget_events.tombstone_key prefix (not target_id).
     """
     if mv_is_redacted:
         return "redacted"
@@ -362,16 +340,13 @@ def _classify_mv(
     if cm_memory_policy in ("offrecord", "forgotten"):
         return "offrecord"
 
-    # Active forget_event for the parent chat_message
-    if cm_id in forgotten_cm_ids:
+    if fe_msg_active:
         return "forgotten"
 
-    # message_hash tombstone
-    if mv_content_hash in forgotten_hashes:
+    if fe_hash_active:
         return "tombstone:message_hash"
 
-    # user tombstone
-    if cm_user_id in forgotten_user_ids:
+    if fe_user_active:
         return "tombstone:user"
 
     return None
@@ -401,3 +376,7 @@ async def assert_publishable(session: AsyncSession, *, page_id: uuid.UUID) -> No
 
 class WikiSourcesMissingError(ValueError):
     """Raised when a wiki page has no cited sources at publication time."""
+
+
+class WikiPageNotFoundError(LookupError):
+    """Raised by validate_sources when the supplied page_id does not exist."""
