@@ -77,6 +77,11 @@ is_allowed_path() {
   [[ "$path" == "bot/services/wiki_renderer.py" ]] && return 0
   [[ "$path" == "tests/services/test_wiki_renderer.py" ]] && return 0
 
+  # T9-05 member wiki router + route tests — enforce governance / suppress
+  # policy at the HTTP layer. Same canonical-literals rationale.
+  [[ "$path" == "web/routes/wiki.py" ]] && return 0
+  [[ "$path" == "tests/web/test_wiki_routes.py" ]] && return 0
+
   return 1
 }
 
