@@ -124,6 +124,43 @@ def test_login_with_member_password_sets_member_role(two_pw_env) -> None:
     assert payload.get("role") == "member"
 
 
+# ── Test 2b: member role blocked on admin-only routes (Codex HIGH-1 fix) ──────
+
+
+def test_member_role_blocked_on_admin_route(two_pw_env) -> None:
+    """A member cookie hitting an admin-only path (/dashboard) must return 403.
+
+    Codex security review HIGH-1: introducing role='member' without a
+    role-based ACL would let members access /dashboard, /members, /cards.
+    Member access is reserved for wiki member routes (T9-05 / /wiki/*).
+    """
+    from web.auth import create_session_cookie
+    client = _make_client()
+    client.cookies.set("session", create_session_cookie(role="member"))
+    response = client.get("/dashboard", follow_redirects=False)
+    assert response.status_code == 403
+    body = response.json()
+    assert body.get("required") == "admin"
+
+
+def test_admin_role_passes_acl_helper(two_pw_env) -> None:
+    """Confirm the ACL helper itself: admin paths are flagged, member paths aren't.
+
+    Direct unit test of _is_admin_only_path avoids hitting actual route handlers
+    (which may have external deps). Combined with test_member_role_blocked_on_admin_route
+    above, this proves both halves of the ACL.
+    """
+    from web.app import _is_admin_only_path
+    assert _is_admin_only_path("/dashboard") is True
+    assert _is_admin_only_path("/cards") is True
+    assert _is_admin_only_path("/members") is True
+    assert _is_admin_only_path("/wiki/intro") is False  # T9-05 member-readable
+    assert _is_admin_only_path("/login") is False  # public
+    assert _is_admin_only_path("/healthz") is False  # public
+    assert _is_admin_only_path("/static/css/main.css") is False  # static
+    assert _is_admin_only_path("/") is False  # root redirect, not gated
+
+
 # ── Test 3: bad password → 403 ────────────────────────────────────────────────
 
 

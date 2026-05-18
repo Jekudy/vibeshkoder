@@ -11,7 +11,10 @@ def test_password_and_session_cookie_roundtrip(app_env) -> None:
 
     cookie = auth.create_session_cookie()
     payload = auth.get_user_from_cookie(cookie)
-    assert payload == {"authenticated": True}
+    # T9-03: payload now carries role; default is admin for back-compat.
+    assert payload is not None
+    assert payload.get("authenticated") is True
+    assert payload.get("role") == "admin"
 
 
 def test_verify_password_constant_time_correct(app_env) -> None:

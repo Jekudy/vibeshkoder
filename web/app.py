@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -18,6 +18,17 @@ TEMPLATES = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
 
 # Paths that don't require authentication
 _PUBLIC_PATHS = {"/login", "/docs", "/openapi.json", "/healthz"}
+
+# Path prefixes accessible to members AND admins (T9-05 wiki member routes).
+# Everything else is admin-only. Members reaching admin-only paths get 403.
+_MEMBER_READABLE_PREFIXES: tuple[str, ...] = ("/wiki/",)
+
+
+def _is_admin_only_path(path: str) -> bool:
+    """True iff the path requires role='admin'."""
+    if path in _PUBLIC_PATHS or path.startswith("/static") or path == "/":
+        return False
+    return not any(path.startswith(p) for p in _MEMBER_READABLE_PREFIXES)
 
 
 def create_app() -> FastAPI:
@@ -41,6 +52,14 @@ def create_app() -> FastAPI:
             return RedirectResponse(url="/login", status_code=302)
 
         is_legacy = user.pop("legacy", False)
+
+        # T9-03 role-based ACL: members are denied on admin-only paths.
+        # Wiki member routes (T9-05) are reachable to both roles.
+        if user.get("role") != "admin" and _is_admin_only_path(path):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "insufficient_role", "required": "admin"},
+            )
 
         if is_legacy:
             # Legacy cookie without 'role' field: treat as admin for this request

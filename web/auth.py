@@ -21,19 +21,29 @@ def derive_role(password: str | None) -> Literal["admin", "member"] | None:
     """Derive role from password by comparing against admin then member passwords.
 
     Returns 'admin', 'member', or None if no match.
+
+    Constant-time across role decisions: both compare_digest calls always run
+    (even when one config slot is unset — uses dummy bytes) so an attacker
+    cannot distinguish admin vs member vs unset via response timing.
     """
     if not password:
         return None
 
+    pw_bytes = password.encode()
     admin_pw = settings.WEB_ADMIN_PASSWORD
     member_pw = settings.WEB_MEMBER_PASSWORD
 
-    if admin_pw and hmac.compare_digest(password.encode(), admin_pw.encode()):
+    # Dummy values keep both compare_digest calls running unconditionally.
+    admin_target = admin_pw.encode() if admin_pw else b"\x00" * len(pw_bytes)
+    member_target = member_pw.encode() if member_pw else b"\x00" * len(pw_bytes)
+
+    admin_match = hmac.compare_digest(pw_bytes, admin_target) and admin_pw is not None
+    member_match = hmac.compare_digest(pw_bytes, member_target) and member_pw is not None
+
+    if admin_match:
         return "admin"
-
-    if member_pw and hmac.compare_digest(password.encode(), member_pw.encode()):
+    if member_match:
         return "member"
-
     return None
 
 
@@ -113,11 +123,26 @@ def _insert_legacy_grace_audit() -> None:
                 )
                 await session.commit()
 
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Schedule as a background task (won't block the request)
-            loop.create_task(_do_insert())
+        # Inside FastAPI middleware there's always a running loop. The sync
+        # fallback (get_event_loop + run_until_complete) is unreachable in
+        # production; kept only for direct test invocation.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        def _log_task_exception(task: asyncio.Task) -> None:
+            """Attach as done_callback so silent FK violations are visible."""
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(
+                    "legacy_cookie_grace audit insert failed: %s", exc
+                )
+
+        if loop is not None and loop.is_running():
+            task = loop.create_task(_do_insert())
+            task.add_done_callback(_log_task_exception)
         else:
-            loop.run_until_complete(_do_insert())
+            asyncio.run(_do_insert())
     except Exception as exc:  # noqa: BLE001
         logger.warning("best-effort legacy_cookie_grace audit insert failed: %s", exc)
