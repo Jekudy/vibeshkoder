@@ -71,6 +71,12 @@ is_allowed_path() {
   [[ "$path" == "bot/services/wiki_governance.py" ]] && return 0
   [[ "$path" == "tests/services/test_wiki_governance.py" ]] && return 0
 
+  # T9-04 wiki renderer + tests implement citation-suppression policy.
+  # The renderer consumes the governance result to enforce suppression of
+  # invalid sources. Same rationale as wiki_governance.py allowlist above.
+  [[ "$path" == "bot/services/wiki_renderer.py" ]] && return 0
+  [[ "$path" == "tests/services/test_wiki_renderer.py" ]] && return 0
+
   return 1
 }
 
