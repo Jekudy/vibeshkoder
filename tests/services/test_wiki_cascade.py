@@ -530,6 +530,75 @@ async def test_cascade_wiki_pages_writes_revision_row(db_session) -> None:
     assert revisions[0]["edit_reason"] == "forget_cascade"
 
 
+# ── AC#10b: cascade audit revision is pre-masked at INSERT (Codex CRITICAL #1) ──
+
+
+async def test_cascade_wiki_pages_audit_revision_pre_masked(db_session) -> None:
+    """AC#10b (Codex CRITICAL #1): the audit wiki_revisions row inserted by
+    _cascade_wiki_pages must already have:
+    - body_markdown == '[CONTENT_REDACTED: forget_event_id={n}]'
+    - revision_status == 'forgotten_redacted'
+    - redacted_at IS NOT NULL
+    - redacted_by_forget_event_id == event.id
+
+    This prevents future queries of the audit log from exposing the forgotten text
+    via the cascade-created row, which has empty source snapshots and is never
+    touched by _cascade_wiki_revisions's overlap filter.
+    """
+    from bot.services.forget_cascade import _cascade_wiki_pages
+    from sqlalchemy import text
+
+    uid = await _make_user(db_session)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    mv_id = await _make_message_version(db_session, chat_message_id=cm.id)
+
+    page_id = await _make_wiki_page(db_session, page_status="reviewed")
+    await _link_mv(db_session, page_id=page_id, message_version_id=mv_id)
+
+    event_id = await _make_forget_event_row(
+        db_session,
+        tombstone_key=f"message:{cm.chat_id}:{cm.message_id}",
+        target_type="message",
+        target_id=str(cm.id),
+    )
+    event = _FakeEvent(
+        id=event_id,
+        target_type="message",
+        target_id=str(cm.id),
+        tombstone_key=f"message:{cm.chat_id}:{cm.message_id}",
+    )
+
+    count = await _cascade_wiki_pages(db_session, event)
+
+    assert count == 1
+
+    # The cascade-created revision must already be masked — NOT 'active' with original body.
+    row = (
+        await db_session.execute(
+            text(
+                "SELECT body_markdown, revision_status, redacted_at, "
+                "redacted_by_forget_event_id "
+                "FROM wiki_revisions "
+                "WHERE wiki_page_id = CAST(:pid AS uuid) "
+                "  AND edit_reason = 'forget_cascade'"
+            ),
+            {"pid": str(page_id)},
+        )
+    ).mappings().one()
+
+    expected_mask = f"[CONTENT_REDACTED: forget_event_id={event_id}]"
+    assert row["body_markdown"] == expected_mask, (
+        f"Expected masked body, got: {row['body_markdown']!r}"
+    )
+    assert row["revision_status"] == "forgotten_redacted", (
+        f"Expected 'forgotten_redacted', got: {row['revision_status']!r}"
+    )
+    assert row["redacted_at"] is not None, "redacted_at must be set at INSERT"
+    assert row["redacted_by_forget_event_id"] == event_id, (
+        f"Expected event_id={event_id}, got: {row['redacted_by_forget_event_id']!r}"
+    )
+
+
 # ── AC#11: _cascade_wiki_revisions mask format ────────────────────────────────
 
 
