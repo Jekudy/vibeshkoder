@@ -65,7 +65,10 @@ async def _clear_wiki_tables(session: AsyncSession) -> None:
                 offrecord_marks,
                 message_versions,
                 chat_messages,
-                forget_events
+                forget_events,
+                ingestion_runs,
+                telegram_updates,
+                users
             RESTART IDENTITY CASCADE
             """
         )
@@ -470,8 +473,12 @@ class TestC8aBodyTokenSuppression:
         assert mvid_forgotten in result.admin_unavailable_markers, (
             f"C8a-admin: forgotten mvid={mvid_forgotten} must be in admin_unavailable_markers"
         )
-        # Admin sees the warning text, not the raw token
-        assert "[⚠ SOURCE UNAVAILABLE]" in result.html_body or result.html_body == "", (
+        # Hardened per Codex LOW #5: require non-empty admin output WITH the
+        # warning marker. The previous `or html_body == ""` made the assertion
+        # vacuous — an empty body would silently pass even when admin should
+        # see [⚠ SOURCE UNAVAILABLE] for invalid tokens.
+        assert result.html_body, "C8a-admin: admin output must not be empty"
+        assert "[⚠ SOURCE UNAVAILABLE]" in result.html_body, (
             "C8a-admin: admin output must contain [⚠ SOURCE UNAVAILABLE] for invalid tokens"
         )
 

@@ -72,7 +72,10 @@ async def _clear_wiki_tables(session: AsyncSession) -> None:
                 knowledge_cards,
                 message_versions,
                 chat_messages,
-                forget_events
+                forget_events,
+                ingestion_runs,
+                telegram_updates,
+                users
             RESTART IDENTITY CASCADE
             """
         )
@@ -373,9 +376,17 @@ class TestWikiLeakage:
             body_markdown=f"Контент страницы [^mv:{mv_id}] конец.",
         )
 
-        # The offrecord mvid must be suppressed, not rendered as a valid citation.
-        assert str(mv_id) not in result.html_body or "wiki-citation" not in result.html_body, (
-            f"L9a: offrecord mv_id {mv_id} leaked as valid citation in html_body"
+        # Hardened per Codex MEDIUM #4: explicit check that the offrecord secret
+        # text does NOT appear in the rendered body, AND no valid citation anchor
+        # is emitted for the offrecord mvid. The previous OR-form could pass even
+        # if secret_text leaked, as long as no "wiki-citation" marker was present.
+        secret_payload = "секретное содержание L9a"
+        assert secret_payload not in result.html_body, (
+            f"L9a: offrecord secret text leaked into html_body for mv_id={mv_id}"
+        )
+        citation_anchor = f'data-mv-id="{mv_id}"'
+        assert citation_anchor not in result.html_body, (
+            f"L9a: offrecord mv_id={mv_id} rendered as valid citation anchor"
         )
         # Citation must be suppressed (either in suppressed list OR page archived).
         assert (
