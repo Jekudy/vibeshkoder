@@ -525,11 +525,12 @@ evidence in PR bodies). Phase 11 binding extended 30 → **42/42** with 12 new c
 
 ---
 
-## Phase 9 — Wiki / Community Catalog (AUTHORIZED 2026-05-17, in progress)
+## Phase 9 — Wiki / Community Catalog (CLOSED 2026-05-19)
 
-**Status:** Sprint 0c complete (plan ratified). Wave 2 — 8/8 implementation
-sprints merged. Phase 11 binding tests (T9-08) green — 30 tests / 18 AC IDs
-across L9a-e + C8a-b + I7a-e + R6.a-f + G1. Awaiting FHR + ROLLOUT.
+**Status:** CLOSED. All 8 implementation sprints (T9-01..T9-08) + FHR fix
+sprint merged. Phase 11 binding **60/60** green (42 prior + 18 new wiki).
+Production rollout playbook in `docs/memory-system/PHASE9_ROLLOUT.md`.
+Flag `memory.wiki.enabled` default OFF — operator-controlled.
 
 **Sprint completion (T9-01..T9-08 merged):**
 - T9-01: PR #314 (schema migrations 050-054)
@@ -539,7 +540,26 @@ across L9a-e + C8a-b + I7a-e + R6.a-f + G1. Awaiting FHR + ROLLOUT.
 - T9-05: PR #319 (member router + Jinja + /robots.txt)
 - T9-06: PR #320 (admin /wiki_publish / /wiki_unpublish / /wiki_robots)
 - T9-07: PR #321 (forget cascade + advisory lock binding — closes T9-06 lock carryover)
-- T9-08: Phase 11 binding tests — 30 tests / 18 AC IDs (this PR)
+- T9-08: PR #322 (Phase 11 binding tests — 30 tests / 18 AC IDs)
+- FHR closure: this PR (CRITICAL cascade audit mask + HIGH-1 member login
+  + HIGH-2 legacy_cookie_grace audit migration 055 + PHASE9_ROLLOUT.md +
+  CLOSED markers)
+
+**FHR findings addressed (CRITICAL + HIGH):**
+- **CRITICAL** (Codex): `_cascade_wiki_pages` audit revision INSERT now
+  masks `body_markdown` with canonical `[CONTENT_REDACTED: forget_event_id={n}]`
+  + `revision_status='forgotten_redacted'` at insert. Previously the audit
+  row retained forgotten content because empty `source_message_version_ids_snapshot`
+  bypassed `_cascade_wiki_revisions` overlap filter.
+- **HIGH-1** (Claude): member login flow end-to-end. `POST /login` and `GET /`
+  redirect role-aware (member → `/wiki`, admin → `/dashboard`); role-aware nav
+  template (admin-only Dashboard/Members/Cards, Wiki visible to all); login
+  copy "Enter your password" (dropped "admin").
+- **HIGH-2** (both): legacy_cookie_grace audit persists. Migration 055 makes
+  `wiki_publication_log.wiki_page_id` NULLABLE with CHECK
+  `(wiki_page_id IS NOT NULL OR action='legacy_cookie_grace')`.
+  `_insert_legacy_grace_audit` writes NULL page_id. I7d binding test no
+  longer patches helper to no-op; asserts row persists.
 
 **Plan:** `docs/memory-system/PHASE9_PLAN.md` (1550+ lines, ratified
 2026-05-17 after dual-model spec review — Claude product + Codex technical
@@ -575,9 +595,28 @@ across L9a-e + C8a-b + I7a-e + R6.a-f + G1. Awaiting FHR + ROLLOUT.
   + drift simulator) — 18-21 new test IDs; total target 60-63
 
 **Phase 9.5 carryovers** (deferred):
+- **FK action mismatch** (Codex MED #3): `wiki_pages.created_by_user_id`
+  NOT NULL + `ON DELETE SET NULL` — incompatible. Only fires if/when
+  user-row deletion is attempted; deferred until anonymization workflow
+  designed.
+- **`_cascade_wiki_revisions` idempotency** (Codex LOW #4): no guard
+  excluding already-redacted rows; overlap-on-later-event rewrites
+  `redacted_by_forget_event_id`. Preserve first-redaction provenance via
+  partial predicate.
+- **Stale-page member silent 404 → 410** (Claude MED-4): member route
+  returns generic 404 when `page_status='stale'/'archived'`; should
+  return 410 Gone with templated "page being re-validated" explanation.
+- **Missing `WEB_MEMBER_PASSWORD` startup warning** (Claude MED-5):
+  silent fail when env var unset; should emit explicit log warning if
+  wiki flag is ON.
+- **Cache-Control on member `/wiki/{slug}`** (Claude MED-6): public path
+  applies `Cache-Control: no-store`; member path does not. Inconsistent
+  with privacy invariant.
+- **L9a assertion OR-form polish** (Claude product r1 MED, non-blocking):
+  cosmetic — paired tests L9b/L9d/L9e assert status directly.
 - Multilingual, static export, two-admin quorum, edit-conflict resolution,
   page tagging, content moderation flow, member-compromise runbook, #291
-  shared predicate refactor
+  shared predicate refactor (out-of-scope original deferrals).
 
 ---
 

@@ -210,6 +210,42 @@ Codex technical) with revision passes addressing 2 BLOCKER + 7-9 HIGH +
 4 MEDIUM audit findings per phase. Phase 11 binding suite expected to
 grow from 42 → 75+ at closure of both phases.
 
+**Phase 9 (wiki / community catalog) — CLOSED 2026-05-19.** All 8 tickets
+merged (T9-01 schema PR #314, T9-02 governance PR #316, T9-03 auth role
+split PR #317 — closes BLOCKER C, T9-04 renderer + bleach PR #318, T9-05
+member router + Jinja + /robots.txt PR #319, T9-06 admin /wiki_publish /
+/wiki_unpublish / /wiki_robots PR #320, T9-07 forget cascade +
+advisory lock binding PR #321 — closes T9-06 lock carryover with 4
+Codex security fixes inline, T9-08 Phase 11 binding 30 tests / 18 AC
+PR #322 — 5 Codex PAR fixes applied inline). FHR Claude
+`deep-product-reviewer` NEEDS_FIXES + Codex deep-technical FAIL with 1
+CRITICAL + 2 HIGH + 2 MEDIUM + 2 LOW — all CRITICAL + HIGH addressed in
+closure PR. CRITICAL: `_cascade_wiki_pages` audit revision INSERT now
+masks `body_markdown` with `[CONTENT_REDACTED: forget_event_id={n}]` +
+`revision_status='forgotten_redacted'` at insert (previously copied
+forgotten content into audit row with empty source snapshot, bypassing
+`_cascade_wiki_revisions` overlap filter); HIGH-1: member login flow
+end-to-end — `POST /login` + `GET /` redirect role-aware (member →
+`/wiki`, admin → `/dashboard`), role-aware nav (Dashboard/Members/Cards
+admin-only, Wiki visible to all authenticated), login copy fixed
+("Enter your password"); HIGH-2: legacy_cookie_grace audit persists —
+migration 055 makes `wiki_publication_log.wiki_page_id` NULLABLE with
+CHECK `(wiki_page_id IS NOT NULL OR action='legacy_cookie_grace')`,
+`_insert_legacy_grace_audit` writes NULL page_id, I7d binding test no
+longer patches the helper to no-op. Phase 11 binding **60/60** green
+(42 prior + 18 new). Flag `memory.wiki.enabled` default OFF —
+production rollout playbook in `docs/memory-system/PHASE9_ROLLOUT.md`.
+Two-password role split: `WEB_ADMIN_PASSWORD` + `WEB_MEMBER_PASSWORD`
+(must differ); legacy `WEB_PASSWORD` aliased one release cycle.
+Phase 9.5 carryovers: FK action mismatch `created_by_user_id NOT NULL`
++ `ON DELETE SET NULL` (Codex MED #3, only relevant if/when user delete
+is used), `_cascade_wiki_revisions` no idempotency guard for already-
+redacted rows (Codex LOW #4), stale-page member silent 404 → 410 with
+explanation template (Claude MED-4), missing `WEB_MEMBER_PASSWORD`
+startup warning (Claude MED-5), `Cache-Control: no-store` on member
+`/wiki/{slug}` (Claude MED-6), L9a OR-form assertion polish (Claude
+product r1 MED, non-blocking).
+
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
 
