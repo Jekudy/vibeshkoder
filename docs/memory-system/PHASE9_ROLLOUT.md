@@ -100,26 +100,28 @@ Phase 5 LLM env vars.
    ```
    No restart required — handlers re-read the flag per request.
 
-6. **Smoke test as admin.** Open the web UI, log in with
-   `WEB_ADMIN_PASSWORD`. Navigate to `/wiki/<slug>` for the seeded draft.
-   Expected: page renders, `[⚠ SOURCE UNAVAILABLE]` markers visible for
-   any invalid citation tokens, page status banner shows `draft`.
-
-7. **Smoke test as member.** Open in a fresh browser (or incognito), log
-   in with `WEB_MEMBER_PASSWORD`. Navigate to the same `/wiki/<slug>`.
-   Expected: page renders WITHOUT admin markers (invalid citations are
-   silently suppressed for members). If `page_status != 'reviewed'`, the
-   member surface MAY still render — but `/wiki/public/{slug}` will return
-   404 (only `reviewed + public_enabled=true` makes it public).
-
-8. **Promote to reviewed.** Once an admin verifies the page content is
-   suitable for community visibility:
+6. **Promote the seeded page to `reviewed`.** The `/wiki/{slug}` route
+   serves only `page_status='reviewed'` rows (drafts are admin-curatable
+   via direct DB or a future admin UI, but not via the web wiki route).
+   Promote the seed page first so the upcoming smoke tests find it:
    ```sql
    UPDATE wiki_pages
    SET page_status = 'reviewed', updated_at = now()
    WHERE slug = '<slug>';
    ```
-   This makes the page eligible for `/wiki_publish`.
+   This also makes the page eligible for `/wiki_publish`.
+
+7. **Smoke test as admin.** Open the web UI, log in with
+   `WEB_ADMIN_PASSWORD`. Navigate to `/wiki/<slug>` for the now-reviewed
+   page. Expected: page renders, `[⚠ SOURCE UNAVAILABLE]` markers visible
+   for any invalid citation tokens, page status banner shows `reviewed`.
+
+8. **Smoke test as member.** Open in a fresh browser (or incognito), log
+   in with `WEB_MEMBER_PASSWORD`. Expected: post-login redirect to `/wiki`
+   (member landing). Navigate to `/wiki/<slug>`. Expected: page renders
+   WITHOUT admin markers (invalid citations are silently suppressed for
+   members). `/wiki/public/{slug}` will still return 404 until step 9
+   (only `reviewed + public_enabled=true` makes the page public).
 
 9. **Publish the page.** From an admin Telegram session:
    ```
