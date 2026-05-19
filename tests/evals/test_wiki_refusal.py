@@ -404,11 +404,11 @@ def test_r6e_member_password_cannot_escalate_to_admin_via_user_id(monkeypatch) -
             follow_redirects=False,
         )
 
-        # Must redirect to /dashboard on successful login
+        # Must redirect to /wiki on successful member login (members cannot access /dashboard)
         assert response.status_code == 302, (
             f"Expected 302 redirect, got {response.status_code}: {response.text[:200]}"
         )
-        assert response.headers.get("location") == "/dashboard"
+        assert response.headers.get("location") == "/wiki"
 
         # Decode the session cookie and verify role='member'
         session_cookie = response.cookies.get("session")
@@ -520,6 +520,102 @@ def test_r6f_archived_after_forget_yields_410_with_no_store_header(monkeypatch) 
         cache_control = response.headers.get("Cache-Control", "")
         assert "no-store" in cache_control, (
             f"Expected Cache-Control: no-store in 410 response, got: {cache_control!r}"
+        )
+
+
+# ── R6.g — member login redirects to /wiki, not /dashboard ──────────────────
+
+
+def test_r6g_member_login_redirects_to_wiki(monkeypatch) -> None:
+    """R6.g: POST /login with WEB_MEMBER_PASSWORD → 302 to /wiki (not /dashboard).
+
+    Members have no access to /dashboard (admin-only path). After a successful
+    member login the handler must redirect to /wiki so the member lands on a
+    page they can actually access.  This test was added as part of Phase 9 FHR
+    HIGH-1 fix.
+    """
+    monkeypatch.setenv("WEB_ADMIN_PASSWORD", "admin-secret-pw-1234")
+    monkeypatch.setenv("WEB_MEMBER_PASSWORD", "member-secret-pw-5678")
+    monkeypatch.setenv("WEB_SESSION_SECRET", "test-session-secret-32-chars-long!")
+    monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("COMMUNITY_CHAT_ID", "-1001234567890")
+    monkeypatch.setenv("ADMIN_IDS", "[149820031]")
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    monkeypatch.setenv("GOOGLE_SHEETS_CREDS_FILE", "")
+    monkeypatch.setenv("GOOGLE_SHEET_ID", "")
+    monkeypatch.setenv("WEB_BASE_URL", "http://localhost:8080")
+    monkeypatch.setenv("WEB_BOT_USERNAME", "vibeshkoder_dev_bot")
+    monkeypatch.setenv("DB_PASSWORD", "changeme")
+    monkeypatch.setenv("DEV_MODE", "true")
+
+    import sys
+    for mod in list(sys.modules):
+        if mod == "bot" or mod.startswith("bot.") or mod == "web" or mod.startswith("web."):
+            sys.modules.pop(mod, None)
+
+    web_app = import_module("web.app")
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(web_app.create_app(), raise_server_exceptions=False) as client:
+        # Member POST /login
+        response = client.post(
+            "/login",
+            data={"password": "member-secret-pw-5678"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 302, (
+            f"Expected 302 redirect, got {response.status_code}: {response.text[:200]}"
+        )
+        location = response.headers.get("location", "")
+        assert location == "/wiki", (
+            f"Expected member login to redirect to /wiki, got {location!r}. "
+            "Members cannot access /dashboard (admin-only) — they must land on /wiki."
+        )
+
+
+def test_r6g_admin_login_still_redirects_to_dashboard(monkeypatch) -> None:
+    """R6.g (admin side): POST /login with WEB_ADMIN_PASSWORD → 302 to /dashboard.
+
+    Admin redirect must be unchanged by the member-flow fix.
+    """
+    monkeypatch.setenv("WEB_ADMIN_PASSWORD", "admin-secret-pw-1234")
+    monkeypatch.setenv("WEB_MEMBER_PASSWORD", "member-secret-pw-5678")
+    monkeypatch.setenv("WEB_SESSION_SECRET", "test-session-secret-32-chars-long!")
+    monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("COMMUNITY_CHAT_ID", "-1001234567890")
+    monkeypatch.setenv("ADMIN_IDS", "[149820031]")
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    monkeypatch.setenv("GOOGLE_SHEETS_CREDS_FILE", "")
+    monkeypatch.setenv("GOOGLE_SHEET_ID", "")
+    monkeypatch.setenv("WEB_BASE_URL", "http://localhost:8080")
+    monkeypatch.setenv("WEB_BOT_USERNAME", "vibeshkoder_dev_bot")
+    monkeypatch.setenv("DB_PASSWORD", "changeme")
+    monkeypatch.setenv("DEV_MODE", "true")
+
+    import sys
+    for mod in list(sys.modules):
+        if mod == "bot" or mod.startswith("bot.") or mod == "web" or mod.startswith("web."):
+            sys.modules.pop(mod, None)
+
+    web_app = import_module("web.app")
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(web_app.create_app(), raise_server_exceptions=False) as client:
+        response = client.post(
+            "/login",
+            data={"password": "admin-secret-pw-1234"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 302, (
+            f"Expected 302 redirect, got {response.status_code}: {response.text[:200]}"
+        )
+        location = response.headers.get("location", "")
+        assert location == "/dashboard", (
+            f"Expected admin login to redirect to /dashboard, got {location!r}."
         )
 
 

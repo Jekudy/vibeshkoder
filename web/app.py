@@ -116,9 +116,12 @@ def create_app() -> FastAPI:
     app.include_router(wiki_router)
     app.include_router(wiki_robots_router)
 
-    # Root redirect
+    # Root redirect — role-aware: members go to /wiki, admins to /dashboard
     @app.get("/")
-    async def root():
-        return RedirectResponse(url="/dashboard", status_code=302)
+    async def root(request: Request):
+        user = getattr(request.state, "user", None)
+        role = user.get("role") if isinstance(user, dict) else None
+        url = "/wiki" if role == "member" else "/dashboard"
+        return RedirectResponse(url=url, status_code=302)
 
     return app
