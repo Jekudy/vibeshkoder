@@ -1037,13 +1037,6 @@ async def _cascade_wiki_pages(session: AsyncSession, event) -> int:
             "archived" if (surviving_direct <= 0 and surviving_cards <= 0) else "stale"
         )
 
-        # Capture current body_markdown for the revision snapshot.
-        current_row = await session.execute(
-            text("SELECT body_markdown FROM wiki_pages WHERE id = CAST(:pid AS uuid)"),
-            {"pid": page_id_str},
-        )
-        current_body = current_row.scalar_one_or_none() or ""
-
         # UPDATE wiki_pages: set page_status, public_enabled=false, AND robots
         # policy back to 'noindex' (Codex MED #6 fix part b — cascade flip
         # without robots reset left crawlers seeing the prior indexable hint).
@@ -1067,23 +1060,27 @@ async def _cascade_wiki_pages(session: AsyncSession, event) -> int:
         )
         next_seq = seq_row.scalar_one()
 
-        # INSERT audit revision row.
+        # INSERT audit revision row — pre-masked to prevent forgotten content
+        # from leaking via audit log queries (Codex CRITICAL #1 fix).
+        # The cascade-created row has empty source snapshots, so _cascade_wiki_revisions
+        # overlap filter would never touch it; we must mask at INSERT time.
+        redact_text = f"[CONTENT_REDACTED: forget_event_id={event.id}]"
         await session.execute(
             text(
                 "INSERT INTO wiki_revisions "
                 "(id, wiki_page_id, revision_seq, body_markdown, revision_status, "
                 " source_message_version_ids_snapshot, source_card_ids_snapshot, "
                 " edit_reason, edited_at, created_at, "
-                " redacted_by_forget_event_id) "
+                " redacted_at, redacted_by_forget_event_id) "
                 "VALUES "
-                "(gen_random_uuid(), CAST(:pid AS uuid), :seq, :body, 'active', "
+                "(gen_random_uuid(), CAST(:pid AS uuid), :seq, :body, 'forgotten_redacted', "
                 " '[]'::jsonb, '[]'::jsonb, "
-                " 'forget_cascade', now(), now(), :event_id)"
+                " 'forget_cascade', now(), now(), now(), :event_id)"
             ),
             {
                 "pid": page_id_str,
                 "seq": next_seq,
-                "body": current_body,
+                "body": redact_text,
                 "event_id": int(event.id),
             },
         )
