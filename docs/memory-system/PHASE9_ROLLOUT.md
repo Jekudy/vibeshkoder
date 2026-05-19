@@ -159,9 +159,9 @@ Phase 5 LLM env vars.
 | Check | Command | Expected |
 |---|---|---|
 | Flag is ON | `SELECT enabled FROM feature_flags WHERE flag_key='memory.wiki.enabled';` | `t` |
-| Migrations applied | `alembic current` | `054` (or later) |
+| Migrations applied | `alembic current` | `055` (or later — includes legacy-grace nullable wiki_page_id) |
 | Two passwords configured | `web/auth.py` logs on startup | `WEB_ADMIN_PASSWORD set; WEB_MEMBER_PASSWORD set` |
-| Member login → role='member' | `curl -X POST /login -d 'password=<member-pw>&user_id=<admin_id>'` then decode session cookie | `role=='member'` regardless of `user_id` body param |
+| Member login → role='member' | `curl -X POST /login -d 'password=<member-pw>'` then decode session cookie | `role=='member'`. R6.e binding test additionally proves that *if* a `user_id` form field is supplied, it's silently ignored (`web/routes/auth.py` accepts only `password`); role is derived from password match alone. |
 | Privacy binding green | `EVAL_HARNESS_ENABLED=1 pytest tests/evals/test_wiki_*.py` | 30/30 pass |
 | Forget cascade hits wiki | Trigger `/forget_reply` on a cited message → `SELECT page_status FROM wiki_pages WHERE id=<id>` | `stale` or `archived`, `public_enabled=false` |
 | robots.txt gated correctly | `curl https://<host>/robots.txt` | Only `/wiki/public/<indexed-slug>` allowed |
@@ -206,13 +206,27 @@ downgrade will fail FK pre-flight.
 
 These are deferred items tracked for post-launch follow-up:
 
-- **L9c assertion polish** (Claude product MEDIUM, non-blocking) —
-  L9a/L9c uses an OR-form assertion; paired with L9b/L9d/L9e which
-  assert `page_status` directly. Hardening to AND-form is cosmetic.
-- **`_insert_legacy_grace_audit` silent failure** (all sprints LOW) —
-  `wiki_publication_log.wiki_page_id` is NOT NULL, so legacy-session
-  audit cannot insert. Needs a separate session-events table; tracked
-  for Phase 9.5.
+- **L9a assertion polish** (Claude product r1 MEDIUM, non-blocking) —
+  L9a uses an OR-form assertion; paired with L9b/L9d/L9e which assert
+  `page_status` directly. Hardening to AND-form is cosmetic.
+- **FK action mismatch on `created_by_user_id`** (Codex FHR MED #3) —
+  column is NOT NULL but FK action is `ON DELETE SET NULL`. Future
+  user-row delete will fail. Only relevant if/when anonymization
+  workflow is added; deferred until then.
+- **`_cascade_wiki_revisions` idempotency guard** (Codex FHR LOW #4) —
+  rewriting already-redacted revision rows on overlapping later forget
+  events overwrites `redacted_by_forget_event_id`. Preserve first-
+  redaction provenance via partial predicate. Cosmetic; mask format is
+  already deterministic.
+- **Stale-page member silent 404 → 410** (Claude FHR MED-4) — member
+  route returns generic 404 when `page_status='stale'/'archived'`;
+  should return 410 Gone with templated explanation. Public path
+  already returns 410 + `Cache-Control: no-store` correctly.
+- **Missing `WEB_MEMBER_PASSWORD` startup warning** (Claude FHR MED-5) —
+  unset env var silently disables member login. Should emit explicit
+  log warning if `memory.wiki.enabled` is ON.
+- **Cache-Control on member `/wiki/{slug}`** (Claude FHR MED-6) — public
+  path applies `Cache-Control: no-store`; member path does not.
 - **Two-admin quorum** (deferred) — current model: one admin can
   publish. Future: require N-of-M admin approval before
   `public_enabled=true`. Out of scope for v1.
@@ -223,8 +237,19 @@ These are deferred items tracked for post-launch follow-up:
 - **Static export** — current model: dynamic render every request.
   Pre-rendered HTML cache deferred.
 - **Page tagging + moderation flow** — deferred to Phase 9.5+.
-- **`/wiki/{slug}` Cache-Control on 503** — currently only the public
-  path gets `no-store` on 503. Member paths could use the same; tracked.
+
+**Closed in this cycle** (do not list as carryover):
+- `_insert_legacy_grace_audit` FK violation — **FIXED** via migration 055
+  (nullable `wiki_page_id` + CHECK `(wiki_page_id IS NOT NULL OR
+  action='legacy_cookie_grace')`). I7d binding test now asserts row
+  persists.
+- `_cascade_wiki_pages` audit revision retaining forgotten body —
+  **FIXED** (Codex FHR CRITICAL #1) — INSERT pre-masks
+  `body_markdown` + sets `revision_status='forgotten_redacted'` +
+  `redacted_at` + `redacted_by_forget_event_id`. New integration test
+  `test_cascade_wiki_pages_audit_revision_pre_masked` verifies.
+- Member login flow broken — **FIXED** (Claude FHR HIGH-1) — role-aware
+  redirect + role-aware nav + login copy.
 
 ## Communications
 
