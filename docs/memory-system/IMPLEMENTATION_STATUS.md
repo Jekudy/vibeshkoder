@@ -527,8 +527,19 @@ evidence in PR bodies). Phase 11 binding extended 30 → **42/42** with 12 new c
 
 ## Phase 9 — Wiki / Community Catalog (AUTHORIZED 2026-05-17, in progress)
 
-**Status:** Sprint 0c complete (plan ratified). Sprint 0d implementation
-waves dispatching.
+**Status:** Sprint 0c complete (plan ratified). Wave 2 — 8/8 implementation
+sprints merged. Phase 11 binding tests (T9-08) green — 30 tests / 18 AC IDs
+across L9a-e + C8a-b + I7a-e + R6.a-f + G1. Awaiting FHR + ROLLOUT.
+
+**Sprint completion (T9-01..T9-08 merged):**
+- T9-01: PR #314 (schema migrations 050-054)
+- T9-02: PR #316 (governance validator)
+- T9-03: PR #317 (web auth role split — BLOCKER C closed)
+- T9-04: PR #318 (renderer + bleach allowlist)
+- T9-05: PR #319 (member router + Jinja + /robots.txt)
+- T9-06: PR #320 (admin /wiki_publish / /wiki_unpublish / /wiki_robots)
+- T9-07: PR #321 (forget cascade + advisory lock binding — closes T9-06 lock carryover)
+- T9-08: Phase 11 binding tests — 30 tests / 18 AC IDs (this PR)
 
 **Plan:** `docs/memory-system/PHASE9_PLAN.md` (1550+ lines, ratified
 2026-05-17 after dual-model spec review — Claude product + Codex technical

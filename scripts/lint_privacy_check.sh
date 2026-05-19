@@ -88,6 +88,17 @@ is_allowed_path() {
   # file's job is to ENFORCE the privacy cascade contract.
   [[ "$path" == "tests/services/test_wiki_cascade.py" ]] && return 0
 
+  # T9-08 Phase 11 binding tests for wiki — name the canonical privacy
+  # literals in docstrings, assertion messages, and seed-data SQL because
+  # they ENFORCE the policy by name. Same rationale as test_digest_leakage.py
+  # / test_wiki_governance.py allowlist entries above. Covers L9a-e, C8a-b,
+  # I7a-e, R6.a-f, G1.
+  [[ "$path" == "tests/evals/test_wiki_leakage.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_wiki_citations.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_wiki_cascade.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_wiki_refusal.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_wiki_no_graph.py" ]] && return 0
+
   # forget_cascade.py — the canonical enforcer of the forget policy across
   # all cascade layers (chat_messages, message_versions, digests, wiki_pages,
   # wiki_revisions, card_sources, llm_synthesis_cache, qa_traces_llm). The
