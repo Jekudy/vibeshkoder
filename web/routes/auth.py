@@ -38,7 +38,7 @@ async def login_submit(request: Request, password: str = Form(...)):
 
     cookie_value = create_session_cookie(role=role)
 
-    response = RedirectResponse(url="/dashboard", status_code=302)
+    response = RedirectResponse(url="/wiki" if role == "member" else "/dashboard", status_code=302)
     response.set_cookie(
         key="session",
         value=cookie_value,

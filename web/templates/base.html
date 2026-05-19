@@ -20,6 +20,12 @@
             </button>
             <div class="collapse navbar-collapse" id="navContent">
                 <ul class="navbar-nav me-auto">
+                    {% if user is defined and user %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="/wiki">Wiki</a>
+                    </li>
+                    {% endif %}
+                    {% if user is defined and user and user.role == "admin" %}
                     <li class="nav-item">
                         <a class="nav-link" href="/dashboard">Dashboard</a>
                     </li>
@@ -29,11 +35,14 @@
                     <li class="nav-item">
                         <a class="nav-link" href="/cards">Cards</a>
                     </li>
+                    {% endif %}
                 </ul>
                 <ul class="navbar-nav">
+                    {% if user is defined and user %}
                     <li class="nav-item">
                         <a class="nav-link" href="/logout">Logout</a>
                     </li>
+                    {% endif %}
                 </ul>
             </div>
         </div>
