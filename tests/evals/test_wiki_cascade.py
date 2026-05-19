@@ -421,13 +421,13 @@ def test_I7d_legacy_cookie_without_role_treated_as_admin_and_cookie_refreshed(
     """I7d: Cookie without 'role' field treated as admin (grace window); response
     refreshes cookie with explicit role='admin'; WARN logged on first request.
 
-    Uses TestClient against the FastAPI app. The best-effort audit DB insert is
-    patched to a no-op since no real DB is required for this behaviour.
+    Uses TestClient against the FastAPI app. The best-effort audit DB insert runs
+    as a background task; DB persistence is verified by a separate async test
+    (test_I7d_audit_row_persisted_with_null_wiki_page_id).
     """
     from tests.conftest import import_module
 
     web_auth = import_module("web.auth")
-    monkeypatch.setattr(web_auth, "_insert_legacy_grace_audit", lambda: None)
 
     web_app = import_module("web.app")
     from fastapi.testclient import TestClient
@@ -480,6 +480,80 @@ def test_I7d_legacy_cookie_without_role_treated_as_admin_and_cookie_refreshed(
         refreshed_payload = s.loads(new_cookie_value)
         assert refreshed_payload.get("role") == "admin", (
             f"Refreshed cookie must carry role='admin', got: {refreshed_payload}"
+        )
+
+
+# ── I7d-db: legacy_cookie_grace audit row persisted with wiki_page_id IS NULL ──
+
+
+async def test_I7d_audit_row_persisted_with_null_wiki_page_id(
+    postgres_engine,
+) -> None:
+    """I7d-db: _insert_legacy_grace_audit writes a wiki_publication_log row with
+    action='legacy_cookie_grace' AND wiki_page_id IS NULL (migration 055 fix).
+
+    Before migration 055: wiki_page_id was NOT NULL with FK to wiki_pages.id.
+    The old code used gen_random_uuid() which always failed with ForeignKeyViolation.
+    After migration 055: wiki_page_id is NULLABLE; only legacy_cookie_grace rows
+    may have NULL (enforced by CHECK constraint).
+
+    This test calls _insert_legacy_grace_audit() via its internal async coroutine
+    directly (bypassing the loop.create_task() scheduling) so the insert completes
+    synchronously within the test, allowing immediate DB verification.
+    Cleans up the inserted row after assertion to leave the DB clean.
+    """
+    from tests.conftest import import_module
+    from sqlalchemy import text
+
+    # Reload web.auth so that env vars from app_env fixture are in effect.
+    web_auth = import_module("web.auth")
+
+    # Call _insert_legacy_grace_audit() as it is called in production:
+    # sync wrapper that schedules a background task on the running event loop.
+    # Since we are in an async test, there IS a running loop — the task is
+    # scheduled immediately. We must wait for it to complete before querying.
+    import asyncio
+
+    # Collect all currently running tasks so we can wait only for new ones.
+    before = set(asyncio.all_tasks())
+    web_auth._insert_legacy_grace_audit()
+    after_start = set(asyncio.all_tasks())
+    new_tasks = after_start - before
+    if new_tasks:
+        # Wait for all newly scheduled tasks to complete.
+        await asyncio.gather(*new_tasks, return_exceptions=True)
+
+    # Verify the row was written with wiki_page_id IS NULL and correct action.
+    async with postgres_engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT action, wiki_page_id FROM wiki_publication_log "
+                    "WHERE action = 'legacy_cookie_grace' AND wiki_page_id IS NULL "
+                    "ORDER BY created_at DESC LIMIT 1"
+                )
+            )
+        ).mappings().first()
+
+    assert row is not None, (
+        "Expected a wiki_publication_log row with action='legacy_cookie_grace', "
+        "but none found. The column wiki_page_id must be NULLABLE (migration 055) "
+        "and the insert must use NULL not gen_random_uuid()."
+    )
+    assert row["action"] == "legacy_cookie_grace", (
+        f"Expected action='legacy_cookie_grace', got: {row['action']!r}"
+    )
+    assert row["wiki_page_id"] is None, (
+        f"Expected wiki_page_id IS NULL for legacy_cookie_grace row, got: {row['wiki_page_id']!r}"
+    )
+
+    # Cleanup: delete the test row so it doesn't accumulate between test runs.
+    async with postgres_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "DELETE FROM wiki_publication_log "
+                "WHERE action = 'legacy_cookie_grace' AND wiki_page_id IS NULL"
+            )
         )
 
 
