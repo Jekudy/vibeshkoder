@@ -391,35 +391,35 @@ def test_r6e_member_password_cannot_escalate_to_admin_via_user_id(monkeypatch) -
 
     from fastapi.testclient import TestClient
 
-    client = TestClient(web_app.create_app(), raise_server_exceptions=False)
+    # Codex LOW #6: context-managed TestClient.
+    with TestClient(web_app.create_app(), raise_server_exceptions=False) as client:
+        # POST /login with member password AND an admin-looking user_id in body.
+        # The handler must ignore user_id entirely.
+        response = client.post(
+            "/login",
+            data={
+                "password": "member-secret-pw-5678",
+                "user_id": str(_ADMIN_ID),  # attempt to claim admin identity
+            },
+            follow_redirects=False,
+        )
 
-    # POST /login with member password AND an admin-looking user_id in body.
-    # The handler must ignore user_id entirely.
-    response = client.post(
-        "/login",
-        data={
-            "password": "member-secret-pw-5678",
-            "user_id": str(_ADMIN_ID),  # attempt to claim admin identity
-        },
-        follow_redirects=False,
-    )
+        # Must redirect to /dashboard on successful login
+        assert response.status_code == 302, (
+            f"Expected 302 redirect, got {response.status_code}: {response.text[:200]}"
+        )
+        assert response.headers.get("location") == "/dashboard"
 
-    # Must redirect to /dashboard on successful login
-    assert response.status_code == 302, (
-        f"Expected 302 redirect, got {response.status_code}: {response.text[:200]}"
-    )
-    assert response.headers.get("location") == "/dashboard"
+        # Decode the session cookie and verify role='member'
+        session_cookie = response.cookies.get("session")
+        assert session_cookie, "Expected session cookie to be set after login"
 
-    # Decode the session cookie and verify role='member'
-    session_cookie = response.cookies.get("session")
-    assert session_cookie, "Expected session cookie to be set after login"
-
-    payload = web_auth.get_user_from_cookie(session_cookie)
-    assert payload is not None, "Session cookie must be valid"
-    assert payload.get("role") == "member", (
-        f"Expected role='member', got role={payload.get('role')!r}. "
-        "Supplying admin user_id must not escalate role."
-    )
+        payload = web_auth.get_user_from_cookie(session_cookie)
+        assert payload is not None, "Session cookie must be valid"
+        assert payload.get("role") == "member", (
+            f"Expected role='member', got role={payload.get('role')!r}. "
+            "Supplying admin user_id must not escalate role."
+        )
 
 
 # ── R6.f — unpublish + forget → public route returns 404/410 with no-store ────
@@ -459,19 +459,19 @@ def test_r6f_unpublish_and_forget_yields_gone_with_no_store_header(monkeypatch) 
     from fastapi.testclient import TestClient
 
     web_app = import_module("web.app")
-    client = TestClient(web_app.create_app(), raise_server_exceptions=False)
+    # Codex LOW #6: context-managed TestClient.
+    with TestClient(web_app.create_app(), raise_server_exceptions=False) as client:
+        response = client.get("/wiki/public/forgotten-page", follow_redirects=False)
 
-    response = client.get("/wiki/public/forgotten-page", follow_redirects=False)
+        # Must be 404 (public_enabled=False) or 410 (archived/gone)
+        assert response.status_code in (404, 410), (
+            f"Expected 404 or 410 after unpublish, got {response.status_code}"
+        )
 
-    # Must be 404 (public_enabled=False) or 410 (archived/gone)
-    assert response.status_code in (404, 410), (
-        f"Expected 404 or 410 after unpublish, got {response.status_code}"
-    )
-
-    cache_control = response.headers.get("Cache-Control", "")
-    assert "no-store" in cache_control, (
-        f"Expected Cache-Control: no-store in response headers, got: {cache_control!r}"
-    )
+        cache_control = response.headers.get("Cache-Control", "")
+        assert "no-store" in cache_control, (
+            f"Expected Cache-Control: no-store in response headers, got: {cache_control!r}"
+        )
 
 
 def test_r6f_archived_after_forget_yields_410_with_no_store_header(monkeypatch) -> None:
@@ -509,18 +509,18 @@ def test_r6f_archived_after_forget_yields_410_with_no_store_header(monkeypatch) 
     from fastapi.testclient import TestClient
 
     web_app = import_module("web.app")
-    client = TestClient(web_app.create_app(), raise_server_exceptions=False)
+    # Codex LOW #6: context-managed TestClient.
+    with TestClient(web_app.create_app(), raise_server_exceptions=False) as client:
+        response = client.get("/wiki/public/archived-page", follow_redirects=False)
 
-    response = client.get("/wiki/public/archived-page", follow_redirects=False)
+        assert response.status_code == 410, (
+            f"Expected 410 Gone after forget cascade, got {response.status_code}"
+        )
 
-    assert response.status_code == 410, (
-        f"Expected 410 Gone after forget cascade, got {response.status_code}"
-    )
-
-    cache_control = response.headers.get("Cache-Control", "")
-    assert "no-store" in cache_control, (
-        f"Expected Cache-Control: no-store in 410 response, got: {cache_control!r}"
-    )
+        cache_control = response.headers.get("Cache-Control", "")
+        assert "no-store" in cache_control, (
+            f"Expected Cache-Control: no-store in 410 response, got: {cache_control!r}"
+        )
 
 
 # ── async helpers for sync monkeypatch lambdas ────────────────────────────────

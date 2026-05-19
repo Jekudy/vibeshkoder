@@ -437,48 +437,50 @@ def test_I7d_legacy_cookie_without_role_treated_as_admin_and_cookie_refreshed(
     s = URLSafeTimedSerializer(web_auth._SECRET_KEY)
     legacy_cookie = s.dumps({"authenticated": True})  # no 'role'
 
-    client = TestClient(web_app.create_app(), raise_server_exceptions=True)
-    client.cookies.set("session", legacy_cookie)
+    # Codex LOW #6: wrap TestClient in a context manager so lifespan / background
+    # resources are released between tests.
+    with TestClient(web_app.create_app(), raise_server_exceptions=True) as client:
+        client.cookies.set("session", legacy_cookie)
 
-    # Capture WARNING log on the first request. Use /dashboard — the middleware
-    # refreshes the cookie before the route handler runs (even if the route fails
-    # with a 500 from a missing DB).
-    import logging
-    log_records: list[logging.LogRecord] = []
+        # Capture WARNING log on the first request. Use /dashboard — the middleware
+        # refreshes the cookie before the route handler runs (even if the route
+        # fails with a 500 from a missing DB).
+        import logging
+        log_records: list[logging.LogRecord] = []
 
-    class _Capture(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            log_records.append(record)
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                log_records.append(record)
 
-    handler = _Capture()
-    handler.setLevel(logging.WARNING)
-    app_logger = logging.getLogger("web.app")
-    app_logger.addHandler(handler)
-    try:
-        response = client.get("/dashboard", follow_redirects=False)
-    finally:
-        app_logger.removeHandler(handler)
+        handler = _Capture()
+        handler.setLevel(logging.WARNING)
+        app_logger = logging.getLogger("web.app")
+        app_logger.addHandler(handler)
+        try:
+            response = client.get("/dashboard", follow_redirects=False)
+        finally:
+            app_logger.removeHandler(handler)
 
-    # The middleware must NOT redirect to /login (legacy cookie is still valid)
-    assert response.status_code != 302 or response.headers.get("location") != "/login", (
-        "Legacy cookie should not redirect to /login — must be treated as admin"
-    )
+        # The middleware must NOT redirect to /login (legacy cookie is still valid)
+        assert response.status_code != 302 or response.headers.get("location") != "/login", (
+            "Legacy cookie should not redirect to /login — must be treated as admin"
+        )
 
-    # A WARNING must have been logged about the legacy session promotion
-    warn_messages = [r.getMessage() for r in log_records if r.levelno >= logging.WARNING]
-    assert any("legacy session cookie promoted to admin" in m for m in warn_messages), (
-        f"Expected WARN about legacy session promotion, logged: {warn_messages}"
-    )
+        # A WARNING must have been logged about the legacy session promotion
+        warn_messages = [r.getMessage() for r in log_records if r.levelno >= logging.WARNING]
+        assert any("legacy session cookie promoted to admin" in m for m in warn_messages), (
+            f"Expected WARN about legacy session promotion, logged: {warn_messages}"
+        )
 
-    # The response must set a refreshed cookie with explicit role='admin'
-    new_cookie_value = response.cookies.get("session")
-    assert new_cookie_value is not None, (
-        "Response must set a refreshed 'session' cookie with role='admin'"
-    )
-    refreshed_payload = s.loads(new_cookie_value)
-    assert refreshed_payload.get("role") == "admin", (
-        f"Refreshed cookie must carry role='admin', got: {refreshed_payload}"
-    )
+        # The response must set a refreshed cookie with explicit role='admin'
+        new_cookie_value = response.cookies.get("session")
+        assert new_cookie_value is not None, (
+            "Response must set a refreshed 'session' cookie with role='admin'"
+        )
+        refreshed_payload = s.loads(new_cookie_value)
+        assert refreshed_payload.get("role") == "admin", (
+            f"Refreshed cookie must carry role='admin', got: {refreshed_payload}"
+        )
 
 
 # ── I7e: _cascade_wiki_revisions masks body_markdown + updates resolved_at ─────
