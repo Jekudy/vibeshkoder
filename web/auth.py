@@ -90,13 +90,13 @@ def _cookie_fingerprint(cookie: str) -> str:
 def _insert_legacy_grace_audit() -> None:
     """Best-effort audit insert for legacy cookie promotion.
 
-    Attempts to insert a wiki_publication_log row with action='legacy_cookie_grace'.
-    Wrapped in try/except — failure is logged but does NOT block the request.
+    Inserts a wiki_publication_log row with action='legacy_cookie_grace' and
+    wiki_page_id=NULL. Legacy-grace events are session-level, not page-level,
+    so no wiki_page_id exists — migration 055 made the column NULLABLE for this
+    action (CHECK: wiki_page_id IS NOT NULL OR action = 'legacy_cookie_grace').
 
-    NOTE: wiki_publication_log requires a NOT NULL wiki_page_id FK to wiki_pages.
-    Without a wiki page in context (this is a session-level event, not page-level),
-    the insert will fail with a FK/NOT NULL violation. This is expected and caught.
-    The log entry serves as an audit signal when a wiki_page_id IS available in future.
+    Wrapped in try/except — failure is logged as WARNING but does NOT block the
+    request. Success is logged as INFO.
     """
     try:
         import asyncio
@@ -115,24 +115,25 @@ def _insert_legacy_grace_audit() -> None:
                         " prior_robots_policy, new_robots_policy, "
                         " source_check_result, reason) "
                         "VALUES ('legacy_cookie_grace', NULL, "
-                        " gen_random_uuid(), "
+                        " NULL, "
                         " false, false, 'index', 'index', "
                         " '{\"reason\": \"missing_role_field\"}'::jsonb, "
-                        " 'legacy session promoted to admin')"
+                        " 'legacy_cookie_promoted_to_admin')"
                     )
                 )
                 await session.commit()
+            logger.info("legacy_cookie_grace audit row inserted successfully")
 
         # Inside FastAPI middleware there's always a running loop. The sync
-        # fallback (get_event_loop + run_until_complete) is unreachable in
-        # production; kept only for direct test invocation.
+        # fallback (asyncio.run) is used only for direct test invocation outside
+        # a running event loop.
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
 
         def _log_task_exception(task: asyncio.Task) -> None:
-            """Attach as done_callback so silent FK violations are visible."""
+            """Attach as done_callback so insert failures are visible."""
             exc = task.exception()
             if exc is not None:
                 logger.warning(
