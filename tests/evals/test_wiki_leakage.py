@@ -524,7 +524,6 @@ class TestWikiLeakage:
         _ = eval_app_env
         session = wiki_leakage_session
         models = importlib.import_module("bot.db.models")
-        from sqlalchemy import select
 
         # Persist source message.
         cm_id, mv_id = await _persist_message(
