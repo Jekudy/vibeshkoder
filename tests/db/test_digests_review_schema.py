@@ -125,19 +125,20 @@ async def migrated_database_url(temp_database_url: str) -> AsyncIterator[str]:
     yield temp_database_url
 
 
-# ─── Test: head is now 054 (Phase 9 wiki schema) ───────────────────────────────
+# ─── Test: head is now 055 (Phase 9 FHR legacy-grace nullable) ────────────────
 
 
-async def test_alembic_head_is_054(migrated_database_url: str) -> None:
-    """After upgrade head, alembic_version reports 054 (latest Phase 9 wiki migration).
+async def test_alembic_head_is_055(migrated_database_url: str) -> None:
+    """After upgrade head, alembic_version reports 055 (latest Phase 9 migration).
 
     Previously asserted '038' (Phase 8 weekly review-gate); rolled forward to
-    '054' when T9-01 added wiki migrations 050-054. The intent of this test
-    is unchanged — assert the head matches the latest shipped migration.
-    Update the literal when new migrations land.
+    '054' when T9-01 added wiki migrations 050-054; then to '055' when Phase 9
+    FHR landed the legacy-grace nullable `wiki_page_id` migration. The intent
+    of this test is unchanged — assert the head matches the latest shipped
+    migration. Update the literal when new migrations land.
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "054"
+    assert current == "055"
 
 
 # ─── Test: upgrade adds 4 review columns with correct types/nullability ──────
