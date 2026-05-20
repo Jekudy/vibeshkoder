@@ -186,9 +186,9 @@ async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str
     # + T9-01 (050-054 wiki schema) + Phase 9 FHR (055 legacy-grace nullable
     # wiki_page_id) + Phase 10 W0-A (060 graph_projection_runs) + T10-02
     # (061 graph_provenance, 062 graph_edges) + T10-03 (064 add_llm_ledger_call_type)
-    # advanced the head past 025.
+    # + T10-06 (063 graph_purge_pending) + T10-06 CRITICAL-1 fix (065) advanced the head past 025.
     # Assert the current head explicitly; revisit when future migrations land.
-    assert current == "064"
+    assert current == "065"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(

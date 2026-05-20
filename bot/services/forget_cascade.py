@@ -168,6 +168,14 @@ CASCADE_LAYER_ORDER: tuple[str, ...] = (
     "message_links",
     "attachments",
     "fts_rows",
+    # Phase 10 / T10-06 layer:
+    # MUST run AFTER card_sources so card_source ids are still
+    # resolvable when we look up graph_provenance rows keyed by card.
+    # MUST run AFTER message_versions so the affected mvid set is
+    # fully resolved before the graph purge begins.
+    # Advisory-lock-guarded Postgres writes only in this layer;
+    # actual Neo4j bolt DELETE is delegated to graph_purge_worker (async).
+    "graph_nodes",
 )
 
 # Layers that apply only to specific target_types. Layers absent from this dict
@@ -195,6 +203,11 @@ _LAYER_APPLICABLE_TARGET_TYPES: dict[str, frozenset[str]] = {
     # (L9d: message_hash; L9e: user).
     "wiki_pages": frozenset({"message", "message_hash", "user"}),
     "wiki_revisions": frozenset({"message", "message_hash", "user"}),
+    # Phase 10 / T10-06 (PHASE10_PLAN.md §5.F): graph_nodes layer applies to
+    # all target_types that touch message_versions or knowledge_cards.
+    # Invariant #9: the layer MUST run even when memory.graph.projection.enabled
+    # is OFF — the flag gates new projections, not purge of already-projected content.
+    "graph_nodes": frozenset({"message", "message_hash", "user"}),
 }
 
 
@@ -1159,6 +1172,133 @@ async def _cascade_wiki_revisions(session: AsyncSession, event) -> int:
     return count
 
 
+# ─── Phase 10 / T10-06 cascade layer ─────────────────────────────────────────
+
+
+async def _cascade_graph_provenance(session: AsyncSession, event) -> int:
+    """Logical cascade for graph projections (T10-06 / PHASE10_PLAN.md §5.F).
+
+    1. Find all graph_provenance rows where (source_table, source_pk) matches
+       the forget_event target (via find_by_source). The lookup is by
+       source_message_version_id membership in the resolved affected_mvids set.
+    2. For each row: mark_inactive (soft-delete purged_at) + atomically enqueue a
+       graph_purge_pending row carrying graph_node_key + graph_edge_key.
+    3. graph_purge_pending rows drive the async Neo4j DETACH DELETE in a separate
+       worker (graph_purge_worker_tick). This layer does NO Neo4j bolt calls.
+    4. Fails closed: any DB write failure here means the entire forget cascade
+       FAILS for this event — does NOT swallow exceptions.
+
+    Invariant #9 binding: this layer is mandatory and runs even when
+    memory.graph.projection.enabled is OFF. The flag gates new projections,
+    not purge of already-projected content.
+
+    Returns the count of graph_purge_pending rows enqueued.
+    """
+    from bot.db.repos.graph_provenance import find_by_source, mark_inactive
+    from bot.db.repos.graph_purge_pending import enqueue as enqueue_purge
+
+    # Resolve affected message_version_ids (same helper as other layers).
+    mvids = await _resolve_affected_mvids(session, event)
+
+    if not mvids and event.target_type not in ("message", "message_hash", "user"):
+        return 0
+
+    # Build the set of (source_table, source_pk) pairs to query.
+    # Path 1: source_table='message_versions' — one pair per affected mvid.
+    source_pairs: list[tuple[str, str]] = []
+    for mvid in mvids:
+        source_pairs.append(("message_versions", str(mvid)))
+
+    # Path 2 (CRITICAL-2): source_table='knowledge_cards' — find cards whose
+    # graph_provenance rows must also be purged.
+    #
+    # Design note: this layer runs AFTER card_sources (per CASCADE_LAYER_ORDER).
+    # The card_sources layer has already deleted the card_sources rows and
+    # archived knowledge_cards whose all sources were forgotten. So we cannot
+    # query card_sources here (they are gone). Instead we look at:
+    #   graph_provenance WHERE source_table='knowledge_cards'
+    #     AND source_card_id IN (archived knowledge_cards)
+    #
+    # "Archived" cards are those set to card_status='archived' by the
+    # _cascade_card_sources_on_forget layer that ran before us. Purging all
+    # graph_provenance for archived cards is correct: an archived card's graph
+    # representation is stale and must not be served in queries.
+    if mvids:
+        from bot.db.models import KnowledgeCard, GraphProvenance as _GP
+        from sqlalchemy import select as _select
+
+        archived_card_subq = _select(KnowledgeCard.id).where(
+            KnowledgeCard.card_status == "archived"
+        )
+        archived_prov_rows = await session.execute(
+            _select(_GP.source_pk)
+            .where(_GP.source_table == "knowledge_cards")
+            .where(_GP.source_card_id.in_(archived_card_subq))
+            .where(_GP.purged_at.is_(None))
+        )
+        affected_card_ids = [str(r[0]) for r in archived_prov_rows.all()]
+        seen_card_ids: set[str] = set()
+        for card_id_str in affected_card_ids:
+            if card_id_str not in seen_card_ids:
+                seen_card_ids.add(card_id_str)
+                source_pairs.append(("knowledge_cards", card_id_str))
+
+    if not source_pairs:
+        return 0
+
+    enqueued_count = 0
+    for source_table, source_pk in source_pairs:
+        # find_by_source returns both active and already-purged rows.
+        provenance_rows = await find_by_source(
+            session, source_table=source_table, source_pk=source_pk
+        )
+        for prov in provenance_rows:
+            # Soft-delete the provenance row (idempotent if already purged).
+            # MEDIUM-8 fix: LookupError is re-raised as a cascade failure so the
+            # forget_event is NOT silently marked complete with missing purges.
+            await mark_inactive(session, prov.id)
+
+            # Enqueue purge_pending (idempotent per provenance row via
+            # ON CONFLICT DO NOTHING on the 4-column unique key).
+            await enqueue_purge(
+                session,
+                forget_event_id=int(event.id),
+                source_table=source_table,
+                source_pk=source_pk,
+                graph_node_key=prov.graph_node_key,
+                graph_edge_key=prov.graph_edge_key,
+                graph_provenance_id=prov.id,
+            )
+            enqueued_count += 1
+
+    # HIGH-4: soft-delete graph_edges rows for all provenance ids in this batch.
+    # Must run in the same transaction before the cascade layer completes.
+    if enqueued_count > 0:
+        from bot.db.models import GraphEdge
+        from sqlalchemy import update
+        from datetime import datetime, timezone
+
+        # Collect the provenance ids we just processed.
+        processed_prov_ids: list[int] = []
+        for source_table, source_pk in source_pairs:
+            prov_rows = await find_by_source(
+                session, source_table=source_table, source_pk=source_pk
+            )
+            for prov in prov_rows:
+                processed_prov_ids.append(prov.id)
+
+        if processed_prov_ids:
+            await session.execute(
+                update(GraphEdge)
+                .where(GraphEdge.graph_provenance_id.in_(processed_prov_ids))
+                .where(GraphEdge.purged_at.is_(None))
+                .values(purged_at=datetime.now(tz=timezone.utc))
+            )
+            await session.flush()
+
+    return enqueued_count
+
+
 # Map layer name → cascade function. Layers absent from this map are recorded as
 # skipped. When a future phase adds a layer's table, add its function here.
 _LAYER_FUNCS: dict[str, Any] = {
@@ -1176,6 +1316,8 @@ _LAYER_FUNCS: dict[str, Any] = {
     "wiki_revisions": _cascade_wiki_revisions,
     # T6-01 Phase 6 layer — PHASE6_PLAN.md §5.A.5.
     "card_sources": _cascade_card_sources_on_forget,
+    # T10-06 Phase 10 layer — PHASE10_PLAN.md §5.F. Runs AFTER card_sources.
+    "graph_nodes": _cascade_graph_provenance,
 }
 
 
