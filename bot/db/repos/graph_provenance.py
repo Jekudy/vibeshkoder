@@ -116,8 +116,12 @@ async def create_provenance(
 async def mark_inactive(
     session: AsyncSession,
     provenance_id: int,
+    *,
+    purge_reason: str = "forget_cascade",
 ) -> None:
-    """Soft-delete a graph_provenance row by setting purged_at to now().
+    """Soft-delete a graph_provenance row by setting purged_at and purge_reason.
+
+    Spec §5.F step 2: SET purged_at = now(), purge_reason = 'forget_cascade'.
 
     Idempotent: if already purged, silently leaves the value as-is.
     Raises LookupError if the row does not exist.
@@ -130,7 +134,10 @@ async def mark_inactive(
         update(GraphProvenance)
         .where(GraphProvenance.id == provenance_id)
         .where(GraphProvenance.purged_at.is_(None))
-        .values(purged_at=datetime.now(tz=timezone.utc))
+        .values(
+            purged_at=datetime.now(tz=timezone.utc),
+            purge_reason=purge_reason,
+        )
     )
     result = await session.execute(stmt)
     if result.rowcount == 0:
@@ -149,7 +156,11 @@ async def mark_inactive(
         )
         return
     await session.flush()
-    _log.debug("graph_provenance: marked inactive id=%s", provenance_id)
+    _log.debug(
+        "graph_provenance: marked inactive id=%s purge_reason=%s",
+        provenance_id,
+        purge_reason,
+    )
 
 
 async def find_by_source(

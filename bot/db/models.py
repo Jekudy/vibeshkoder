@@ -1724,3 +1724,71 @@ class GraphEdge(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class GraphPurgePending(Base):
+    """Async purge queue for Neo4j bolt DELETE (T10-06 / alembic 063).
+
+    Written atomically in the same Postgres transaction as the Postgres-side forget
+    cascade. graph_purge_worker consumes rows and executes Neo4j DETACH DELETE via
+    bolt. graph_query.py checks this table before any traversal — fails closed
+    (abstained=True) while any non-purged row exists for query result nodes.
+
+    RFC-001:415 fail-closed invariant: purged_at IS NULL means the Neo4j purge has
+    NOT yet completed; graph queries must not return those nodes.
+
+    Migration 063.
+    """
+
+    __tablename__ = "graph_purge_pending"
+    __table_args__ = (
+        CheckConstraint(
+            "source_table IN ('message_versions', 'knowledge_cards', 'card_sources')",
+            name="ck_graph_purge_pending_source_table",
+        ),
+        # CRITICAL-1 fix (T10-06): include graph_provenance_id so multiple provenance rows
+        # for same (source_table, source_pk) each get their own purge_pending row.
+        # Previously: (forget_event_id, source_table, source_pk) — collapsed multi-provenance.
+        # Migration 065 drops old constraint and creates this one.
+        UniqueConstraint(
+            "forget_event_id",
+            "source_table",
+            "source_pk",
+            "graph_provenance_id",
+            name="uq_graph_purge_pending_event_source_prov",
+        ),
+        Index(
+            "ix_graph_purge_pending_queue",
+            "enqueued_at",
+            postgresql_where=text("purged_at IS NULL AND failed_at IS NULL"),
+        ),
+        Index(
+            "ix_graph_purge_pending_node_key",
+            "graph_node_key",
+            postgresql_where=text("purged_at IS NULL"),
+        ),
+        Index("ix_graph_purge_pending_forget_event", "forget_event_id"),
+        Index("ix_graph_purge_pending_source", "source_table", "source_pk"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    forget_event_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_table: Mapped[str] = mapped_column(Text, nullable=False)
+    source_pk: Mapped[str] = mapped_column(Text, nullable=False)
+    # known at enqueue time if provenance row exists
+    graph_node_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    graph_edge_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    graph_provenance_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("graph_provenance.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    enqueued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("0"), default=0
+    )

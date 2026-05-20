@@ -136,12 +136,14 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     FHR landed the legacy-grace nullable `wiki_page_id` migration; then to '060'
     when Phase 10 W0-A added graph_projection_runs; then to '062' when T10-02
     added graph_provenance (061) and graph_edges (062); then to '064' when T10-03
-    added llm_usage_ledger.call_type. The intent of this test is unchanged —
-    assert the head matches the latest shipped migration. Update the literal when
-    new migrations land.
+    added llm_usage_ledger.call_type; then to '063' when T10-06 added
+    graph_purge_pending (chain: 062→064→063); then to '065' when T10-06 CRITICAL-1
+    fix updated graph_purge_pending unique constraint to include graph_provenance_id.
+    The intent of this test is unchanged — assert the head matches the latest
+    shipped migration. Update the literal when new migrations land.
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "064"
+    assert current == "065"
 
 
 # ─── Test: upgrade adds 4 review columns with correct types/nullability ──────
