@@ -43,10 +43,15 @@ class LedgerRepo:
         request_id: str | None,
         cache_hit: bool,
         error: str | None,
+        call_type: str = "unknown",
     ) -> LlmUsageLedger:
         """Insert a ledger row. Flushes; caller commits. NEVER commits internally.
 
         Used by the cache-hit path where all fields are known up-front.
+
+        ``call_type`` added in migration 064 (T10-03). Allowed values:
+        'unknown' (legacy default), 'qa_synthesis', 'digest_daily',
+        'digest_weekly', 'graph_projection'. Caller SHOULD pass explicitly.
         """
         row = LlmUsageLedger(
             qa_trace_id=qa_trace_id,
@@ -61,6 +66,7 @@ class LedgerRepo:
             request_id=request_id,
             cache_hit=cache_hit,
             error=error,
+            call_type=call_type,
         )
         session.add(row)
         await session.flush()

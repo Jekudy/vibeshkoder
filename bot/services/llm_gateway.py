@@ -134,6 +134,7 @@ class LedgerRepoProtocol(Protocol):
         request_id: str | None,
         cache_hit: bool,
         error: str | None,
+        call_type: str = "unknown",
     ) -> Any:
         ...
 
@@ -420,6 +421,7 @@ async def synthesize_answer(
             request_id=request_id,
             cache_hit=cache_hit,
             error=error,
+            call_type="qa_synthesis",
         )
 
     # Invariant 1 — empty bundle short-circuit.
@@ -1160,6 +1162,7 @@ async def extract_candidates(
                 request_id=None,
                 cache_hit=False,
                 error="budget_exceeded",
+                call_type="unknown",
             )
             return {"candidates": [], "llm_usage_ledger_id": row.id}
 
@@ -1177,6 +1180,7 @@ async def extract_candidates(
             request_id=None,
             cache_hit=False,
             error=None,
+            call_type="unknown",
         )
     finally:
         await session.execute(
@@ -1691,6 +1695,8 @@ async def synthesize_digest(
             _BUDGET_LOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
         )
         over_budget = await _budget_check(session, config, ledger_repo)
+        # digest call_type: 'digest_daily' or 'digest_weekly' based on `type` param.
+        digest_call_type = f"digest_{type}"
         if over_budget:
             row = await ledger_repo.record(
                 session,
@@ -1706,6 +1712,7 @@ async def synthesize_digest(
                 request_id=None,
                 cache_hit=False,
                 error="budget_exceeded",
+                call_type=digest_call_type,
             )
             raise LLMBudgetExceededError(f"gateway budget exceeded; ledger_id={row.id}")
         placeholder_row = await ledger_repo.record(
@@ -1722,6 +1729,7 @@ async def synthesize_digest(
             request_id=None,
             cache_hit=False,
             error=None,
+            call_type=digest_call_type,
         )
     finally:
         await session.execute(
@@ -1846,6 +1854,318 @@ async def synthesize_digest(
     )
 
 
+# ─── Phase 10 / T10-03 — extract_graph_triples ───────────────────────────────
+
+
+@dataclass(frozen=True)
+class GraphTriple:
+    """A single typed relationship triple extracted from community memory."""
+
+    subject_label: str    # canonical entity label (e.g. "Вася К.", "проект X")
+    subject_type: str     # one of ALLOWED_NODE_TYPES
+    predicate: str        # one of ALLOWED_PREDICATES
+    object_label: str
+    object_type: str      # one of ALLOWED_NODE_TYPES
+    confidence: float     # 0.0-1.0
+    source_id: str        # verbatim from prompt input
+
+
+@dataclass(frozen=True)
+class ExtractGraphTriplesResult:
+    """Result of extract_graph_triples."""
+
+    triples: list[GraphTriple]
+    llm_usage_ledger_id: int | None
+    cost_usd: Decimal
+    skipped_total: int  # triples dropped: UNKNOWN labels, invalid predicate/type, or UNKNOWN_* entity ids
+
+
+async def _resolve_entity(
+    session: AsyncSession,
+    *,
+    label: str,
+    entity_type: str,
+    source_card_id: Any | None,
+    source_mv_id: int | None,
+) -> str:
+    """Resolve a label to a canonical entity_id.
+
+    Priority order (per PHASE10_PLAN.md §5.B step 7):
+    (a) knowledge_cards.id — matched by title (exact, case-insensitive).
+    (b) users.id formatted as "user:<telegram_id>" — matched by username
+        or first_name (display_name proxy).
+    (c) UNKNOWN_{md5(label)[:8]} placeholder.
+
+    When result is UNKNOWN_*, the caller drops the triple (refuse-on-UNKNOWN).
+    """
+    # Priority (a): card title match.
+    # ORDER BY id ASC ensures deterministic result when multiple cards share a title
+    # (FIX-HIGH-4: nondeterministic LIMIT 1 without ORDER BY).
+    result = await session.execute(
+        text(
+            "SELECT id::text FROM knowledge_cards "
+            "WHERE LOWER(title) = LOWER(:label) "
+            "ORDER BY id ASC "
+            "LIMIT 1"
+        ),
+        {"label": label},
+    )
+    card_id = result.scalar_one_or_none()
+    if card_id is not None:
+        return str(card_id)
+
+    # Priority (b): user match by username or first_name.
+    # ORDER BY id ASC ensures deterministic result when multiple users share a name
+    # (FIX-HIGH-4: nondeterministic LIMIT 1 without ORDER BY).
+    result = await session.execute(
+        text(
+            "SELECT id FROM users "
+            "WHERE LOWER(username) = LOWER(:label) "
+            "   OR LOWER(first_name) = LOWER(:label) "
+            "ORDER BY id ASC "
+            "LIMIT 1"
+        ),
+        {"label": label},
+    )
+    user_id = result.scalar_one_or_none()
+    if user_id is not None:
+        return f"user:{user_id}"
+
+    # Priority (c): UNKNOWN sentinel — caller will drop the triple.
+    suffix = hashlib.md5(label.encode()).hexdigest()[:8]
+    return f"UNKNOWN_{suffix}"
+
+
+async def extract_graph_triples(
+    session: AsyncSession,
+    *,
+    source_table: Literal["message_versions", "knowledge_cards"],
+    source_pk: str,
+    source_text: str,
+    source_id: str,
+    source_mv_id: int | None,
+    prompt_version: str,
+    run_id: int,
+    governance_policy: str,
+    config: LLMGatewayConfig,
+    ledger_repo: LedgerRepoProtocol,
+    provider: LLMProvider,
+    max_triples: int = 5,
+) -> ExtractGraphTriplesResult:
+    """Extract typed relationship triples from a governance-filtered text.
+
+    10 behaviour steps per PHASE10_PLAN.md §5.B:
+
+    1. Pre-call governance assertion.
+    2. Budget check (_budget_check shared guard).
+    3. (caller responsibility: per-run dry-run cost estimate vs ceiling).
+    4. Ledger placeholder with call_type='graph_projection'.
+    5. Build prompt, call provider (temperature=0.1, max_tokens=512).
+    6. Parse + validate predicate/types; drop UNKNOWN subject/object triples.
+    7. Entity registry resolution; drop triples with UNKNOWN_* entity ids.
+    8. Enforce max_triples cap.
+    9. update_placeholder with actuals.
+    10. Return ExtractGraphTriplesResult.
+
+    Raises:
+        GraphProjectionPolicyError: if governance_policy != 'normal'.
+        GraphProjectionBudgetError: if budget check fails.
+    """
+    from bot.services.graph_common import (
+        ALLOWED_NODE_TYPES,
+        ALLOWED_PREDICATES,
+        RESERVED_LEDGER_CALL_TYPES,
+        ExtractGraphTriplesError,
+        GraphProjectionBudgetError,
+        GraphProjectionPolicyError,
+    )
+    from bot.services.llm_prompts.graph_triples_v0_1_0 import (
+        SYSTEM_PROMPT,
+        build_user_prompt,
+    )
+
+    # Step 1: governance assertion — fail closed on non-normal content.
+    if governance_policy != "normal":
+        raise GraphProjectionPolicyError(
+            f"extract_graph_triples: governance_policy={governance_policy!r} is not 'normal'; "
+            "refusing extraction (fail-closed)"
+        )
+
+    # Step 2: budget check (shared daily/monthly guard).
+    await session.execute(_BUDGET_LOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID})
+    graph_call_type = RESERVED_LEDGER_CALL_TYPES[0]  # 'graph_projection'
+    try:
+        over_budget = await _budget_check(session, config, ledger_repo)
+        if over_budget:
+            raise GraphProjectionBudgetError(
+                "extract_graph_triples: daily/monthly LLM budget exceeded"
+            )
+
+        # Step 4: ledger placeholder.
+        user_prompt = build_user_prompt(
+            source_id=source_id,
+            source_table=source_table,
+            source_text=source_text,
+            max_triples=max_triples,
+        )
+        # Build full prompt for hashing (system + user concatenated).
+        full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+        prompt_hash = _prompt_hash(full_prompt)
+
+        placeholder_row = await ledger_repo.record(
+            session,
+            qa_trace_id=None,
+            provider=config.provider,
+            model=config.model,
+            prompt_hash=prompt_hash,
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=Decimal("0"),
+            latency_ms=0,
+            request_id=None,
+            cache_hit=False,
+            error=None,
+            call_type=graph_call_type,
+        )
+    finally:
+        await session.execute(_BUDGET_UNLOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID})
+
+    # Step 5: provider call.
+    _GW_ERROR_MAX_LEN = 2000
+    started = time.monotonic()
+    try:
+        provider_result = await provider.call(prompt=full_prompt, model=config.model)
+    except (ProviderTransientError, ProviderStructuralError) as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency,
+            error=str(exc)[:_GW_ERROR_MAX_LEN],
+        )
+        raise
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    cost_usd = _estimate_cost(
+        config=config,
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+    )
+    resp_hash = hashlib.sha256(provider_result.answer_text.encode()).hexdigest()
+
+    # Step 6: parse + validate.
+    # FIX-HIGH-3: malformed JSON and non-list root must raise, not silently become [].
+    skipped_total = 0
+    raw_triples: list[GraphTriple] = []
+    try:
+        parsed = json.loads(provider_result.answer_text)
+    except json.JSONDecodeError as e:
+        raise ExtractGraphTriplesError(
+            f"Provider returned malformed JSON: {e}; "
+            f"first 200 chars: {provider_result.answer_text[:200]!r}"
+        ) from e
+    if not isinstance(parsed, list):
+        raise ExtractGraphTriplesError(
+            f"Provider returned non-list JSON root: {type(parsed).__name__}; expected list"
+        )
+
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        subj = str(item.get("subject_label", ""))
+        obj = str(item.get("object_label", ""))
+        pred = str(item.get("predicate", ""))
+        subj_type = str(item.get("subject_type", ""))
+        obj_type = str(item.get("object_type", ""))
+        try:
+            confidence = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        src_id = str(item.get("source_id", source_id))
+
+        # Refuse UNKNOWN subject or object labels.
+        if subj == "UNKNOWN" or obj == "UNKNOWN":
+            skipped_total += 1
+            continue
+
+        # Validate predicate and types against ontology.
+        if pred not in ALLOWED_PREDICATES:
+            skipped_total += 1
+            continue
+        if subj_type not in ALLOWED_NODE_TYPES or obj_type not in ALLOWED_NODE_TYPES:
+            skipped_total += 1
+            continue
+
+        raw_triples.append(
+            GraphTriple(
+                subject_label=subj,
+                subject_type=subj_type,
+                predicate=pred,
+                object_label=obj,
+                object_type=obj_type,
+                confidence=confidence,
+                source_id=src_id,
+            )
+        )
+
+    # Step 7: entity registry resolution — drop triples with UNKNOWN_* entity ids.
+    resolved_triples: list[GraphTriple] = []
+    for triple in raw_triples:
+        subj_id = await _resolve_entity(
+            session,
+            label=triple.subject_label,
+            entity_type=triple.subject_type,
+            source_card_id=None,
+            source_mv_id=source_mv_id,
+        )
+        if subj_id.startswith("UNKNOWN_"):
+            skipped_total += 1
+            continue
+
+        obj_id = await _resolve_entity(
+            session,
+            label=triple.object_label,
+            entity_type=triple.object_type,
+            source_card_id=None,
+            source_mv_id=source_mv_id,
+        )
+        if obj_id.startswith("UNKNOWN_"):
+            skipped_total += 1
+            continue
+
+        resolved_triples.append(triple)
+
+    # Step 8: max_triples cap.
+    resolved_triples = resolved_triples[:max_triples]
+
+    # Step 9: update placeholder with actuals.
+    await ledger_repo.update_placeholder(
+        session,
+        llm_call_id=placeholder_row.id,
+        cost_usd=cost_usd,
+        response_hash=resp_hash,
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+        request_id=provider_result.request_id,
+        latency_ms=latency_ms,
+        error=None,
+    )
+
+    # Step 10: return result.
+    return ExtractGraphTriplesResult(
+        triples=resolved_triples,
+        llm_usage_ledger_id=placeholder_row.id,
+        cost_usd=cost_usd,
+        skipped_total=skipped_total,
+    )
+
+
 __all__ = [
     "Abstention",
     "AbstentionReason",
@@ -1856,6 +2176,8 @@ __all__ = [
     "DigestEmptyWindowError",
     "DigestGatewayError",
     "DigestProviderError",
+    "ExtractGraphTriplesResult",
+    "GraphTriple",
     "LLM_BUDGET_LOCK_ID",
     "LLMBudgetExceededError",
     "LLMGatewayConfig",
@@ -1867,7 +2189,9 @@ __all__ = [
     "SynthesizeDigestResult",
     "_cache_input_hash",
     "_normalize_query",
+    "_resolve_entity",
     "extract_candidates",
+    "extract_graph_triples",
     "load_gateway_config",
     "resolve_provider",
     "synthesize_answer",

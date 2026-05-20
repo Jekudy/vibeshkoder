@@ -162,6 +162,7 @@ class FakeLedgerRepo:
         request_id: str | None,
         cache_hit: bool,
         error: str | None,
+        call_type: str = "unknown",
     ) -> _LedgerRow:
         row = _LedgerRow(
             id=self._next_id,
@@ -1687,3 +1688,171 @@ def test_estimate_cost_unknown_model_returns_zero_emits_stop_signal(monkeypatch)
     cost = _estimate_cost(config=cfg, tokens_in=100, tokens_out=100)
     assert cost == Decimal("0")
     assert emitted == ["llm_provider_structural"]
+
+
+# ─── T10-03 Codex review fixes: FIX-HIGH-3 provider JSON error ───────────────
+
+
+def _make_extract_config(
+    *,
+    daily: Decimal = Decimal("5.00"),
+    monthly: Decimal = Decimal("50.00"),
+) -> LLMGatewayConfig:
+    return LLMGatewayConfig(
+        provider="anthropic",
+        model="claude-haiku-4-5-20251001",
+        daily_ceiling_usd=daily,
+        monthly_ceiling_usd=monthly,
+        prompt_template_version="graph_triples_v0_1_0",
+    )
+
+
+@dataclass
+class _ExtractFakeSession:
+    """Minimal session fake for extract_graph_triples tests.
+
+    pg_advisory calls are silenced. All other execute() calls return no rows
+    (simulating no matching card or user → UNKNOWN_* entities, which means
+    triples resolve to UNKNOWN and are dropped — irrelevant for JSON parse tests).
+    """
+
+    async def execute(self, *args: Any, **kwargs: Any) -> Any:
+        stmt = args[0] if args else kwargs.get("statement")
+        if stmt is not None and "pg_advisory" in str(stmt):
+            return _SessionExecutor([])
+        return _SessionExecutor([])
+
+
+@dataclass
+class _ExtractFakeLedger:
+    """Minimal ledger fake for extract_graph_triples error path tests."""
+
+    rows: list[Any] = field(default_factory=list)
+    daily_cost: Decimal = Decimal("0")
+    monthly_cost: Decimal = Decimal("0")
+    _next_id: int = 1
+
+    async def record(self, session: Any, *, qa_trace_id: Any, provider: str, model: str,
+                     prompt_hash: str, response_hash: Any, tokens_in: int, tokens_out: int,
+                     cost_usd: Decimal, latency_ms: int, request_id: Any, cache_hit: bool,
+                     error: Any, call_type: str = "unknown") -> Any:
+        from dataclasses import make_dataclass
+        Row = make_dataclass("Row", [("id", int), ("cost_usd", Decimal), ("call_type", str)])
+        row = Row(id=self._next_id, cost_usd=cost_usd, call_type=call_type)
+        self.rows.append(row)
+        self._next_id += 1
+        return row
+
+    async def daily_cost_usd(self, session: Any, *, day: Any) -> Decimal:
+        return self.daily_cost
+
+    async def monthly_cost_usd(self, session: Any, *, year: int, month: int) -> Decimal:
+        return self.monthly_cost
+
+    async def update_placeholder(self, session: Any, *, llm_call_id: int, cost_usd: Decimal,
+                                  response_hash: Any, tokens_in: int, tokens_out: int,
+                                  request_id: Any, latency_ms: int, error: Any) -> Any:
+        for row in self.rows:
+            if row.id == llm_call_id:
+                row.cost_usd = cost_usd
+                return row
+        raise KeyError(f"not found: {llm_call_id}")
+
+
+@dataclass
+class _ExtractFakeProvider:
+    answer_json: str
+    tokens_in: int = 10
+    tokens_out: int = 5
+
+    async def call(self, *, prompt: str, model: str) -> Any:
+        return ProviderResult(
+            answer_text=self.answer_json,
+            citation_ids=(),
+            tokens_in=self.tokens_in,
+            tokens_out=self.tokens_out,
+            request_id="req-test",
+            raw_latency_ms=5,
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_raises_on_malformed_json() -> None:
+    """Provider returning malformed JSON must raise ExtractGraphTriplesError (FIX-HIGH-3)."""
+    from bot.services.graph_common import ExtractGraphTriplesError
+    from bot.services.llm_gateway import extract_graph_triples
+
+    provider = _ExtractFakeProvider(answer_json="not-json{")
+    ledger = _ExtractFakeLedger()
+    session = _ExtractFakeSession()
+
+    with pytest.raises(ExtractGraphTriplesError, match="malformed JSON"):
+        await extract_graph_triples(
+            session,  # type: ignore[arg-type]
+            source_table="message_versions",
+            source_pk="1",
+            source_text="текст",
+            source_id="1",
+            source_mv_id=None,
+            prompt_version="graph_triples_v0_1_0",
+            run_id=1,
+            governance_policy="normal",
+            config=_make_extract_config(),
+            ledger_repo=ledger,
+            provider=provider,
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_raises_on_non_list_json() -> None:
+    """Provider returning a JSON object (not array) must raise ExtractGraphTriplesError (FIX-HIGH-3)."""
+    from bot.services.graph_common import ExtractGraphTriplesError
+    from bot.services.llm_gateway import extract_graph_triples
+
+    provider = _ExtractFakeProvider(answer_json='{"foo": "bar"}')
+    ledger = _ExtractFakeLedger()
+    session = _ExtractFakeSession()
+
+    with pytest.raises(ExtractGraphTriplesError, match="non-list JSON root"):
+        await extract_graph_triples(
+            session,  # type: ignore[arg-type]
+            source_table="message_versions",
+            source_pk="1",
+            source_text="текст",
+            source_id="1",
+            source_mv_id=None,
+            prompt_version="graph_triples_v0_1_0",
+            run_id=1,
+            governance_policy="normal",
+            config=_make_extract_config(),
+            ledger_repo=ledger,
+            provider=provider,
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_empty_list_still_works_no_regression() -> None:
+    """Provider returning [] is valid empty extraction — no error (FIX-HIGH-3 regression guard)."""
+    from bot.services.llm_gateway import extract_graph_triples
+
+    provider = _ExtractFakeProvider(answer_json="[]")
+    ledger = _ExtractFakeLedger()
+    session = _ExtractFakeSession()
+
+    result = await extract_graph_triples(
+        session,  # type: ignore[arg-type]
+        source_table="message_versions",
+        source_pk="1",
+        source_text="текст",
+        source_id="1",
+        source_mv_id=None,
+        prompt_version="graph_triples_v0_1_0",
+        run_id=1,
+        governance_policy="normal",
+        config=_make_extract_config(),
+        ledger_repo=ledger,
+        provider=provider,
+    )
+
+    assert result.triples == []
+    assert result.skipped_total == 0
