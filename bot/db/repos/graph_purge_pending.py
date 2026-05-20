@@ -172,10 +172,9 @@ def sa_interval(minutes: int):
     """Return a SQLAlchemy interval expression for PostgreSQL."""
     from sqlalchemy import text
 
-    # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
     # `minutes` is coerced to int below — no user input can flow into the SQL string.
     minutes_int = int(minutes)
-    return text(f"INTERVAL '{minutes_int} minutes'")
+    return text(f"INTERVAL '{minutes_int} minutes'")  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 
 
 async def mark_purged(
