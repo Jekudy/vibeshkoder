@@ -258,6 +258,7 @@ async def _fetch_eligible_cards(
         params["since_timestamp"] = since_timestamp
 
     where_sql = " AND ".join(where_clauses)
+    # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- where_sql is a static-clause string built from in-code conditions; no user input flows in.
     stmt = text(
         f"SELECT kc.id, kc.title, kc.body_markdown, kc.created_at\n"
         f"FROM knowledge_cards kc\n"
@@ -337,6 +338,7 @@ async def _fetch_eligible_message_versions(
         params["since_timestamp"] = since_timestamp
 
     where_sql = " AND ".join(where_clauses)
+    # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- where_sql is a static-clause string built from in-code conditions; no user input flows in.
     stmt = text(
         f"SELECT mv.id, mv.chat_message_id, mv.version_seq, mv.captured_at AS created_at,\n"
         f"       cm.chat_id\n"

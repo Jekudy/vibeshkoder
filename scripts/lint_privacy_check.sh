@@ -99,6 +99,12 @@ is_allowed_path() {
   [[ "$path" == "tests/evals/test_wiki_refusal.py" ]] && return 0
   [[ "$path" == "tests/evals/test_wiki_no_graph.py" ]] && return 0
 
+  # T10-04 graph_projector integration test — verifies governance pre-filter
+  # excludes governance-restricted cards from projection. Names canonical
+  # privacy literals in fixture SQL and assertion messages because the test
+  # ENFORCES the invariant by name. Same rationale as test_wiki_*.py / test_digest_*.py.
+  [[ "$path" == "tests/db/test_graph_projector_integration.py" ]] && return 0
+
   # forget_cascade.py — the canonical enforcer of the forget policy across
   # all cascade layers (chat_messages, message_versions, digests, wiki_pages,
   # wiki_revisions, card_sources, llm_synthesis_cache, qa_traces_llm). The
