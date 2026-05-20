@@ -33,7 +33,7 @@ WAVE 0 (3 PRs):
     bot/services/graph_source_eligibility.py: governance-aware source filter
     Reuses bot/services/governance.py forget_excludes predicate
     Pure code, no migrations. Imports from graph_common.py
-    Tests: positive (eligible source) + negative (forgotten/offrecord/nomem)
+    Tests: positive (eligible source) + negative (all 3 governance-excluded categories per governance.py contract)
   
   W0-D - feat/p10-w0d-neo4j-ci (NEW per duo iter 2)
     .github/workflows/evals.yml: Neo4j 5.x service block + healthcheck
