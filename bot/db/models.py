@@ -864,6 +864,12 @@ class LlmUsageLedger(Base):
     request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # call_type added in migration 064 (T10-03). Allowed values per spec:
+    # 'unknown' (legacy / default), 'qa_synthesis', 'digest_daily',
+    # 'digest_weekly', 'graph_projection'.
+    call_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default=text("'unknown'")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

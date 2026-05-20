@@ -161,6 +161,15 @@ class GraphProjectionBudgetError(RefusalError):
     """
 
 
+class ExtractGraphTriplesError(RefusalError):
+    """Raised when extract_graph_triples cannot parse provider response.
+
+    Per FIX-HIGH-3 (Codex review): malformed JSON or non-list JSON root
+    from the provider must raise this error so callers can mark the source
+    as skipped rather than silently treating it as empty extraction.
+    """
+
+
 # ─── Protocols ───────────────────────────────────────────────────────────────
 
 
