@@ -62,6 +62,7 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 markers = [
     "graph_unit: unit tests for graph adapter using NetworkXAdapter (no real Neo4j required)",
+    "graph_integration: integration tests that require a live Neo4j instance (NEO4J_BOLT_URI must be set)",
 ]
 
 [tool.ruff]

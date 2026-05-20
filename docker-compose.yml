@@ -53,12 +53,16 @@ services:
     volumes:
       - neo4j_data:/data
     environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-test_password_min_32_chars_for_neo4j_5}
+      # NEO4J_AUTH_PASSWORD is the canonical name (matches Settings.NEO4J_AUTH_PASSWORD in
+      # bot/config.py and the env var used by conftest.py neo4j_session fixture + CI workflows).
+      # The legacy NEO4J_PASSWORD is accepted as a fallback for backward compatibility.
+      NEO4J_AUTH: neo4j/${NEO4J_AUTH_PASSWORD:-${NEO4J_PASSWORD:-test_password_min_32_chars_for_neo4j_5}}
+      NEO4J_AUTH_USER: neo4j
       NEO4J_server_memory_heap_initial__size: 512m
       NEO4J_server_memory_heap_max__size: 512m
       NEO4J_server_memory_pagecache_size: 512m
     healthcheck:
-      test: ["CMD-SHELL", "cypher-shell -u neo4j -p $${NEO4J_PASSWORD:-test_password_min_32_chars_for_neo4j_5} 'RETURN 1' || exit 1"]
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p $${NEO4J_AUTH_PASSWORD:-$${NEO4J_PASSWORD:-test_password_min_32_chars_for_neo4j_5}} 'RETURN 1' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
