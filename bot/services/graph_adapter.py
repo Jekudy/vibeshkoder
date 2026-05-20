@@ -378,3 +378,8 @@ class NetworkXAdapter:
 
     async def close(self) -> None:
         pass
+
+    @property
+    def nodes(self) -> dict:
+        """Return node dictionary (for test inspection)."""
+        return dict(self._graph.nodes(data=True))
