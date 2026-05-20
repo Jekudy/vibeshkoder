@@ -184,10 +184,10 @@ async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str
     # T6-01 (030-034) + T6-02 (035 operator_user_id) + Phase 6.5 M-2 (036
     # gateway_error) + T7-01 (037 digests) + T8-01 (038 review-gate states)
     # + T9-01 (050-054 wiki schema) + Phase 9 FHR (055 legacy-grace nullable
-    # wiki_page_id) + Phase 10 W0-A (060 graph_projection_runs) advanced the
-    # head past 025. Assert the current head explicitly; revisit when future
-    # migrations land.
-    assert current == "060"
+    # wiki_page_id) + Phase 10 W0-A (060 graph_projection_runs) + T10-02
+    # (061 graph_provenance, 062 graph_edges) advanced the head past 025.
+    # Assert the current head explicitly; revisit when future migrations land.
+    assert current == "062"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(

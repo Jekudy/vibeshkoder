@@ -1569,3 +1569,152 @@ class GraphProjectionRun(Base):
     # started_by is stored as a free-text label (e.g. 'scheduler', 'admin:149820031')
     # NOT a FK — the projector can be triggered without a users row (scheduler, CLI).
     started_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class GraphProvenance(Base):
+    """Source-to-graph mapping; one row per projected source triple.
+
+    Maps each projected source (message_version or knowledge_card) to the Neo4j
+    graph. Used by forget cascade (logical source_table/source_pk lookup) and by
+    drift detection (active non-purged rows vs Neo4j node count).
+
+    source_table / source_pk are logical application-code refs — NOT typed FK
+    columns. FK ON DELETE CASCADE on source_card_id / source_message_version_id
+    is a safety net only. See PHASE10_PLAN.md §5.A for rationale.
+
+    Migration 061.
+    """
+
+    __tablename__ = "graph_provenance"
+    __table_args__ = (
+        CheckConstraint(
+            "source_table IN ('message_versions', 'knowledge_cards')",
+            name="ck_graph_provenance_source_table",
+        ),
+        CheckConstraint(
+            "source_message_version_id IS NOT NULL OR source_card_id IS NOT NULL",
+            name="ck_graph_provenance_has_source",
+        ),
+        CheckConstraint(
+            "graph_store IN ('neo4j', 'networkx_dev')",
+            name="ck_graph_provenance_graph_store",
+        ),
+        # Cascade forget lookup: find all provenance rows for a given message_version
+        Index(
+            "ix_graph_provenance_mvid",
+            "source_message_version_id",
+            postgresql_where=text("source_message_version_id IS NOT NULL"),
+        ),
+        # Cascade forget lookup: find all provenance rows for a given card
+        Index(
+            "ix_graph_provenance_card_id",
+            "source_card_id",
+            postgresql_where=text("source_card_id IS NOT NULL"),
+        ),
+        # Drift detection: active (non-purged) provenance rows
+        Index(
+            "ix_graph_provenance_active",
+            "projection_run_id",
+            postgresql_where=text("purged_at IS NULL"),
+        ),
+        # Idempotency: stable triple key within a projection run
+        Index(
+            "uq_graph_provenance_triple",
+            "source_table",
+            "source_pk",
+            "triple_hash",
+            unique=True,
+            postgresql_where=text("purged_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    projection_run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("graph_projection_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    source_table: Mapped[str] = mapped_column(Text, nullable=False)
+    source_pk: Mapped[str] = mapped_column(Text, nullable=False)
+    source_message_version_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("message_versions.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    source_card_id: Mapped[_uuid_module.UUID | None] = mapped_column(
+        Uuid, ForeignKey("knowledge_cards.id", ondelete="CASCADE"), nullable=True
+    )
+    source_content_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    graph_store: Mapped[str] = mapped_column(
+        Text, nullable=False, default="neo4j", server_default="neo4j"
+    )
+    graph_node_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    graph_edge_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    triple_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    governance_policy: Mapped[str] = mapped_column(
+        Text, nullable=False, default="normal", server_default="normal"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    purge_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class GraphEdge(Base):
+    """Postgres-side edge registry for idempotency and drift detection.
+
+    Neo4j holds the traversable graph; this table proves every Neo4j edge has
+    a Postgres-side provenance record.
+
+    Predicate vocabulary is CHECK-constrained to ALLOWED_PREDICATES from
+    bot/services/graph_common.py.
+
+    Migration 062.
+    """
+
+    __tablename__ = "graph_edges"
+    __table_args__ = (
+        CheckConstraint(
+            "predicate IN ("
+            "'MENTIONS', 'AUTHORED', 'KNOWS_ABOUT', 'ASKED', 'ANSWERED', "
+            "'DECIDED', 'RELATED_TO', 'SUPPORTS', 'DERIVED_FROM', "
+            "'PART_OF', 'CONTRADICTS', 'SUPERSEDES'"
+            ")",
+            name="ck_graph_edges_predicate",
+        ),
+        CheckConstraint(
+            "confidence_score >= 0.00 AND confidence_score <= 1.00",
+            name="ck_graph_edges_confidence",
+        ),
+        # Drift detection: Neo4j edge count vs graph_edges count must match
+        Index(
+            "ix_graph_edges_active",
+            "graph_provenance_id",
+            postgresql_where=text("purged_at IS NULL"),
+        ),
+        # Idempotent MERGE lookup: is this edge already projected?
+        Index(
+            "uq_graph_edges_key",
+            "edge_key",
+            unique=True,
+            postgresql_where=text("purged_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    graph_provenance_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("graph_provenance.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subject_node_key: Mapped[str] = mapped_column(Text, nullable=False)
+    predicate: Mapped[str] = mapped_column(Text, nullable=False)
+    object_node_key: Mapped[str] = mapped_column(Text, nullable=False)
+    # stable MERGE key: SHA-256(subject+predicate+object)
+    edge_key: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence_score: Mapped[Decimal] = mapped_column(
+        Numeric(3, 2), nullable=False, default=Decimal("0.50"), server_default="0.50"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
