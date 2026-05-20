@@ -26,6 +26,18 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      neo4j:
+        image: neo4j:5.20-community
+        env:
+          NEO4J_AUTH: neo4j/ci-test-password-min-32-chars-ok!
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "wget --spider --quiet http://localhost:7474 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
     env:
       BOT_TOKEN: 123456:test-token
       COMMUNITY_CHAT_ID: -1001234567890
@@ -41,6 +53,9 @@ jobs:
       WEB_PASSWORD: test-pass
       WEB_SESSION_SECRET: test-session-secret
       DEV_MODE: "true"
+      NEO4J_BOLT_URI: bolt://localhost:7687
+      NEO4J_AUTH_USER: neo4j
+      NEO4J_AUTH_PASSWORD: ci-test-password-min-32-chars-ok!
     steps:
       - uses: actions/checkout@v4
 

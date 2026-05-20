@@ -118,6 +118,55 @@ def graph_adapter_fake() -> NetworkXAdapter:
     return NetworkXAdapter()
 
 
+_NEO4J_SAFE_HOSTS = {"localhost", "127.0.0.1", "neo4j", "neo4j-test"}
+
+
+def _neo4j_host_from_uri(uri: str) -> str:
+    """Extract the host portion from a bolt URI (e.g. bolt://localhost:7687 → localhost)."""
+    from urllib.parse import urlparse
+
+    return urlparse(uri).hostname or ""
+
+
+@pytest_asyncio.fixture()
+async def neo4j_session():
+    """Provides a cleaned Neo4j async session for tests marked @pytest.mark.graph_integration.
+
+    Connects to the bolt URI in NEO4J_BOLT_URI (CI Neo4j service or local compose).
+    Cleans all nodes/relationships BEFORE yielding so each test starts with an empty DB.
+    Closes the session and driver after the test.
+
+    Skipped automatically if NEO4J_BOLT_URI is not set in env (allows local dev without Neo4j).
+
+    Safety guard: refuses to wipe the DB if the URI host is not in the local allowlist
+    {localhost, 127.0.0.1, neo4j, neo4j-test}. This prevents accidentally wiping data when
+    NEO4J_BOLT_URI is mistakenly pointed at a staging or production instance.
+    """
+    bolt_uri = os.environ.get("NEO4J_BOLT_URI")
+    if not bolt_uri:
+        pytest.skip("NEO4J_BOLT_URI not set — skipping graph_integration test")
+
+    host = _neo4j_host_from_uri(bolt_uri)
+    if host not in _NEO4J_SAFE_HOSTS:
+        pytest.fail(
+            f"neo4j_session fixture refuses to wipe non-local Neo4j (host={host!r}). "
+            "Set NEO4J_BOLT_URI to localhost or a *-test instance for tests."
+        )
+
+    from neo4j import AsyncGraphDatabase  # type: ignore[import]
+
+    user = os.environ.get("NEO4J_AUTH_USER", "neo4j")
+    password = os.environ.get("NEO4J_AUTH_PASSWORD", "")
+    driver = AsyncGraphDatabase.driver(bolt_uri, auth=(user, password))
+    try:
+        async with driver.session(database="neo4j") as session:
+            # Clean before test so each test starts with an empty graph
+            await session.run("MATCH (n) DETACH DELETE n")
+            yield session
+    finally:
+        await driver.close()
+
+
 @pytest_asyncio.fixture()
 async def db_session(postgres_engine) -> AsyncIterator:
     """Yield an AsyncSession bound to the test postgres.
