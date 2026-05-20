@@ -1932,7 +1932,8 @@ async def _resolve_entity(
         return f"user:{user_id}"
 
     # Priority (c): UNKNOWN sentinel — caller will drop the triple.
-    suffix = hashlib.md5(label.encode()).hexdigest()[:8]
+    # MD5 used as non-cryptographic stable short hash; usedforsecurity=False signals scanner intent.
+    suffix = hashlib.md5(label.encode(), usedforsecurity=False).hexdigest()[:8]
     return f"UNKNOWN_{suffix}"
 
 
