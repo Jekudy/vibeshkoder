@@ -216,6 +216,15 @@ CREATE INDEX ix_graph_projection_runs_status
     WHERE status IN ('running', 'failed');
 ```
 
+**W0-A implementation note (added 2026-05-20):** Migration 060 implementation also
+adds a `started_by TEXT NULL` column for admin/scheduler audit trail (admin handler
+records admin telegram_id as text; scheduler records `'scheduler'` literal).
+This column is NOT in the canonical spec table above but is required by the
+`create_run(*, started_by: str | None)` signature in §5.C and §5.G/H consumers.
+See `docs/rollout-fragments/phase10/W0-A.md` for rationale.
+
+<!-- updated-by-w0a:2026-05-20 -->
+
 **Migration 061: `graph_provenance`**
 
 ```sql

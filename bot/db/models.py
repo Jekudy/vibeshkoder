@@ -1476,3 +1476,96 @@ class DigestRun(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+# ─── Phase 10: graph projection runs (T10-W0-A / alembic 060) ─────────────────
+
+
+class GraphProjectionRun(Base):
+    """Audit row for one graph projection pass (W0-A / alembic 060).
+
+    One row per projector invocation (dry_run, incremental, full_rebuild, repair).
+    Tracks source counts, projected node/edge counts, skip counts, token usage,
+    cost estimates, and terminal status.
+
+    Status lifecycle: running → completed | failed | cancelled | cost_exceeded |
+                                dry_run_complete
+
+    Mode values: dry_run, incremental, full_rebuild, repair.
+
+    This table is the Postgres-side audit anchor for everything Neo4j-related.
+    graph_provenance (migration 061), graph_edges (062), and graph_purge_pending (063)
+    all reference this table's id.
+    """
+
+    __tablename__ = "graph_projection_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "mode IN ('dry_run', 'incremental', 'full_rebuild', 'repair')",
+            name="ck_graph_projection_runs_mode",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'completed', 'failed', 'cancelled', "
+            "'cost_exceeded', 'dry_run_complete')",
+            name="ck_graph_projection_runs_status",
+        ),
+        Index("ix_graph_projection_runs_started_at", text("started_at DESC")),
+        # Partial index: only index rows we need to look up for monitoring/operations
+        Index(
+            "ix_graph_projection_runs_status",
+            "status",
+            postgresql_where=text("status IN ('running', 'failed')"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="running", server_default="running"
+    )
+    source_cutoff_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source_card_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    source_message_version_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    projected_node_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    projected_edge_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    skipped_policy_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    skipped_budget_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    llm_prompt_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    llm_completion_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    estimated_cost_usd: Mapped[Decimal] = mapped_column(
+        Numeric(10, 6), nullable=False, default=Decimal("0"), server_default=text("0")
+    )
+    actual_cost_usd: Mapped[Decimal] = mapped_column(
+        Numeric(10, 6), nullable=False, default=Decimal("0"), server_default=text("0")
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_context: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    # started_by is stored as a free-text label (e.g. 'scheduler', 'admin:149820031')
+    # NOT a FK — the projector can be triggered without a users row (scheduler, CLI).
+    started_by: Mapped[str | None] = mapped_column(Text, nullable=True)
