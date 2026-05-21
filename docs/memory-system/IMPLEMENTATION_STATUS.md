@@ -620,70 +620,47 @@ Flag `memory.wiki.enabled` default OFF — operator-controlled.
 
 ---
 
-## Phase 10 — Graph Projection / Neo4j (AUTHORIZED 2026-05-17, in progress)
+## Phase 10 — Graph Projection / Neo4j (CLOSED 2026-05-21)
 
-**Status:** Sprint 0c complete (plan ratified). Sprint 0d implementation
-waves dispatching.
+**Status:** All 10 sprints merged. Phase 11 binding suite 77/77 green.
 
 **Plan:** `docs/memory-system/PHASE10_PLAN.md` (1593 lines, ratified
 2026-05-17 after dual-model spec review with 2 BLOCKER + 9 HIGH + 4 MEDIUM
 audit findings addressed across revision passes — including critical
 sync→async cascade FLIP per RFC-001:415 conditional Neo4j approval).
 
-**Authorized scope:**
-- 4 Postgres tables, migrations 060-063: `graph_projection_runs`,
-  `graph_provenance`, `graph_edges`, `graph_purge_pending`. Migration 064
-  adds `llm_usage_ledger.call_type` discriminator with backfill.
-- Neo4j 5.x Community Edition via docker-compose `--profile graph` (dev
-  only initially; prod gated on hard ops checklist incl. Bolt SSL,
-  password rotation, backup runbook, healthcheck, memory limits).
-- Services: `graph_projector.py`, `graph_query.py`, `graph_adapter.py`
-  (Protocol with `Neo4jAdapter` prod + `NetworkXAdapter` unit-test fake),
-  `graph_purge_worker.py`.
-- LLM gateway extension: `extract_graph_triples()` with `call_type=
-  'graph_projection'` ledger column.
-- Async cascade integration (RFC-001:415 strict pattern): forget cascade
-  atomically enqueues `graph_purge_pending` rows in Postgres transaction;
-  separate `graph_purge_worker` drives Neo4j bolt DELETE asynchronously;
-  `graph_query.py` fails-closed via pending-purge read-block during async
-  window. Replaces an earlier synchronous-purge proposal that violated
-  RFC-001 condition.
-- Ontology split: cards → semantic CONCEPT nodes + LLM triples;
-  message_versions → provenance/event nodes only (no LLM extraction;
-  avoids double-counting).
-- Cost ceilings (separate from shared `LLM_DAILY_USD_CEILING` $5/day):
-  `GRAPH_PROJECTION_DAILY_USD_CEILING` $2/day,
-  `GRAPH_PROJECTION_RUN_USD_CEILING` $0.50/run, max 200 sources/run.
-- 3 feature flags default OFF: `memory.graph.projection.enabled`,
-  `memory.graph.query.enabled`, `memory.graph.write_pending.paused`.
+**Sprint queue (CLOSED):**
 
-**Sprint queue (9 tickets):**
-- T10-01: docker-compose Neo4j service + graph_adapter Protocol +
-  Neo4jAdapter + NetworkXAdapter + testcontainers dev dep
-- T10-02: source eligibility contract + governance pre-filter helpers
-- T10-03: schema migrations 060-064 (projection_runs + provenance +
-  edges + purge_pending + ledger call_type backfill) + repos
-- T10-04: `llm_gateway.extract_graph_triples()` + entity registry
-  (cards.id → users.id → UNKNOWN refuse-on-UNKNOWN)
-- T10-05: `graph_projector.py` modes (dry_run, incremental, full_rebuild
-  replay-only no LLM, repair) + dry-run cost estimate
-- T10-06: forget cascade integration — async layer
-  (`_cascade_graph_provenance` enqueues purge_pending) + `graph_purge_worker`
-  in cascade_worker_tick + read-block in graph_query
-- T10-07: `graph_query.py` read-only API with role/visibility filters
-  + provenance-required output + parameterized Cypher (no string
-  interpolation)
-- T10-08: admin Telegram handlers `/graph_project_now` (advisory lock
-  serialization), `/graph_stats`, `/graph_query` + scheduler nightly
-  03:30 MSK + PHASE10_ROLLOUT.md ops checklist
-- T10-09: Phase 11 binding tests (6 new test files + Neo4j CI service
-  block in evals.yml) — 15-16 new test IDs; total target 57-58
+| Sprint | PR | Status |
+|---|---|---|
+| W0-A | #324 | MERGED — migration 060 `graph_projection_runs`, ORM, repo, `graph_common.py` |
+| W0-D | #325 | MERGED — Neo4j CI service, `neo4j_session` fixture, `graph_integration` marker |
+| T10-02-rest | #326 | MERGED — migrations 061 (`graph_provenance`) + 062 (`graph_edges`), ORM, repos |
+| T10-03 | #327 | MERGED — migration 064 (`llm_usage_ledger.call_type`), `extract_graph_triples`, prompt template |
+| T10-04 | #328 | MERGED — `graph_projector.py` (4 modes), `memory.graph.projection.enabled` flag |
+| T10-06 | #329 | MERGED — migration 063 (`graph_purge_pending`), purge readblock, purge worker, cascade layer `graph_nodes`, kill-switch |
+| T10-05 | #330 | MERGED — `graph_query.py` read-only API, RFC-001:415 read-block, `memory.graph.query.enabled` flag |
+| T10-08 | #331 | MERGED — drift detection: `reconcile_counts()`, `GraphDriftReport`, extended `graph_stats()` |
+| T10-07 | #332 | MERGED — admin handlers (`/graph_project_now`, `/graph_stats`, `/graph_query`, `/graph_purge_now`), scheduler jobs |
+| T10-09 | #333 | MERGED — Phase 11 binding suite 60 → 77 tests (L10a-c, C9a-b, I8a-e, R7a-d, G2a-b, replay-only invariant) |
+
+**Phase 10 binding tests in evals.yml: 77/77 green (was 60 before T10-09).**
 
 **Phase 10.5 carryovers** (deferred):
-- Real-time projection hooks
-- Member-facing graph queries
-- Public graph surface
-- Expertise pages
-- APOC procedures (security review surface)
+- `LedgerRepo.daily_cost_usd` typed call_type method (inline query in projector today)
+- Hard budget cap pre-call estimation
+- `dry_run` source_types parameter
+- Migration 064 backfill batching for large `llm_usage_ledger`
+- `source_card_id` arg parity in `_resolve_entity`
+- `extract_candidates` call_type named bucket (currently `'unknown'`)
+- `GraphPath.edges` async edge fetch batch optimization
+- Pre-guard scope refinement in `graph_query` (message-only rows)
+- `ck_graph_provenance_has_source` OR → XOR at DB level
+- `edge_key_hash` MERGE in T10-04 projector for hash-based drift activation
+- `NetworkXAdapter` synthetic edge_key_hash full hash comparison
+- Fixture host-allowlist refinement (Docker bridge network hostnames)
+- `full_rebuild` 60s interactive confirmation gate (--confirm stopgap shipped)
+- I8e Jaccard re-extraction softer eval (requires real LLM in CI)
+- Member-facing graph queries, public graph surface, expertise pages, APOC procedures
 
 <!-- updated-by-superflow:2026-05-17 -->
