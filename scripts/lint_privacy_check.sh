@@ -114,6 +114,17 @@ is_allowed_path() {
   # entries above.
   [[ "$path" == "bot/services/forget_cascade.py" ]] && return 0
 
+  # T10-09 Phase 11 binding tests for graph privacy, provenance, cascade, refusal, drift.
+  # Test files name canonical privacy literals in docstrings and assertion messages because
+  # they ENFORCE the governance policy by name (L10/C9/I8/R7/G2 binding tests).
+  # Same rationale as test_wiki_*.py / test_digest_*.py allowlist entries above.
+  [[ "$path" == "tests/evals/test_graph_leakage.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_graph_citations.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_graph_cascade.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_graph_refusal.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_graph_drift.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_graph_no_llm_in_rebuild.py" ]] && return 0
+
   return 1
 }
 
