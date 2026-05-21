@@ -58,6 +58,14 @@ class GraphAdapter(Protocol):
         max_results: int,
     ) -> list[dict]: ...
 
+    async def query_traversal_with_paths(
+        self,
+        start_label: str,
+        end_label: str,
+        max_hops: int,
+        max_results: int,
+    ) -> list[dict]: ...
+
     async def health_check(self) -> bool: ...
 
     async def close(self) -> None: ...
@@ -214,6 +222,38 @@ class Neo4jAdapter:
             result = await session.run(query, topic=topic, max_results=max_results)
             records = await result.data()
         return [dict(r) for r in records]
+
+    async def query_traversal_with_paths(
+        self,
+        start_label: str,
+        end_label: str,
+        max_hops: int,
+        max_results: int,
+    ) -> list[dict]:
+        """Return paths (nodes + edges) from start_label to end_label using shortestPath.
+
+        Each result dict has keys: nodes (list of {label, node_type, node_key}),
+        edges (list of {source_key, target_key, predicate}).
+        Bound as parameters — no string interpolation of user input.
+        """
+        safe_hops = max(1, min(max_hops, 5))
+        query = (
+            f"MATCH p = shortestPath((a:MemoryNode)-[*1..{safe_hops}]-(b:MemoryNode))\n"
+            "WHERE a.label = $start_label AND b.label = $end_label\n"
+            "RETURN "
+            "[n IN nodes(p) | {label: n.label, node_type: n.node_type, node_key: n.node_key}] AS path_nodes,\n"
+            "[r IN relationships(p) | {source_key: startNode(r).node_key, target_key: endNode(r).node_key, predicate: r.predicate}] AS path_edges\n"
+            "LIMIT $max_results"
+        )
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(
+                query,
+                start_label=start_label,
+                end_label=end_label,
+                max_results=max_results,
+            )
+            records = await result.data()
+        return [{"nodes": r["path_nodes"], "edges": r["path_edges"]} for r in records]
 
     async def health_check(self) -> bool:
         """Run RETURN 1 to verify bolt connectivity."""
@@ -372,6 +412,81 @@ class NetworkXAdapter:
                     break
 
         return results[:max_results]
+
+    async def query_traversal_with_paths(
+        self,
+        start_label: str,
+        end_label: str,
+        max_hops: int,
+        max_results: int,
+    ) -> list[dict]:
+        """Return shortest paths (nodes + edges) from start_label to end_label using BFS.
+
+        Each result dict: {nodes: [{label, node_type, node_key}, ...], edges: [{source_key, target_key, predicate}, ...]}.
+        """
+        safe_hops = max(1, min(max_hops, 5))
+
+        # Find start and end nodes by label
+        start_nodes = [n for n, d in self._graph.nodes(data=True) if d.get("label") == start_label]
+        end_nodes = [n for n, d in self._graph.nodes(data=True) if d.get("label") == end_label]
+
+        if not start_nodes or not end_nodes:
+            return []
+
+        # Use networkx to find shortest paths between any start/end pair
+        # Convert to undirected for traversal (symmetric reachability)
+        undirected = self._graph.to_undirected()
+
+        results: list[dict] = []
+        for start in start_nodes:
+            for end in end_nodes:
+                if start == end:
+                    continue
+                try:
+                    path_nodes_keys = nx.shortest_path(undirected, start, end)
+                except nx.NetworkXNoPath:
+                    continue
+
+                if len(path_nodes_keys) - 1 > safe_hops:
+                    continue
+
+                # Build node dicts
+                path_node_dicts = []
+                for nk in path_nodes_keys:
+                    nd = dict(self._graph.nodes[nk])
+                    path_node_dicts.append({
+                        "label": nd.get("label"),
+                        "node_type": nd.get("node_type"),
+                        "node_key": nk,
+                    })
+
+                # Build edge dicts for each consecutive pair
+                path_edge_dicts = []
+                for i in range(len(path_nodes_keys) - 1):
+                    src = path_nodes_keys[i]
+                    tgt = path_nodes_keys[i + 1]
+                    # Find edge between src and tgt (either direction in original graph)
+                    edge_data = {}
+                    if self._graph.has_edge(src, tgt):
+                        # Get first edge data
+                        for key, data in self._graph[src][tgt].items():
+                            edge_data = data
+                            break
+                    elif self._graph.has_edge(tgt, src):
+                        for key, data in self._graph[tgt][src].items():
+                            edge_data = data
+                            break
+                    path_edge_dicts.append({
+                        "source_key": src,
+                        "target_key": tgt,
+                        "predicate": edge_data.get("predicate") or edge_data.get("relationship_type"),
+                    })
+
+                results.append({"nodes": path_node_dicts, "edges": path_edge_dicts})
+                if len(results) >= max_results:
+                    return results
+
+        return results
 
     async def health_check(self) -> bool:
         return True
