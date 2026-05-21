@@ -246,6 +246,25 @@ startup warning (Claude MED-5), `Cache-Control: no-store` on member
 `/wiki/{slug}` (Claude MED-6), L9a OR-form assertion polish (Claude
 product r1 MED, non-blocking).
 
+**Phase 10 (graph projection / Neo4j) — CLOSED 2026-05-21.** All 10 sprints
+merged (W0-A foundation PR #324, W0-D Neo4j CI PR #325, T10-02-rest migrations
+061-062 PR #326, T10-03 `extract_graph_triples` + migration 064 PR #327,
+T10-04 `graph_projector.py` 4 modes PR #328, T10-06 async purge cascade +
+readblock + migration 063 PR #329, T10-05 `graph_query.py` read-only API
+PR #330, T10-08 drift detection + `reconcile_counts` PR #331, T10-07 admin
+handlers + scheduler PR #332, T10-09 Phase 11 binding suite 60→77 PR #333).
+Privacy-critical invariant: forget cascade atomically enqueues
+`graph_purge_pending` rows in Postgres; `graph_purge_worker` drives Neo4j
+DELETE asynchronously; `graph_query` fails-closed via pending-purge read-block
+(RFC-001:415). Ontology split: `knowledge_cards` → CONCEPT nodes + LLM triples
+(`call_type='graph_projection'`); `message_versions` → provenance/event nodes
+only (no LLM). Migrations 060-066. Three flags all default OFF:
+`memory.graph.projection.enabled` / `memory.graph.query.enabled` /
+`memory.graph.write_pending.paused`. Cost ceilings: $2/day, $0.50/run, max 200
+sources/run. Scheduler: `graph_projection_nightly` (03:30 MSK) +
+`graph_purge_worker` (5-min interval). Phase 11 binding **77/77** green.
+Rollout playbook: `docs/memory-system/PHASE10_ROLLOUT.md`.
+
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
 
