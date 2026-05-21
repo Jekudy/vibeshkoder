@@ -143,7 +143,7 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     shipped migration. Update the literal when new migrations land.
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "065"
+    assert current == "066"
 
 
 # ─── Test: upgrade adds 4 review columns with correct types/nullability ──────
