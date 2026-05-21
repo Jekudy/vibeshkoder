@@ -14,6 +14,7 @@ from bot.handlers import (
     admin,
     admin_cards,
     admin_extract,
+    admin_graph,
     chat_events,
     chat_messages,
     digest,
@@ -175,6 +176,7 @@ async def main() -> None:
         admin.router,
         admin_extract.router,  # T6-03: /admin_extract — Phase 6 backfill (private chat + admin gated)
         admin_cards.router,    # T6-04/T6-05: /candidates /approve /reject /cards /card
+        admin_graph.router,    # T10-07: /graph_project_now /graph_stats /graph_query /graph_purge_now
         digest.router,         # T7-06: /digest_now /digest_preview /digest_history
         wiki.router,           # T9-06: /wiki_publish /wiki_unpublish /wiki_robots (admin-only)
         chat_events.router,
