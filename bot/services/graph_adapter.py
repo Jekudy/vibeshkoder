@@ -66,6 +66,14 @@ class GraphAdapter(Protocol):
         max_results: int,
     ) -> list[dict]: ...
 
+    async def count_nodes(self) -> int:
+        """Return total node count in the graph."""
+        ...
+
+    async def count_edges(self) -> int:
+        """Return total edge/relationship count in the graph."""
+        ...
+
     async def health_check(self) -> bool: ...
 
     async def close(self) -> None: ...
@@ -254,6 +262,20 @@ class Neo4jAdapter:
             )
             records = await result.data()
         return [{"nodes": r["path_nodes"], "edges": r["path_edges"]} for r in records]
+
+    async def count_nodes(self) -> int:
+        """Return total MemoryNode count via Cypher."""
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run("MATCH (n:MemoryNode) RETURN count(n) AS c")
+            record = await result.single()
+            return int(record["c"]) if record else 0
+
+    async def count_edges(self) -> int:
+        """Return total GRAPH_EDGE relationship count via Cypher."""
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run("MATCH ()-[r:GRAPH_EDGE]->() RETURN count(r) AS c")
+            record = await result.single()
+            return int(record["c"]) if record else 0
 
     async def health_check(self) -> bool:
         """Run RETURN 1 to verify bolt connectivity."""
@@ -487,6 +509,14 @@ class NetworkXAdapter:
                     return results
 
         return results
+
+    async def count_nodes(self) -> int:
+        """Return total node count."""
+        return len(self._graph.nodes)
+
+    async def count_edges(self) -> int:
+        """Return total edge count."""
+        return self._graph.number_of_edges()
 
     async def health_check(self) -> bool:
         return True

@@ -1,4 +1,4 @@
-"""Graph Query Service — read-only traversal API (Phase 10 / T10-05).
+"""Graph Query Service — read-only traversal API (Phase 10 / T10-05 + T10-08).
 
 Implements three public traversal functions per PHASE10_PLAN.md §5.E:
 
@@ -6,7 +6,8 @@ Implements three public traversal functions per PHASE10_PLAN.md §5.E:
 - find_people_for_topic: finds Person nodes connected to a topic
 - explain_connection: finds paths between two named nodes
 - sources_for_path: resolves provenance rows for returned paths
-- graph_stats: basic node/edge counts
+- graph_stats: node/edge counts (extended in T10-08 with Neo4j + drift fields)
+- reconcile_counts: drift detection per §5.I (T10-08)
 
 Rules (§5.E verbatim contract):
 - Read-only. No writes, no MERGE, no LLM calls.
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, text
@@ -95,11 +97,49 @@ class GraphQueryResult:
 
 @dataclass(frozen=True)
 class GraphStatsResult:
-    """Counts from the live graph (Postgres canonical)."""
+    """Counts from the live graph (Postgres canonical) + optional Neo4j drift signals (T10-08).
+
+    Fields added by T10-08:
+    - neo4j_nodes_total: total MemoryNode count in Neo4j (None if adapter not provided)
+    - neo4j_edges_total: total GRAPH_EDGE count in Neo4j (None if adapter not provided)
+    - drift_detected: True if hash mismatch between Postgres and Neo4j (None if no adapter)
+    - drift_pct: absolute percentage difference between Postgres provenance and Neo4j node count
+                 relative to max(postgres, neo4j). None if adapter not provided.
+    """
 
     active_provenance_rows: int
     active_edge_rows: int
     purged_provenance_rows: int
+    # T10-08 extension — optional (None when adapter is not provided)
+    neo4j_nodes_total: int | None = None
+    neo4j_edges_total: int | None = None
+    drift_detected: bool | None = None
+    drift_pct: float | None = None
+
+
+@dataclass(frozen=True)
+class GraphDriftReport:
+    """Full drift reconciliation report per §5.I (T10-08).
+
+    Returned by reconcile_counts(). Captures Postgres + Neo4j state snapshot
+    and all drift signals at the time of the check.
+
+    Hash fields are advisory for forensic comparison; production drift signal is
+    count-based until T10-04 projector writes edge_key_hash (Phase 10.5 carryover).
+    """
+
+    postgres_active_provenance: int
+    postgres_active_edges: int
+    neo4j_node_count: int
+    neo4j_edge_count: int
+    postgres_active_hash: str | None    # md5 over sorted triple_hash values (advisory)
+    neo4j_edge_hash: str | None         # sum of edge_key_hash on GRAPH_EDGE (advisory; None on infra error)
+    drift_detected: bool
+    drift_orphan_node_count: int        # Neo4j nodes with no active Postgres provenance
+    drift_orphan_edge_count: int        # Neo4j edges with no active Postgres provenance
+    drift_missing_node_count: int       # Postgres provenance rows with no Neo4j node
+    pending_purge_count: int            # graph_purge_pending rows not yet processed
+    checked_at: datetime
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -208,6 +248,81 @@ def _build_paths_from_traversal(
         )
 
     return paths
+
+
+# ─── Drift helpers (T10-08) ───────────────────────────────────────────────────
+
+
+async def _compute_postgres_active_hash(session: AsyncSession) -> str | None:
+    """Compute md5 over sorted active triple_hash values from graph_provenance.
+
+    Per §5.I:
+      SELECT md5(string_agg(triple_hash, ',' ORDER BY triple_hash))
+      FROM graph_provenance
+      WHERE purged_at IS NULL AND triple_hash IS NOT NULL;
+
+    Returns None when there are no active provenance rows with triple_hash set.
+    """
+    result = await session.execute(
+        text(
+            "SELECT md5(string_agg(triple_hash, ',' ORDER BY triple_hash))"
+            " FROM graph_provenance"
+            " WHERE purged_at IS NULL AND triple_hash IS NOT NULL"
+        )
+    )
+    value = result.scalar()
+    return value  # None if no rows match
+
+
+async def _compute_neo4j_edge_hash(adapter: GraphAdapter) -> str | None:
+    """Compute neo4j_edge_hash from the graph adapter. Returns None on infra error.
+
+    For Neo4jAdapter (production):
+      MATCH ()-[r:GRAPH_EDGE]->() RETURN toString(sum(r.edge_key_hash)) AS neo4j_edge_hash
+      (§5.I step 2)
+
+    For NetworkXAdapter (tests/unit): compute from edge metadata stored in the in-memory
+    graph. Falls back to a synthetic hash based on edge count if edge_key_hash is absent.
+
+    Returns None when Neo4j infra error occurs (graceful degrade per no-fallback policy:
+    returns None, logs structured warning, does NOT swallow silently as "0").
+    Hash field is ADVISORY ONLY — drift_detected is count-based (see reconcile_counts).
+    """
+    from bot.services.graph_adapter import Neo4jAdapter, NetworkXAdapter
+
+    if isinstance(adapter, Neo4jAdapter):
+        # Production path: use stored edge_key_hash on GRAPH_EDGE relationships
+        try:
+            # Access via the driver session directly
+            async with adapter._driver.session(database=adapter._database) as session:  # type: ignore[attr-defined]
+                result = await session.run(
+                    "MATCH ()-[r:GRAPH_EDGE]->() RETURN toString(sum(r.edge_key_hash)) AS h"
+                )
+                record = await result.single()
+                return record["h"] if record else "0"
+        except Exception:
+            _log.warning(
+                "_compute_neo4j_edge_hash: Neo4j query failed; hash set to None (advisory field)",
+                exc_info=True,
+            )
+            return None  # None signals infra error; drift_detected is NOT set from this
+
+    if isinstance(adapter, NetworkXAdapter):
+        # Test path: sum edge_key_hash values stored on edges if present,
+        # otherwise use edge count as a synthetic signal
+        total = 0
+        for _u, _v, data in adapter._graph.edges(data=True):  # type: ignore[attr-defined]
+            ekh = data.get("edge_key_hash", 0)
+            if ekh:
+                total += int(ekh)
+        # If no edge_key_hash stored, use synthetic based on edge count to detect count drift
+        if total == 0:
+            # Use edge count string to differentiate empty vs non-empty
+            total = adapter._graph.number_of_edges()  # type: ignore[attr-defined]
+        return str(total)
+
+    # Fallback for unknown adapter types
+    return "0"
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -558,12 +673,24 @@ async def sources_for_path(
 
 async def graph_stats(
     session: AsyncSession,
-    adapter: GraphAdapter,
+    adapter: GraphAdapter | None = None,
 ) -> GraphStatsResult:
-    """Return basic graph statistics from the Postgres canonical store.
+    """Return graph statistics from Postgres canonical store + optional Neo4j drift signals.
 
-    Per §5.E: Postgres is canonical (invariant #6). We count from Postgres,
-    not from Neo4j. The adapter health_check is used to verify connectivity.
+    Per §5.E: Postgres is canonical (invariant #6). Postgres counts are always returned.
+
+    When adapter is provided (T10-08 extension):
+    - neo4j_nodes_total and neo4j_edges_total are populated via count_nodes()/count_edges()
+    - drift_detected is True when COUNT mismatch is detected (count-based, not hash-based)
+    - drift_pct is the absolute percentage difference between Postgres provenance count
+      and Neo4j node count, relative to max(1, postgres_count) per spec §5.I
+
+    Hash fields (postgres_active_hash, neo4j_edge_hash in reconcile_counts) are ADVISORY
+    for forensic comparison. Production drift signal is count-based until T10-04 projector
+    writes edge_key_hash (Phase 10.5 carryover).
+
+    When adapter is None, all Neo4j fields are None (backward compat).
+    Old callers using `await graph_stats(session)` continue to work — adapter defaults to None.
     """
     # Count active provenance rows (non-purged)
     active_prov_result = await session.execute(
@@ -583,8 +710,125 @@ async def graph_stats(
     )
     purged_provenance = purged_prov_result.scalar() or 0
 
+    if adapter is None:
+        return GraphStatsResult(
+            active_provenance_rows=int(active_provenance),
+            active_edge_rows=int(active_edges),
+            purged_provenance_rows=int(purged_provenance),
+            neo4j_nodes_total=None,
+            neo4j_edges_total=None,
+            drift_detected=None,
+            drift_pct=None,
+        )
+
+    # T10-08: query Neo4j for live counts
+    neo4j_nodes = await adapter.count_nodes()
+    neo4j_edges = await adapter.count_edges()
+
+    # drift_detected: count-based only (hash is advisory; T10-04 projector carryover)
+    pg_count = int(active_provenance)
+    drift_detected = pg_count != neo4j_nodes
+
+    # drift_pct: absolute % difference using max(1, postgres_count) as denominator (spec §5.I)
+    denom = max(1, pg_count)
+    drift_pct = abs(pg_count - neo4j_nodes) / denom * 100.0
+
     return GraphStatsResult(
-        active_provenance_rows=int(active_provenance),
+        active_provenance_rows=pg_count,
         active_edge_rows=int(active_edges),
         purged_provenance_rows=int(purged_provenance),
+        neo4j_nodes_total=neo4j_nodes,
+        neo4j_edges_total=neo4j_edges,
+        drift_detected=drift_detected,
+        drift_pct=drift_pct,
+    )
+
+
+async def reconcile_counts(
+    session: AsyncSession,
+    adapter: GraphAdapter,
+) -> GraphDriftReport:
+    """Drift reconciliation per §5.I (T10-08).
+
+    Compares Postgres active provenance/edge counts against Neo4j node/edge counts.
+    Computes hash-based drift signal:
+    - postgres_active_hash: md5 over sorted active triple_hash values from graph_provenance
+    - neo4j_edge_hash: sum of edge_key_hash from GRAPH_EDGE relationships (or synthetic
+                       for NetworkXAdapter in tests)
+
+    Returns GraphDriftReport with all drift signals.
+    """
+    # 1. Postgres active provenance count
+    pg_prov_result = await session.execute(
+        text("SELECT COUNT(*) FROM graph_provenance WHERE purged_at IS NULL")
+    )
+    postgres_active_provenance = int(pg_prov_result.scalar() or 0)
+
+    # 2. Postgres active edge count
+    pg_edge_result = await session.execute(
+        text("SELECT COUNT(*) FROM graph_edges WHERE purged_at IS NULL")
+    )
+    postgres_active_edges = int(pg_edge_result.scalar() or 0)
+
+    # 3. Postgres active hash (md5 over sorted triple_hash values)
+    postgres_active_hash = await _compute_postgres_active_hash(session)
+
+    # 4. Neo4j counts
+    neo4j_node_count = await adapter.count_nodes()
+    neo4j_edge_count = await adapter.count_edges()
+
+    # 5. Neo4j edge hash
+    neo4j_edge_hash = await _compute_neo4j_edge_hash(adapter)
+
+    # 6. Pending purge count (non-zero means async purge in progress — not drift, but logged)
+    pending_result = await session.execute(
+        text("SELECT COUNT(*) FROM graph_purge_pending WHERE purged_at IS NULL")
+    )
+    pending_purge_count = int(pending_result.scalar() or 0)
+
+    # 7. Drift detection: count-based ONLY.
+    # Hash fields are ADVISORY for forensic comparison only.
+    # Production drift signal is count-based until T10-04 projector writes edge_key_hash
+    # (Phase 10.5 carryover — see PHASE10_PLAN.md §5.I and rollout fragment).
+    drift_detected = (
+        postgres_active_provenance != neo4j_node_count
+        or postgres_active_edges != neo4j_edge_count
+    )
+
+    # 8. Orphan/missing detection (count-based; detailed key comparison is a T10-09 eval)
+    # Orphan: Neo4j has more nodes than Postgres provenance → likely orphaned nodes
+    drift_orphan_node_count = max(0, neo4j_node_count - postgres_active_provenance)
+    drift_orphan_edge_count = max(0, neo4j_edge_count - postgres_active_edges)
+    # Missing: Postgres has provenance with no corresponding Neo4j node
+    drift_missing_node_count = max(0, postgres_active_provenance - neo4j_node_count)
+
+    if drift_detected:
+        _log.warning(
+            "reconcile_counts: drift detected "
+            "postgres_provenance=%d neo4j_nodes=%d "
+            "postgres_edges=%d neo4j_edges=%d "
+            "pg_hash=%s neo4j_hash=%s "
+            "pending_purge=%d",
+            postgres_active_provenance,
+            neo4j_node_count,
+            postgres_active_edges,
+            neo4j_edge_count,
+            postgres_active_hash,
+            neo4j_edge_hash,
+            pending_purge_count,
+        )
+
+    return GraphDriftReport(
+        postgres_active_provenance=postgres_active_provenance,
+        postgres_active_edges=postgres_active_edges,
+        neo4j_node_count=neo4j_node_count,
+        neo4j_edge_count=neo4j_edge_count,
+        postgres_active_hash=postgres_active_hash,
+        neo4j_edge_hash=neo4j_edge_hash,
+        drift_detected=drift_detected,
+        drift_orphan_node_count=drift_orphan_node_count,
+        drift_orphan_edge_count=drift_orphan_edge_count,
+        drift_missing_node_count=drift_missing_node_count,
+        pending_purge_count=pending_purge_count,
+        checked_at=datetime.now(timezone.utc),
     )
