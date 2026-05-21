@@ -1081,3 +1081,81 @@ project_repair = project_repair_source
 
 # SUGGESTION Product #1: repair_source alias per §5.C public API name compliance.
 repair_source = project_repair_source
+
+
+# ─── Config factory ──────────────────────────────────────────────────────────
+
+
+def default_projector_config(adapter: Any) -> GraphProjectorConfig:
+    """Build a GraphProjectorConfig wired to the canonical Postgres repos.
+
+    Eliminates the repeated inline _RunRepo / _ProvRepo / _EdgeRepo anonymous class
+    boilerplate in admin handlers and the scheduler. adapter is caller-supplied so
+    tests can pass a NetworkXAdapter without touching real Neo4j.
+
+    Usage (admin handler / scheduler):
+        from bot.services.graph_projector import default_projector_config
+        from bot.services.graph_adapter import Neo4jAdapter
+
+        config = default_projector_config(Neo4jAdapter())
+        result = await project_incremental(session, config=config, started_by="scheduler")
+    """
+    from bot.db.repos.graph_edge import create_edge, find_by_provenance as _fp
+    from bot.db.repos.graph_projection_run import (
+        create_run,
+        finalize_run,
+        get_active_run,
+        update_run_stats,
+    )
+    from bot.db.repos.graph_provenance import (
+        create_provenance,
+        find_active,
+        find_by_source,
+    )
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+
+    class _RunRepo:
+        async def create_run(self, s: AsyncSession, *, mode: Any, started_by: Any) -> Any:
+            return await create_run(s, mode=mode, started_by=started_by)
+
+        async def update_run_stats(
+            self, s: AsyncSession, run_id: int, *, stats_patch: dict
+        ) -> None:
+            return await update_run_stats(s, run_id, stats_patch=stats_patch)
+
+        async def finalize_run(
+            self, s: AsyncSession, run_id: int, *, status: Any, cost_usd: Any = None
+        ) -> None:
+            return await finalize_run(s, run_id, status=status, cost_usd=cost_usd)
+
+        async def get_active_run(self, s: AsyncSession) -> Any:
+            return await get_active_run(s)
+
+    class _ProvRepo:
+        async def create_provenance(self, s: AsyncSession, **kw: Any) -> Any:
+            return await create_provenance(s, **kw)
+
+        async def find_active(
+            self, s: AsyncSession, *, projection_run_id: int | None = None
+        ) -> list:
+            return await find_active(s, projection_run_id=projection_run_id)
+
+        async def find_by_source(
+            self, s: AsyncSession, *, source_table: str, source_pk: str
+        ) -> list:
+            return await find_by_source(s, source_table=source_table, source_pk=source_pk)
+
+    class _EdgeRepo:
+        async def create_edge(self, s: AsyncSession, **kw: Any) -> Any:
+            return await create_edge(s, **kw)
+
+        async def find_by_provenance(self, s: AsyncSession, prov_id: int) -> list:
+            return await _fp(s, prov_id)
+
+    return GraphProjectorConfig(
+        adapter=adapter,
+        run_repo=_RunRepo(),
+        provenance_repo=_ProvRepo(),
+        edge_repo=_EdgeRepo(),
+        ledger_repo=LedgerRepo(),
+    )

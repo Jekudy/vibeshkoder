@@ -17,6 +17,8 @@ from bot.db.repos.user import UserRepo
 from bot.html_escape import html_escape
 from bot.services.extractor import extraction_scheduler_tick
 from bot.services.forget_cascade import cascade_worker_tick
+from bot.services.graph_projector import default_projector_config, project_incremental
+from bot.services.graph_purge_worker import graph_purge_worker_tick
 from bot.services.invite_worker import process_invite_outbox
 from bot.services.llm_gateway import (
     LiveExtractCandidatesGateway,
@@ -791,6 +793,92 @@ async def digest_stale_review_reaper_job(bot: Bot) -> None:
         logger.exception("digest_stale_review_reaper crashed")
 
 
+# ─── T10-07: Phase 10 graph scheduler jobs ──────────────────────────────────
+
+
+async def graph_projection_nightly_job(bot: Bot) -> None:
+    """Nightly graph projection at 03:30 MSK.
+
+    Per PHASE10_PLAN.md §5.H. Strict no-op when ``memory.graph.projection.enabled``
+    is OFF. On failure: logs exception (no admin DM in this sprint — T10-07 scope).
+
+    Wraps in try/except so apscheduler never stops firing.
+    """
+    try:
+        async with async_session() as session:
+            from bot.db.repos.feature_flag import FeatureFlagRepo
+
+            flag_enabled = await FeatureFlagRepo.get(
+                session, "memory.graph.projection.enabled"
+            )
+            if not flag_enabled:
+                logger.info("graph_projection_nightly_job: flag disabled, skipping")
+                return
+
+            from bot.services.graph_adapter import Neo4jAdapter
+
+            config = default_projector_config(Neo4jAdapter())
+            try:
+                result = await project_incremental(
+                    session,
+                    config=config,
+                    started_by="scheduler",
+                )
+                await session.commit()
+                logger.info(
+                    "graph_projection_nightly_job: run_id=%s status=%s "
+                    "sources_processed=%s triples_created=%s cost_usd=%s",
+                    result.run_id,
+                    result.status,
+                    result.sources_processed,
+                    result.triples_created,
+                    result.cost_usd,
+                )
+            except Exception:
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception("graph_projection_nightly_job: rollback failed")
+                logger.exception("graph_projection_nightly_job: incremental projection failed")
+    except Exception:
+        logger.exception("graph_projection_nightly_job: session setup failed")
+
+
+async def graph_purge_worker_job() -> None:
+    """Graph purge worker tick — every 5 minutes.
+
+    Per PHASE10_PLAN.md §5.H. Reads feature flag ``memory.graph.write_pending.paused``;
+    skips if ON (kill-switch for Neo4j downtime). Calls graph_purge_worker_tick with
+    batch_size=20.
+
+    Wraps in try/except so apscheduler never stops firing.
+    """
+    try:
+        async with async_session() as session:
+            from bot.services.graph_adapter import Neo4jAdapter
+
+            adapter = Neo4jAdapter()
+            try:
+                tick_result = await graph_purge_worker_tick(
+                    session, adapter=adapter, batch_size=20
+                )
+                await session.commit()
+                logger.info(
+                    "graph_purge_worker_job: processed=%s errors=%s skipped_paused=%s",
+                    tick_result.get("processed", 0),
+                    tick_result.get("errors", 0),
+                    tick_result.get("skipped_paused", False),
+                )
+            except Exception:
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception("graph_purge_worker_job: rollback failed")
+                logger.exception("graph_purge_worker_job: tick failed")
+    except Exception:
+        logger.exception("graph_purge_worker_job: session setup failed")
+
+
 def start_scheduler(bot: Bot) -> None:
     """Configure and start the scheduler."""
     scheduler.add_job(
@@ -926,6 +1014,38 @@ def start_scheduler(bot: Bot) -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=300,
+    )
+    # T10-07: Phase 10 graph projection nightly job. Cron 03:30 MSK = 00:30 UTC.
+    # Gated by feature flag ``memory.graph.projection.enabled`` (default OFF);
+    # job body re-checks the flag and is a strict no-op when disabled.
+    # Separate from digest crons (09:00/09:15 MSK) — no LLM gateway pressure overlap.
+    graph_projection_hour_msk = int(getattr(settings, "GRAPH_PROJECTION_HOUR_MSK", 3))
+    graph_projection_minute_msk = int(getattr(settings, "GRAPH_PROJECTION_MINUTE_MSK", 30))
+    scheduler.add_job(
+        graph_projection_nightly_job,
+        "cron",
+        hour=graph_projection_hour_msk,
+        minute=graph_projection_minute_msk,
+        args=[bot],
+        id="graph_projection_nightly",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,  # 30-min grace — projection can run long
+        timezone=msk,
+    )
+    # T10-07: Phase 10 graph purge worker. Every 5 minutes.
+    # Not flag-gated at scheduler level — the worker itself reads
+    # ``memory.graph.write_pending.paused`` kill-switch each tick.
+    scheduler.add_job(
+        graph_purge_worker_job,
+        "interval",
+        minutes=5,
+        id="graph_purge_worker",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
     scheduler.start()
     logger.info("Scheduler started")
