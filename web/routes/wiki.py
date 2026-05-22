@@ -59,6 +59,17 @@ WIKI_FEATURE_FLAG = "memory.wiki.enabled"
 
 _NO_STORE = "no-store, max-age=0, must-revalidate"
 
+# Member-facing authenticated routes (GET /wiki/{slug}) require stronger
+# cache directives: no-store to prevent storage, no-cache to force
+# revalidation, private to block shared caches, must-revalidate per HTTP
+# spec. Pragma and Expires are legacy headers for HTTP/1.0 compliance.
+_MEMBER_NO_STORE = "no-store, no-cache, must-revalidate, private"
+_MEMBER_CACHE_HEADERS = {
+    "Cache-Control": _MEMBER_NO_STORE,
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
 # ── Allowed roles for member routes ─────────────────────────────────────────
 
 _MEMBER_ROLES = {"admin", "member"}
@@ -310,7 +321,12 @@ async def wiki_public_page(slug: str, request: Request) -> Response:
 
 @router.get("/{slug}")
 async def wiki_page(slug: str, request: Request) -> Response:
-    """Single page view with governance revalidation. Member or admin only."""
+    """Single page view with governance revalidation. Member or admin only.
+
+    Cache-Control (9.5-F): every response (200, 404, 410) carries
+    ``Cache-Control: no-store, no-cache, must-revalidate, private`` so that
+    stale browser/CDN caches cannot serve forgotten or redacted content.
+    """
     role = _require_member_or_admin(request)
     if role is None:
         return JSONResponse(
@@ -329,7 +345,7 @@ async def wiki_page(slug: str, request: Request) -> Response:
         page = await _get_page_by_slug(session, slug)
 
         if page is None:
-            return Response(status_code=404)
+            return Response(status_code=404, headers=_MEMBER_CACHE_HEADERS)
 
         page_id = uuid.UUID(str(page.id))
 
@@ -342,11 +358,11 @@ async def wiki_page(slug: str, request: Request) -> Response:
         )
 
         if render_result.page_archived:
-            return Response(status_code=410)
+            return Response(status_code=410, headers=_MEMBER_CACHE_HEADERS)
 
         sources = await _get_page_sources(session, page_id)
 
-    return TEMPLATES.TemplateResponse(
+    template_response = TEMPLATES.TemplateResponse(
         request=request,
         name="wiki/page.html",
         context={
@@ -358,6 +374,9 @@ async def wiki_page(slug: str, request: Request) -> Response:
             "user": getattr(request.state, "user", {}),
         },
     )
+    for header, value in _MEMBER_CACHE_HEADERS.items():
+        template_response.headers[header] = value
+    return template_response
 
 
 # ── /robots.txt — wiki variant (AC#9 HIGH F) ─────────────────────────────────
