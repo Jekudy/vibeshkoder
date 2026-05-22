@@ -17,6 +17,11 @@ from tests.evals.conftest import SEED_CHAT_ID
 
 pytestmark = pytest.mark.asyncio(loop_scope="class")
 
+# Explicit non-community chat_ids used in R3b/R3c wrong-chat branch tests.
+# These must differ from SEED_CHAT_ID so the handler's community-id guard fires.
+NON_COMMUNITY_CHAT_ID_PRIVATE = -1099887766   # R3b: private chat wrong-chat path
+NON_COMMUNITY_CHAT_ID_GROUP = -1099887767    # R3c: supergroup wrong-chat + forbidden path
+
 CONTENT_TRUNCATE_SQL = text(
     "TRUNCATE TABLE qa_traces, message_versions, chat_messages, forget_events "
     "RESTART IDENTITY CASCADE"
@@ -290,7 +295,7 @@ class TestRefusal:
             "UserRepo.get must not be reached on wrong-chat branch"
         ))
         message = _message(
-            chat_id=SEED_CHAT_ID + 7777,  # non-community
+            chat_id=NON_COMMUNITY_CHAT_ID_PRIVATE,
             chat_type="private",
             user_id=1001,
             message_id=902,
@@ -322,7 +327,7 @@ class TestRefusal:
             "UserRepo.get must not be reached on wrong-chat branch"
         ))
         message = _message(
-            chat_id=SEED_CHAT_ID + 8888,
+            chat_id=NON_COMMUNITY_CHAT_ID_GROUP,
             chat_type="supergroup",
             user_id=1001,
             message_id=903,
