@@ -38,7 +38,7 @@ phase 0 safety
 | 9 | Wiki (member / internal)                   | **CLOSED 2026-05-19** | 8/8 sprints merged (T9-01 schema PR #314 migrations 050-054, T9-02 governance PR #316, T9-03 auth role split PR #317 — BLOCKER C closed, T9-04 renderer + bleach PR #318, T9-05 member router + Jinja + /robots.txt PR #319, T9-06 admin /wiki_publish/_unpublish/_robots PR #320, T9-07 forget cascade + advisory lock PR #321 — 4 Codex security fixes, T9-08 Phase 11 binding 30 tests / 18 AC PR #322 — 5 Codex PAR fixes) + FHR closure PR (CRITICAL cascade audit mask + HIGH-1 member login flow + HIGH-2 legacy_cookie_grace migration 055). Phase 11 binding **60/60**. Flag `memory.wiki.enabled` default OFF. Two-password split `WEB_ADMIN_PASSWORD` + `WEB_MEMBER_PASSWORD`. Phase 9.5 carryovers: FK action mismatch (Codex MED #3), `_cascade_wiki_revisions` idempotency (Codex LOW #4), stale-page member 410 (Claude MED-4), missing-password warning (Claude MED-5), Cache-Control on member route (Claude MED-6), L9a OR-assertion polish (Claude product r1 MED). Rollout playbook: `PHASE9_ROLLOUT.md`. |
 | 10| Graph projection (Neo4j / Graphiti)        | **CLOSED 2026-05-21 — all 10 sprints merged: W0-A foundation, W0-D Neo4j CI, T10-02-rest migrations 061-062, T10-03 LLM extract + migration 064, T10-04 projector 4 modes, T10-05 graph_query read-only API + migration 066, T10-06 cascade + purge worker + readblock + migrations 063+065, T10-07 admin handlers + scheduler, T10-08 drift detection + reconcile_counts, T10-09 Phase 11 binding suite 60→77. Flags: memory.graph.projection.enabled / memory.graph.query.enabled / memory.graph.write_pending.paused (all default OFF). Cost ceiling $2/day. Rollout playbook: PHASE10_ROLLOUT.md.** | 9 sprints T10-01..T10-09; Neo4j 5.x via async cascade worker per RFC-001:415; replay-only full rebuild; 3 feature flags default OFF; ~15-16 new Phase 11 binding tests. |
 | 11| Shkoderbench / evals                       | **DONE 2026-05-11** + follow-ups all closed 2026-05-12 | leakage / citation / no-answer / no-LLM-imports tests in CI nightly (`evals.yml` + `lint-privacy.yml`). Follow-ups: #224 High #5 (PR #243), #224 Critical #4 (PR #247), #224 High #1-#4 (already on main), #219 seed_v1 quality (PR #253), #255 message-branch tombstone (PR #257). |
-| 12| Future butler — design-only                | NO          | docs only; no execution code                                              |
+| 12| Future butler — design-only                | NO          | docs only; no execution code — see `PHASE12_DESIGN.md` (companion to ratified `PHASE12_PLAN.md`) |
 
 ## Phase gates (must be true to advance)
 
@@ -83,4 +83,4 @@ Cannot parallelize without gate:
 
 Phase 10 closed 2026-05-21. Phase 11 (Shkoderbench / evals) already CLOSED 2026-05-11; Phase 12 (future butler) remains design-only.
 
-<!-- updated-by-superflow:2026-05-21 -->
+<!-- updated-by-superflow:2026-05-22 -->

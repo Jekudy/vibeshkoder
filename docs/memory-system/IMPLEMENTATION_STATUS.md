@@ -663,4 +663,35 @@ sync→async cascade FLIP per RFC-001:415 conditional Neo4j approval).
 - I8e Jaccard re-extraction softer eval (requires real LLM in CI)
 - Member-facing graph queries, public graph surface, expertise pages, APOC procedures
 
+### Phase 10 dev verify (2026-05-22)
+
+- Worktree cleanup: 14/15 удалены (p10-w0a оставлен — активный Claude
+  session, будет очищен пользователем после её завершения; git упирается
+  в "is current working directory" при попытке удалить активный worktree).
+- Удалённые worktrees + branches:
+  - `.worktrees/orch-B-experiments-rfc` → `plan/p10-rfc-graph-store-benchmark`
+  - `.worktrees/orch-B-experiments-visibility` → `feat/p9-experiments-visibility-derivation`
+  - `.worktrees/p10-closure` → `feat/p10-closure-docs`
+  - `.worktrees/p10-t10-02` → `feat/p10-t10-02-migrations-061-062`
+  - `.worktrees/p10-t10-03` → `feat/p10-t10-03-llm-extract`
+  - `.worktrees/p10-t10-04` → `feat/p10-t10-04-projector`
+  - `.worktrees/p10-t10-05` → `feat/p10-t10-05-graph-query`
+  - `.worktrees/p10-t10-06` → `feat/p10-t10-06-cascade-purge`
+  - `.worktrees/p10-t10-07` → `feat/p10-t10-07-admin-handlers`
+  - `.worktrees/p10-t10-08` → `feat/p10-t10-08-drift-detect`
+  - `.worktrees/p10-t10-09` → `feat/p10-t10-09-binding-tests`
+  - `.worktrees/p10-w0d` → `feat/p10-w0d-neo4j-ci`
+  - `.worktrees/p10.1` → `feat/p10.1-t10-01-adapter`
+  - `.worktrees/p6.1` → `phase/p6.1`
+- `git worktree prune` выполнен; финальный `git worktree list` показывает
+  только main repo + `.worktrees/p10-w0a` (активная Claude session).
+- Dev verify: **SKIP** — Docker daemon недоступен (`docker info` exit≠0).
+  Smoke-проверка `docker compose --profile graph up -d neo4j` не запущена.
+- Static config check: `docker-compose.yml` содержит сервис `neo4j`
+  (image `neo4j:5-community`, profile `graph`, ports 7687/7474, healthcheck
+  через `cypher-shell` с `NEO4J_PASSWORD`, heap/pagecache 512m каждый,
+  volume `neo4j_data`) — конфиг присутствует на main и выглядит корректно;
+  фактический запуск отложен до окружения с поднятым Docker Desktop.
+
 <!-- updated-by-superflow:2026-05-17 -->
+<!-- phase-a-cleanup:2026-05-22 -->
