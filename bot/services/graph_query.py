@@ -371,7 +371,7 @@ async def find_related_topics(
     # It may over-block if the label matches a purge entry, but post-guard (below)
     # is the authoritative check on actual graph_node_keys returned by the adapter.
     try:
-        await assert_no_pending_purge(session, node_keys=[topic])
+        await assert_no_pending_purge(session, node_keys=[topic], source_table_filter="message_versions")
     except RefusalError as exc:
         _log.warning("graph_query find_related_topics: read-block fired topic=%s: %s", topic, exc)
         return GraphQueryResult(
@@ -409,7 +409,7 @@ async def find_related_topics(
     node_keys = [n["node_key"] for n in traversal_nodes if n.get("node_key")]
 
     try:
-        await assert_no_pending_purge(session, node_keys=node_keys)
+        await assert_no_pending_purge(session, node_keys=node_keys, source_table_filter="message_versions")
     except RefusalError as exc:
         _log.warning(
             "graph_query find_related_topics: post-traversal read-block fired: %s", exc
@@ -523,7 +523,7 @@ async def explain_connection(
 
     # Read-block: check both anchor nodes before traversal
     try:
-        await assert_no_pending_purge(session, node_keys=[node_a, node_b])
+        await assert_no_pending_purge(session, node_keys=[node_a, node_b], source_table_filter="message_versions")
     except RefusalError as exc:
         _log.warning(
             "graph_query explain_connection: read-block fired node_a=%s node_b=%s: %s",
@@ -571,7 +571,7 @@ async def explain_connection(
 
     # Post-traversal read-block
     try:
-        await assert_no_pending_purge(session, node_keys=all_node_keys)
+        await assert_no_pending_purge(session, node_keys=all_node_keys, source_table_filter="message_versions")
     except RefusalError as exc:
         _log.warning(
             "graph_query explain_connection: post-traversal read-block: %s", exc
