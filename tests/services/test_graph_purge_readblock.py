@@ -144,7 +144,6 @@ async def test_assert_no_pending_purge_scope_narrowed_to_message_versions(db_ses
 
     Task 10.5-8: graph_query pre-guard scope narrowing.
     """
-    from bot.services.graph_common import RefusalError
     from bot.services.graph_purge_readblock import assert_no_pending_purge
 
     node_key = f"node:test:{_next_id()}"

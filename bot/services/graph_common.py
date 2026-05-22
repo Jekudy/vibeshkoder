@@ -10,11 +10,12 @@ Ownership model:
 References: PHASE10_PLAN.md §5.A (schema) and §5.B (extract_graph_triples contract).
 
 RESERVED_LEDGER_CALL_TYPES contract:
-  The single reserved value for llm_usage_ledger.call_type is 'graph_projection'.
-  This matches PHASE10_PLAN.md §5.B step 4 exactly. Discrimination between
-  dry_run / incremental / full_rebuild / repair modes is done via the
-  graph_projection_runs.mode column (CHECK-constrained), NOT via call_type
-  subdivision. Migration 064 (owned by W1-C) reserves this single string.
+  Reserved values for llm_usage_ledger.call_type: 'graph_projection' and
+  'extract_candidates'. Migration 064 (owned by W1-C) reserves 'graph_projection'.
+  'extract_candidates' was added in Task 10.5-6 (renamed from legacy 'unknown').
+  Discrimination between dry_run / incremental / full_rebuild / repair modes is
+  done via the graph_projection_runs.mode column (CHECK-constrained), NOT via
+  call_type subdivision.
 """
 
 from __future__ import annotations
@@ -78,11 +79,12 @@ ALLOWED_PREDICATES: tuple[str, ...] = (
 )
 
 # Reserved llm_usage_ledger.call_type values for Phase 10.
-# Migration 064 (owned by W1-C) will ALTER TABLE llm_usage_ledger to add the
-# call_type column. Per PHASE10_PLAN.md §5.B step 4, there is exactly ONE
-# reserved value: 'graph_projection'. Mode discrimination (dry_run vs incremental
-# vs full_rebuild vs repair) is handled via graph_projection_runs.mode column
-# (CHECK-constrained), NOT via call_type subdivision.
+# Migration 064 (owned by W1-C) added the call_type column and reserved
+# 'graph_projection' per PHASE10_PLAN.md §5.B step 4. 'extract_candidates'
+# was added in Task 10.5-6 (renamed from legacy 'unknown' default).
+# Mode discrimination (dry_run vs incremental vs full_rebuild vs repair) is
+# handled via graph_projection_runs.mode column (CHECK-constrained), NOT via
+# call_type subdivision.
 RESERVED_LEDGER_CALL_TYPES: tuple[str, ...] = (
     "graph_projection",    # per PHASE10_PLAN §5.B step 4
                            # discrimination of dry/incremental/full/repair modes

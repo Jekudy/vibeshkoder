@@ -632,3 +632,99 @@ async def test_graph_stats_returns_counts(db_session):
     assert stats.active_provenance_rows >= 0
     assert stats.active_edge_rows >= 0
     assert stats.purged_provenance_rows >= 0
+
+
+@pytest.mark.asyncio
+async def test_find_related_topics_abstains_on_knowledge_cards_purge(db_session):
+    """RFC-001:415 fail-closed: knowledge_cards pending purge also blocks graph_query.
+
+    Codex CRITICAL fix: 10.5-8 narrowed assert_no_pending_purge to
+    source_table_filter='message_versions', but forget_cascade enqueues
+    knowledge_cards purges too (forget_cascade.py:1230-1262, 1281-1289).
+    The narrowing created a privacy leak — stale Neo4j nodes for purged
+    cards could still be returned. No source_table_filter must be used on
+    the post-traversal guard.
+    """
+    from bot.db.models import GraphPurgePending
+    from bot.services.graph_adapter import NetworkXAdapter
+    from bot.services.graph_query import find_related_topics
+    from unittest.mock import AsyncMock, patch
+
+    adapter = NetworkXAdapter()
+    topic_key = f"topic:{_next_id()}"
+
+    # Insert a pending purge row with source_table='knowledge_cards'
+    # (this is what forget_cascade enqueues for knowledge_cards sources)
+    row = GraphPurgePending(
+        forget_event_id=_next_id(),
+        source_table="knowledge_cards",
+        source_pk=str(_next_id()),
+        graph_node_key=topic_key,
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+    with patch(
+        "bot.services.graph_query._is_query_enabled",
+        new=AsyncMock(return_value=True),
+    ):
+        result = await find_related_topics(
+            db_session,
+            adapter,
+            topic=topic_key,
+            viewer_is_admin=True,
+            max_hops=2,
+        )
+
+    # RFC-001:415 fail-closed: must abstain even for knowledge_cards purge
+    assert result.abstained is True, (
+        "RFC-001:415 violated: knowledge_cards pending purge must trigger "
+        "fail-closed read-block, not be ignored by source_table_filter narrowing"
+    )
+    assert result.abstain_reason is not None
+
+
+@pytest.mark.asyncio
+async def test_explain_connection_abstains_on_knowledge_cards_purge(db_session):
+    """RFC-001:415 fail-closed: knowledge_cards pending purge blocks explain_connection.
+
+    Same Codex CRITICAL as above — post-traversal guard in explain_connection
+    must not use source_table_filter='message_versions'.
+    """
+    from bot.db.models import GraphPurgePending
+    from bot.services.graph_adapter import NetworkXAdapter
+    from bot.services.graph_query import explain_connection
+    from unittest.mock import AsyncMock, patch
+
+    adapter = NetworkXAdapter()
+    node_key = f"topic:{_next_id()}"
+    other_key = f"topic:{_next_id()}"
+
+    # Insert knowledge_cards pending purge for the anchor node
+    row = GraphPurgePending(
+        forget_event_id=_next_id(),
+        source_table="knowledge_cards",
+        source_pk=str(_next_id()),
+        graph_node_key=node_key,
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+    with patch(
+        "bot.services.graph_query._is_query_enabled",
+        new=AsyncMock(return_value=True),
+    ):
+        result = await explain_connection(
+            db_session,
+            adapter,
+            node_a=node_key,
+            node_b=other_key,
+            viewer_is_admin=True,
+            max_hops=2,
+        )
+
+    # RFC-001:415 fail-closed: must abstain even for knowledge_cards purge
+    assert result.abstained is True, (
+        "RFC-001:415 violated: knowledge_cards pending purge must trigger "
+        "fail-closed read-block in explain_connection"
+    )
