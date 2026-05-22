@@ -1174,7 +1174,7 @@ async def extract_candidates(
                 request_id=None,
                 cache_hit=False,
                 error="budget_exceeded",
-                call_type="unknown",
+                call_type="extract_candidates",
             )
             return {"candidates": [], "llm_usage_ledger_id": row.id}
 
@@ -1192,7 +1192,7 @@ async def extract_candidates(
             request_id=None,
             cache_hit=False,
             error=None,
-            call_type="unknown",
+            call_type="extract_candidates",
         )
     finally:
         await session.execute(

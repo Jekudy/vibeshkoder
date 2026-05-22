@@ -37,8 +37,10 @@ def test_graph_common_constants_present() -> None:
     assert "MENTIONS" in ALLOWED_PREDICATES
     assert "SUPERSEDES" in ALLOWED_PREDICATES
 
-    # RESERVED_LEDGER_CALL_TYPES: exactly one value per PHASE10_PLAN §5.B step 4
-    assert RESERVED_LEDGER_CALL_TYPES == ("graph_projection",), RESERVED_LEDGER_CALL_TYPES
+    # RESERVED_LEDGER_CALL_TYPES: graph_projection (PHASE10_PLAN §5.B step 4)
+    # + extract_candidates (Task 10.5-6 bucket rename from 'unknown')
+    assert "graph_projection" in RESERVED_LEDGER_CALL_TYPES
+    assert "extract_candidates" in RESERVED_LEDGER_CALL_TYPES
 
     # GraphProjectionMode: exactly the 4 CHECK constraint values from migration 060
     assert GraphProjectionMode.__args__ == ("dry_run", "incremental", "full_rebuild", "repair")

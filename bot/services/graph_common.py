@@ -84,11 +84,14 @@ ALLOWED_PREDICATES: tuple[str, ...] = (
 # vs full_rebuild vs repair) is handled via graph_projection_runs.mode column
 # (CHECK-constrained), NOT via call_type subdivision.
 RESERVED_LEDGER_CALL_TYPES: tuple[str, ...] = (
-    "graph_projection",  # per PHASE10_PLAN §5.B step 4
-                         # discrimination of dry/incremental/full/repair modes
-                         # is via graph_projection_runs.mode column (CHECK-constrained),
-                         # NOT via ledger.call_type subdivision. This is the reserved
-                         # value contract for migration 064 in W1-C.
+    "graph_projection",    # per PHASE10_PLAN §5.B step 4
+                           # discrimination of dry/incremental/full/repair modes
+                           # is via graph_projection_runs.mode column (CHECK-constrained),
+                           # NOT via ledger.call_type subdivision. This is the reserved
+                           # value contract for migration 064 in W1-C.
+    "extract_candidates",  # Phase 6 T6-03 extraction gateway (Task 10.5-6).
+                           # Renamed from legacy 'unknown' default to enable
+                           # per-feature cost reporting in llm_usage_ledger.
 )
 
 
