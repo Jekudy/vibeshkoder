@@ -205,6 +205,14 @@ class TestCitationInvariants:
             f"qa_traces.evidence_ids={persisted.evidence_ids!r} does not match "
             f"bundle.evidence_ids={mv_ids!r}"
         )
+        # Verify the row shape written by the REAL handler helper: abstained=False
+        # for a non-empty bundle, and query text preserved verbatim.
+        assert persisted.abstained is False, (
+            "QaTrace.abstained must be False for a non-empty evidence bundle"
+        )
+        assert persisted.query_text == _CITATION_QUERY, (
+            f"QaTrace.query_text={persisted.query_text!r} does not match query sent to handler"
+        )
 
 
 # ---------------------------------------------------------------------------
