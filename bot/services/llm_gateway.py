@@ -1564,7 +1564,8 @@ def _validate_every_bullet_has_citation(
 # Revalidation SQL — forget-event exclusion via the shared helper (#291).
 # The NOT EXISTS clause comes from forget_predicate.forget_excludes_sql_fragment();
 # updating that module is the only required change point for predicate semantics.
-_DIGEST_REVALIDATE_MV_SQL = text(f"""  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- _FORGET_EXCLUDES is a module-level constant SQL fragment from forget_predicate.py; no user input flows in.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- _FORGET_EXCLUDES is a module-level constant SQL fragment from forget_predicate.py; no user input flows in.
+_DIGEST_REVALIDATE_MV_SQL = text(f"""
     SELECT mv.id FROM message_versions mv
     JOIN chat_messages cm ON cm.id = mv.chat_message_id
     WHERE mv.id = ANY(:mv_ids)
@@ -1573,7 +1574,8 @@ _DIGEST_REVALIDATE_MV_SQL = text(f"""  # nosemgrep: python.sqlalchemy.security.a
       AND {_FORGET_EXCLUDES}
 """)
 
-_DIGEST_REVALIDATE_CS_SQL = text(f"""  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- _FORGET_EXCLUDES is a module-level constant SQL fragment from forget_predicate.py; no user input flows in.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- _FORGET_EXCLUDES is a module-level constant SQL fragment from forget_predicate.py; no user input flows in.
+_DIGEST_REVALIDATE_CS_SQL = text(f"""
     SELECT cs.id::text FROM card_sources cs
     JOIN knowledge_cards kc ON kc.id = cs.card_id
     JOIN message_versions mv ON mv.id = cs.message_version_id
