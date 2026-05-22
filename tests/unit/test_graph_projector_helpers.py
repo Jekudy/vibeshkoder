@@ -87,7 +87,7 @@ class FakeLedgerRepo:
     def __init__(self, daily_cost: Decimal = Decimal("0.00")):
         self._daily_cost = daily_cost
 
-    async def daily_cost_usd(self, session, *, day):
+    async def daily_cost_usd(self, session, *, day, call_type: str | None = None):
         return self._daily_cost
 
     async def monthly_cost_usd(self, session, *, year, month):
