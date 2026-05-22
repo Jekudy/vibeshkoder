@@ -47,23 +47,14 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.services.forget_predicate import forget_excludes_sql_fragment
 
-# Forget-event exclusion predicate (inlined verbatim into both queries below).
-#
-# Defense-in-depth: a forget_event in 'pending' or 'processing' state would
-# not yet have flipped `is_redacted` to TRUE on the message_version, so the
-# `is_redacted=FALSE` filter alone is insufficient. The predicate covers the
-# three target_type cases that `_cascade_message_versions` matches:
-#   - target_type='message' AND target_id = chat_messages.id (single message)
-#   - target_type='user'    AND target_id = chat_messages.user_id (telegram id)
-#   - target_type='message_hash' AND target_id = mv.content_hash
-# Status filter 'completed' is included because completed events are durable
-# and digests must respect them even after cascade finishes.
-#
-# Inlined (not interpolated) so that semgrep's f-string-SQL rule does not
-# flag this as a dynamic-SQL surface; the predicate is identical in both
-# queries below. Phase 7.5 issue #291 tracks the proper extraction into a
-# shared helper used by both this module and `forget_cascade`.
+# Forget-event exclusion predicate — sourced from the shared helper.
+# Issue #291 extracted the inline SQL fragment to bot/services/forget_predicate.py
+# so that digest_context.py, llm_gateway.py, and forget_cascade.py all use the
+# SAME predicate string.  Changing the predicate semantics requires updating
+# forget_predicate.py AND the golden snapshot in test_forget_predicate_parity.py.
+_FORGET_EXCLUDES = forget_excludes_sql_fragment()
 
 
 # Cards SQL LIMIT per digest type. Daily window is 24h; weekly is 7d
@@ -189,7 +180,7 @@ async def build_digest_context(
     )
 
     # ---- cards-first query ----
-    cards_sql = text("""
+    cards_sql = text(f"""
         SELECT
             kc.id::text AS card_id,
             kc.title,
@@ -206,17 +197,7 @@ async def build_digest_context(
           AND cm.date <  :we
           AND cm.memory_policy = 'normal'
           AND mv.is_redacted = FALSE
-          AND NOT EXISTS (
-              SELECT 1 FROM forget_events fe
-              WHERE fe.status IN ('pending', 'processing', 'completed')
-                AND (
-                    (fe.target_type = 'message' AND fe.target_id = cm.id::text)
-                    OR
-                    (fe.target_type = 'user' AND fe.target_id = cm.user_id::text)
-                    OR
-                    (fe.target_type = 'message_hash' AND fe.target_id = mv.content_hash)
-                )
-          )
+          AND {_FORGET_EXCLUDES}
         GROUP BY kc.id, kc.title, kc.body_markdown, kc.approved_at
         ORDER BY kc.approved_at DESC NULLS LAST
         LIMIT :cards_limit
@@ -248,7 +229,7 @@ async def build_digest_context(
     # ---- raw fallback only when cards too few ----
     messages: list[DigestContextMessage] = []
     if len(cards) < min_threshold:
-        raw_sql = text("""
+        raw_sql = text(f"""
             SELECT
                 mv.id AS message_version_id,
                 mv.chat_message_id,
@@ -264,17 +245,7 @@ async def build_digest_context(
               AND cm.date <  :we
               AND cm.memory_policy = 'normal'
               AND mv.is_redacted = FALSE
-              AND NOT EXISTS (
-                  SELECT 1 FROM forget_events fe
-                  WHERE fe.status IN ('pending', 'processing', 'completed')
-                    AND (
-                        (fe.target_type = 'message' AND fe.target_id = cm.id::text)
-                        OR
-                        (fe.target_type = 'user' AND fe.target_id = cm.user_id::text)
-                        OR
-                        (fe.target_type = 'message_hash' AND fe.target_id = mv.content_hash)
-                    )
-              )
+              AND {_FORGET_EXCLUDES}
             ORDER BY cm.date ASC
             LIMIT :top_n
         """)

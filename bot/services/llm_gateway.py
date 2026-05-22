@@ -59,11 +59,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.evidence import EvidenceBundle
+from bot.services.forget_predicate import forget_excludes_sql_fragment
 from bot.services.llm_providers import (
     LLMProvider,
     ProviderStructuralError,
     ProviderTransientError,
 )
+
+# Shared forget-event exclusion predicate — sourced from forget_predicate.py (#291).
+# Do NOT change this inline; update bot/services/forget_predicate.py instead.
+_FORGET_EXCLUDES = forget_excludes_sql_fragment()
 
 logger = logging.getLogger(__name__)
 
@@ -1549,31 +1554,19 @@ def _validate_every_bullet_has_citation(
             )
 
 
-# Inlined revalidation SQL — verbatim NOT EXISTS clause embedded in each
-# query string (no concatenation) so semgrep's text+concat rule doesn't
-# fire. The clause matches the same three forget_events target_types as
-# digest_context.py and forget_cascade._cascade_message_versions. Phase
-# 7.5 issue #291 tracks the proper shared-helper extraction.
-_DIGEST_REVALIDATE_MV_SQL = text("""
+# Revalidation SQL — forget-event exclusion via the shared helper (#291).
+# The NOT EXISTS clause comes from forget_predicate.forget_excludes_sql_fragment();
+# updating that module is the only required change point for predicate semantics.
+_DIGEST_REVALIDATE_MV_SQL = text(f"""
     SELECT mv.id FROM message_versions mv
     JOIN chat_messages cm ON cm.id = mv.chat_message_id
     WHERE mv.id = ANY(:mv_ids)
       AND cm.memory_policy = 'normal'
       AND mv.is_redacted = FALSE
-      AND NOT EXISTS (
-          SELECT 1 FROM forget_events fe
-          WHERE fe.status IN ('pending', 'processing', 'completed')
-            AND (
-                (fe.target_type = 'message' AND fe.target_id = cm.id::text)
-                OR
-                (fe.target_type = 'user' AND fe.target_id = cm.user_id::text)
-                OR
-                (fe.target_type = 'message_hash' AND fe.target_id = mv.content_hash)
-            )
-      )
+      AND {_FORGET_EXCLUDES}
 """)
 
-_DIGEST_REVALIDATE_CS_SQL = text("""
+_DIGEST_REVALIDATE_CS_SQL = text(f"""
     SELECT cs.id::text FROM card_sources cs
     JOIN knowledge_cards kc ON kc.id = cs.card_id
     JOIN message_versions mv ON mv.id = cs.message_version_id
@@ -1582,17 +1575,7 @@ _DIGEST_REVALIDATE_CS_SQL = text("""
       AND kc.card_status = 'approved'
       AND cm.memory_policy = 'normal'
       AND mv.is_redacted = FALSE
-      AND NOT EXISTS (
-          SELECT 1 FROM forget_events fe
-          WHERE fe.status IN ('pending', 'processing', 'completed')
-            AND (
-                (fe.target_type = 'message' AND fe.target_id = cm.id::text)
-                OR
-                (fe.target_type = 'user' AND fe.target_id = cm.user_id::text)
-                OR
-                (fe.target_type = 'message_hash' AND fe.target_id = mv.content_hash)
-            )
-      )
+      AND {_FORGET_EXCLUDES}
 """)
 
 
