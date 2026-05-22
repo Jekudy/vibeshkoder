@@ -1598,7 +1598,9 @@ class GraphProvenance(Base):
             name="ck_graph_provenance_source_table",
         ),
         CheckConstraint(
-            "source_message_version_id IS NOT NULL OR source_card_id IS NOT NULL",
+            "(source_message_version_id IS NOT NULL AND source_card_id IS NULL)"
+            " OR "
+            "(source_message_version_id IS NULL AND source_card_id IS NOT NULL)",
             name="ck_graph_provenance_has_source",
         ),
         CheckConstraint(
