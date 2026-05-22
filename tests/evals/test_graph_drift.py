@@ -113,7 +113,7 @@ async def _make_provenance(
         source_pk=source_pk,
         source_message_version_id=source_message_version_id,
         graph_node_key=graph_node_key,
-        triple_hash=f"th-{_next_id()}",
+        triple_hash=_next_id(),
         governance_policy="normal",
     )
     db_session.add(prov)

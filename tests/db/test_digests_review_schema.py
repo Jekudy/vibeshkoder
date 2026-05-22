@@ -142,9 +142,10 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     The intent of this test is unchanged — assert the head matches the latest
     shipped migration. Update the literal when new migrations land.
     Migration 067: tightened ck_graph_provenance_has_source OR → XOR (10.5-9).
+    Migration 068: graph_provenance.triple_hash TEXT → BIGINT (10.5-S3).
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "067"
+    assert current == "068"
 
 
 # ─── Test: upgrade adds 4 review columns with correct types/nullability ──────

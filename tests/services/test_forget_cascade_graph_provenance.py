@@ -98,7 +98,7 @@ async def _make_provenance(
     source_message_version_id: int | None = None,
     source_card_id=None,
     graph_node_key: str | None = None,
-    triple_hash: str | None = None,
+    triple_hash: int | None = None,
 ) -> int:
     """Insert a graph_provenance row. Returns its id."""
     from bot.db.repos.graph_provenance import create_provenance
@@ -278,7 +278,7 @@ async def test_cascade_enqueues_purge_for_all_provenance_rows_of_source(db_sessi
             source_pk=source_pk,
             source_message_version_id=mv_id,
             graph_node_key=f"node:mv:{mv_id}:triple{i}",
-            triple_hash=f"hash_{mv_id}_{i}",
+            triple_hash=mv_id * 100 + i,
         )
 
     await _make_forget_event(

@@ -33,7 +33,7 @@ async def create_provenance(
     source_pk: str,
     source_card_id: uuid.UUID | None = None,
     source_message_version_id: int | None = None,
-    triple_hash: str | None = None,
+    triple_hash: int | None = None,
     graph_store: str = "neo4j",
     graph_node_key: str | None = None,
     graph_edge_key: str | None = None,

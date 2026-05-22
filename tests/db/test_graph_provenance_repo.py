@@ -230,7 +230,7 @@ async def test_create_provenance_with_card_source(prov_session) -> None:
         source_table="knowledge_cards",
         source_pk=str(card_id),
         source_card_id=card_id,
-        triple_hash="abc123",
+        triple_hash=123456789,
     )
 
     assert row.id is not None
@@ -239,7 +239,7 @@ async def test_create_provenance_with_card_source(prov_session) -> None:
     assert row.source_pk == str(card_id)
     assert row.source_card_id == card_id
     assert row.source_message_version_id is None
-    assert row.triple_hash == "abc123"
+    assert row.triple_hash == 123456789
     assert row.purged_at is None
     assert row.graph_store == "neo4j"
 
@@ -257,7 +257,7 @@ async def test_create_provenance_with_message_version_source(prov_session) -> No
         source_table="message_versions",
         source_pk=str(mv_id),
         source_message_version_id=mv_id,
-        triple_hash="def456",
+        triple_hash=456789012,
     )
 
     assert row.id is not None
@@ -319,7 +319,7 @@ async def test_create_provenance_rejects_duplicate_active_triple(prov_session) -
         source_table="message_versions",
         source_pk=str(mv_id),
         source_message_version_id=mv_id,
-        triple_hash="hash_abc123",
+        triple_hash=987654321,
     )
 
     with pytest.raises(IntegrityError):
@@ -329,7 +329,7 @@ async def test_create_provenance_rejects_duplicate_active_triple(prov_session) -
             source_table="message_versions",
             source_pk=str(mv_id),
             source_message_version_id=mv_id,
-            triple_hash="hash_abc123",
+            triple_hash=987654321,
         )
 
 

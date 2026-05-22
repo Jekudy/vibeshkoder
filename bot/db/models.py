@@ -1656,7 +1656,7 @@ class GraphProvenance(Base):
     )
     graph_node_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     graph_edge_key: Mapped[str | None] = mapped_column(Text, nullable=True)
-    triple_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    triple_hash: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     governance_policy: Mapped[str] = mapped_column(
         Text, nullable=False, default="normal", server_default="normal"
     )

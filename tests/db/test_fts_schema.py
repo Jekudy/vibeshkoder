@@ -188,8 +188,9 @@ async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str
     # (061 graph_provenance, 062 graph_edges) + T10-03 (064 add_llm_ledger_call_type)
     # + T10-06 (063 graph_purge_pending) + T10-06 CRITICAL-1 fix (065) advanced the head past 025.
     # + 10.5-9 (067 XOR constraint on graph_provenance).
+    # + 10.5-S3 (068 graph_provenance.triple_hash TEXT → BIGINT).
     # Assert the current head explicitly; revisit when future migrations land.
-    assert current == "067"
+    assert current == "068"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(

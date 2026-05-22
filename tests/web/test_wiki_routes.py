@@ -177,7 +177,7 @@ def test_all_sources_forgotten_page_returns_410(monkeypatch) -> None:
     wiki_routes = import_module("web.routes.wiki")
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
     monkeypatch.setattr(
-        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(page)
+        wiki_routes, "_get_page_by_slug", lambda session, slug: _async_page(page)
     )
     monkeypatch.setattr(wiki_routes, "render_wiki_page", _fake_render)
 
@@ -346,7 +346,7 @@ def test_member_transitive_offrecord_suppresses_citation(monkeypatch) -> None:
     wiki_routes = import_module("web.routes.wiki")
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
     monkeypatch.setattr(
-        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(page)
+        wiki_routes, "_get_page_by_slug", lambda session, slug: _async_page(page)
     )
     monkeypatch.setattr(wiki_routes, "render_wiki_page", _fake_render)
     monkeypatch.setattr(wiki_routes, "_get_page_sources", lambda session, page_id: _async_list([]))
@@ -406,7 +406,7 @@ def test_template_renders_citation_section(monkeypatch) -> None:
     wiki_routes = import_module("web.routes.wiki")
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
     monkeypatch.setattr(
-        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(page)
+        wiki_routes, "_get_page_by_slug", lambda session, slug: _async_page(page)
     )
     monkeypatch.setattr(wiki_routes, "render_wiki_page", _fake_render)
     monkeypatch.setattr(wiki_routes, "_get_page_sources", lambda session, page_id: _async_list([source]))
@@ -439,7 +439,7 @@ def test_member_role_no_admin_marker_visible(monkeypatch) -> None:
     wiki_routes = import_module("web.routes.wiki")
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
     monkeypatch.setattr(
-        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(page)
+        wiki_routes, "_get_page_by_slug", lambda session, slug: _async_page(page)
     )
     monkeypatch.setattr(wiki_routes, "render_wiki_page", _fake_render)
     monkeypatch.setattr(wiki_routes, "_get_page_sources", lambda session, page_id: _async_list([]))
