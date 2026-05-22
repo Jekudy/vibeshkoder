@@ -39,6 +39,7 @@ from bot.services.graph_common import (
     GraphProjectionMode,
     GraphProjectionRunStatus,
     RefusalError,
+    compute_edge_key_hash,
 )
 from bot.services.llm_gateway import extract_graph_triples  # noqa: E402 — module-level for patchability
 
@@ -606,7 +607,7 @@ async def project_incremental(
                     edge_key = _compute_edge_key(
                         triple.subject_label, triple.predicate, triple.object_label
                     )
-                    triple_hash = hashlib.sha256(edge_key.encode()).hexdigest()[:16]
+                    triple_hash = compute_edge_key_hash(edge_key)
 
                     # SAVEPOINT: Postgres writes (provenance + edge) are isolated
                     async with session.begin_nested():
@@ -850,7 +851,7 @@ async def project_full_rebuild(
                 nodes_merged += 1
 
                 # MERGE edge (include edge_key_hash for drift detection)
-                edge_key_hash = hashlib.sha256(edge.edge_key.encode()).hexdigest()[:16]
+                edge_key_hash = compute_edge_key_hash(edge.edge_key)
                 await config.adapter.merge_edge(
                     edge_key=edge.edge_key,
                     source_key=edge.subject_node_key,
@@ -1005,7 +1006,7 @@ async def project_repair_source(
                 edge_key = _compute_edge_key(
                     triple.subject_label, triple.predicate, triple.object_label
                 )
-                triple_hash = hashlib.sha256(edge_key.encode()).hexdigest()[:16]
+                triple_hash = compute_edge_key_hash(edge_key)
 
                 prov = await config.provenance_repo.create_provenance(
                     session,

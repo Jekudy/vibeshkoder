@@ -396,7 +396,16 @@ async def wiki_page(slug: str, request: Request) -> Response:
         )
 
         if render_result.page_archived:
-            return Response(status_code=410, headers=_MEMBER_CACHE_HEADERS)
+            # Render gone.html for UX parity with archived/stale status path above.
+            gone_response = TEMPLATES.TemplateResponse(
+                request=request,
+                name="wiki/gone.html",
+                context={"request": request},
+                status_code=410,
+            )
+            for header, value in _MEMBER_CACHE_HEADERS.items():
+                gone_response.headers[header] = value
+            return gone_response
 
         sources = await _get_page_sources(session, page_id)
 

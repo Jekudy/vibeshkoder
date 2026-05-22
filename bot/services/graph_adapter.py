@@ -149,6 +149,10 @@ class Neo4jAdapter:
     ) -> None:
         """MERGE an edge between two existing MemoryNode nodes."""
         provenance_id = properties.get("provenance_id")
+        # edge_key_hash is a signed int64 stored for drift detection sum().
+        # It is NOT in the MERGE key pattern (would create duplicate edges
+        # for existing edges that have no hash yet — backfilled via ON MATCH SET).
+        edge_key_hash = properties.get("edge_key_hash")
         query = (
             "MATCH (s:MemoryNode {node_key: $source_key})\n"
             "MATCH (o:MemoryNode {node_key: $target_key})\n"
@@ -157,11 +161,13 @@ class Neo4jAdapter:
             "    r.predicate = $relationship_type,\n"
             "    r.provenance_ids = CASE WHEN $provenance_id IS NOT NULL"
             " THEN [$provenance_id] ELSE [] END,\n"
+            "    r.edge_key_hash = $edge_key_hash,\n"
             "    r.created_at = datetime()\n"
             "ON MATCH SET\n"
             "    r.provenance_ids = CASE WHEN $provenance_id IS NOT NULL\n"
             "        THEN r.provenance_ids + [$provenance_id]\n"
             "        ELSE r.provenance_ids END,\n"
+            "    r.edge_key_hash = $edge_key_hash,\n"
             "    r.updated_at = datetime()\n"
             "RETURN r.edge_key"
         )
@@ -173,6 +179,7 @@ class Neo4jAdapter:
                 target_key=target_key,
                 relationship_type=relationship_type,
                 provenance_id=provenance_id,
+                edge_key_hash=edge_key_hash,
             )
 
     async def delete_provenance(self, provenance_id: str) -> int:
@@ -524,11 +531,12 @@ class NetworkXAdapter:
     async def close(self) -> None:
         pass
 
-    def get_edge_key_hash(self, edge_key: str) -> str | None:
+    def get_edge_key_hash(self, edge_key: str) -> int | None:
         """Return the edge_key_hash stored for the edge with the given edge_key.
 
         Used by G4 binding tests to verify drift detection hash path.
         Returns None if no edge with that edge_key exists.
+        The value is a signed int64 (compute_edge_key_hash formula).
         """
         for _u, _v, _key, data in self._graph.edges(data=True, keys=True):  # type: ignore[misc]
             if data.get("edge_key") == edge_key:

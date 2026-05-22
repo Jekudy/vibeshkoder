@@ -4,20 +4,23 @@ Spec: 10.5-10 / 10.5-11 — projector must write edge_key_hash into adapter on m
 NetworkXAdapter must store and return it on query.
 
 G4a: After merge_edge with edge_key_hash in properties → stored in NetworkXAdapter edge.
-G4b: Computed edge_key_hash matches expected sha256-based formula.
+G4b: Computed edge_key_hash matches expected sha256-based formula (frozen literal).
 G4c: NetworkXAdapter.count_edges reflects merged edge.
+G4d: Neo4jAdapter.merge_edge passes edge_key_hash parameter to Cypher (mock driver).
+G4e: compute_edge_key_hash returns int, sum over multiple hashes does not raise.
 
-These tests use NetworkXAdapter (in-memory) — no live Neo4j required.
+These tests use NetworkXAdapter (in-memory) or mock for Neo4j — no live Neo4j required.
 """
 
 from __future__ import annotations
 
-import hashlib
 import itertools
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from bot.services.graph_adapter import NetworkXAdapter
+from bot.services.graph_common import compute_edge_key_hash
 
 pytestmark = pytest.mark.usefixtures("app_env")
 
@@ -26,12 +29,6 @@ _counter = itertools.count(start=77_000_000)
 
 def _next_id() -> int:
     return next(_counter)
-
-
-def _compute_edge_key_hash(node_key_a: str, predicate: str, node_key_b: str) -> str:
-    """Expected edge_key_hash formula: sha256(a|predicate|b).hexdigest()[:16]."""
-    canonical = f"{node_key_a}|{predicate}|{node_key_b}"
-    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
 class TestGraphDriftHash:
@@ -45,7 +42,7 @@ class TestGraphDriftHash:
         node_b = f"nodeB-{_next_id()}"
         predicate = "RELATED_TO"
         edge_key = f"ek-{_next_id()}"
-        edge_key_hash = _compute_edge_key_hash(node_a, predicate, node_b)
+        edge_key_hash = compute_edge_key_hash(edge_key)
 
         await adapter.merge_node(
             node_key=node_a,
@@ -75,39 +72,40 @@ class TestGraphDriftHash:
             f"G4a: edge_key_hash not stored correctly. "
             f"expected={edge_key_hash!r}, got={stored_hash!r}"
         )
+        assert isinstance(stored_hash, int), (
+            f"G4a: edge_key_hash must be int, got {type(stored_hash)}"
+        )
 
     async def test_g4b_edge_key_hash_formula_matches_projector(self) -> None:
-        """G4b: hash computed by test helper matches the graph_projector formula."""
+        """G4b: hash computed by compute_edge_key_hash matches frozen literal.
+
+        Frozen value locks the formula — if this test fails, drift detection sums
+        stored in Neo4j are inconsistent with newly computed hashes.
+        """
         from bot.services.graph_projector import _compute_edge_key
 
         node_a = "concept:Python"
         node_b = "concept:Programming"
         predicate = "IS_PART_OF"
 
-        # The projector computes edge_key = sha256(a|pred|b).hexdigest() (full 64 chars)
-        # edge_key_hash = sha256(edge_key).hexdigest()[:16]
+        # The projector computes edge_key = sha256(canonical).hexdigest() (64 chars)
+        # then triple_hash = compute_edge_key_hash(edge_key) → signed int64
         edge_key = _compute_edge_key(node_a, predicate, node_b)
-        import hashlib as _hl
-        expected_hash = _hl.sha256(edge_key.encode()).hexdigest()[:16]
+        result = compute_edge_key_hash(edge_key)
 
-        # Our test formula (direct sha256 of canonical triple)
-        direct_hash = _compute_edge_key_hash(node_a, predicate, node_b)
-
-        # The projector's edge_key is sha256(triple), and its triple_hash is
-        # sha256(edge_key)[:16]. The edge_key_hash on the adapter should be the
-        # triple_hash computed by the projector.
-        # Both should be deterministic and reproducible.
-        assert len(expected_hash) == 16, f"G4b: triple_hash length mismatch: {expected_hash!r}"
-        assert len(direct_hash) == 16, f"G4b: direct_hash length mismatch: {direct_hash!r}"
-        # Both are SHA-256 based; they differ only in what's hashed — that's OK.
-        # The important property is determinism and non-emptiness.
-        assert expected_hash, "G4b: projector triple_hash must be non-empty"
-        assert direct_hash, "G4b: direct edge_key_hash must be non-empty"
+        # FROZEN LITERAL — changing the formula will break stored hashes.
+        # Recomputed via: hashlib.sha256(sha256("concept:Python|IS_PART_OF|concept:Programming").hexdigest().encode()).digest()[:8] → struct '>q'
+        FROZEN_EXPECTED: int = -1196849340388981680
+        assert result == FROZEN_EXPECTED, (
+            f"G4b: formula drifted — drift detection will break. "
+            f"expected={FROZEN_EXPECTED}, got={result}. "
+            f"edge_key={edge_key!r}"
+        )
+        assert isinstance(result, int), "G4b: compute_edge_key_hash must return int"
 
     async def test_g4c_projector_writes_edge_key_hash_to_adapter(self) -> None:
         """G4c: projector passes edge_key_hash in merge_edge properties → adapter stores it."""
         from bot.services.graph_projector import _compute_edge_key
-        import hashlib as _hl
 
         adapter = NetworkXAdapter()
 
@@ -117,7 +115,7 @@ class TestGraphDriftHash:
 
         # Compute edge_key and triple_hash exactly as the projector does
         edge_key = _compute_edge_key(node_a, predicate, node_b)
-        triple_hash = _hl.sha256(edge_key.encode()).hexdigest()[:16]
+        triple_hash = compute_edge_key_hash(edge_key)
 
         await adapter.merge_node(
             node_key=node_a,
@@ -147,3 +145,103 @@ class TestGraphDriftHash:
             f"expected={triple_hash!r}, got={stored!r}"
         )
         assert await adapter.count_edges() == 1, "G4c: adapter must have exactly 1 edge"
+
+    async def test_g4d_neo4j_adapter_writes_edge_key_hash(self) -> None:
+        """G4d: Neo4jAdapter.merge_edge passes edge_key_hash parameter to Cypher.
+
+        Uses a mock driver — no live Neo4j required.
+        """
+        from bot.services.graph_projector import _compute_edge_key
+
+        # Build a mock Neo4j driver that captures run() calls
+        mock_session = AsyncMock()
+        mock_result = AsyncMock()
+        mock_result.single = AsyncMock(return_value=None)
+        mock_session.run = AsyncMock(return_value=mock_result)
+        # __aenter__/__aexit__ for async context manager
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        mock_driver = MagicMock()
+        mock_driver.session = MagicMock(return_value=mock_session)
+
+        # Construct Neo4jAdapter and replace its driver
+        from bot.services.graph_adapter import Neo4jAdapter
+
+        adapter = object.__new__(Neo4jAdapter)
+        adapter._driver = mock_driver  # type: ignore[attr-defined]
+        adapter._database = "neo4j"  # type: ignore[attr-defined]
+
+        node_a = f"subject-{_next_id()}"
+        node_b = f"object-{_next_id()}"
+        predicate = "RELATED_TO"
+        edge_key = _compute_edge_key(node_a, predicate, node_b)
+        edge_key_hash = compute_edge_key_hash(edge_key)
+
+        await adapter.merge_edge(
+            edge_key=edge_key,
+            source_key=node_a,
+            target_key=node_b,
+            relationship_type=predicate,
+            properties={
+                "predicate": predicate,
+                "provenance_id": "prov-abc",
+                "edge_key_hash": edge_key_hash,
+            },
+        )
+
+        # Verify session.run was called with edge_key_hash kwarg
+        assert mock_session.run.called, "G4d: mock session.run was not called"
+        call_kwargs = mock_session.run.call_args
+        # Keyword arguments passed to session.run
+        kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
+        # If not in kwargs, check args[1:] (positional after query string)
+        if "edge_key_hash" not in kwargs:
+            # The driver may receive params as positional dicts; check all args
+            all_args = call_kwargs.args
+            found = any(
+                isinstance(a, dict) and "edge_key_hash" in a for a in all_args
+            )
+            assert found, (
+                f"G4d: edge_key_hash not passed to Neo4j session.run. "
+                f"call_args={call_kwargs!r}"
+            )
+        else:
+            assert kwargs["edge_key_hash"] == edge_key_hash, (
+                f"G4d: edge_key_hash value mismatch. "
+                f"expected={edge_key_hash}, got={kwargs['edge_key_hash']}"
+            )
+
+        # Also verify edge_key_hash appears in the Cypher string
+        cypher = mock_session.run.call_args.args[0]
+        assert "edge_key_hash" in cypher, (
+            f"G4d: 'edge_key_hash' not in Cypher query. cypher={cypher!r}"
+        )
+
+    async def test_g4e_edge_key_hash_aggregation_type_int64(self) -> None:
+        """G4e: compute_edge_key_hash returns int; sum over multiple hashes does not raise.
+
+        Verifies that Cypher sum(r.edge_key_hash) analogue works in Python,
+        and that hex-parsing ValueError cannot occur (regression guard).
+        """
+        edge_keys = [
+            "concept:Python|IS_PART_OF|concept:Programming",
+            "user:alice|KNOWS_ABOUT|concept:Python",
+            "event:hackathon|MENTIONS|concept:Programming",
+        ]
+
+        hashes = [compute_edge_key_hash(ek) for ek in edge_keys]
+
+        # All values must be int, not str
+        for ek, h in zip(edge_keys, hashes):
+            assert isinstance(h, int), (
+                f"G4e: compute_edge_key_hash({ek!r}) returned {type(h)}, expected int"
+            )
+
+        # sum() must not raise (would fail if values were hex strings like "a1b2...")
+        total = sum(hashes)
+        assert isinstance(total, int), f"G4e: sum of hashes must be int, got {type(total)}"
+
+        # Determinism check: same input → same output
+        hashes2 = [compute_edge_key_hash(ek) for ek in edge_keys]
+        assert hashes == hashes2, "G4e: compute_edge_key_hash is not deterministic"
