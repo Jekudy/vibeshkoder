@@ -137,7 +137,9 @@ class _EdgeRepoProtocol(Protocol):
 
 
 class _LedgerRepoProtocol(Protocol):
-    async def daily_cost_usd(self, session: AsyncSession, *, day: Any) -> Decimal: ...
+    async def daily_cost_usd(
+        self, session: AsyncSession, *, day: Any, call_type: str | None = None
+    ) -> Decimal: ...
 
 
 @dataclass(frozen=True)
@@ -192,16 +194,11 @@ async def _check_graph_budget(
     SUGGESTION fix: changed >= to > (soft cap — exact ceiling is allowed).
     """
     today = datetime.now(tz=timezone.utc).date()
-    # Pass call_type to isolate graph_projection costs from QA/digest costs (HIGH-3).
-    # Falls back gracefully if the repo doesn't support call_type kwarg.
-    import inspect
-    sig = inspect.signature(ledger_repo.daily_cost_usd)
-    if "call_type" in sig.parameters:
-        daily_cost = await ledger_repo.daily_cost_usd(
-            session, day=today, call_type="graph_projection"
-        )
-    else:
-        daily_cost = await ledger_repo.daily_cost_usd(session, day=today)
+    # LedgerRepoProtocol guarantees call_type kwarg (Task 10.5-1 / #291).
+    # call_type='graph_projection' isolates graph costs from QA/digest costs (HIGH-3).
+    daily_cost = await ledger_repo.daily_cost_usd(
+        session, day=today, call_type="graph_projection"
+    )
 
     if daily_cost > daily_ceiling_usd:
         raise GraphProjectionBudgetError(

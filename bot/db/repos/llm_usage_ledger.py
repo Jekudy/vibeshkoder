@@ -78,21 +78,30 @@ class LedgerRepo:
         session: AsyncSession,
         *,
         day: date,
+        call_type: str | None = None,
     ) -> Decimal:
         """SUM(cost_usd) WHERE created_at >= day_utc_start AND < day_utc_end.
 
         UTC-bounded; ``day`` is interpreted as a UTC calendar date. Zero rows =>
         ``Decimal("0")`` (NEVER ``None``).
+
+        ``call_type=None`` sums across all call types (backwards-compatible default).
+        Pass ``call_type='graph_projection'`` to isolate graph projection costs from
+        QA/digest costs, per the Phase 10 cost-bucket contract (Task 10.5-1 / #291).
         """
         day_start = datetime.combine(day, time(0), tzinfo=timezone.utc)
         next_day = date.fromordinal(day.toordinal() + 1)
         day_end = datetime.combine(next_day, time(0), tzinfo=timezone.utc)
 
+        filters = [
+            LlmUsageLedger.created_at >= day_start,
+            LlmUsageLedger.created_at < day_end,
+        ]
+        if call_type is not None:
+            filters.append(LlmUsageLedger.call_type == call_type)
+
         result = await session.execute(
-            select(func.sum(LlmUsageLedger.cost_usd)).where(
-                LlmUsageLedger.created_at >= day_start,
-                LlmUsageLedger.created_at < day_end,
-            )
+            select(func.sum(LlmUsageLedger.cost_usd)).where(*filters)
         )
         total = result.scalar_one_or_none()
         return Decimal(str(total)) if total is not None else Decimal("0")

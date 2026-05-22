@@ -143,7 +143,14 @@ class LedgerRepoProtocol(Protocol):
     ) -> Any:
         ...
 
-    async def daily_cost_usd(self, session: Any, *, day: Any) -> Decimal:
+    async def daily_cost_usd(
+        self, session: Any, *, day: Any, call_type: str | None = None
+    ) -> Decimal:
+        """Return USD spent today, optionally filtered by call_type bucket.
+
+        call_type=None means all call types (default, backwards-compatible).
+        call_type='graph_projection' isolates graph costs from QA/digest costs.
+        """
         ...
 
     async def monthly_cost_usd(
