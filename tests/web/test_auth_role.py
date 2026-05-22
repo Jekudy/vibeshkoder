@@ -10,10 +10,12 @@ Scenarios:
 7. WEB_PASSWORD alias: only WEB_PASSWORD set → accepted as admin + DeprecationWarning on startup
 8. ConfigurationError raised when WEB_ADMIN_PASSWORD == WEB_MEMBER_PASSWORD
 9. Backward compat: existing single-password test path still works
+10. 9.5-E: create_app() warns when WEB_MEMBER_PASSWORD is absent (wiki member login unavailable)
 """
 
 from __future__ import annotations
 
+import logging
 import warnings
 
 import pytest
@@ -330,3 +332,43 @@ def test_backward_compat_existing_session_cookie(app_env) -> None:
     payload = _decode_cookie(cookie)
     assert payload.get("role") == "admin"
     assert payload.get("authenticated") is True
+
+
+# ── Test 10: 9.5-E — WEB_MEMBER_PASSWORD startup warning ─────────────────────
+
+
+def test_create_app_warns_when_member_password_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """9.5-E: create_app() emits a WARNING via the 'web.app' logger when
+    WEB_MEMBER_PASSWORD is not set.
+
+    Wiki member login is unavailable without WEB_MEMBER_PASSWORD; admin
+    enabling memory.wiki.enabled would get 500s instead of a clear error.
+    The startup warning surfaces the misconfiguration early.
+    """
+    monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("COMMUNITY_CHAT_ID", "-1001234567890")
+    monkeypatch.setenv("ADMIN_IDS", "[149820031]")
+    monkeypatch.setenv("WEB_ADMIN_PASSWORD", "admin-password-12")
+    monkeypatch.setenv("WEB_SESSION_SECRET", "test-session-secret")
+    monkeypatch.setenv("DEV_MODE", "true")
+    # Explicitly clear WEB_MEMBER_PASSWORD and WEB_PASSWORD to exercise the no-member-pw path.
+    monkeypatch.delenv("WEB_MEMBER_PASSWORD", raising=False)
+    monkeypatch.delenv("WEB_PASSWORD", raising=False)
+    from tests.conftest import _clear_modules
+    _clear_modules()
+
+    with caplog.at_level(logging.WARNING, logger="web.app"):
+        web_app = import_module("web.app")
+        web_app.create_app()
+
+    warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    member_pw_warnings = [m for m in warning_messages if "WEB_MEMBER_PASSWORD" in str(m)]
+    assert member_pw_warnings, (
+        "9.5-E: expected WARNING about WEB_MEMBER_PASSWORD being empty/missing, "
+        f"got log records: {warning_messages}"
+    )
+
+    _clear_modules()

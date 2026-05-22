@@ -12,6 +12,24 @@ from web.auth import get_user_from_cookie, create_session_cookie, _cookie_finger
 
 logger = logging.getLogger(__name__)
 
+
+def _check_member_password_config() -> None:
+    """9.5-E: Warn at startup if WEB_MEMBER_PASSWORD is absent.
+
+    Wiki member login is unavailable without WEB_MEMBER_PASSWORD. Admins who
+    enable memory.wiki.enabled without setting this env var will get 500s
+    instead of a clear error. This check surfaces the misconfiguration early.
+    """
+    from web.config import settings as _settings
+
+    member_pw = _settings.WEB_MEMBER_PASSWORD
+    if not member_pw:
+        logger.warning(
+            "WEB_MEMBER_PASSWORD is empty/missing. "
+            "Wiki member login will be unavailable. "
+            "Set WEB_MEMBER_PASSWORD in env to enable member access."
+        )
+
 _WEB_DIR = Path(__file__).resolve().parent
 
 TEMPLATES = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
@@ -35,6 +53,8 @@ def _is_admin_only_path(path: str) -> bool:
 
 
 def create_app() -> FastAPI:
+    _check_member_password_config()
+
     app = FastAPI(title="Vibe Gatekeeper Admin")
 
     # Mount static files
