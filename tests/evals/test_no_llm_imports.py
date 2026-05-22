@@ -193,6 +193,83 @@ def test_i4_no_llm_provider_url_outside_gateway() -> None:
     )
 
 
+def test_no_llm_provider_urls_outside_gateway() -> None:
+    """I4b: LLM provider URLs must not appear in bot/, web/, or ops/ outside the
+    allow-listed gateway files.
+
+    Extends test_i4_no_llm_provider_url_outside_gateway (bot/-only) to cover
+    web/ and ops/ as well, since a direct httpx call in a web route or ops script
+    would bypass the invariant-#2 contract just as much as one in bot/.
+
+    Additional hostnames covered: api.together.xyz, api.groq.com, api.replicate.com,
+    api.cohere.ai, api.mistral.ai, api.groq.com (already in LLM_PROVIDER_HOSTNAMES).
+
+    Honeypot assertion: tests/fixtures/honeypot_llm_url.py contains a known
+    LLM hostname in a comment; when that file is included in the scan paths
+    it MUST be detected — proving the guard is live and not a no-op.
+    """
+    scan_roots = [
+        root
+        for root in [
+            REPO_ROOT / "bot",
+            REPO_ROOT / "web",
+            REPO_ROOT / "ops",
+        ]
+        if root.is_dir()
+    ]
+
+    # Expanded hostname set: task I4b adds provider domains not in the original I4.
+    extended_hostnames: frozenset[str] = frozenset(
+        set(LLM_PROVIDER_HOSTNAMES)
+        | {
+            "api.together.xyz",
+            "api.groq.com",
+            "api.replicate.com",
+            "api.cohere.com",
+            "api.mistral.ai",
+            "api-inference.huggingface.co",
+        }
+    )
+
+    allowed_url_files: frozenset[str] = frozenset(
+        [
+            "bot/services/llm_gateway.py",
+            "bot/services/llm_providers/anthropic.py",
+            "bot/services/llm_providers/openai.py",
+        ]
+    )
+
+    violations: list[str] = []
+    for root in scan_roots:
+        for path in _collect_python_files(root):
+            rel = _relative_to_repo(path)
+            if rel in allowed_url_files:
+                continue
+            for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                for host in extended_hostnames:
+                    if host in line:
+                        violations.append(f"{rel}:{line_no}: hostname {host!r}")
+                        break
+
+    assert not violations, (
+        "invariant 2 URL-level violation (I4b) — LLM provider hostname in "
+        "bot/, web/, or ops/ outside the allow-list:\n" + "\n".join(violations)
+    )
+
+    # Honeypot: verify the guard would catch the known-bad fixture.
+    honeypot_path = REPO_ROOT / "tests" / "fixtures" / "honeypot_llm_url.py"
+    assert honeypot_path.is_file(), (
+        f"honeypot fixture missing at {honeypot_path} — "
+        "create tests/fixtures/honeypot_llm_url.py with '# api.openai.com'"
+    )
+    honeypot_text = honeypot_path.read_text(encoding="utf-8")
+    honeypot_caught = any(host in honeypot_text for host in extended_hostnames)
+    assert honeypot_caught, (
+        "honeypot fixture does not contain any known LLM hostname — "
+        "the guard would silently pass even a URL-leaking file"
+    )
+
+
 def test_i3_allow_list_contract_documented() -> None:
     """I3: allow-list contains exactly the Phase 5 provider boundary files.
 
