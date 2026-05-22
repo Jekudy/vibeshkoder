@@ -257,15 +257,18 @@ async def _compute_postgres_active_hash(session: AsyncSession) -> str | None:
     """Compute md5 over sorted active triple_hash values from graph_provenance.
 
     Per §5.I:
-      SELECT md5(string_agg(triple_hash, ',' ORDER BY triple_hash))
+      SELECT md5(string_agg(triple_hash::text, ',' ORDER BY triple_hash))
       FROM graph_provenance
       WHERE purged_at IS NULL AND triple_hash IS NOT NULL;
+
+    triple_hash is BIGINT (migration 068 cutover); cast to text for string_agg
+    while ORDER BY operates on the original BIGINT column for numeric ordering.
 
     Returns None when there are no active provenance rows with triple_hash set.
     """
     result = await session.execute(
         text(
-            "SELECT md5(string_agg(triple_hash, ',' ORDER BY triple_hash))"
+            "SELECT md5(string_agg(triple_hash::text, ',' ORDER BY triple_hash))"
             " FROM graph_provenance"
             " WHERE purged_at IS NULL AND triple_hash IS NOT NULL"
         )
