@@ -3,45 +3,74 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 Verdict = Literal["succeeded", "escalated", "no_action"]
 
-# Sources recognised as production monitors.  Payloads from any other source
-# are treated as unverified / synthetic and rejected by the scope guard.
-_TRUSTED_SOURCES: frozenset[str] = frozenset({"coolify", "sentry", "prod-monitor"})
+# Substring markers in a check's ``reason`` field that identify operator-triggered
+# synthetic / dry-run payloads.  Matched case-insensitively.
+_SYNTHETIC_REASON_MARKERS = re.compile(
+    r"\b(synthetic|test|verification|manual|dry[\s_-]?run)\b",
+    re.IGNORECASE,
+)
 
-# Only these severity levels trigger autonomous healing.  Low / medium signals
-# must be investigated manually to avoid spurious pipeline activations.
-_ALLOWED_SEVERITIES: frozenset[str] = frozenset({"critical", "high"})
+# Component names from CheckReport.to_dict() that are included in the is_red
+# calculation.  db_roundtrip is intentionally excluded — the GitHub Actions
+# self-hosted runner has no route to Coolify's internal Docker bridge, so the
+# check is continuously RED without reflecting actual DB health.  See
+# CheckReport.is_red in ops/healing/healthcheck.py for the authoritative comment.
+_HEALING_TARGETS: tuple[str, ...] = ("coolify_status", "telegram_pending")
 
 
-def is_real_bug_signal(payload: dict) -> bool:
-    """Return True only when *payload* represents a genuine production incident.
+def is_real_bug_signal(payload: object) -> bool:
+    """Return True if *payload* represents a genuine production failure worth healing.
 
-    Heuristics (ALL must pass):
-    - ``incident_id`` must be a non-empty, non-null value.
-    - ``severity`` must be one of {"critical", "high"}.
-    - ``source`` must be a trusted production log origin.
-    - Neither ``_synthetic`` nor ``test_payload`` flags may be truthy.
+    Accepts the ``CheckReport.to_dict()`` payload shape produced by
+    ``ops/healing/healthcheck.py``.  Rejects:
 
-    Any failure causes an immediate False return so that synthetic / test /
-    low-severity signals never reach the autonomous pipeline.
+    - Non-mapping inputs (None, list, str, scalar) — malformed JSON guard.
+    - Operator-triggered dry-runs: ``_synthetic=True`` or ``test_payload=True``
+      at the top level.
+    - Payloads with no red check among the healing targets (coolify_status,
+      telegram_pending).
+    - Red checks whose ``reason`` field matches the synthetic/test/verification
+      marker pattern — catches payloads where db_roundtrip.reason='synthetic'
+      would otherwise slip through (2026-05-13 regression payload).
+
+    db_roundtrip is explicitly excluded from healing targets even if red,
+    mirroring the ``CheckReport.is_red`` property in healthcheck.py.
     """
-    if not payload.get("incident_id"):
+    if not isinstance(payload, Mapping):
         return False
-    if payload.get("severity") not in _ALLOWED_SEVERITIES:
+
+    # Explicit synthetic flags from operator-triggered or test runs
+    if payload.get("_synthetic") is True or payload.get("test_payload") is True:
         return False
-    if payload.get("source") not in _TRUSTED_SOURCES:
-        return False
-    if payload.get("_synthetic") or payload.get("test_payload"):
-        return False
-    return True
+
+    # Find red checks among healing targets, skipping synthetic-reason entries
+    red_components: list[str] = []
+    for name in _HEALING_TARGETS:
+        check = payload.get(name)
+        if not isinstance(check, Mapping):
+            continue
+        if check.get("status") != "red":
+            continue
+        reason = str(check.get("reason", ""))
+        if _SYNTHETIC_REASON_MARKERS.search(reason):
+            # Reason field indicates a synthetic/test trigger — skip this check
+            # even though its status is red.
+            continue
+        red_components.append(name)
+
+    return len(red_components) > 0
 
 
 @dataclass(frozen=True)
@@ -267,25 +296,37 @@ def _run_real(signal_payload: str, config: HealingConfig) -> HealingResult:
             # ChatGPT accounts and requires the codex plugin runtime for correct auth.
             # Until that dispatch mechanism is wired, the step falls through if codex
             # is not on PATH (see issue #282 Option C / Option A tracking).
-            codex = subprocess.run(
-                [
-                    "codex",
-                    "exec",
-                    "review",
-                    "--base",
-                    "main",
-                    "-m",
-                    "gpt-5.5",
-                    "-c",
-                    "model_reasoning_effort=high",
-                    "--ephemeral",
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            _write_text(config.work_dir / f"codex-{attempt}.log", codex.stdout + codex.stderr)
-            if codex.returncode != 0 or "APPROVE" not in codex.stdout:
+            codex_path = shutil.which("codex")
+            if codex_path is None:
+                sys.stderr.write(
+                    "[ops.healing.orchestrator] codex not found on PATH — skipping "
+                    "secondary review; merge gating falls back to Claude-only review. "
+                    "See issue #282.\n"
+                )
+                sys.stderr.flush()
+                codex_approved = True  # fall through to Claude-only merge
+            else:
+                codex = subprocess.run(
+                    [
+                        codex_path,
+                        "exec",
+                        "review",
+                        "--base",
+                        "main",
+                        "-m",
+                        "gpt-5.5",
+                        "-c",
+                        "model_reasoning_effort=high",
+                        "--ephemeral",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                _write_text(config.work_dir / f"codex-{attempt}.log", codex.stdout + codex.stderr)
+                codex_approved = codex.returncode == 0 and "APPROVE" in codex.stdout
+
+            if not codex_approved:
                 events.append("codex:reject")
                 time.sleep(config.cooldown_seconds)
                 continue
@@ -344,12 +385,16 @@ def run_healing(
         payload = {}
 
     if not is_real_bug_signal(payload):
+        # Log the CheckReport fields that are relevant for debugging scope-guard
+        # decisions: coolify_status and telegram_pending statuses plus operator flags.
+        coolify = payload.get("coolify_status") if isinstance(payload, Mapping) else None
+        telegram = payload.get("telegram_pending") if isinstance(payload, Mapping) else None
         sys.stderr.write(
             "[ops.healing.orchestrator] Scope guard: signal rejected as synthetic / "
             "unverified. No PR will be opened. Inspect payload fields: "
-            f"incident_id={payload.get('incident_id')!r}, "
-            f"severity={payload.get('severity')!r}, "
-            f"source={payload.get('source')!r}\n"
+            f"coolify_status={coolify!r}, "
+            f"telegram_pending={telegram!r}, "
+            f"_synthetic={payload.get('_synthetic') if isinstance(payload, Mapping) else None!r}\n"
         )
         sys.stderr.flush()
         return HealingResult(
@@ -369,7 +414,10 @@ def main() -> int:
     args = parser.parse_args()
     result = run_healing(args.signal_payload)
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
-    return 0 if result.verdict == "succeeded" else 1
+    # no_action = correct abstain decision (guard rejected a synthetic/non-red payload),
+    # not a failure.  Only escalated verdict signals an unresolved production incident.
+    EXIT_OK = {"succeeded", "no_action"}
+    return 0 if result.verdict in EXIT_OK else 1
 
 
 if __name__ == "__main__":
