@@ -323,7 +323,7 @@ async def wiki_public_page(slug: str, request: Request) -> Response:
 async def wiki_page(slug: str, request: Request) -> Response:
     """Single page view with governance revalidation. Member or admin only.
 
-    Cache-Control (9.5-F): every response (200, 404, 410) carries
+    Cache-Control (9.5-F): every response (200, 403, 404, 410, 503) carries
     ``Cache-Control: no-store, no-cache, must-revalidate, private`` so that
     stale browser/CDN caches cannot serve forgotten or redacted content.
     """
@@ -331,6 +331,7 @@ async def wiki_page(slug: str, request: Request) -> Response:
     if role is None:
         return JSONResponse(
             status_code=403,
+            headers=_MEMBER_CACHE_HEADERS,
             content={"detail": "insufficient_role", "required": "member"},
         )
 
@@ -338,7 +339,7 @@ async def wiki_page(slug: str, request: Request) -> Response:
         if not await _wiki_enabled(session):
             return JSONResponse(
                 status_code=503,
-                headers={"Retry-After": "3600"},
+                headers={**_MEMBER_CACHE_HEADERS, "Retry-After": "60"},
                 content={"detail": "wiki_disabled"},
             )
 
