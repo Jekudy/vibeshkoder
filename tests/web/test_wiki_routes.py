@@ -148,10 +148,14 @@ async def _async_none():
 
 
 def test_draft_page_returns_404(monkeypatch) -> None:
-    """GET /wiki/draft-slug for page_status='draft' → 404."""
+    """GET /wiki/draft-slug for page_status='draft' → 404 (not archived, not reviewed)."""
     wiki_routes = import_module("web.routes.wiki")
+    draft_page = _make_page_row(slug="draft-slug", page_status="draft")
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
-    monkeypatch.setattr(wiki_routes, "_get_page_by_slug", lambda session, slug: _async_none())
+    # Draft page exists in DB but is not visible to members.
+    monkeypatch.setattr(
+        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(draft_page)
+    )
 
     client = _make_client(session_cookie=_member_cookie())
     response = client.get("/wiki/draft-slug", follow_redirects=False)
@@ -172,7 +176,9 @@ def test_all_sources_forgotten_page_returns_410(monkeypatch) -> None:
 
     wiki_routes = import_module("web.routes.wiki")
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
-    monkeypatch.setattr(wiki_routes, "_get_page_by_slug", lambda session, slug: _async_page(page))
+    monkeypatch.setattr(
+        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(page)
+    )
     monkeypatch.setattr(wiki_routes, "render_wiki_page", _fake_render)
 
     client = _make_client(session_cookie=_member_cookie())
@@ -339,7 +345,9 @@ def test_member_transitive_offrecord_suppresses_citation(monkeypatch) -> None:
 
     wiki_routes = import_module("web.routes.wiki")
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
-    monkeypatch.setattr(wiki_routes, "_get_page_by_slug", lambda session, slug: _async_page(page))
+    monkeypatch.setattr(
+        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(page)
+    )
     monkeypatch.setattr(wiki_routes, "render_wiki_page", _fake_render)
     monkeypatch.setattr(wiki_routes, "_get_page_sources", lambda session, page_id: _async_list([]))
 
@@ -397,7 +405,9 @@ def test_template_renders_citation_section(monkeypatch) -> None:
 
     wiki_routes = import_module("web.routes.wiki")
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
-    monkeypatch.setattr(wiki_routes, "_get_page_by_slug", lambda session, slug: _async_page(page))
+    monkeypatch.setattr(
+        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(page)
+    )
     monkeypatch.setattr(wiki_routes, "render_wiki_page", _fake_render)
     monkeypatch.setattr(wiki_routes, "_get_page_sources", lambda session, page_id: _async_list([source]))
 
@@ -428,7 +438,9 @@ def test_member_role_no_admin_marker_visible(monkeypatch) -> None:
 
     wiki_routes = import_module("web.routes.wiki")
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
-    monkeypatch.setattr(wiki_routes, "_get_page_by_slug", lambda session, slug: _async_page(page))
+    monkeypatch.setattr(
+        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(page)
+    )
     monkeypatch.setattr(wiki_routes, "render_wiki_page", _fake_render)
     monkeypatch.setattr(wiki_routes, "_get_page_sources", lambda session, page_id: _async_list([]))
 
@@ -439,18 +451,61 @@ def test_member_role_no_admin_marker_visible(monkeypatch) -> None:
     assert "⚠" not in response.text
 
 
-# ── Test 16: non-reviewed page_status returns 404 ─────────────────────────────
+# ── Test 16: stale/archived page_status returns 410 Gone (9.5-D) ─────────────
 
 
-def test_non_reviewed_page_status_returns_404(monkeypatch) -> None:
-    """GET /wiki/{slug} for a stale/archived page returns 404 (not member-visible)."""
+def test_archived_page_status_returns_410(monkeypatch) -> None:
+    """GET /wiki/{slug} for a page with page_status='archived' → 410 Gone.
+
+    9.5-D: stale-page member silent 404 → 410 Gone with template.
+    The page exists in DB but is no longer available.
+    """
     wiki_routes = import_module("web.routes.wiki")
+    archived_page = _make_page_row(slug="gone-page", page_status="archived")
+
     monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
-    # _get_page_by_slug returns None for non-reviewed pages
-    monkeypatch.setattr(wiki_routes, "_get_page_by_slug", lambda session, slug: _async_none())
+    monkeypatch.setattr(
+        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(archived_page)
+    )
 
     client = _make_client(session_cookie=_member_cookie())
-    response = client.get("/wiki/stale-slug", follow_redirects=False)
+    response = client.get("/wiki/gone-page", follow_redirects=False)
+    assert response.status_code == 410
+    assert "Cache-Control" in response.headers
+    assert "no-store" in response.headers["Cache-Control"]
+
+
+def test_stale_page_status_returns_410(monkeypatch) -> None:
+    """GET /wiki/{slug} for a page with page_status='stale' → 410 Gone.
+
+    9.5-D: stale-page member silent 404 → 410 Gone with template.
+    """
+    wiki_routes = import_module("web.routes.wiki")
+    stale_page = _make_page_row(slug="stale-page", page_status="stale")
+
+    monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
+    monkeypatch.setattr(
+        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_page(stale_page)
+    )
+
+    client = _make_client(session_cookie=_member_cookie())
+    response = client.get("/wiki/stale-page", follow_redirects=False)
+    assert response.status_code == 410
+    assert "Cache-Control" in response.headers
+    assert "no-store" in response.headers["Cache-Control"]
+
+
+def test_unknown_slug_returns_404(monkeypatch) -> None:
+    """GET /wiki/{slug} for a slug not in DB → 404 (page never existed)."""
+    wiki_routes = import_module("web.routes.wiki")
+
+    monkeypatch.setattr(wiki_routes, "_wiki_enabled", lambda session: _async_true())
+    monkeypatch.setattr(
+        wiki_routes, "_get_page_by_slug_any_status", lambda session, slug: _async_none()
+    )
+
+    client = _make_client(session_cookie=_member_cookie())
+    response = client.get("/wiki/no-such-slug", follow_redirects=False)
     assert response.status_code == 404
 
 
