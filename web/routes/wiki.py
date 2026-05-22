@@ -109,6 +109,23 @@ async def _get_page_by_slug(session: AsyncSession, slug: str) -> Any | None:
     return result.fetchone()
 
 
+async def _get_page_by_slug_any_status(session: AsyncSession, slug: str) -> Any | None:
+    """Fetch a wiki page by slug regardless of page_status.
+
+    Used by wiki_page to distinguish between unknown slugs (→ 404) and
+    existing-but-archived/stale pages (→ 410 Gone per 9.5-D).
+    """
+    result = await session.execute(
+        text(
+            "SELECT id, slug, title, body_markdown, page_status, public_enabled "
+            "FROM wiki_pages "
+            "WHERE slug = :slug"
+        ),
+        {"slug": slug},
+    )
+    return result.fetchone()
+
+
 async def _get_public_page_by_slug(session: AsyncSession, slug: str) -> Any | None:
     """Fetch a reviewed wiki page by slug for the public route (no auth check)."""
     result = await session.execute(
@@ -326,6 +343,9 @@ async def wiki_page(slug: str, request: Request) -> Response:
     Cache-Control (9.5-F): every response (200, 403, 404, 410, 503) carries
     ``Cache-Control: no-store, no-cache, must-revalidate, private`` so that
     stale browser/CDN caches cannot serve forgotten or redacted content.
+
+    9.5-D: pages with page_status='archived' or 'stale' return 410 Gone with
+    a template instead of silent 404. Unknown slugs still return 404.
     """
     role = _require_member_or_admin(request)
     if role is None:
@@ -343,9 +363,26 @@ async def wiki_page(slug: str, request: Request) -> Response:
                 content={"detail": "wiki_disabled"},
             )
 
-        page = await _get_page_by_slug(session, slug)
+        page = await _get_page_by_slug_any_status(session, slug)
 
         if page is None:
+            # Unknown slug — page never existed.
+            return Response(status_code=404, headers=_MEMBER_CACHE_HEADERS)
+
+        # 9.5-D: archived/stale pages return 410 Gone with explanation template.
+        if page.page_status in ("archived", "stale"):
+            gone_response = TEMPLATES.TemplateResponse(
+                request=request,
+                name="wiki/gone.html",
+                context={"request": request},
+                status_code=410,
+            )
+            for header, value in _MEMBER_CACHE_HEADERS.items():
+                gone_response.headers[header] = value
+            return gone_response
+
+        # Non-reviewed, non-archived pages (e.g. draft) are not visible.
+        if page.page_status != "reviewed":
             return Response(status_code=404, headers=_MEMBER_CACHE_HEADERS)
 
         page_id = uuid.UUID(str(page.id))
