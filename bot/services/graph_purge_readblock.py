@@ -28,6 +28,7 @@ async def assert_no_pending_purge(
     session: AsyncSession,
     *,
     node_keys: list[str],
+    source_table_filter: str | None = None,
 ) -> None:
     """Assert no pending purge rows exist for any of the given node_keys.
 
@@ -39,6 +40,16 @@ async def assert_no_pending_purge(
 
     node_keys: list of graph_node_key values from the candidate traversal result.
 
+    source_table_filter: if provided, only consider pending rows whose source_table
+        matches this value.  The graph_query pre-guard passes
+        source_table_filter='message_versions' so that knowledge_cards and
+        card_sources purges (which are handled by Phase 6 cascade) do not
+        widen the fail-closed window for message-version-based traversals.
+        Privacy invariant: Phase 6 cascade independently gates knowledge_cards
+        and card_sources — narrowing the guard here does NOT create a leak path.
+        When source_table_filter=None (the default), all source_tables are checked
+        (backwards-compatible full-scope behaviour).  Task 10.5-8.
+
     Invariant #9 binding: this check enforces the fail-closed window while the
     async Neo4j purge is in progress. Even after failed_at is set on a row, the
     row's purged_at is still NULL — so the read-block continues until the admin
@@ -47,12 +58,16 @@ async def assert_no_pending_purge(
     if not node_keys:
         return
 
+    conditions = [
+        GraphPurgePending.graph_node_key.in_(node_keys),
+        GraphPurgePending.purged_at.is_(None),
+    ]
+    if source_table_filter is not None:
+        conditions.append(GraphPurgePending.source_table == source_table_filter)
+
     row = await session.scalar(
         select(GraphPurgePending.id)
-        .where(
-            GraphPurgePending.graph_node_key.in_(node_keys),
-            GraphPurgePending.purged_at.is_(None),
-        )
+        .where(*conditions)
         .limit(1)
     )
     if row is not None:
