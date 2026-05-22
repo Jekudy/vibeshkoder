@@ -216,7 +216,7 @@ class FakeLedgerRepoWithCallType:
         self.monthly_cost += cost_usd
         return row
 
-    async def daily_cost_usd(self, session: Any, *, day: Any) -> Decimal:
+    async def daily_cost_usd(self, session: Any, *, day: Any, call_type: str | None = None) -> Decimal:
         return self.daily_cost
 
     async def monthly_cost_usd(self, session: Any, *, year: int, month: int) -> Decimal:

@@ -180,7 +180,7 @@ async def build_digest_context(
     )
 
     # ---- cards-first query ----
-    cards_sql = text(f"""
+    cards_sql = text(f"""  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- _FORGET_EXCLUDES is a module-level constant SQL fragment from forget_predicate.py; no user input flows in.
         SELECT
             kc.id::text AS card_id,
             kc.title,
@@ -229,7 +229,7 @@ async def build_digest_context(
     # ---- raw fallback only when cards too few ----
     messages: list[DigestContextMessage] = []
     if len(cards) < min_threshold:
-        raw_sql = text(f"""
+        raw_sql = text(f"""  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- _FORGET_EXCLUDES is a module-level constant SQL fragment from forget_predicate.py; no user input flows in.
             SELECT
                 mv.id AS message_version_id,
                 mv.chat_message_id,
