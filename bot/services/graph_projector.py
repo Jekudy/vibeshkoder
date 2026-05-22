@@ -661,7 +661,7 @@ async def project_incremental(
                         )
                         nodes_merged += 1
 
-                        # Neo4j MERGE — edge
+                        # Neo4j MERGE — edge (include edge_key_hash for drift detection)
                         await config.adapter.merge_edge(
                             edge_key=edge_key,
                             source_key=triple.subject_label,
@@ -671,6 +671,7 @@ async def project_incremental(
                                 "predicate": triple.predicate,
                                 "confidence": triple.confidence,
                                 "provenance_id": str(prov.id),
+                                "edge_key_hash": triple_hash,
                             },
                         )
                         edges_merged += 1
@@ -848,7 +849,8 @@ async def project_full_rebuild(
                 )
                 nodes_merged += 1
 
-                # MERGE edge
+                # MERGE edge (include edge_key_hash for drift detection)
+                edge_key_hash = hashlib.sha256(edge.edge_key.encode()).hexdigest()[:16]
                 await config.adapter.merge_edge(
                     edge_key=edge.edge_key,
                     source_key=edge.subject_node_key,
@@ -858,6 +860,7 @@ async def project_full_rebuild(
                         "predicate": edge.predicate,
                         "confidence": float(edge.confidence_score),
                         "provenance_id": str(prov.id),
+                        "edge_key_hash": edge_key_hash,
                     },
                 )
                 edges_merged += 1
@@ -1045,7 +1048,12 @@ async def project_repair_source(
                     source_key=triple.subject_label,
                     target_key=triple.object_label,
                     relationship_type=triple.predicate,
-                    properties={"predicate": triple.predicate, "confidence": triple.confidence, "provenance_id": str(prov.id)},
+                    properties={
+                        "predicate": triple.predicate,
+                        "confidence": triple.confidence,
+                        "provenance_id": str(prov.id),
+                        "edge_key_hash": triple_hash,
+                    },
                 )
                 edges_merged += 1
                 triples_created += 1
