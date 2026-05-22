@@ -314,14 +314,14 @@ async def _create_case(
         return SEED_CHAT_ID, "сигма", {created.version_id}
 
     if case_id == "L3b":
-        # L3b — tombstone by `message_hash:<content_hash>` key.
-        # Production search.py uses this branch when forget targets a content
-        # fingerprint rather than a specific (chat, message_id) tuple.
+        # L3b — tombstone by `message_hash:<content_hash>` key (#224 HIGH #1).
+        # Exercises the content-fingerprint forget path in search.py's NOT EXISTS
+        # subquery (branch: c.content_hash IS NOT NULL AND EXISTS forget_event
+        # WHERE tombstone_key = 'message_hash:<hash>').
         # Note: ChatMessage.content_hash is nullable and not auto-populated by
         # the current ingestion pipeline (message_persistence only stores it on
-        # MessageVersion). We mirror what tests/evals/conftest.py does and copy
-        # the v1 hash onto the chat_message row so the search.py
-        # `c.content_hash IS NOT NULL` branch is exercised.
+        # MessageVersion). We copy the v1 hash onto the chat_message row so the
+        # search.py `c.content_hash IS NOT NULL` branch is exercised.
         forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
         created = await _persist_via_handler(
             session,
@@ -345,12 +345,20 @@ async def _create_case(
             authorized_by="system",
             tombstone_key=f"message_hash:{version.content_hash}",
         )
+        # Precondition: forget_event must carry target_type='message_hash'
+        assert event.target_type == "message_hash", (
+            f"L3b: expected target_type='message_hash', got {event.target_type!r}"
+        )
         await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="processing")
         await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="completed")
         return SEED_CHAT_ID, "тау", {created.version_id}
 
     if case_id == "L3c":
-        # L3c — tombstone by `user:<user_id>` key (full user-level forget).
+        # L3c — tombstone by `user:<user_id>` key (full user-level forget, #224 HIGH #1).
+        # Exercises the user-scope forget path in search.py's NOT EXISTS subquery
+        # (branch: EXISTS forget_event WHERE tombstone_key = 'user:<user_id>'
+        # matched against cm.user_id). Simulates a user invoking /forget_me so
+        # ALL their messages are excluded from /recall results.
         forget_event_repo = importlib.import_module("bot.db.repos.forget_event")
         user_id = 91_008
         created = await _persist_via_service(
@@ -367,6 +375,10 @@ async def _create_case(
             actor_user_id=None,
             authorized_by="system",
             tombstone_key=f"user:{user_id}",
+        )
+        # Precondition: forget_event must carry target_type='user'
+        assert event.target_type == "user", (
+            f"L3c: expected target_type='user', got {event.target_type!r}"
         )
         await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="processing")
         await forget_event_repo.ForgetEventRepo.mark_status(session, event.id, status="completed")
