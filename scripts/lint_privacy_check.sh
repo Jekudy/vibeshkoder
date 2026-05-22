@@ -125,6 +125,12 @@ is_allowed_path() {
   # entries above.
   [[ "$path" == "bot/services/forget_cascade.py" ]] && return 0
 
+  # forget_predicate.py — shared SQL predicate module extracted in #291.
+  # The single source of truth for the NOT EXISTS clause across forget_cascade,
+  # digest_context, and llm_gateway. The docstring names the policy it enforces.
+  # Same rationale as forget_cascade.py above — this file IS the privacy policy.
+  [[ "$path" == "bot/services/forget_predicate.py" ]] && return 0
+
   # T10-09 Phase 11 binding tests for graph privacy, provenance, cascade, refusal, drift.
   # Test files name canonical privacy literals in docstrings and assertion messages because
   # they ENFORCE the governance policy by name (L10/C9/I8/R7/G2 binding tests).

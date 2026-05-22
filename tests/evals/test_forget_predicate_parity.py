@@ -14,8 +14,6 @@ If the snapshot drifts, one of the call sites diverged — privacy leak risk.
 """
 from __future__ import annotations
 
-import pytest
-
 
 # ---------------------------------------------------------------------------
 # Frozen golden snapshot — the EXACT string that `forget_excludes_sql_fragment()`
