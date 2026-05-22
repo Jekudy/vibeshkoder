@@ -524,6 +524,17 @@ class NetworkXAdapter:
     async def close(self) -> None:
         pass
 
+    def get_edge_key_hash(self, edge_key: str) -> str | None:
+        """Return the edge_key_hash stored for the edge with the given edge_key.
+
+        Used by G4 binding tests to verify drift detection hash path.
+        Returns None if no edge with that edge_key exists.
+        """
+        for _u, _v, _key, data in self._graph.edges(data=True, keys=True):  # type: ignore[misc]
+            if data.get("edge_key") == edge_key:
+                return data.get("edge_key_hash")
+        return None
+
     @property
     def nodes(self) -> dict:
         """Return node dictionary (for test inspection)."""
