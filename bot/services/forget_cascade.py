@@ -1108,7 +1108,8 @@ async def _cascade_wiki_revisions(session: AsyncSession, event) -> int:
     """Mask ``wiki_revisions.body_markdown`` for revisions citing forgotten mvids.
 
     For every ``wiki_revisions`` row whose
-    ``source_message_version_ids_snapshot`` JSONB overlaps the affected mvids:
+    ``source_message_version_ids_snapshot`` JSONB overlaps the affected mvids
+    AND whose ``revision_status != 'forgotten_redacted'``:
 
     1. Set ``body_markdown = '[CONTENT_REDACTED: forget_event_id={n}]'``.
     2. Set ``revision_status = 'forgotten_redacted'``.
@@ -1117,6 +1118,12 @@ async def _cascade_wiki_revisions(session: AsyncSession, event) -> int:
     5. Set ``revision_sources_resolved_at = now()``.
 
     Returns count of wiki_revisions rows modified.
+
+    Idempotency (9.5-C): rows already in ``revision_status='forgotten_redacted'``
+    are skipped on re-run — their first-redaction provenance
+    (``redacted_by_forget_event_id``, ``redacted_at``, ``body_markdown``) is
+    preserved unchanged.  A second cascade pass for the same forget_event logs
+    ``already_redacted_skip`` and returns 0.
 
     Run-order invariant: MUST run AFTER ``wiki_pages`` and BEFORE ``card_sources``
     (see CASCADE_LAYER_ORDER). Running after ``wiki_pages`` ensures the page row
@@ -1128,6 +1135,10 @@ async def _cascade_wiki_revisions(session: AsyncSession, event) -> int:
     Privacy invariant: the redact string uses only ``forget_event_id`` (an
     integer) — never any user-readable body content.
     """
+    import logging
+
+    _log = logging.getLogger(__name__)
+
     if event.target_id is None:
         raise ValueError(
             f"forget_event target_type={event.target_type!r} requires non-None target_id"
@@ -1153,7 +1164,8 @@ async def _cascade_wiki_revisions(session: AsyncSession, event) -> int:
             "    redacted_at = now(), "
             "    redacted_by_forget_event_id = :event_id, "
             "    revision_sources_resolved_at = now() "
-            "WHERE source_message_version_ids_snapshot @> ANY("
+            "WHERE revision_status != 'forgotten_redacted' "
+            "  AND source_message_version_ids_snapshot @> ANY("
             "    SELECT jsonb_build_array(v::bigint) "
             "    FROM unnest(CAST(:mvids AS bigint[])) AS v"
             ")"
@@ -1169,6 +1181,12 @@ async def _cascade_wiki_revisions(session: AsyncSession, event) -> int:
     count = result.rowcount or 0
     if count:
         await session.flush()
+    else:
+        _log.debug(
+            "already_redacted_skip: _cascade_wiki_revisions found 0 rows to redact "
+            "(all matching revisions already forgotten_redacted) for forget_event_id=%s",
+            event.id,
+        )
     return count
 
 

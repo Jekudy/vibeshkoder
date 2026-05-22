@@ -705,6 +705,90 @@ async def test_cascade_wiki_revisions_metadata_fields(db_session) -> None:
     assert row["revision_sources_resolved_at"] is not None
 
 
+# ── 9.5-C: _cascade_wiki_revisions idempotency guard ─────────────────────────
+
+
+async def test_cascade_wiki_revisions_idempotent_second_run_is_noop(db_session) -> None:
+    """9.5-C: Running _cascade_wiki_revisions twice for the same forget_event
+    on an already-redacted revision must be a no-op on the second run.
+
+    Contract:
+    - First run: body_markdown is masked, revision_status='forgotten_redacted'.
+    - Second run (same forget_event): row is SKIPPED (already_redacted_skip),
+      body_markdown and redacted_by_forget_event_id are NOT overwritten.
+    - Return value of second run: 0 rows modified.
+    """
+    from bot.services.forget_cascade import _cascade_wiki_revisions
+    from sqlalchemy import text
+
+    uid = await _make_user(db_session)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    mv_id = await _make_message_version(db_session, chat_message_id=cm.id)
+
+    page_id = await _make_wiki_page(db_session, page_status="reviewed")
+    await _link_mv(db_session, page_id=page_id, message_version_id=mv_id)
+
+    rev_id = uuid.uuid4()
+    await session_execute_insert_revision(
+        db_session,
+        rev_id=rev_id,
+        page_id=page_id,
+        mv_ids=[mv_id],
+        body_markdown="original body before forget",
+    )
+
+    event_id = await _make_forget_event_row(
+        db_session,
+        tombstone_key=f"message:{cm.chat_id}:{cm.message_id}",
+        target_type="message",
+        target_id=str(cm.id),
+    )
+    event = _FakeEvent(
+        id=event_id,
+        target_type="message",
+        target_id=str(cm.id),
+        tombstone_key=f"message:{cm.chat_id}:{cm.message_id}",
+    )
+
+    # First run — should redact
+    count1 = await _cascade_wiki_revisions(db_session, event)
+    assert count1 == 1
+
+    row_after_first = (
+        await db_session.execute(
+            text(
+                "SELECT body_markdown, revision_status, redacted_by_forget_event_id "
+                "FROM wiki_revisions WHERE id = :id"
+            ),
+            {"id": str(rev_id)},
+        )
+    ).mappings().one()
+    assert row_after_first["revision_status"] == "forgotten_redacted"
+    first_body = row_after_first["body_markdown"]
+    assert first_body == f"[CONTENT_REDACTED: forget_event_id={event_id}]"
+
+    # Second run — must be no-op (idempotency guard)
+    count2 = await _cascade_wiki_revisions(db_session, event)
+    assert count2 == 0, (
+        f"Second cascade run returned {count2} rows modified; "
+        "expected 0 — already-redacted revisions must be skipped"
+    )
+
+    row_after_second = (
+        await db_session.execute(
+            text(
+                "SELECT body_markdown, revision_status, redacted_by_forget_event_id "
+                "FROM wiki_revisions WHERE id = :id"
+            ),
+            {"id": str(rev_id)},
+        )
+    ).mappings().one()
+    # Provenance must be unchanged
+    assert row_after_second["revision_status"] == "forgotten_redacted"
+    assert row_after_second["body_markdown"] == first_body
+    assert row_after_second["redacted_by_forget_event_id"] == event_id
+
+
 # ── AC#13: cascade order index assertions ─────────────────────────────────────
 
 
