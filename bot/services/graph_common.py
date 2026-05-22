@@ -19,8 +19,27 @@ RESERVED_LEDGER_CALL_TYPES contract:
 
 from __future__ import annotations
 
+import hashlib
+import struct
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
+
+
+# ─── Hash helpers ────────────────────────────────────────────────────────────
+
+
+def compute_edge_key_hash(edge_key: str) -> int:
+    """Deterministic signed int64 hash for edge_key.
+
+    Used by drift detection sum() in graph_query._compute_neo4j_edge_hash.
+    Stored as Neo4j native int (not hex string) so Cypher sum(r.edge_key_hash)
+    works without type errors.
+
+    Formula: first 8 bytes of sha256(edge_key), interpreted as big-endian
+    signed int64. Frozen — changing this formula will break stored hashes.
+    """
+    digest = hashlib.sha256(edge_key.encode()).digest()[:8]
+    return struct.unpack(">q", digest)[0]  # signed int64, big-endian
 
 
 # ─── Allowed ontology values ─────────────────────────────────────────────────
