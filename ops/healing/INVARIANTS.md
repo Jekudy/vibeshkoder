@@ -1,5 +1,13 @@
 You are running in autonomous healing loop.
 
+**Scope guard (MUST read first):** If you cannot identify a concrete, real failure
+from the context bundle — a specific stack trace, log error, or live incident
+artifact pointing at a broken production behaviour — return a null verdict and
+exit immediately. Do not pick items from the backlog. Do not refactor. Do not
+"be helpful." Inventing work when no real failure is present is worse than doing
+nothing: it creates unsolicited PRs, wastes review bandwidth, and erodes trust in
+autonomous pipelines.
+
 Use superpowers:systematic-debugging skill mandatory before proposing or applying any fix.
 Use test-driven development for code changes: reproduce the failure with a red test, implement the smallest fix, then prove green tests.
 

@@ -10,7 +10,38 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-Verdict = Literal["succeeded", "escalated"]
+Verdict = Literal["succeeded", "escalated", "no_action"]
+
+# Sources recognised as production monitors.  Payloads from any other source
+# are treated as unverified / synthetic and rejected by the scope guard.
+_TRUSTED_SOURCES: frozenset[str] = frozenset({"coolify", "sentry", "prod-monitor"})
+
+# Only these severity levels trigger autonomous healing.  Low / medium signals
+# must be investigated manually to avoid spurious pipeline activations.
+_ALLOWED_SEVERITIES: frozenset[str] = frozenset({"critical", "high"})
+
+
+def is_real_bug_signal(payload: dict) -> bool:
+    """Return True only when *payload* represents a genuine production incident.
+
+    Heuristics (ALL must pass):
+    - ``incident_id`` must be a non-empty, non-null value.
+    - ``severity`` must be one of {"critical", "high"}.
+    - ``source`` must be a trusted production log origin.
+    - Neither ``_synthetic`` nor ``test_payload`` flags may be truthy.
+
+    Any failure causes an immediate False return so that synthetic / test /
+    low-severity signals never reach the autonomous pipeline.
+    """
+    if not payload.get("incident_id"):
+        return False
+    if payload.get("severity") not in _ALLOWED_SEVERITIES:
+        return False
+    if payload.get("source") not in _TRUSTED_SOURCES:
+        return False
+    if payload.get("_synthetic") or payload.get("test_payload"):
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -229,6 +260,13 @@ def _run_real(signal_payload: str, config: HealingConfig) -> HealingResult:
                 time.sleep(config.cooldown_seconds)
                 continue
 
+            # TODO: choose dispatch mode based on environment.
+            # When running inside a Claude Code session, replace this block with
+            #   Agent(subagent_type="codex:codex-rescue", ...)
+            # per ~/.claude/rules/codex-routing.md — raw `codex exec` is broken on
+            # ChatGPT accounts and requires the codex plugin runtime for correct auth.
+            # Until that dispatch mechanism is wired, the step falls through if codex
+            # is not on PATH (see issue #282 Option C / Option A tracking).
             codex = subprocess.run(
                 [
                     "codex",
@@ -299,6 +337,29 @@ def run_healing(
     if os.environ.get("HEALING_DRY_RUN") == "true":
         scenario = os.environ.get("HEALING_DRY_RUN_SCENARIO", "success")
         return _dry_run_result(scenario, config)
+
+    try:
+        payload = json.loads(signal_payload)
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+
+    if not is_real_bug_signal(payload):
+        sys.stderr.write(
+            "[ops.healing.orchestrator] Scope guard: signal rejected as synthetic / "
+            "unverified. No PR will be opened. Inspect payload fields: "
+            f"incident_id={payload.get('incident_id')!r}, "
+            f"severity={payload.get('severity')!r}, "
+            f"source={payload.get('source')!r}\n"
+        )
+        sys.stderr.flush()
+        return HealingResult(
+            verdict="no_action",
+            attempts=0,
+            rolled_back=False,
+            escalated=False,
+            events=["scope_guard:reject"],
+        )
+
     return _run_real(signal_payload, config)
 
 
