@@ -104,6 +104,12 @@ is_allowed_path() {
   [[ "$path" == "tests/evals/test_wiki_refusal.py" ]] && return 0
   [[ "$path" == "tests/evals/test_wiki_no_graph.py" ]] && return 0
 
+  # 9.5-F Cache-Control binding test — module-level docstring explains WHY the
+  # no-store header is required by referencing the privacy cascade contract.
+  # Same rationale as other eval test allowlist entries above — the file
+  # enforces the privacy-cache policy by name.
+  [[ "$path" == "tests/evals/test_wiki_cache_control.py" ]] && return 0
+
   # T10-04 graph_projector integration test — verifies governance pre-filter
   # excludes governance-restricted cards from projection. Names canonical
   # privacy literals in fixture SQL and assertion messages because the test
