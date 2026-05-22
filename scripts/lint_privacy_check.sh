@@ -26,6 +26,11 @@ is_allowed_path() {
   # a baseline regen step.
   [[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_PLAN\.md$ ]] && return 0
 
+  # Phase design companion documents (PHASE12_DESIGN.md, …) — orientation
+  # layer for ratified plans, document Butler boundary + governance contract
+  # by literal name. Same rationale as PHASEn_PLAN.md above.
+  [[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_DESIGN\.md$ ]] && return 0
+
   # Phase rollout / closure playbooks (PHASE7_ROLLOUT.md, PHASE8_ROLLOUT.md, …)
   # name the privacy invariants for operator-facing acceptance checks and
   # post-rollout verification matrices. Same rationale as PHASEn_PLAN.md.
