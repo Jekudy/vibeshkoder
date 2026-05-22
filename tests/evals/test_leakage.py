@@ -36,12 +36,15 @@ class PersistedMessage:
     user_id: int
 
 
-@pytest_asyncio.fixture(loop_scope="class")
+@pytest_asyncio.fixture(scope="function", loop_scope="class")
 async def leakage_session(eval_db_session: AsyncSession) -> AsyncIterator[AsyncSession]:
     # Per-case isolation: TRUNCATE before AND after each test invocation so
-    # L1-L5 (parametrized cases) do not see each other's content. Fixture
-    # itself stays class-scoped so the asyncpg connection / loop stays
-    # aligned with the conftest class-scope session.
+    # L1-L6 (parametrized cases) do not see each other's content.
+    # scope="function" is explicit: each parametrized case gets a fresh
+    # TRUNCATE-before / TRUNCATE-after cycle. loop_scope="class" aligns the
+    # asyncio event loop with the class-scoped eval_db_session / engine
+    # fixtures so the asyncpg connection stays bound to the same loop across
+    # all parametrized invocations in the class.
     await _clear_leakage_tables(eval_db_session)
     try:
         yield eval_db_session
