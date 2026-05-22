@@ -122,7 +122,7 @@ class TestGraphProvenanceXOR:
             source_message_version_id=mv_id,
             source_card_id=None,
             graph_node_key=f"msg:{mv_id}",
-            triple_hash=f"th-g3a-{_next_id()}",
+            triple_hash=_next_id(),
             governance_policy="normal",
         )
         db_session.add(prov)
@@ -143,7 +143,7 @@ class TestGraphProvenanceXOR:
             source_message_version_id=None,
             source_card_id=card_id,
             graph_node_key=f"card:{card_id}",
-            triple_hash=f"th-g3b-{_next_id()}",
+            triple_hash=_next_id(),
             governance_policy="normal",
         )
         db_session.add(prov)
@@ -165,7 +165,7 @@ class TestGraphProvenanceXOR:
             source_message_version_id=mv_id,
             source_card_id=card_id,
             graph_node_key=f"msg:{mv_id}",
-            triple_hash=f"th-g3c-{_next_id()}",
+            triple_hash=_next_id(),
             governance_policy="normal",
         )
         db_session.add(prov)
@@ -185,7 +185,7 @@ class TestGraphProvenanceXOR:
             source_message_version_id=None,
             source_card_id=None,
             graph_node_key="msg:0",
-            triple_hash=f"th-g3d-{_next_id()}",
+            triple_hash=_next_id(),
             governance_policy="normal",
         )
         db_session.add(prov)

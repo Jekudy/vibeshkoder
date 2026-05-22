@@ -363,26 +363,22 @@ async def wiki_page(slug: str, request: Request) -> Response:
                 content={"detail": "wiki_disabled"},
             )
 
-        page = await _get_page_by_slug_any_status(session, slug)
+        page = await _get_page_by_slug(session, slug)
 
         if page is None:
-            # Unknown slug — page never existed.
-            return Response(status_code=404, headers=_MEMBER_CACHE_HEADERS)
-
-        # 9.5-D: archived/stale pages return 410 Gone with explanation template.
-        if page.page_status in ("archived", "stale"):
-            gone_response = TEMPLATES.TemplateResponse(
-                request=request,
-                name="wiki/gone.html",
-                context={"request": request},
-                status_code=410,
-            )
-            for header, value in _MEMBER_CACHE_HEADERS.items():
-                gone_response.headers[header] = value
-            return gone_response
-
-        # Non-reviewed, non-archived pages (e.g. draft) are not visible.
-        if page.page_status != "reviewed":
+            # Check if an archived/stale page exists for 410 Gone (9.5-D).
+            archived = await _get_page_by_slug_any_status(session, slug)
+            if archived is not None and archived.page_status in ("archived", "stale"):
+                gone_response = TEMPLATES.TemplateResponse(
+                    request=request,
+                    name="wiki/gone.html",
+                    context={"request": request},
+                    status_code=410,
+                )
+                for header, value in _MEMBER_CACHE_HEADERS.items():
+                    gone_response.headers[header] = value
+                return gone_response
+            # Unknown slug or draft — not visible.
             return Response(status_code=404, headers=_MEMBER_CACHE_HEADERS)
 
         page_id = uuid.UUID(str(page.id))

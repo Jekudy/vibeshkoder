@@ -97,7 +97,7 @@ async def _seed_provenance(db_session, *, node_key: str) -> int:
         source_pk=str(mv_id),
         source_message_version_id=mv_id,
         graph_node_key=node_key,
-        triple_hash=f"thash_{_next_id()}",
+        triple_hash=_next_id(),
     )
     return prov.id
 

@@ -109,7 +109,7 @@ async def _seed_graph_provenance(
         source_pk=str(mv_id),
         source_message_version_id=mv_id,
         graph_node_key=graph_node_key,
-        triple_hash=f"hash_{_next_id()}",
+        triple_hash=_next_id(),
     )
     return prov.id
 
@@ -503,7 +503,7 @@ async def test_sources_for_path_excludes_purged_provenance(db_session):
         source_pk=str(mv_id),
         source_message_version_id=mv_id,
         graph_node_key=f"node:{_next_id()}",
-        triple_hash=f"hash_{_next_id()}",
+        triple_hash=_next_id(),
     )
     purged_prov.purged_at = datetime.now(timezone.utc)
     db_session.add(purged_prov)
