@@ -16,9 +16,9 @@ from pathlib import Path
 
 import pytest
 
-# Single source of truth: LLM_GUARD_HOSTNAMES in tests/evals/_llm_guard.py.
-# Imported here to avoid drift between the runtime guard and the AST check.
-from tests.evals._llm_guard import LLM_GUARD_HOSTNAMES as _LLM_GUARD_HOSTNAMES
+# Single source of truth: LLM_PROVIDER_HOSTNAMES in tests/evals/_llm_guard.py.
+# Imported directly to avoid drift between the runtime guard and the AST check.
+from tests.evals._llm_guard import LLM_PROVIDER_HOSTNAMES
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOT_ROOT = REPO_ROOT / "bot"
@@ -52,8 +52,10 @@ ALLOWED_LLM_IMPORT_FILES: frozenset[str] = frozenset(
 # I4 — URL-level guard. The provider SDK imports above (anthropic / openai)
 # are not the only way to call an LLM endpoint: a direct httpx / requests /
 # aiohttp call to a provider hostname would bypass the invariant-#2 contract
-# while passing the import-graph check. This domain list catches that.
-LLM_PROVIDER_HOSTNAMES: tuple[str, ...] = tuple(sorted(_LLM_GUARD_HOSTNAMES))
+# while passing the import-graph check. LLM_PROVIDER_HOSTNAMES (imported from
+# _llm_guard) is the single source of truth — both the runtime httpx guard
+# and this static scan use the same set, so they cannot drift.
+_LLM_PROVIDER_HOSTNAMES_TUPLE: tuple[str, ...] = tuple(sorted(LLM_PROVIDER_HOSTNAMES))
 
 
 def _relative_to_repo(path: Path) -> str:
@@ -193,6 +195,31 @@ def test_i4_no_llm_provider_url_outside_gateway() -> None:
     )
 
 
+def _scan_files_for_hostnames(
+    paths: list[Path],
+    hostnames: frozenset[str],
+) -> list[tuple[Path, str]]:
+    """Scan *paths* for lines containing any of *hostnames*.
+
+    Returns a list of (path, hostname) pairs — one entry per file/host
+    match (at most one per file line, first hostname match wins).  Both
+    the production assertion and the honeypot assertion call this helper
+    directly, so a broken scanner fails both assertions simultaneously.
+    """
+    matches: list[tuple[Path, str]] = []
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for line in text.splitlines():
+            for host in hostnames:
+                if host in line:
+                    matches.append((path, host))
+                    break
+    return matches
+
+
 def test_no_llm_provider_urls_outside_gateway() -> None:
     """I4b: LLM provider URLs must not appear in bot/, web/, or ops/ outside the
     allow-listed gateway files.
@@ -201,12 +228,14 @@ def test_no_llm_provider_urls_outside_gateway() -> None:
     web/ and ops/ as well, since a direct httpx call in a web route or ops script
     would bypass the invariant-#2 contract just as much as one in bot/.
 
-    Additional hostnames covered: api.together.xyz, api.groq.com, api.replicate.com,
-    api.cohere.ai, api.mistral.ai, api.groq.com (already in LLM_PROVIDER_HOSTNAMES).
+    Hostname set is LLM_PROVIDER_HOSTNAMES from _llm_guard.py — the single
+    source of truth for both the runtime httpx guard and this static scan.
+    Previously extra hostnames (api.together.xyz, api.groq.com, etc.) were
+    defined inline; they are now part of LLM_PROVIDER_HOSTNAMES in _llm_guard.py.
 
     Honeypot assertion: tests/fixtures/honeypot_llm_url.py contains a known
-    LLM hostname in a comment; when that file is included in the scan paths
-    it MUST be detected — proving the guard is live and not a no-op.
+    LLM hostname; the honeypot is scanned with the SAME _scan_files_for_hostnames
+    helper as the production scan — so a broken scanner fails BOTH assertions.
     """
     scan_roots = [
         root
@@ -218,19 +247,6 @@ def test_no_llm_provider_urls_outside_gateway() -> None:
         if root.is_dir()
     ]
 
-    # Expanded hostname set: task I4b adds provider domains not in the original I4.
-    extended_hostnames: frozenset[str] = frozenset(
-        set(LLM_PROVIDER_HOSTNAMES)
-        | {
-            "api.together.xyz",
-            "api.groq.com",
-            "api.replicate.com",
-            "api.cohere.com",
-            "api.mistral.ai",
-            "api-inference.huggingface.co",
-        }
-    )
-
     allowed_url_files: frozenset[str] = frozenset(
         [
             "bot/services/llm_gateway.py",
@@ -239,34 +255,36 @@ def test_no_llm_provider_urls_outside_gateway() -> None:
         ]
     )
 
-    violations: list[str] = []
+    # Production scan: collect all python files, excluding allow-listed gateway files.
+    production_paths: list[Path] = []
     for root in scan_roots:
         for path in _collect_python_files(root):
-            rel = _relative_to_repo(path)
-            if rel in allowed_url_files:
-                continue
-            for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-                for host in extended_hostnames:
-                    if host in line:
-                        violations.append(f"{rel}:{line_no}: hostname {host!r}")
-                        break
+            if _relative_to_repo(path) not in allowed_url_files:
+                production_paths.append(path)
 
+    prod_matches = _scan_files_for_hostnames(production_paths, LLM_PROVIDER_HOSTNAMES)
+
+    violations = [
+        f"{_relative_to_repo(path)}:hostname {host!r}"
+        for path, host in prod_matches
+    ]
     assert not violations, (
         "invariant 2 URL-level violation (I4b) — LLM provider hostname in "
         "bot/, web/, or ops/ outside the allow-list:\n" + "\n".join(violations)
     )
 
-    # Honeypot: verify the guard would catch the known-bad fixture.
+    # Honeypot: the SAME helper must detect the known-bad fixture.
     honeypot_path = REPO_ROOT / "tests" / "fixtures" / "honeypot_llm_url.py"
     assert honeypot_path.is_file(), (
         f"honeypot fixture missing at {honeypot_path} — "
         "create tests/fixtures/honeypot_llm_url.py with '# api.openai.com'"
     )
-    honeypot_text = honeypot_path.read_text(encoding="utf-8")
-    honeypot_caught = any(host in honeypot_text for host in extended_hostnames)
-    assert honeypot_caught, (
-        "honeypot fixture does not contain any known LLM hostname — "
-        "the guard would silently pass even a URL-leaking file"
+    honeypot_matches = _scan_files_for_hostnames(
+        [honeypot_path], LLM_PROVIDER_HOSTNAMES
+    )
+    assert len(honeypot_matches) >= 1, (
+        "honeypot fixture was not detected by _scan_files_for_hostnames — "
+        "the scanner is broken or the fixture no longer contains a known LLM hostname"
     )
 
 

@@ -16,22 +16,34 @@ from typing import Any
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
-# LLM hostname block-list (mirrors LLM_PROVIDER_HOSTNAMES in
-# tests/evals/test_no_llm_imports.py — keep in sync).
+# LLM hostname block-list — single source of truth.
+#
+# LLM_PROVIDER_HOSTNAMES is the canonical frozenset used by:
+#   - the runtime httpx guard (LLM_GUARD_HOSTNAMES alias below)
+#   - the static AST/text scan in tests/evals/test_no_llm_imports.py
+#     (imported directly as LLM_PROVIDER_HOSTNAMES)
+#
+# Adding a new LLM provider? Add it here only — both guards pick it up.
 # ---------------------------------------------------------------------------
 
-LLM_GUARD_HOSTNAMES: frozenset[str] = frozenset(
+LLM_PROVIDER_HOSTNAMES: frozenset[str] = frozenset(
     [
         "api.anthropic.com",
         "api.openai.com",
+        "generativelanguage.googleapis.com",
+        "api.together.xyz",
+        "api.groq.com",
+        "api.mistral.ai",
         "api.cohere.ai",
         "api.cohere.com",
-        "api.mistral.ai",
-        "generativelanguage.googleapis.com",
         "api.replicate.com",
         "api-inference.huggingface.co",
     ]
 )
+
+# Alias kept for backwards-compat with existing callers that import
+# LLM_GUARD_HOSTNAMES directly.
+LLM_GUARD_HOSTNAMES: frozenset[str] = LLM_PROVIDER_HOSTNAMES
 
 
 class LLMNetworkCallDetected(AssertionError):
