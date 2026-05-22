@@ -19,7 +19,7 @@ pytestmark = pytest.mark.asyncio(loop_scope="class")
 
 # Explicit non-community chat_ids used in R3b/R3c wrong-chat branch tests.
 # These must differ from SEED_CHAT_ID so the handler's community-id guard fires.
-NON_COMMUNITY_CHAT_ID_PRIVATE = -1099887766   # R3b: private chat wrong-chat path
+NON_COMMUNITY_CHAT_ID_PRIVATE = 1099887766    # R3b: private chat wrong-chat path (positive: Telegram private chat IDs > 0)
 NON_COMMUNITY_CHAT_ID_GROUP = -1099887767    # R3c: supergroup wrong-chat + forbidden path
 
 CONTENT_TRUNCATE_SQL = text(
