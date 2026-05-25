@@ -94,6 +94,10 @@ RESERVED_LEDGER_CALL_TYPES: tuple[str, ...] = (
     "extract_candidates",  # Phase 6 T6-03 extraction gateway (Task 10.5-6).
                            # Renamed from legacy 'unknown' default to enable
                            # per-feature cost reporting in llm_usage_ledger.
+    "butler_decision",     # Phase 12 T12-01 — LLM call for Butler plan generation.
+                           # Added to allow-list in migration 071 + DB CHECK.
+    "butler_summary",      # Phase 12 T12-01 — LLM call for Butler result summarization.
+                           # Added to allow-list in migration 071 + DB CHECK.
 )
 
 
