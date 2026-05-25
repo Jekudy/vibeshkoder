@@ -24,7 +24,7 @@ is_allowed_path() {
   # Same rationale as Tn-XX_design.md above. Pre-existing phase plans pass
   # via baseline-diff; this entry lets new phase plans land cleanly without
   # a baseline regen step.
-  [[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_PLAN\.md$ ]] && return 0
+  [[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_PLAN(_REFRESH)?\.md$ ]] && return 0
 
   # Phase design companion documents (PHASE12_DESIGN.md, …) — orientation
   # layer for ratified plans, document Butler boundary + governance contract

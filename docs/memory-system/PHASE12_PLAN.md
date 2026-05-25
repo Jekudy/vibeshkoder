@@ -58,6 +58,10 @@ and intentionally not preserved.
 
 ---
 
+**2026-05-25 ERRATUM:** All references to `EvidenceContext` in this document are superseded by `EvidenceBundle` from `bot/services/evidence.py:122-160`. See `PHASE12_PLAN_REFRESH.md §4.2` for the canonical rename. Phase 12 implementation authorized 2026-05-25 (see `AUTHORIZED_SCOPE.md`).
+
+---
+
 ## §1. Invariants Verbatim
 
 Non-negotiable invariants from `HANDOFF.md §1`:

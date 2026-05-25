@@ -468,6 +468,58 @@ NOT in Phase 8 scope (defer to Phase 8.5+ or Phase 9+):
 
 ---
 
+## Authorized: Phase 12 — Future Butler / Action Layer (2026-05-25)
+
+Phase 12 authorized for implementation 2026-05-25. Predecessor gates (Phases 0–11) all CLOSED on `main` as of 2026-05-21. Owned by Orchestrator B per `ORCHESTRATOR_REGISTRY.md`. Canonical specs:
+- `docs/memory-system/PHASE12_PLAN.md` (ratified 2026-05-02, design contract)
+- `docs/memory-system/PHASE12_DESIGN.md` (post-Phase 9/10 companion)
+- `docs/memory-system/PHASE12_PLAN_REFRESH.md` (this Sprint 0 PR — patches PLAN/DESIGN for current-main reality)
+
+Team-lead authorization (jekudy@gmail.com) recorded in the Sprint 0 PR description.
+
+Authorized scope:
+- **5 tables (migrations 070–073):** `butler_actions`, `butler_tool_invocations`, `butler_action_confirmations`, `butler_rate_buckets`, `butler_card_suggestions`. All DDL includes CHECK constraints (status, tool_name, rollback_kind, risk_level, action_type, confirmation_role, bucket_kind) and `ON DELETE RESTRICT` FKs except `butler_card_suggestions.extraction_candidate_id` (nullable + SET NULL since candidate may be created later by Phase 6 admin review).
+- **Migration 071:** add CHECK constraint to `llm_usage_ledger.call_type` enumerating valid values: `'unknown'`, `'qa_synthesis'`, `'digest_daily'`, `'digest_weekly'`, `'graph_projection'`, `'extract_candidates'`, `'butler_decision'`, `'butler_summary'`.
+- **`bot/services/butler.py`** — ButlerService orchestrator with planning/validation/confirmation/execution state machine (11 statuses).
+- **`bot/services/butler_evidence.py`** — `build_butler_evidence(...)` producing sealed `ButlerEvidenceContext` wrapping `EvidenceBundle` (NOT `EvidenceContext` — that name does not exist in main code per `bot/services/evidence.py:122-160`).
+- **`bot/services/butler_tools/__init__.py`** — `ButlerTool` Protocol + `ButlerPlan` pydantic model + `ALLOWED_BUTLER_TOOLS = frozenset({"recall_evidence", "schedule_meeting", "send_intro", "update_intro", "suggest_card_creation"})`.
+- **`bot/services/butler_tools/recall_evidence.py`, `schedule_meeting.py`, `send_intro.py`, `update_intro.py`, `suggest_card_creation.py`** — exactly 5 tool implementations.
+- **`bot/handlers/butler.py`** — `/butler`, `/butler_status`, `/butler_cancel`, `/butler_undo` + inline keyboard callbacks. DMs only in baseline.
+- **`bot/services/butler_budget.py`** — Butler-specific cost guard + rate bucket increment via `INSERT ... ON CONFLICT (...) DO UPDATE SET count=count+1 WHERE count<ceiling RETURNING` atomic pattern.
+- **`bot/services/llm_gateway.py` extension** — new method `plan_butler_action(...)` using `provider.call(prompt=..., model=...)` (matches `bot/services/llm_providers/__init__.py:62`); new optional `summarize_butler_evidence(...)`. Both write ledger rows with `call_type IN ('butler_decision', 'butler_summary')`.
+- **`bot/db/repos/llm_usage_ledger.py` extensions** — `monthly_cost_usd(session, *, month: date | None = None, call_type: str | None = None) -> Decimal` parity with `daily_cost_usd`; `LedgerRepoProtocol.monthly_cost_usd` signature extended at `bot/services/llm_gateway.py:156-158`.
+- **`bot/services/forget_cascade.py` extension** — 3 new layers (`_cascade_butler_action_confirmations`, `_cascade_butler_tool_invocations`, `_cascade_butler_actions`) appended to `CASCADE_LAYER_ORDER` AFTER `graph_nodes` at the tail (graph_nodes is at index 14 of 15 layers in current main — see `bot/services/forget_cascade.py:133-179`). Redaction format `[CONTENT_REDACTED: forget_event_id={n}]`.
+- **5 feature flags, all default OFF:** `memory.butler.enabled` (master), `memory.butler.schedule_meeting.enabled`, `memory.butler.send_intro.enabled`, `memory.butler.update_intro.enabled`, `memory.butler.suggest_card.enabled`.
+- **Cost ceilings (global Butler-call-type scope, NOT per-chat):** `BUTLER_DAILY_USD_CEILING=Decimal("1.00")`, `BUTLER_PER_USER_DAILY_USD_CEILING=Decimal("0.20")`, `BUTLER_PER_ACTION_USD_CEILING=Decimal("0.10")`, `BUTLER_MONTHLY_USD_CEILING=Decimal("10.00")`.
+- **Rate buckets (per chat caps live HERE, not at cost-ceiling layer):** calendar-aligned MSK windows. Plans/user/day=10, executions/user/day=5, per-chat/day=50. Per-tool hour limits: send_intro=3, update_intro=5, schedule_meeting=5, suggest_card_creation=10, recall_evidence=30.
+- **TTLs:** plan=15min, confirmation token=5min, evidence snapshot=30min.
+- **Evidence freshness:** SNAPSHOT on plan + cascade-aware fail-closed revalidation pre-execute using the SQL predicate in `PHASE12_PLAN_REFRESH.md §3.6 step 3` (uses `fe.tombstone_key` 3-key prefix, NOT `target_id` — read-side convention per memory `feedback-tombstone-key-read-side-convention.md` 2026-05-12).
+- **Phase 11 binding expansion:** 25 new tests (L11.a-e + C10.a-c + I9.a-f + R8.a-g + G3.a-d). Suite: 77/77 → 102/102.
+- **11 sprints:** Sprint 0 (this PR) + T12-01..T12-10. Governance mode `critical`. Per-PR dual-model PAR (Claude product + Codex technical). FHR mandatory at T12-10.
+
+§10 design decisions (frozen team-lead 2026-05-25):
+1. Surface: DMs only baseline. Group surface deferred to Phase 12.5+.
+2. Triggers/cron: DEFER to 12.5+. No `butler_triggers` table.
+3. Per-user opt-in: NO. Authz = membership (Phase 0 `UserRepo.get(user_id)` + `user.is_member is True OR user.is_admin is True` pattern from `bot/handlers/qa.py:369`).
+4. Rate-limit storage: `butler_rate_buckets` Postgres table.
+5. Admin override of cross-user consent: NO override in baseline.
+6. Evidence freshness: snapshot + TTL ≤30min + cascade-aware fail-closed.
+
+NOT in Phase 12 baseline scope (deferred to Phase 12.5+):
+- Group-chat `/butler` invocation.
+- Cron/scheduler triggers, deferred reminders, `butler_triggers` table.
+- Per-user opt-in (`butler_consent` table).
+- Admin override of cross-user consent.
+- Public `/butler` surface of any kind (members only).
+- Calendar / email / browser / shell / arbitrary HTTP integrations — Butler stays Telegram-native.
+- Money / payment / CRM tools.
+- Multi-action transactional bundles (each action is independent).
+- Long-running background actions (any tool call > 30s timeout = fail-closed).
+
+Phase 11 binding family extension (T12-09): L11.a-e leakage, C10.a-c citations, I9.a-f forget cascade, R8.a-g refusal, G3.a-d drift / no-LLM-imports + no-graph_query imports per-path AST scan.
+
+---
+
 ## NOT authorized (future phases — gates not passed)
 
 Do not start, design, or write speculative code for:

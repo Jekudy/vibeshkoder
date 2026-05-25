@@ -11,7 +11,7 @@
 | ID | Phase chain | Branch namespace | Worktree | Owned alembic range | Started |
 |----|-------------|------------------|----------|----------------------|---------|
 | **A — Synthesis chain** | Phase 5 → 6 → 7 → 8 (sequential) | `feat/p5-*`, `feat/p6-*`, `feat/p7-*`, `feat/p8-*`, `fix/p{5,6,7,8}-*`, `hotfix/p{5,6,7,8}-*`, `plan/p{5,6,7,8}-*` | `.worktrees/orch-A` (create on first use) | 022–049 | TBD |
-| **B — Lateral expansion** | Phase 9 (wiki) + Phase 10 (graph) + Phase 12 (butler docs only) | `feat/p9-*`, `feat/p10-*`, `feat/p12-*`, `fix/p{9,10,12}-*`, `plan/p{9,10,12}-*` | `.worktrees/orch-B` | 050–069 (only if Phase 9/10 ratified by AUTHORIZED_SCOPE.md and after Orchestrator A unblocks dependency) | TBD |
+| **B — Lateral expansion** | Phase 9 (wiki) + Phase 10 (graph) + Phase 12 (butler) | `feat/p9-*`, `feat/p10-*`, `feat/p12-*`, `fix/p{9,10,12}-*`, `plan/p{9,10,12}-*` | `.worktrees/orch-B` | 050–099 (migration_window: 050-099; Phase 12 reserves 070-073 per PHASE12_PLAN_REFRESH §9; 074-079 buffer) | TBD |
 | **C — Evaluation harness** | Phase 11 (Shkoderbench / evals) | `feat/p11-*`, `fix/p11-*`, `plan/p11-*` | `.worktrees/orch-C` | none (no schema changes; read-only on DB) | 2026-05-02 |
 
 ---
@@ -29,7 +29,7 @@
 ### Orchestrator B — exclusive write
 - `bot/services/wiki*.py`, `bot/services/graph*.py`, `bot/web/wiki/*`, `web/templates/wiki/*`
 - `bot/db/repos/wiki*.py`, `bot/db/repos/graph*.py`
-- alembic versions `050_*.py` through `069_*.py` (only after Phase 9/10 authorization in AUTHORIZED_SCOPE.md AND after Orchestrator A confirms cards/relations stable)
+- alembic versions `050_*.py` through `099_*.py` (Phase 12 reserves 070-073: 070=audit triple, 071=call_type CHECK, 072=rate_buckets, 073=card_suggestions, 074-079 unreserved buffer; Phase 9/10 authorization required per AUTHORIZED_SCOPE.md; Phase 12 authorized 2026-05-25)
 - `tests/services/test_wiki*`, `tests/services/test_graph*`
 - `docs/memory-system/PHASE9_PLAN.md`, `PHASE10_PLAN.md`, `PHASE12_PLAN.md`
 
