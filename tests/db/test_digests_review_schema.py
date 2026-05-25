@@ -143,9 +143,11 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     shipped migration. Update the literal when new migrations land.
     Migration 067: tightened ck_graph_provenance_has_source OR → XOR (10.5-9).
     Migration 068: graph_provenance.triple_hash TEXT → BIGINT (10.5-S3).
+    Migrations 070-073: Phase 12 Butler schema foundation (T12-01) —
+    070 audit triple, 071 ledger call_type CHECK, 072 rate buckets, 073 card suggestions.
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "068"
+    assert current == "073"
 
 
 # ─── Test: upgrade adds 4 review columns with correct types/nullability ──────

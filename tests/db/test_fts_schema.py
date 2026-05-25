@@ -189,8 +189,10 @@ async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str
     # + T10-06 (063 graph_purge_pending) + T10-06 CRITICAL-1 fix (065) advanced the head past 025.
     # + 10.5-9 (067 XOR constraint on graph_provenance).
     # + 10.5-S3 (068 graph_provenance.triple_hash TEXT → BIGINT).
+    # + T12-01 (070-073 Phase 12 Butler schema foundation: audit triple,
+    #   ledger call_type CHECK, rate buckets, card suggestions).
     # Assert the current head explicitly; revisit when future migrations land.
-    assert current == "068"
+    assert current == "073"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(
