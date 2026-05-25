@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import itertools
 from datetime import datetime, timezone
-from typing import Any
 
 import pytest
 
@@ -176,7 +175,7 @@ async def _create_butler_action_with_evidence(
 
 async def test_cascade_butler_actions_terminal_row_redacted(db_session) -> None:
     """A terminal butler_action row gets evidence_ids redacted on forget."""
-    from bot.db.models import ChatMessage, MessageVersion, ButlerAction
+    from bot.db.models import ChatMessage, ButlerAction
     from sqlalchemy import select
 
     cm_id, mv_id = await _make_message_with_version(db_session)
@@ -213,7 +212,6 @@ async def test_cascade_butler_actions_user_target(db_session) -> None:
     """User-targeted forget expires all butler_actions for that requester_tg_id."""
     tg_id = _next_id()
     from bot.db.models import ButlerAction
-    from sqlalchemy import select
 
     # Create action for that user with status='rejected' (terminal).
     row = ButlerAction(
@@ -235,7 +233,6 @@ async def test_cascade_butler_actions_user_target(db_session) -> None:
     )
     db_session.add(row)
     await db_session.flush()
-    action_id = row.id
 
     ev = await _make_forget_event(
         db_session,

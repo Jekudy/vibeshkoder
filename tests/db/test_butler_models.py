@@ -13,7 +13,6 @@ Tests do NOT call session.commit().
 from __future__ import annotations
 
 import itertools
-import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
