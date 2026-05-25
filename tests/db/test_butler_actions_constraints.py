@@ -71,7 +71,6 @@ async def test_butler_action_status_exempt_from_ledger_valid(db_session, status:
 
 
 async def test_butler_action_status_invalid(db_session) -> None:
-    from bot.db.models import ButlerAction
     from sqlalchemy import text
 
     with pytest.raises(IntegrityError):

@@ -1526,7 +1526,6 @@ async def _cascade_butler_actions(session: AsyncSession, event) -> int:
     from sqlalchemy import bindparam
     from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
     from sqlalchemy.types import BigInteger
-    from datetime import timezone
 
     mvids = await _resolve_affected_mvids(session, event)
     action_ids: list[int] = []
@@ -1565,7 +1564,6 @@ async def _cascade_butler_actions(session: AsyncSession, event) -> int:
     count = 0
 
     # Expire non-terminal rows.
-    non_terminal = ("pending_confirmation", "confirmed", "executing")
     result = await session.execute(
         text(
             "UPDATE butler_actions "
