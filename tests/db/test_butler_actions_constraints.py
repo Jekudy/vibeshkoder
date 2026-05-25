@@ -295,6 +295,46 @@ async def test_butler_action_executed_has_inverse_edit_message_ok(db_session) ->
     )
 
 
+async def test_butler_action_executed_has_inverse_succeeded_with_payload_ok(db_session) -> None:
+    """POSITIVE: status='succeeded' + inverse_op_payload IS NOT NULL → row accepted (F3)."""
+    from sqlalchemy import text
+
+    ledger_id = await _make_ledger(db_session)
+    await db_session.execute(
+        text(
+            "INSERT INTO butler_actions "
+            "(requester_tg_id, chat_id, action_type, status, tool_name, "
+            " tool_manifest_version, governance_filter_version, "
+            " evidence_context_hash, plan_summary, action_args, action_args_hash, "
+            " rollback_kind, risk_level, llm_usage_ledger_id, inverse_op_payload) "
+            "VALUES (:tg, :chat, 'recall', 'succeeded', 'recall_evidence', "
+            " '1.0', 'v1', 'x', 'p', '{}', 'h', 'edit_message', 'low', :lid, "
+            " '{\"kind\": \"delete_message\"}'::jsonb)"
+        ),
+        {"tg": _next_id(), "chat": _next_id(), "lid": ledger_id},
+    )
+
+
+async def test_butler_action_executed_has_inverse_succeeded_no_payload_fails(db_session) -> None:
+    """NEGATIVE: status='succeeded' + rollback_kind != 'not_reversible' + inverse_op_payload=NULL → IntegrityError (F3)."""
+    from sqlalchemy import text
+
+    ledger_id = await _make_ledger(db_session)
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            text(
+                "INSERT INTO butler_actions "
+                "(requester_tg_id, chat_id, action_type, status, tool_name, "
+                " tool_manifest_version, governance_filter_version, "
+                " evidence_context_hash, plan_summary, action_args, action_args_hash, "
+                " rollback_kind, risk_level, llm_usage_ledger_id, inverse_op_payload) "
+                "VALUES (:tg, :chat, 'recall', 'succeeded', 'recall_evidence', "
+                " '1.0', 'v1', 'x', 'p', '{}', 'h', 'edit_message', 'low', :lid, NULL)"
+            ),
+            {"tg": _next_id(), "chat": _next_id(), "lid": ledger_id},
+        )
+
+
 # ── ck_butler_tool_invocations constraints ────────────────────────────────────
 
 
@@ -457,7 +497,127 @@ async def test_butler_rate_bucket_count_over_ceiling(db_session) -> None:
         )
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── ck_butler_tool_invocations_tool_name negative ────────────────────────────
+
+
+async def test_butler_tool_invocation_tool_name_invalid_negative(db_session) -> None:
+    """NEGATIVE: tool_name not in allow-list → IntegrityError (F4)."""
+    from sqlalchemy import text
+
+    action_id, _ = await _make_action_id(db_session)
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            text(
+                "INSERT INTO butler_tool_invocations "
+                "(action_id, tool_name, invocation_seq, idempotency_key, "
+                " request_payload, request_payload_hash, status) "
+                "VALUES (:aid, 'invalid_tool', 1, :ikey, '{}', 'h', 'pending')"
+            ),
+            {"aid": action_id, "ikey": f"ikey-{_next_id()}"},
+        )
+
+
+# ── ck_butler_action_confirmations_status negative ────────────────────────────
+
+
+async def test_butler_confirmation_status_invalid_negative(db_session) -> None:
+    """NEGATIVE: confirmation status not in allow-list → IntegrityError (F4)."""
+    from sqlalchemy import text
+
+    action_id, _ = await _make_action_id(db_session)
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            text(
+                "INSERT INTO butler_action_confirmations "
+                "(action_id, confirmer_tg_id, confirmation_role, status, "
+                " preview_payload_hash, expires_at) "
+                "VALUES (:aid, :tg, 'requester', 'INVALID_STATUS', 'h', NOW() + INTERVAL '1h')"
+            ),
+            {"aid": action_id, "tg": _next_id()},
+        )
+
+
+# ── ck_butler_rate_buckets window/count negatives ─────────────────────────────
+
+
+async def test_butler_rate_bucket_window_end_before_start_fails(db_session) -> None:
+    """NEGATIVE: window_end <= window_start → IntegrityError (F4)."""
+    from sqlalchemy import text
+
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            text(
+                "INSERT INTO butler_rate_buckets "
+                "(bucket_kind, scope_id, bucket_key, window_start, window_end, "
+                " count, ceiling) "
+                "VALUES ('user_plans_day', :sid, :key, NOW(), NOW() - INTERVAL '1s', 0, 10)"
+            ),
+            {"sid": _next_id(), "key": f"day:2026-05-25-{_next_id()}"},
+        )
+
+
+async def test_butler_rate_bucket_count_negative_fails(db_session) -> None:
+    """NEGATIVE: count < 0 → IntegrityError (F4)."""
+    from sqlalchemy import text
+
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            text(
+                "INSERT INTO butler_rate_buckets "
+                "(bucket_kind, scope_id, bucket_key, window_start, window_end, "
+                " count, ceiling) "
+                "VALUES ('user_plans_day', :sid, :key, NOW(), NOW() + INTERVAL '1h', -1, 10)"
+            ),
+            {"sid": _next_id(), "key": f"day:2026-05-25-{_next_id()}"},
+        )
+
+
+# ── butler_card_suggestions UNIQUE(butler_action_id) negative ─────────────────
+
+
+async def test_butler_card_suggestion_unique_action_id_fails(db_session) -> None:
+    """NEGATIVE: two butler_card_suggestions rows with same butler_action_id → IntegrityError (F4)."""
+    from bot.db.repos.butler_card_suggestion import ButlerCardSuggestionRepo
+
+    action_id, _ = await _make_action_id(db_session)
+    user_id = await _make_user_id(db_session)
+
+    # First insert succeeds.
+    await ButlerCardSuggestionRepo.create(
+        db_session,
+        butler_action_id=action_id,
+        suggested_card_payload={"title": "first"},
+        created_by_user_id=user_id,
+    )
+    # Second insert with same butler_action_id must fail UNIQUE constraint.
+    with pytest.raises(IntegrityError):
+        await ButlerCardSuggestionRepo.create(
+            db_session,
+            butler_action_id=action_id,
+            suggested_card_payload={"title": "second"},
+            created_by_user_id=user_id,
+        )
+
+
+# ── llm_usage_ledger.call_type CHECK negative ─────────────────────────────────
+
+
+async def test_llm_usage_ledger_call_type_invalid_negative(db_session) -> None:
+    """NEGATIVE: call_type not in allow-list → IntegrityError (F4)."""
+    from sqlalchemy import text
+
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            text(
+                "INSERT INTO llm_usage_ledger "
+                "(provider, model, tokens_in, tokens_out, cost_usd, latency_ms, "
+                " cache_hit, call_type) "
+                "VALUES ('openai', 'gpt-4o', 0, 0, 0, 0, false, 'invalid_call_type')"
+            ),
+        )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 async def _make_action_id(db_session) -> tuple[int, int]:
@@ -469,3 +629,42 @@ async def _make_action_id(db_session) -> tuple[int, int]:
     db_session.add(row)
     await db_session.flush()
     return row.id, tg_id
+
+
+async def _make_user_id(db_session) -> int:
+    """Insert a minimal users row and return its id (for FK columns that require users(id)).
+
+    users.id IS the Telegram user ID (not a separate auto-increment).
+    """
+    from bot.db.repos.user import UserRepo
+
+    uid = _next_id()
+    await UserRepo.upsert(
+        db_session,
+        telegram_id=uid,
+        username=f"ctest_{uid}",
+        first_name="CTest",
+        last_name=None,
+    )
+    return uid
+
+
+async def _make_ledger(db_session) -> int:
+    """Insert a minimal LlmUsageLedger row and return its id (used for succeeded-status tests)."""
+    from decimal import Decimal
+
+    from bot.db.models import LlmUsageLedger
+
+    ledger = LlmUsageLedger(
+        provider="openai",
+        model="gpt-4o",
+        tokens_in=0,
+        tokens_out=0,
+        cost_usd=Decimal("0"),
+        latency_ms=0,
+        cache_hit=False,
+        call_type="butler_decision",
+    )
+    db_session.add(ledger)
+    await db_session.flush()
+    return ledger.id

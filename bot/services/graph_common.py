@@ -10,9 +10,11 @@ Ownership model:
 References: PHASE10_PLAN.md §5.A (schema) and §5.B (extract_graph_triples contract).
 
 RESERVED_LEDGER_CALL_TYPES contract:
-  Reserved values for llm_usage_ledger.call_type: 'graph_projection' and
-  'extract_candidates'. Migration 064 (owned by W1-C) reserves 'graph_projection'.
-  'extract_candidates' was added in Task 10.5-6 (renamed from legacy 'unknown').
+  Canonical 8-value allow-list for llm_usage_ledger.call_type (enforced by migration 071 CHECK):
+    'unknown', 'qa_synthesis', 'digest_daily', 'digest_weekly',
+    'graph_projection', 'extract_candidates', 'butler_decision', 'butler_summary'.
+  Migration 064 (owned by W1-C) added call_type with 'graph_projection' reserved.
+  'extract_candidates' added in Task 10.5-6. 'butler_decision' + 'butler_summary' added T12-01.
   Discrimination between dry_run / incremental / full_rebuild / repair modes is
   done via the graph_projection_runs.mode column (CHECK-constrained), NOT via
   call_type subdivision.
@@ -78,10 +80,12 @@ ALLOWED_PREDICATES: tuple[str, ...] = (
     "SUPERSEDES",
 )
 
-# Reserved llm_usage_ledger.call_type values for Phase 10.
-# Migration 064 (owned by W1-C) added the call_type column and reserved
-# 'graph_projection' per PHASE10_PLAN.md §5.B step 4. 'extract_candidates'
-# was added in Task 10.5-6 (renamed from legacy 'unknown' default).
+# Reserved llm_usage_ledger.call_type values — canonical 8-value allow-list (migration 071 CHECK).
+# Full list: 'unknown', 'qa_synthesis', 'digest_daily', 'digest_weekly',
+#            'graph_projection', 'extract_candidates', 'butler_decision', 'butler_summary'.
+# Migration 064 (W1-C) added the call_type column and reserved 'graph_projection'.
+# 'extract_candidates' added Task 10.5-6 (renamed from legacy 'unknown').
+# 'butler_decision' + 'butler_summary' added T12-01.
 # Mode discrimination (dry_run vs incremental vs full_rebuild vs repair) is
 # handled via graph_projection_runs.mode column (CHECK-constrained), NOT via
 # call_type subdivision.

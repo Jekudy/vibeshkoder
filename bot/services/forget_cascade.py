@@ -1352,6 +1352,10 @@ async def _cascade_butler_action_confirmations(session: AsyncSession, event) -> 
     JSONB array contains any of the affected mvids, OR whose requester_tg_id
     matches a user-targeted forget event.
 
+    Convention note (write-side): affected rows resolved via event.target_id +
+        _resolve_affected_mvids — write-side cascade convention; read-side filters
+        use fe.tombstone_key prefix (see memory/feedback-tombstone-key-read-side-convention.md).
+
     Returns count of rows modified.
     """
     from sqlalchemy import bindparam
@@ -1438,6 +1442,10 @@ async def _cascade_butler_tool_invocations(session: AsyncSession, event) -> int:
             WHERE response_payload IS NOT NULL
             AND (response_payload->>'forget_event_id') IS NULL  -- idempotency guard.
 
+    Convention note (write-side): affected rows resolved via event.target_id +
+        _resolve_affected_mvids — this is the write-side cascade convention; read-side
+        filters use fe.tombstone_key prefix (see memory/feedback-tombstone-key-read-side-convention.md).
+
     Returns count of rows modified.
     """
     from sqlalchemy import bindparam
@@ -1496,15 +1504,22 @@ async def _cascade_butler_tool_invocations(session: AsyncSession, event) -> int:
 
 
 async def _cascade_butler_actions(session: AsyncSession, event) -> int:
-    """Expire non-terminal butler_actions and redact evidence_snapshot on terminal rows (T12-01).
+    """Expire non-terminal butler_actions and redact evidence_ids + result_payload on terminal rows (T12-01).
 
     For non-terminal status rows ('pending_confirmation', 'confirmed', 'executing'):
         UPDATE status='expired', rejection_reason='source_forgotten'.
 
     For terminal rows:
-        Redact evidence_ids with '[CONTENT_REDACTED: forget_event_id={n}]' convention
-        (stored as JSONB: {"redacted": true, "forget_event_id": <n>}) preserving
-        ids + structural metadata for audit replay.
+        Redact evidence_ids and result_payload with {"redacted": true, "forget_event_id": <n>}
+        (preserves structural metadata for audit replay; removes user-visible privacy surface).
+        result_payload carries rendered Telegram message text / proposed-meeting JSON / intro
+        text — must be masked alongside evidence_ids on terminal rows (F1, Codex CRITICAL #2).
+
+    Convention note (write-side vs read-side tombstone resolution):
+        This is a WRITE-SIDE cascade layer; affected rows are resolved via event.target_id +
+        _resolve_affected_mvids (matching all other write-side layers: digests, wiki_pages,
+        graph_nodes). Read-side filters (validators / search / extractor / gateway) MUST use
+        fe.tombstone_key prefix instead — see memory/feedback-tombstone-key-read-side-convention.md.
 
     Returns count of rows modified.
     """
@@ -1566,11 +1581,22 @@ async def _cascade_butler_actions(session: AsyncSession, event) -> int:
     )
     count += len(result.fetchall())
 
-    # Redact evidence_ids on terminal rows (preserve audit row but remove privacy surface).
+    # Redact evidence_ids + result_payload on terminal rows (preserve audit row but
+    # remove privacy surface).  result_payload carries rendered Telegram message text /
+    # proposed-meeting JSON / intro text — user-visible content that must be masked.
+    # Write-side cascade uses event.target_id (resolved via _resolve_affected_mvids) per
+    # the tombstone-key convention: only read-side filters use fe.tombstone_key prefix;
+    # see memory/feedback-tombstone-key-read-side-convention.md.
     result2 = await session.execute(
         text(
             "UPDATE butler_actions "
             "SET evidence_ids = CAST(:redact_json AS jsonb), "
+            "    result_payload = CASE "
+            "        WHEN result_payload IS NOT NULL "
+            "             AND (result_payload->>'forget_event_id') IS NULL "
+            "        THEN CAST(:redact_json AS jsonb) "
+            "        ELSE result_payload "
+            "    END, "
             "    updated_at = NOW() "
             "WHERE id = ANY(CAST(:action_ids AS bigint[])) "
             "  AND status NOT IN ('pending_confirmation','confirmed','executing') "
