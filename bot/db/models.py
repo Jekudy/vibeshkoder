@@ -1794,3 +1794,425 @@ class GraphPurgePending(Base):
     retry_count: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, server_default=text("0"), default=0
     )
+
+
+# ─── Phase 12: Butler / Action layer (T12-01 / alembic 070-073) ───────────────
+
+
+class ButlerAction(Base):
+    """Butler action audit row — one row per /butler request (T12-01 / alembic 070).
+
+    Captures the full lifecycle of a Butler action from initial request through
+    execution and optional undo. Status is CHECK-constrained to a fixed state
+    machine (see ck_butler_actions_status). The governance_filter_version column
+    is frozen at action creation time and NEVER recomputed — if the version
+    changes mid-flight the action must be expired (C5/I9.e contract).
+
+    Key constraints:
+    - ck_butler_actions_ledger_required_post_plan: once LLM budget is spent
+      (status NOT IN 'rejected'/'expired'/'cancelled'), llm_usage_ledger_id MUST
+      exist.
+    - ck_butler_actions_executed_has_inverse: executed/succeeded rows must have
+      inverse_op_payload OR rollback_kind='not_reversible'.
+    """
+
+    __tablename__ = "butler_actions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ("
+            "'requested','evidence_loaded','planned','pending_confirmation',"
+            "'confirmed','executing','succeeded',"
+            "'undo_pending','undo_succeeded','undo_failed',"
+            "'rejected','expired','execution_failed','cancelled'"
+            ")",
+            name="ck_butler_actions_status",
+        ),
+        CheckConstraint(
+            "tool_name IN ("
+            "'recall_evidence','schedule_meeting','send_intro',"
+            "'update_intro','suggest_card_creation'"
+            ")",
+            name="ck_butler_actions_tool_name",
+        ),
+        CheckConstraint(
+            "rollback_kind IN ("
+            "'delete_message','edit_message','followup_correction',"
+            "'cancel_pending','not_reversible'"
+            ")",
+            name="ck_butler_actions_rollback_kind",
+        ),
+        CheckConstraint(
+            "risk_level IN ('low','medium','high')",
+            name="ck_butler_actions_risk_level",
+        ),
+        CheckConstraint(
+            "confirmation_policy IN ('per_action','opt_in_by_button')",
+            name="ck_butler_actions_confirmation_policy",
+        ),
+        CheckConstraint(
+            "action_type IN ('meeting','intro','intro_update','card_suggestion','recall')",
+            name="ck_butler_actions_action_type",
+        ),
+        CheckConstraint(
+            "(status NOT IN ('succeeded','undo_pending','undo_succeeded')) "
+            "OR (inverse_op_payload IS NOT NULL OR rollback_kind = 'not_reversible')",
+            name="ck_butler_actions_executed_has_inverse",
+        ),
+        CheckConstraint(
+            "status IN ('rejected','expired','cancelled') "
+            "OR llm_usage_ledger_id IS NOT NULL",
+            name="ck_butler_actions_ledger_required_post_plan",
+        ),
+        Index(
+            "ix_butler_actions_requester_created",
+            "requester_tg_id",
+            "created_at",
+        ),
+        Index(
+            "ix_butler_actions_chat_created",
+            "chat_id",
+            "created_at",
+        ),
+        Index(
+            "ix_butler_actions_status_expires",
+            "status",
+            "expires_at",
+            postgresql_where=text("status IN ('pending_confirmation','planned')"),
+        ),
+        Index(
+            "ix_butler_actions_parent",
+            "parent_action_id",
+            postgresql_where=text("parent_action_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_butler_actions_llm_ledger",
+            "llm_usage_ledger_id",
+            postgresql_where=text("llm_usage_ledger_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    action_uuid: Mapped[_uuid_module.UUID] = mapped_column(
+        Uuid(),
+        nullable=False,
+        unique=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    parent_action_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "butler_actions.id",
+            name="fk_butler_actions_parent_action_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    requester_tg_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    action_type: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    tool_name: Mapped[str] = mapped_column(Text, nullable=False)
+    tool_manifest_version: Mapped[str] = mapped_column(Text, nullable=False)
+    governance_filter_version: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_context_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_ids: Mapped[list] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        server_default=text("'[]'"),
+    )
+    approved_card_source_ids: Mapped[list] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        server_default=text("'[]'"),
+    )
+    plan_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    action_args: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+    )
+    action_args_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    result_payload: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
+    result_payload_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    inverse_op_payload: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
+    rollback_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    risk_level: Mapped[str] = mapped_column(Text, nullable=False)
+    requires_confirmation: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    confirmation_policy: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'per_action'")
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_context: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
+    llm_usage_ledger_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "llm_usage_ledger.id",
+            name="fk_butler_actions_llm_usage_ledger_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ButlerToolInvocation(Base):
+    """One tool invocation within a Butler action (T12-01 / alembic 070).
+
+    A single ButlerAction may spawn multiple invocations (e.g. retries with
+    incremented invocation_seq). idempotency_key is globally UNIQUE to prevent
+    double-execution on process restart.
+
+    FK to butler_actions ON DELETE RESTRICT — invocations cannot outlive their
+    parent action.
+    """
+
+    __tablename__ = "butler_tool_invocations"
+    __table_args__ = (
+        CheckConstraint(
+            "tool_name IN ("
+            "'recall_evidence','schedule_meeting','send_intro',"
+            "'update_intro','suggest_card_creation'"
+            ")",
+            name="ck_butler_tool_invocations_tool_name",
+        ),
+        CheckConstraint(
+            "status IN ('pending','running','succeeded','failed','rolled_back')",
+            name="ck_butler_tool_invocations_status",
+        ),
+        CheckConstraint(
+            "invocation_seq >= 1",
+            name="ck_butler_tool_invocations_seq_positive",
+        ),
+        Index("ix_butler_tool_invocations_action", "action_id"),
+        Index("ix_butler_tool_invocations_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    action_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "butler_actions.id",
+            name="fk_butler_tool_invocations_action_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    tool_name: Mapped[str] = mapped_column(Text, nullable=False)
+    invocation_seq: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    request_payload: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+    )
+    request_payload_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    response_payload: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
+    response_payload_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_context: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
+
+
+class ButlerActionConfirmation(Base):
+    """Confirmation request sent to a user for a Butler action (T12-01 / alembic 070).
+
+    One confirmation row per (action, confirmer) pair. A single action may require
+    multiple confirmations (e.g. requester + affected_user + admin).
+
+    FK to butler_actions ON DELETE RESTRICT — confirmations cannot outlive their
+    parent action.
+    """
+
+    __tablename__ = "butler_action_confirmations"
+    __table_args__ = (
+        CheckConstraint(
+            "confirmation_role IN ('requester','affected_user','admin','rollback_requester')",
+            name="ck_butler_action_confirmations_role",
+        ),
+        CheckConstraint(
+            "status IN ('pending','confirmed','rejected','expired','cancelled')",
+            name="ck_butler_action_confirmations_status",
+        ),
+        Index("ix_butler_action_confirmations_action", "action_id"),
+        Index(
+            "ix_butler_action_confirmations_status_expires",
+            "status",
+            "expires_at",
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    action_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "butler_actions.id",
+            name="fk_butler_action_confirmations_action_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    confirmer_tg_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    confirmation_role: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    confirmation_message_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    confirmation_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    preview_payload_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ButlerRateBucket(Base):
+    """Calendar-window rate bucket for Butler per-user/per-chat limiting (T12-01 / alembic 072).
+
+    Rows are written via atomic ON CONFLICT upsert (see ButlerRateBucketRepo.try_increment).
+    The UNIQUE constraint on (bucket_kind, scope_id, bucket_key) makes the upsert race-free:
+    concurrent inserts for the same window always converge on the same row.
+
+    count is bounded by ceiling (ck_butler_rate_buckets_count_nonneg_under_ceiling).
+    The upsert WHERE clause (count < ceiling) ensures ceiling is never exceeded.
+    """
+
+    __tablename__ = "butler_rate_buckets"
+    __table_args__ = (
+        CheckConstraint(
+            "bucket_kind IN ("
+            "'user_plans_day','user_execs_day','chat_actions_day',"
+            "'tool_hour:recall_evidence','tool_hour:schedule_meeting',"
+            "'tool_hour:send_intro','tool_hour:update_intro','tool_hour:suggest_card_creation'"
+            ")",
+            name="ck_butler_rate_buckets_kind",
+        ),
+        CheckConstraint(
+            "window_end > window_start",
+            name="ck_butler_rate_buckets_window_positive",
+        ),
+        CheckConstraint(
+            "count >= 0 AND count <= ceiling",
+            name="ck_butler_rate_buckets_count_nonneg_under_ceiling",
+        ),
+        CheckConstraint(
+            "ceiling > 0",
+            name="ck_butler_rate_buckets_ceiling_positive",
+        ),
+        UniqueConstraint(
+            "bucket_kind",
+            "scope_id",
+            "bucket_key",
+            name="uq_butler_rate_buckets_kind_scope_key",
+        ),
+        Index("ix_butler_rate_buckets_window_end", "window_end"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    bucket_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    bucket_key: Mapped[str] = mapped_column(Text, nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), default=0)
+    ceiling: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ButlerCardSuggestion(Base):
+    """Mapping between a Butler suggest_card_creation action and the Phase 6 review queue
+    (T12-01 / alembic 073).
+
+    UNIQUE on butler_action_id: one /butler request → exactly one suggestion row.
+    extraction_candidate_id is NULLABLE (ON DELETE SET NULL) because the candidate
+    may be created asynchronously after the Butler suggestion is written.
+
+    The Phase 6 admin-review surface is unchanged — the admin sees a normal
+    extraction_candidates row; this mapping table provides Butler-side audit linkage.
+    """
+
+    __tablename__ = "butler_card_suggestions"
+    __table_args__ = (
+        UniqueConstraint(
+            "butler_action_id",
+            name="uq_butler_card_suggestions_action",
+        ),
+        Index(
+            "ix_butler_card_suggestions_candidate",
+            "extraction_candidate_id",
+            postgresql_where=text("extraction_candidate_id IS NOT NULL"),
+        ),
+        Index("ix_butler_card_suggestions_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    butler_action_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "butler_actions.id",
+            name="fk_butler_card_suggestions_butler_action_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    extraction_candidate_id: Mapped[_uuid_module.UUID | None] = mapped_column(
+        Uuid(),
+        ForeignKey(
+            "extraction_candidates.id",
+            name="fk_butler_card_suggestions_extraction_candidate_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    suggested_card_payload: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    created_by_user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "users.id",
+            name="fk_butler_card_suggestions_created_by_user_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )

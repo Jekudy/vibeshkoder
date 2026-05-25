@@ -176,6 +176,16 @@ CASCADE_LAYER_ORDER: tuple[str, ...] = (
     # Advisory-lock-guarded Postgres writes only in this layer;
     # actual Neo4j bolt DELETE is delegated to graph_purge_worker (async).
     "graph_nodes",
+    # Phase 12 / T12-01 layers — PHASE12_PLAN_REFRESH.md §4.4:
+    # Butler layers go AFTER graph_nodes at the very tail. Order:
+    # confirmations first (carry preview payload hashes — smallest privacy surface),
+    # invocations second (carry response payloads / Telegram message ids),
+    # actions last (parent audit row — status transitions reflect downstream state).
+    # FK dependency: confirmations and invocations reference butler_actions(id)
+    # with ON DELETE RESTRICT, so children MUST be processed before parent.
+    "butler_action_confirmations",
+    "butler_tool_invocations",
+    "butler_actions",
 )
 
 # Layers that apply only to specific target_types. Layers absent from this dict
@@ -208,6 +218,13 @@ _LAYER_APPLICABLE_TARGET_TYPES: dict[str, frozenset[str]] = {
     # Invariant #9: the layer MUST run even when memory.graph.projection.enabled
     # is OFF — the flag gates new projections, not purge of already-projected content.
     "graph_nodes": frozenset({"message", "message_hash", "user"}),
+    # Phase 12 / T12-01 (PHASE12_PLAN_REFRESH.md §4.4): butler layers apply to
+    # all target_types that touch message_versions (evidence_ids) or users
+    # (requester_tg_id). message_hash is included because evidence may be
+    # keyed by content_hash.
+    "butler_action_confirmations": frozenset({"message", "message_hash", "user"}),
+    "butler_tool_invocations": frozenset({"message", "message_hash", "user"}),
+    "butler_actions": frozenset({"message", "message_hash", "user"}),
 }
 
 
@@ -1317,6 +1334,258 @@ async def _cascade_graph_provenance(session: AsyncSession, event) -> int:
     return enqueued_count
 
 
+# ─── Phase 12 / T12-01 cascade layers ────────────────────────────────────────
+
+
+async def _cascade_butler_action_confirmations(session: AsyncSession, event) -> int:
+    """Expire or redact butler_action_confirmations rows tied to a forget event (T12-01).
+
+    For non-terminal confirmation rows (status='pending'):
+        UPDATE status='expired', rejection_reason='source_forgotten'.
+
+    For terminal rows (confirmed/rejected/expired/cancelled):
+        Redact preview_payload_hash with the standard Phase 9 format
+        '[CONTENT_REDACTED: forget_event_id={n}]' to preserve audit
+        continuity while removing the privacy-sensitive hash.
+
+    Affected rows are those belonging to butler_actions whose evidence_ids
+    JSONB array contains any of the affected mvids, OR whose requester_tg_id
+    matches a user-targeted forget event.
+
+    Returns count of rows modified.
+    """
+    from sqlalchemy import bindparam
+    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+    from sqlalchemy.types import BigInteger
+
+    mvids = await _resolve_affected_mvids(session, event)
+
+    # Build the set of butler_action_ids whose evidence overlaps.
+    action_ids: list[int] = []
+
+    if mvids:
+        # Find butler_actions where any mvid appears in evidence_ids JSONB array.
+        rows = await session.execute(
+            text(
+                "SELECT id FROM butler_actions "
+                "WHERE evidence_ids @> ANY("
+                "  SELECT jsonb_build_array(v::bigint) "
+                "  FROM unnest(CAST(:mvids AS bigint[])) AS v"
+                ")"
+            ).bindparams(bindparam("mvids", type_=PG_ARRAY(BigInteger))),
+            {"mvids": list(mvids)},
+        )
+        action_ids = [r[0] for r in rows]
+
+    if event.target_type == "user" and event.target_id is not None:
+        try:
+            tg_id = int(event.target_id)
+        except (TypeError, ValueError):
+            pass
+        else:
+            rows = await session.execute(
+                text("SELECT id FROM butler_actions WHERE requester_tg_id = :tg_id"),
+                {"tg_id": tg_id},
+            )
+            for r in rows:
+                if r[0] not in action_ids:
+                    action_ids.append(r[0])
+
+    if not action_ids:
+        return 0
+
+    redact_text = f"[CONTENT_REDACTED: forget_event_id={event.id}]"
+    count = 0
+
+    # Expire non-terminal pending rows.
+    result = await session.execute(
+        text(
+            "UPDATE butler_action_confirmations "
+            "SET status = 'expired', "
+            "    preview_payload_hash = :redact_text "
+            "WHERE action_id = ANY(CAST(:action_ids AS bigint[])) "
+            "  AND status = 'pending' "
+            "RETURNING id"
+        ).bindparams(bindparam("action_ids", type_=PG_ARRAY(BigInteger))),
+        {"action_ids": action_ids, "redact_text": redact_text},
+    )
+    count += len(result.fetchall())
+
+    # Redact preview_payload_hash on terminal rows (audit continuity).
+    result2 = await session.execute(
+        text(
+            "UPDATE butler_action_confirmations "
+            "SET preview_payload_hash = :redact_text "
+            "WHERE action_id = ANY(CAST(:action_ids AS bigint[])) "
+            "  AND status != 'pending' "
+            "  AND preview_payload_hash != :redact_text "
+            "RETURNING id"
+        ).bindparams(bindparam("action_ids", type_=PG_ARRAY(BigInteger))),
+        {"action_ids": action_ids, "redact_text": redact_text},
+    )
+    count += len(result2.fetchall())
+
+    if count:
+        await session.flush()
+    return count
+
+
+async def _cascade_butler_tool_invocations(session: AsyncSession, event) -> int:
+    """Redact response_payload on butler_tool_invocations rows tied to a forget event (T12-01).
+
+    For all invocations belonging to affected butler_actions:
+        SET response_payload = '{"redacted": true, "forget_event_id": <n>}'
+            WHERE response_payload IS NOT NULL
+            AND (response_payload->>'forget_event_id') IS NULL  -- idempotency guard.
+
+    Returns count of rows modified.
+    """
+    from sqlalchemy import bindparam
+    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+    from sqlalchemy.types import BigInteger
+
+    mvids = await _resolve_affected_mvids(session, event)
+    action_ids: list[int] = []
+
+    if mvids:
+        rows = await session.execute(
+            text(
+                "SELECT id FROM butler_actions "
+                "WHERE evidence_ids @> ANY("
+                "  SELECT jsonb_build_array(v::bigint) "
+                "  FROM unnest(CAST(:mvids AS bigint[])) AS v"
+                ")"
+            ).bindparams(bindparam("mvids", type_=PG_ARRAY(BigInteger))),
+            {"mvids": list(mvids)},
+        )
+        action_ids = [r[0] for r in rows]
+
+    if event.target_type == "user" and event.target_id is not None:
+        try:
+            tg_id = int(event.target_id)
+        except (TypeError, ValueError):
+            pass
+        else:
+            rows = await session.execute(
+                text("SELECT id FROM butler_actions WHERE requester_tg_id = :tg_id"),
+                {"tg_id": tg_id},
+            )
+            for r in rows:
+                if r[0] not in action_ids:
+                    action_ids.append(r[0])
+
+    if not action_ids:
+        return 0
+
+    redact_payload = f'{{"redacted": true, "forget_event_id": {event.id}}}'
+    result = await session.execute(
+        text(
+            "UPDATE butler_tool_invocations "
+            "SET response_payload = CAST(:redact_payload AS jsonb) "
+            "WHERE action_id = ANY(CAST(:action_ids AS bigint[])) "
+            "  AND response_payload IS NOT NULL "
+            "  AND (response_payload->>'forget_event_id') IS NULL "
+            "RETURNING id"
+        ).bindparams(bindparam("action_ids", type_=PG_ARRAY(BigInteger))),
+        {"action_ids": action_ids, "redact_payload": redact_payload},
+    )
+    count = len(result.fetchall())
+    if count:
+        await session.flush()
+    return count
+
+
+async def _cascade_butler_actions(session: AsyncSession, event) -> int:
+    """Expire non-terminal butler_actions and redact evidence_snapshot on terminal rows (T12-01).
+
+    For non-terminal status rows ('pending_confirmation', 'confirmed', 'executing'):
+        UPDATE status='expired', rejection_reason='source_forgotten'.
+
+    For terminal rows:
+        Redact evidence_ids with '[CONTENT_REDACTED: forget_event_id={n}]' convention
+        (stored as JSONB: {"redacted": true, "forget_event_id": <n>}) preserving
+        ids + structural metadata for audit replay.
+
+    Returns count of rows modified.
+    """
+    from sqlalchemy import bindparam
+    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+    from sqlalchemy.types import BigInteger
+    from datetime import timezone
+
+    mvids = await _resolve_affected_mvids(session, event)
+    action_ids: list[int] = []
+
+    if mvids:
+        rows = await session.execute(
+            text(
+                "SELECT id FROM butler_actions "
+                "WHERE evidence_ids @> ANY("
+                "  SELECT jsonb_build_array(v::bigint) "
+                "  FROM unnest(CAST(:mvids AS bigint[])) AS v"
+                ")"
+            ).bindparams(bindparam("mvids", type_=PG_ARRAY(BigInteger))),
+            {"mvids": list(mvids)},
+        )
+        action_ids = [r[0] for r in rows]
+
+    if event.target_type == "user" and event.target_id is not None:
+        try:
+            tg_id = int(event.target_id)
+        except (TypeError, ValueError):
+            pass
+        else:
+            rows = await session.execute(
+                text("SELECT id FROM butler_actions WHERE requester_tg_id = :tg_id"),
+                {"tg_id": tg_id},
+            )
+            for r in rows:
+                if r[0] not in action_ids:
+                    action_ids.append(r[0])
+
+    if not action_ids:
+        return 0
+
+    redact_json = f'{{"redacted": true, "forget_event_id": {event.id}}}'
+    count = 0
+
+    # Expire non-terminal rows.
+    non_terminal = ("pending_confirmation", "confirmed", "executing")
+    result = await session.execute(
+        text(
+            "UPDATE butler_actions "
+            "SET status = 'expired', "
+            "    rejection_reason = 'source_forgotten', "
+            "    evidence_ids = CAST(:redact_json AS jsonb), "
+            "    updated_at = NOW() "
+            "WHERE id = ANY(CAST(:action_ids AS bigint[])) "
+            "  AND status = ANY(ARRAY['pending_confirmation','confirmed','executing']) "
+            "RETURNING id"
+        ).bindparams(bindparam("action_ids", type_=PG_ARRAY(BigInteger))),
+        {"action_ids": action_ids, "redact_json": redact_json},
+    )
+    count += len(result.fetchall())
+
+    # Redact evidence_ids on terminal rows (preserve audit row but remove privacy surface).
+    result2 = await session.execute(
+        text(
+            "UPDATE butler_actions "
+            "SET evidence_ids = CAST(:redact_json AS jsonb), "
+            "    updated_at = NOW() "
+            "WHERE id = ANY(CAST(:action_ids AS bigint[])) "
+            "  AND status NOT IN ('pending_confirmation','confirmed','executing') "
+            "  AND (evidence_ids->>'forget_event_id') IS NULL "
+            "RETURNING id"
+        ).bindparams(bindparam("action_ids", type_=PG_ARRAY(BigInteger))),
+        {"action_ids": action_ids, "redact_json": redact_json},
+    )
+    count += len(result2.fetchall())
+
+    if count:
+        await session.flush()
+    return count
+
+
 # Map layer name → cascade function. Layers absent from this map are recorded as
 # skipped. When a future phase adds a layer's table, add its function here.
 _LAYER_FUNCS: dict[str, Any] = {
@@ -1336,6 +1605,10 @@ _LAYER_FUNCS: dict[str, Any] = {
     "card_sources": _cascade_card_sources_on_forget,
     # T10-06 Phase 10 layer — PHASE10_PLAN.md §5.F. Runs AFTER card_sources.
     "graph_nodes": _cascade_graph_provenance,
+    # T12-01 Phase 12 layers — PHASE12_PLAN_REFRESH.md §4.4. Runs AFTER graph_nodes.
+    "butler_action_confirmations": _cascade_butler_action_confirmations,
+    "butler_tool_invocations": _cascade_butler_tool_invocations,
+    "butler_actions": _cascade_butler_actions,
 }
 
 
