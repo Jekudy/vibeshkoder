@@ -541,16 +541,19 @@ CREATE INDEX ix_butler_card_suggestions_created
 
 **Current reality** (`ORCHESTRATOR_REGISTRY.md §2`): Orchestrator B owns "alembic versions `050_*.py` through `069_*.py`". Phase 9 consumed 050-055; Phase 10 consumed 060-068. Only `069` is free.
 
-**Decision:** Reserve **070-079** for Phase 12. Update `ORCHESTRATOR_REGISTRY.md §2 Orchestrator B exclusive write` row to read:
+**Decision:** Extend Orchestrator B's owned range to **050-099** (was `050-069`). Phase 12 explicitly reserves **070-073** (audit triple + call_type CHECK + rate_buckets + card_suggestions). **074-079** is Phase 12 hotfix/follow-up buffer. **080-099** is Phase 12.5+ runway under Orchestrator B without another registry edit. Update `ORCHESTRATOR_REGISTRY.md §2 Orchestrator B exclusive write` row to read:
 
 ```
-alembic versions `050_*.py` through `079_*.py`
+alembic versions `050_*.py` through `099_*.py`
   (Phase 9: 050-055 — CLOSED 2026-05-19;
    Phase 10: 060-068 — CLOSED 2026-05-21;
-   Phase 12: 070-079 — Sprint 0 ratification 2026-05-25, execution starts T12-01)
+   Phase 12: 070-073 reserved — Sprint 0 ratification 2026-05-25, execution starts T12-01
+     (070 audit triple, 071 call_type CHECK, 072 rate_buckets, 073 card_suggestions);
+   074-079 = Phase 12 hotfix/follow-up buffer;
+   080-099 = Phase 12.5+ runway, no further registry edit required)
 ```
 
-Phase 12 starts at **070**. Migrations 069 (single slot between Phase 10 closure and Phase 12 reservation) is left unclaimed and may be consumed by a Phase 10.5 carryover if needed.
+Phase 12 starts at **070**. Migration 069 (single slot between Phase 10 closure and Phase 12 reservation) is left unclaimed and may be consumed by a Phase 10.5 carryover if needed.
 
 **Fixup location:** `ORCHESTRATOR_REGISTRY.md §2` edit, committed as part of this Sprint 0 PR.
 
@@ -760,7 +763,7 @@ Sprint 0 PR `feat/p12-s0-ratification` delivers exactly these artefacts:
 |---|----------|------|--------|
 | 1 | Sprint 0 refresh spec (this file) | `docs/memory-system/PHASE12_PLAN_REFRESH.md` | NEW |
 | 2 | AUTHORIZED_SCOPE amendment | `docs/memory-system/AUTHORIZED_SCOPE.md` | EDIT — insert new "## Authorized: Phase 12 …" block before "## NOT authorized" (line 471). Verbatim block in §8. |
-| 3 | ORCHESTRATOR_REGISTRY migration window | `docs/memory-system/ORCHESTRATOR_REGISTRY.md` §2 Orchestrator B row | EDIT — extend owned range to 050-079 with phase-by-phase annotation (§9 verbatim). |
+| 3 | ORCHESTRATOR_REGISTRY migration window | `docs/memory-system/ORCHESTRATOR_REGISTRY.md` §2 Orchestrator B row | EDIT — extend owned range to **050-099** (Phase 12 reserves 070-073, 074-079 hotfix buffer, 080-099 Phase 12.5+ runway) with phase-by-phase annotation per §9 below. |
 | 4 | PHASE12_PLAN errata addendum | `docs/memory-system/PHASE12_PLAN.md` | APPEND a new "## §12. Errata (added 2026-05-25, Sprint 0 refresh)" section after current §11 with the four errata items below; PLUS a single errata-note line at §0 referencing this refresh for the `EvidenceContext` rename audit (§7.2 below). |
 | 5 | PHASE12_DESIGN errata addendum | `docs/memory-system/PHASE12_DESIGN.md` | APPEND a new "## §14. Errata (added 2026-05-25, Sprint 0 refresh)" section after §13 with the two errata items below; PLUS a single errata-note line at §0 referencing this refresh for the `EvidenceContext` rename audit (§7.2 below). |
 | 6 | lint-privacy allowlist extension | `scripts/lint_privacy_check.sh` | EDIT — extend the existing path-allowlist with a new branch `[[ "$path" =~ ^docs/memory-system/PHASE[0-9]+_PLAN(_REFRESH)?\.md$ ]] && return 0`, replacing the current `PHASE[0-9]+_PLAN\.md` branch. Required because this refresh doc legitimately names `#nomem`, `#offrecord`, `forgotten`, `forget` and would otherwise fail the CI gate on its own merge. See §11 DoD note 10 for the "single authorized script edit" carve-out. |
@@ -847,7 +850,7 @@ Authorized scope (per `PHASE12_PLAN_REFRESH.md`):
 - Per-PR PAR (Claude product + Codex technical) on each of 10 execution sprints.
   FHR mandatory after T12-10 (governance_mode=critical + 10 sprints + privacy
   invariants binding triggers superflow Rule 9).
-- 4 feature flags all default OFF, layered per substep §10 of refresh:
+- 5 feature flags all default OFF (1 master + 4 per-tool), layered per substep §10 of refresh:
   `memory.butler.enabled` (parent), `memory.butler.schedule_meeting.enabled`,
   `memory.butler.send_intro.enabled` + `memory.butler.update_intro.enabled`,
   `memory.butler.suggest_card.enabled`.
@@ -892,10 +895,12 @@ NOT in Phase 12 baseline (deferred to Phase 12.5+ per §3 of refresh):
 The Orchestrator B row in `ORCHESTRATOR_REGISTRY.md §2 Orchestrator B exclusive write` is updated. Replace the existing migration-range line with:
 
 ```
-- alembic versions `050_*.py` through `079_*.py` (extended range reserves Phase 12).
+- alembic versions `050_*.py` through `099_*.py` (extended range reserves Phase 12 + 12.5+ runway).
   Phase 9 consumed 050-055 — CLOSED 2026-05-19.
   Phase 10 consumed 060-068 — CLOSED 2026-05-21.
-  Phase 12 reserves 070-079 — Sprint 0 ratification 2026-05-25 (`PHASE12_PLAN_REFRESH.md`).
+  Phase 12 reserves 070-073 — Sprint 0 ratification 2026-05-25 (`PHASE12_PLAN_REFRESH.md`).
+  074-079 = Phase 12 hotfix/follow-up buffer.
+  080-099 = Phase 12.5+ runway (no further registry edit required).
   069 unclaimed; available for Phase 10.5 carryovers if any.
 ```
 
@@ -980,8 +985,8 @@ Wave 4:        T12-09             (sequential)
 Sprint 0 is DONE when ALL of the following hold:
 
 1. `docs/memory-system/PHASE12_PLAN_REFRESH.md` (this file) merged to `main`.
-2. `docs/memory-system/AUTHORIZED_SCOPE.md` contains the new "## Authorized: Phase 12 — Future Butler / Action Layer (2026-05-25)" block (verbatim §8 above), inserted before the "## NOT authorized" section.
-3. `docs/memory-system/ORCHESTRATOR_REGISTRY.md` §1 and §2 reflect the 050-079 migration window for Orchestrator B (§9 above).
+2. `docs/memory-system/AUTHORIZED_SCOPE.md` contains the new "## Authorized: Phase 12 — Future Butler / Action Layer (2026-05-25)" block — **substantially equivalent to §8 above** (the landed block MAY re-structure §8 bullets for clarity, including an explicit `§10 design decisions` enumeration, provided NO scope item is dropped/added/substantively changed; small editorial fixes such as correcting an in-source typo are allowed). Inserted before the "## NOT authorized" section.
+3. `docs/memory-system/ORCHESTRATOR_REGISTRY.md` §1 and §2 reflect the **050-099** migration window for Orchestrator B (§9 above) — Phase 12 reserves 070-073; 074-079 hotfix buffer; 080-099 Phase 12.5+ runway.
 4. `docs/memory-system/PHASE12_PLAN.md` has a new §12 errata addendum (4 items per §7) PLUS a single errata-note line at §0 per §7.2.
 5. `docs/memory-system/PHASE12_DESIGN.md` has a new §14 errata addendum (2 items per §7) PLUS a single errata-note line at §0 per §7.2.
 6. Dual-model spec review verdicts: Claude `deep-spec-reviewer` ACCEPTED + Codex `deep audit` APPROVE. Both verdicts recorded in `.par-evidence.json` at branch root with the schema from `superflow-enforcement.md` Hard Rule 3.
@@ -1118,7 +1123,7 @@ H2 reconciliation — **calendar buckets** (MSK timezone, consistent with Phase 
 4. Rate-limit storage — `butler_rate_buckets` table, migration 072. (§3.4, §5.2)
 5. Admin override of cross-user consent — none in baseline. (§3.5)
 6. Evidence freshness — snapshot + TTL ≤ 30 min + cascade-aware revalidation pre-execute. (§3.6)
-7. Migration window — 070-079 reserved for Phase 12. (§5.1, §9)
+7. Migration window — Orchestrator B owns **050-099**; Phase 12 reserves 070-073 (074-079 hotfix buffer; 080-099 Phase 12.5+ runway). (§5.1, §9)
 8. Ledger call_type allow-list — extended via migration 071 CHECK + repo/model docstring + `RESERVED_LEDGER_CALL_TYPES`. (§5.3)
 9. CASCADE_LAYER_ORDER position — Butler layers AFTER `graph_nodes` at tail. (§4.4)
 10. `EvidenceContext` rename — `ButlerEvidenceContext` sealed wrapper around `EvidenceBundle`. (§4.2)
