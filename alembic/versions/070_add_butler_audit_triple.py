@@ -29,7 +29,12 @@ def upgrade() -> None:
 CREATE TABLE butler_actions (
   id BIGSERIAL PRIMARY KEY,
   action_uuid UUID NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+  -- ON DELETE RESTRICT preserves immutable audit chain: undo writes a NEW row, never
+  -- mutates the parent. RESTRICT blocks parent deletion, protecting audit history.
   parent_action_id BIGINT REFERENCES butler_actions(id) ON DELETE RESTRICT,
+  -- Scalar tg_id without FK to users(id): affected_user may not have a registered
+  -- users row at action-plan time (cross-user intro to non-registered target).
+  -- FK enforcement deferred to runtime check in butler service layer.
   requester_tg_id BIGINT NOT NULL,
   chat_id BIGINT NOT NULL,
   action_type TEXT NOT NULL,

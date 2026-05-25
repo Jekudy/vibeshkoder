@@ -93,6 +93,12 @@ is_allowed_path() {
   # file's job is to ENFORCE the privacy cascade contract.
   [[ "$path" == "tests/services/test_wiki_cascade.py" ]] && return 0
 
+  # T12-01 Butler cascade layer tests — test the forget cascade behavior for
+  # butler_actions, butler_tool_invocations, butler_action_confirmations.
+  # Docstrings name the canonical privacy literals because the tests ENFORCE
+  # the cascade policy by name. Same rationale as test_wiki_cascade.py above.
+  [[ "$path" == "tests/services/test_forget_cascade_butler.py" ]] && return 0
+
   # T9-08 Phase 11 binding tests for wiki — name the canonical privacy
   # literals in docstrings, assertion messages, and seed-data SQL because
   # they ENFORCE the policy by name. Same rationale as test_digest_leakage.py

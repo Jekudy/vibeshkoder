@@ -164,17 +164,90 @@ async def test_butler_action_repo_list_pending_for_chat(db_session) -> None:
 
 
 async def test_butler_action_repo_mark_expired_past_ttl(db_session) -> None:
+    """mark_expired_past_ttl returns an int (may be 0 in test isolation)."""
     from bot.db.repos.butler_action import ButlerActionRepo
-    from sqlalchemy import text
 
-    # Insert a 'pending_confirmation' row with expires_at in the past,
-    # but that requires llm_usage_ledger_id. Use direct SQL with a fake ledger_id
-    # that references a non-existent row... actually ON DELETE RESTRICT prevents
-    # this. Instead test with a 'rejected' row to verify the method runs without error.
     rowcount = await ButlerActionRepo.mark_expired_past_ttl(db_session)
-    # Just verify the method runs and returns an integer.
     assert isinstance(rowcount, int)
     assert rowcount >= 0
+
+
+async def test_mark_expired_past_ttl_transitions_real_pending_rows(db_session) -> None:
+    """mark_expired_past_ttl transitions pending_confirmation rows with past expires_at to expired,
+    and leaves future-expiry rows untouched (F2, Codex HIGH #3)."""
+    from decimal import Decimal
+
+    from bot.db.models import ButlerAction, LlmUsageLedger
+    from bot.db.repos.butler_action import ButlerActionRepo
+
+    # Create a real LlmUsageLedger row (required by ck_butler_actions_ledger_required_post_plan).
+    ledger = LlmUsageLedger(
+        provider="openai",
+        model="gpt-4o",
+        prompt_hash=None,
+        response_hash=None,
+        tokens_in=10,
+        tokens_out=10,
+        cost_usd=Decimal("0.001"),
+        latency_ms=100,
+        request_id=None,
+        cache_hit=False,
+        error=None,
+        call_type="butler_decision",
+    )
+    db_session.add(ledger)
+    await db_session.flush()
+
+    tg_id = _next_id()
+    chat_id = _next_id()
+
+    # pending_confirmation with expires_at in the PAST — should be expired.
+    action_past = ButlerAction(
+        requester_tg_id=tg_id,
+        chat_id=chat_id,
+        action_type="recall",
+        status="pending_confirmation",
+        tool_name="recall_evidence",
+        tool_manifest_version="1.0",
+        governance_filter_version="v1",
+        evidence_context_hash="hash_past",
+        plan_summary="past plan",
+        action_args={},
+        action_args_hash="hpast",
+        rollback_kind="not_reversible",
+        risk_level="low",
+        llm_usage_ledger_id=ledger.id,
+        expires_at=_now() - timedelta(minutes=10),
+    )
+    # pending_confirmation with expires_at in the FUTURE — should NOT be expired.
+    action_future = ButlerAction(
+        requester_tg_id=tg_id,
+        chat_id=chat_id,
+        action_type="recall",
+        status="pending_confirmation",
+        tool_name="recall_evidence",
+        tool_manifest_version="1.0",
+        governance_filter_version="v1",
+        evidence_context_hash="hash_future",
+        plan_summary="future plan",
+        action_args={},
+        action_args_hash="hfuture",
+        rollback_kind="not_reversible",
+        risk_level="low",
+        llm_usage_ledger_id=ledger.id,
+        expires_at=_future(seconds=600),
+    )
+    db_session.add_all([action_past, action_future])
+    await db_session.flush()
+
+    repo = ButlerActionRepo
+    expired_count = await repo.mark_expired_past_ttl(db_session)
+
+    assert expired_count >= 1  # at least our past row
+    await db_session.refresh(action_past)
+    await db_session.refresh(action_future)
+    assert action_past.status == "expired"
+    assert action_future.status == "pending_confirmation"
 
 
 # ── ButlerToolInvocationRepo ──────────────────────────────────────────────────

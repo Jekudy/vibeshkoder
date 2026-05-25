@@ -864,9 +864,10 @@ class LlmUsageLedger(Base):
     request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # call_type added in migration 064 (T10-03). Allowed values per spec:
-    # 'unknown' (legacy / default), 'qa_synthesis', 'digest_daily',
-    # 'digest_weekly', 'graph_projection'.
+    # call_type added in migration 064 (T10-03). Canonical 8-value allow-list (migration 071 CHECK):
+    # 'unknown' (legacy / default), 'qa_synthesis', 'digest_daily', 'digest_weekly',
+    # 'graph_projection', 'extract_candidates', 'butler_decision', 'butler_summary'.
+    # Caller SHOULD always pass explicitly; 'unknown' is the fallback only for legacy rows.
     call_type: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default=text("'unknown'")
     )
@@ -1898,6 +1899,10 @@ class ButlerAction(Base):
         unique=True,
         server_default=text("gen_random_uuid()"),
     )
+    # ON DELETE RESTRICT (not SET NULL) preserves immutable audit chain: undo operations
+    # write a NEW row pointing back to the original; the parent row is never mutated or
+    # deleted. RESTRICT ensures the audit history cannot be silently destroyed via parent
+    # deletion. Design choice rationale: Codex HIGH #1 accepted as-is.
     parent_action_id: Mapped[int | None] = mapped_column(
         BigInteger,
         ForeignKey(
@@ -1907,6 +1912,11 @@ class ButlerAction(Base):
         ),
         nullable=True,
     )
+    # Scalar tg_id (not FK to users.id) matches the chat_messages.from_user_id pattern.
+    # affected_user (affected_tg_id) may not yet have a registered users row at
+    # action-plan time — e.g. cross-user intro from a member to a non-registered target.
+    # FK enforcement is deferred to runtime checks in the butler service layer.
+    # Design choice rationale: Codex HIGH #2 accepted as-is.
     requester_tg_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     action_type: Mapped[str] = mapped_column(Text, nullable=False)

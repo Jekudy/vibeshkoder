@@ -49,9 +49,10 @@ class LedgerRepo:
 
         Used by the cache-hit path where all fields are known up-front.
 
-        ``call_type`` added in migration 064 (T10-03). Allowed values:
-        'unknown' (legacy default), 'qa_synthesis', 'digest_daily',
-        'digest_weekly', 'graph_projection'. Caller SHOULD pass explicitly.
+        ``call_type`` added in migration 064 (T10-03). Canonical 8-value allow-list
+        (migration 071 CHECK): 'unknown', 'qa_synthesis', 'digest_daily', 'digest_weekly',
+        'graph_projection', 'extract_candidates', 'butler_decision', 'butler_summary'.
+        Caller SHOULD pass explicitly; 'unknown' is the fallback only for legacy rows.
         """
         row = LlmUsageLedger(
             qa_trace_id=qa_trace_id,
