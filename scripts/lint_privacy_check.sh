@@ -114,6 +114,14 @@ is_allowed_path() {
   # Same rationale as forget_cascade.py / digest_redactor.py above.
   [[ "$path" == "bot/services/butler_evidence.py" ]] && return 0
 
+  # T12-02 rollout fragment — operator-facing rollout doc that documents the
+  # privacy constraints honored by butler_evidence.py (Charter Hard
+  # Constraint #3 references canonical forget-cascade policy literals by
+  # name as part of explaining what the sprint protects against). Same
+  # rationale as the butler_evidence.py allowlist above — the doc
+  # describes the policy by name, so it must mention the canonical terms.
+  [[ "$path" == "docs/rollout-fragments/phase12/t12-02.md" ]] && return 0
+
   # T9-08 Phase 11 binding tests for wiki — name the canonical privacy
   # literals in docstrings, assertion messages, and seed-data SQL because
   # they ENFORCE the policy by name. Same rationale as test_digest_leakage.py
