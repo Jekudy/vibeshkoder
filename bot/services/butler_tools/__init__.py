@@ -196,14 +196,6 @@ assert set(TOOL_ARGS_SCHEMA.keys()) == set(ALLOWED_BUTLER_TOOLS), (
 # ButlerActionStep — a single action inside a ButlerPlan
 # ---------------------------------------------------------------------------
 
-_ToolNameLiteral = Literal[
-    "recall_evidence",
-    "schedule_meeting",
-    "send_intro",
-    "update_intro",
-    "suggest_card_creation",
-]
-
 _RiskLevel = Literal["low", "medium", "high"]
 
 _RollbackKind = Literal[
@@ -219,7 +211,10 @@ class ButlerActionStep(BaseModel):
     """A single action step inside a ``ButlerPlan``.
 
     Spec §10 T12-03 authoritative field list:
-    - tool_name: Literal[...5 names...]
+    - tool_name: str — plain str so pydantic accepts any string from LLM output.
+      Allowlist enforcement is done exclusively by ``validate_butler_plan``
+      (single source of truth for tool name validation per Option A of the
+      Codex HIGH fix). Unknown tool_name → ToolNotAllowedError(error_kind='tool_not_allowed').
     - args: dict — raw args from LLM (validated per-tool by validate_butler_plan)
     - requires_confirmation: bool
     - affected_user_ids: list[int]
@@ -230,7 +225,11 @@ class ButlerActionStep(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    tool_name: _ToolNameLiteral
+    # Plain str — NOT Literal[...]. Allowlist check lives entirely in
+    # validate_butler_plan so unknown tool names raise ToolNotAllowedError
+    # (error_kind='tool_not_allowed') rather than a pydantic ValidationError
+    # that would be caught as error_kind='invalid_plan_schema'.
+    tool_name: str
     args: dict[str, Any]
     requires_confirmation: bool = True
     # tuple not list: immutable inside frozen model (M-3)
@@ -420,12 +419,12 @@ def validate_butler_plan(
     validated_actions: list[ButlerActionStep] = []
 
     for step in plan.actions:
-        # Step 1 — tool whitelist check (this should already be enforced by
-        # ButlerActionStep's Literal annotation, but validate_butler_plan is
-        # the external-input guard that catches dict-constructed plans).
+        # Step 1 — tool whitelist check (Option A: ButlerActionStep.tool_name is
+        # plain str, so this is the SINGLE source of truth for allowlist enforcement).
         if step.tool_name not in _allowed:
             raise ToolNotAllowedError(
-                f"tool_name {step.tool_name!r} is not in allowed_tools"
+                f"tool_name={step.tool_name!r} not in ALLOWED_BUTLER_TOOLS",
+                error_kind="tool_not_allowed",
             )
 
         # Step 2 — per-tool args schema validation.
@@ -434,7 +433,8 @@ def validate_butler_plan(
             validated_args = args_model_cls.model_validate(step.args)
         except ValidationError as exc:
             raise InvalidToolArgsError(
-                f"args for tool {step.tool_name!r} failed schema validation: {exc}"
+                f"args validation failed for tool={step.tool_name}: {exc}",
+                error_kind="invalid_args",
             ) from exc
 
         # Step 3 — args canonicalisation (H-4): replace raw args with the
