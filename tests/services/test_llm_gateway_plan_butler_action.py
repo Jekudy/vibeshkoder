@@ -898,7 +898,6 @@ async def test_plan_butler_action_returns_three_tuple() -> None:
     assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
     assert len(result) == 3, f"Expected 3-tuple, got {len(result)}-tuple"
     plan, ledger_id, cost_usd = result
-    from bot.services.butler_tools import ButlerPlan
     assert isinstance(plan, ButlerPlan)
     assert isinstance(ledger_id, int)
     assert ledger_id > 0
