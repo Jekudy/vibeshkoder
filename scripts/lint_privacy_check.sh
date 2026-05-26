@@ -99,6 +99,14 @@ is_allowed_path() {
   # the cascade policy by name. Same rationale as test_wiki_cascade.py above.
   [[ "$path" == "tests/services/test_forget_cascade_butler.py" ]] && return 0
 
+  # T12-02 Butler evidence leakage binding tests (L11.b family) — test that
+  # governance.detect_policy exclusion works for all 6 fields at the
+  # build_butler_evidence boundary. Docstrings and comments name the canonical
+  # privacy literals (memory_policy='nomem', #nomem) because the tests ENFORCE
+  # the policy by name. Same rationale as test_digest_leakage.py /
+  # test_wiki_leakage.py / test_graph_leakage.py allowlist entries above.
+  [[ "$path" == "tests/evals/test_butler_leakage.py" ]] && return 0
+
   # T9-08 Phase 11 binding tests for wiki — name the canonical privacy
   # literals in docstrings, assertion messages, and seed-data SQL because
   # they ENFORCE the policy by name. Same rationale as test_digest_leakage.py
