@@ -100,3 +100,39 @@ class ButlerRateBucketRepo:
         )
         await session.flush()
         return True
+
+    @staticmethod
+    async def decrement(
+        session: AsyncSession,
+        *,
+        bucket_kind: str,
+        scope_id: int,
+        bucket_key: str,
+    ) -> None:
+        """Decrement bucket count by 1 (floor 0).
+
+        Used to roll back prior increments when a later rate-check fails within
+        the same plan_action call (H1: partial-failure rollback).
+
+        Only decrements if count > 0 — prevents negative counts.
+        Does NOT create the row if absent (decrement of a non-existent bucket
+        is a no-op; the row may have been removed by a concurrent transaction).
+
+        Flushes; caller commits.
+        """
+        await session.execute(
+            text("""
+                UPDATE butler_rate_buckets
+                SET count = GREATEST(0, count - 1),
+                    updated_at = NOW()
+                WHERE bucket_kind = :bucket_kind
+                  AND scope_id = :scope_id
+                  AND bucket_key = :bucket_key
+            """),
+            {
+                "bucket_kind": bucket_kind,
+                "scope_id": scope_id,
+                "bucket_key": bucket_key,
+            },
+        )
+        await session.flush()

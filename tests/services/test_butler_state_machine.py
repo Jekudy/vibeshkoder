@@ -501,6 +501,17 @@ class FakeButlerRateBucketRepo:
             return False
         return True
 
+    async def decrement(
+        self,
+        session: Any,
+        *,
+        bucket_kind: str,
+        scope_id: int,
+        bucket_key: str,
+    ) -> None:
+        # No-op in basic fake — tracking variant (TrackingFakeButlerRateBucketRepo) records calls
+        pass
+
 
 class FakeLedgerRepo:
     def __init__(self, *, over_budget: bool = False) -> None:
@@ -2050,3 +2061,329 @@ async def test_cancel_action_non_admin_forbidden_via_user_repo() -> None:
         )
 
     assert exc_info.value.error_kind == "forbidden"
+
+
+# ===========================================================================
+# Tests — Fix3: invariant_broken on missing query/visibility_scope (F1)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_confirm_action_raises_invariant_broken_when_query_is_none() -> None:
+    """confirm_action raises ButlerActionError(invariant_broken) when action.query is None.
+
+    After migration 074, query/visibility_scope are NOT NULL. A None value means
+    schema invariant is broken — getattr default would silently mask this.
+    """
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test query",
+        visibility_scope="member",
+    )
+
+    # Get the real confirmation token before corrupting state
+    all_confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    conf = all_confs[0]
+    real_token = conf.confirmation_token
+
+    # Simulate a broken schema invariant: set query to None directly on the stored row
+    stored = harness.action_repo._rows[action.id]
+    stored.query = None  # type: ignore[assignment]
+
+    # confirm_action navigates token validation (real token) then hits query=None
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.confirm_action(
+            action_id=action.id,
+            confirming_user_id=42,
+            confirmation_token=real_token,
+        )
+
+    assert exc_info.value.error_kind == "invariant_broken"
+
+
+@pytest.mark.asyncio
+async def test_confirm_action_raises_invariant_broken_when_visibility_scope_is_none() -> None:
+    """confirm_action raises ButlerActionError(invariant_broken) when action.visibility_scope is None."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test query",
+        visibility_scope="member",
+    )
+
+    # Get the real token before corrupting state
+    all_confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    conf = all_confs[0]
+    real_token = conf.confirmation_token
+
+    # Simulate broken schema: set visibility_scope to None
+    stored = harness.action_repo._rows[action.id]
+    stored.visibility_scope = None  # type: ignore[assignment]
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.confirm_action(
+            action_id=action.id,
+            confirming_user_id=42,
+            confirmation_token=real_token,
+        )
+
+    assert exc_info.value.error_kind == "invariant_broken"
+
+
+# ===========================================================================
+# Tests — Fix3: invariant_broken on invalid plan_payload (F2)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_execute_action_raises_invariant_broken_on_empty_plan_payload() -> None:
+    """execute_action raises ButlerActionError(invariant_broken) when plan_payload is empty.
+
+    plan_payload must contain 'actions' key per plan.model_dump() shape.
+    Empty dict or missing 'actions' key = invariant broken — synthesis fallback removed.
+    """
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+    all_confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    await svc.confirm_action(
+        action_id=action.id,
+        confirming_user_id=42,
+        confirmation_token=all_confs[0].confirmation_token,
+    )
+
+    # Simulate broken invariant: clear plan_payload
+    stored = harness.action_repo._rows[action.id]
+    stored.plan_payload = {}  # missing 'actions' key
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.execute_action(action_id=action.id)
+
+    assert exc_info.value.error_kind == "invariant_broken"
+
+
+@pytest.mark.asyncio
+async def test_execute_action_raises_invariant_broken_on_none_plan_payload() -> None:
+    """execute_action raises ButlerActionError(invariant_broken) when plan_payload is None."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+    all_confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    await svc.confirm_action(
+        action_id=action.id,
+        confirming_user_id=42,
+        confirmation_token=all_confs[0].confirmation_token,
+    )
+
+    # Simulate broken invariant: None plan_payload
+    stored = harness.action_repo._rows[action.id]
+    stored.plan_payload = None  # type: ignore[assignment]
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.execute_action(action_id=action.id)
+
+    assert exc_info.value.error_kind == "invariant_broken"
+
+
+# ===========================================================================
+# Tests — Fix3: rate-bucket rollback on partial failure (H1)
+# ===========================================================================
+
+
+class TrackingFakeButlerRateBucketRepo:
+    """Rate bucket fake that tracks increments and decrements for H1 rollback testing."""
+
+    def __init__(self, *, fail_on_kind: str | None = None) -> None:
+        self._fail_on_kind = fail_on_kind
+        # Track (bucket_kind, scope_id, bucket_key) tuples
+        self.incremented: list[tuple[str, int, str]] = []
+        self.decremented: list[tuple[str, int, str]] = []
+
+    async def try_increment(
+        self,
+        session: Any,
+        *,
+        bucket_kind: str,
+        scope_id: int,
+        bucket_key: str,
+        window_start: Any,
+        window_end: Any,
+        ceiling: int,
+    ) -> bool:
+        if self._fail_on_kind and self._fail_on_kind in bucket_kind:
+            return False
+        self.incremented.append((bucket_kind, scope_id, bucket_key))
+        return True
+
+    async def decrement(
+        self,
+        session: Any,
+        *,
+        bucket_kind: str,
+        scope_id: int,
+        bucket_key: str,
+    ) -> None:
+        self.decremented.append((bucket_kind, scope_id, bucket_key))
+
+
+@pytest.mark.asyncio
+async def test_plan_action_tool_hour_failure_decrements_prior_buckets() -> None:
+    """When tool_hour rate-bucket fails, prior increments (user_plans_day, chat_actions_day)
+    are rolled back via decrement calls — H1 fix.
+    """
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    rate_repo = TrackingFakeButlerRateBucketRepo(fail_on_kind="tool_hour")
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+        rate_bucket_repo=rate_repo,
+    )
+    svc = harness.make_service()
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.plan_action(
+            requester_user_id=42,
+            chat_id=CHAT_ID,
+            query="test",
+            visibility_scope="member",
+        )
+
+    assert exc_info.value.error_kind == "rate_limit_exceeded"
+    # Two prior increments (user_plans_day + chat_actions_day) must have been decremented
+    assert len(rate_repo.decremented) == 2
+    decremented_kinds = {k for k, _, _ in rate_repo.decremented}
+    assert "user_plans_day" in decremented_kinds
+    assert "chat_actions_day" in decremented_kinds
+
+
+# ===========================================================================
+# Tests — Fix3: F3 NOWAIT OperationalError → CascadeInFlightError mapping
+# ===========================================================================
+
+
+class RaisingButlerActionRepo(FakeButlerActionRepo):
+    """Fake that raises OperationalError on get_for_update (simulates NOWAIT contention)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raise_operational_error_ids: set[int] = set()
+
+    async def get_for_update(self, session: Any, action_id: int) -> Any:
+        if action_id in self.raise_operational_error_ids:
+            # Simulate psycopg LockNotAvailable wrapped in SQLAlchemy OperationalError
+            from sqlalchemy.exc import OperationalError
+            raise OperationalError("statement", {}, Exception("LockNotAvailable"))
+        return await super().get_for_update(session, action_id)
+
+
+@pytest.mark.asyncio
+async def test_confirm_action_operational_error_maps_to_cascade_in_flight() -> None:
+    """OperationalError from NOWAIT get_for_update → CascadeInFlightError (F3).
+
+    Real Postgres raises OperationalError wrapping psycopg.errors.LockNotAvailable
+    when NOWAIT lock is contended. The service must catch it and raise CascadeInFlightError.
+    """
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    # Replace the action_repo with the raising variant
+    raising_repo = RaisingButlerActionRepo()
+    harness.action_repo = raising_repo
+    svc = harness.make_service()
+
+    # Create an action via the raising repo (not locked yet during plan)
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+
+    # Now simulate NOWAIT contention on confirm
+    raising_repo.raise_operational_error_ids.add(action.id)
+
+    all_confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+
+    with pytest.raises(CascadeInFlightError) as exc_info:
+        await svc.confirm_action(
+            action_id=action.id,
+            confirming_user_id=42,
+            confirmation_token=all_confs[0].confirmation_token,
+        )
+
+    assert exc_info.value.error_kind == "cascade_in_flight"
+
+
+@pytest.mark.asyncio
+async def test_cancel_action_operational_error_maps_to_cascade_in_flight() -> None:
+    """OperationalError from NOWAIT get_for_update in cancel_action → CascadeInFlightError (F3)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    raising_repo = RaisingButlerActionRepo()
+    harness.action_repo = raising_repo
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+
+    raising_repo.raise_operational_error_ids.add(action.id)
+
+    with pytest.raises(CascadeInFlightError) as exc_info:
+        await svc.cancel_action(
+            action_id=action.id,
+            cancelling_user_id=42,
+            is_admin=False,
+        )
+
+    assert exc_info.value.error_kind == "cascade_in_flight"

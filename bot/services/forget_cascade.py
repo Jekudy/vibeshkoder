@@ -1352,6 +1352,12 @@ async def _cascade_butler_action_confirmations(session: AsyncSession, event) -> 
     JSONB array contains any of the affected mvids, OR whose requester_tg_id
     matches a user-targeted forget event.
 
+    F4 (parent-lock ordering): acquires SELECT FOR UPDATE NOWAIT on all affected
+    butler_actions rows BEFORE updating any child confirmation rows.  This ensures
+    that a concurrent confirm_action / cancel_action (which also uses NOWAIT) will
+    fail-fast with CascadeInFlightError rather than racing past the child updates
+    into a state where the parent row is temporarily inconsistent.
+
     Convention note (write-side): affected rows resolved via event.target_id +
         _resolve_affected_mvids — write-side cascade convention; read-side filters
         use fe.tombstone_key prefix (see memory/feedback-tombstone-key-read-side-convention.md).
@@ -1397,6 +1403,20 @@ async def _cascade_butler_action_confirmations(session: AsyncSession, event) -> 
 
     if not action_ids:
         return 0
+
+    # F4: Acquire SELECT FOR UPDATE NOWAIT on parent butler_actions rows BEFORE
+    # updating any child rows.  A concurrent confirm_action or cancel_action that
+    # calls get_for_update(nowait=True) on the same rows will immediately receive
+    # OperationalError (LockNotAvailable) → CascadeInFlightError, preventing any
+    # state transition while cascade is in-flight.
+    await session.execute(
+        text(
+            "SELECT id FROM butler_actions "
+            "WHERE id = ANY(CAST(:action_ids AS bigint[])) "
+            "FOR UPDATE NOWAIT"
+        ).bindparams(bindparam("action_ids", type_=PG_ARRAY(BigInteger))),
+        {"action_ids": action_ids},
+    )
 
     redact_text = f"[CONTENT_REDACTED: forget_event_id={event.id}]"
     count = 0

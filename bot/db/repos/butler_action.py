@@ -95,16 +95,20 @@ class ButlerActionRepo:
 
     @staticmethod
     async def get_for_update(session: AsyncSession, action_id: int) -> ButlerAction | None:
-        """SELECT FOR UPDATE on butler_actions row. Returns None if row absent.
+        """SELECT FOR UPDATE NOWAIT on butler_actions row. Returns None if row absent.
+
+        NOWAIT: if the row is locked by a concurrent transaction (e.g. cascade), raises
+        ``sqlalchemy.exc.OperationalError`` wrapping ``psycopg.errors.LockNotAvailable``
+        immediately rather than blocking. The caller (ButlerService) catches this and
+        re-raises as ``CascadeInFlightError``.
 
         Used by ButlerService.confirm_action / execute_action / cancel_action /
-        expire_action to coordinate with ``_cascade_butler_actions`` per §3.6 step 5
-        (cascade holds an advisory lock; this matches via SELECT FOR UPDATE row lock).
+        expire_action to coordinate with ``_cascade_butler_actions`` per §3.6 step 5.
         """
         result = await session.execute(
             select(ButlerAction)
             .where(ButlerAction.id == action_id)
-            .with_for_update()
+            .with_for_update(nowait=True)
         )
         return result.scalar_one_or_none()
 
