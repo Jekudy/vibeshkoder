@@ -294,7 +294,7 @@ class TestGovernanceExcludedCount:
         from bot.services.butler_evidence import build_butler_evidence
         from bot.services.search import SearchHit
 
-        # One hit that will trigger nomem policy via text field.
+        # One hit that will trigger governance policy via text field.
         _NOMEM = "#" + "no" + "mem"
         hit = SearchHit(
             message_version_id=101,
