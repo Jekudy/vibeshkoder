@@ -391,6 +391,8 @@ async def test_butler_tool_invocation_seq_positive(db_session) -> None:
 
 
 async def test_butler_confirmation_role_valid(db_session) -> None:
+    import secrets
+
     from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
     import datetime
 
@@ -404,6 +406,7 @@ async def test_butler_confirmation_role_valid(db_session) -> None:
             status="pending",
             preview_payload_hash="h",
             expires_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1),
+            confirmation_token=secrets.token_urlsafe(32),
         )
 
 

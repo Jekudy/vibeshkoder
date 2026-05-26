@@ -192,7 +192,7 @@ async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str
     # + T12-01 (070-073 Phase 12 Butler schema foundation: audit triple,
     #   ledger call_type CHECK, rate buckets, card suggestions).
     # Assert the current head explicitly; revisit when future migrations land.
-    assert current == "073"
+    assert current == "074"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(
