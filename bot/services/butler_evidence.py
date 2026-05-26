@@ -25,11 +25,12 @@ Privacy invariants
   (first-line filter).  This transitively covers poll_question / contact_name /
   forward_text / forward_caption since those fields are not stored in columns —
   their governance classification is durably recorded in ``memory_policy`` at ingest.
-* ``_fetch_governance_fields`` re-reads text + caption from the DB so even if the
-  search snippet is truncated, the full fields are inspected for the second-line
-  ``detect_policy`` re-check.
-* The single-query approach in ``_fetch_governance_fields`` folds the forget/tombstone
+* ``_fetch_governance_fields`` re-reads text + caption from the DB for ALL source
+  mvids in a single batched SELECT (``= ANY(:mvids)``), so even if the search snippet
+  is truncated, the full fields are inspected for the second-line ``detect_policy`` re-check.
+* The batched query in ``_fetch_governance_fields`` folds the forget/tombstone
   predicate into the same SELECT, closing the race window between search and re-read.
+  One query regardless of the number of hits (no N+1).
 * Vanished rows (row absent from the single-query JOIN) are treated as fail-closed:
   excluded and counted in ``governance_excluded_count``.
 
@@ -56,6 +57,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Literal
@@ -128,6 +130,17 @@ class ButlerEvidenceContext:
     query: str
     snapshot_at: datetime
     governance_excluded_count: int
+
+    _VALID_VISIBILITY_SCOPES: frozenset[str] = frozenset({"member", "admin", "self"})
+
+    def __post_init__(self) -> None:
+        # Runtime validation: Literal annotation is type-checker only; a bad scope would
+        # silently change the hash and produce non-replayable contexts in T12-04.
+        if self.visibility_scope not in self._VALID_VISIBILITY_SCOPES:
+            raise ValueError(
+                f"visibility_scope must be one of {sorted(self._VALID_VISIBILITY_SCOPES)}, "
+                f"got {self.visibility_scope!r}"
+            )
 
     @property
     def evidence_ids(self) -> list[int]:
@@ -235,81 +248,100 @@ def _compute_context_hash(
 # ---------------------------------------------------------------------------
 # Governance field fetcher (internal)
 #
-# Single-query approach: folds the forget/tombstone predicate INTO the SELECT
-# so the same memory_policy='normal' + is_redacted=FALSE + forget_events
-# exclusion that covers the search query also covers this re-check.
-# This resolves three issues simultaneously:
-#   C-2: only selects text + caption (the actual chat_messages columns)
-#   C-3: forget predicate is part of the same query (no race window)
-#   H-2: single query instead of N+1
-#   H-1: returns None for vanished/forgotten rows (sentinel for fail-closed)
+# Batched single-query approach: accepts a collection of mvids, returns a
+# mapping mvid → fields dict (or None sentinel).  Folds the forget/tombstone
+# predicate INTO the same SELECT so there is no race window between the
+# original search result and this re-check.
+#
+# Why batched?
+#   The old single-mvid helper was called inside a per-hit loop, producing
+#   an N+1 query pattern for multi-hit responses.  By accepting a Collection
+#   and using = ANY(:mvids), we issue exactly ONE query regardless of how many
+#   hits (or card-source mvids) need re-checking.
+#
+# Sentinel semantics:
+#   An mvid present in the input set but ABSENT from the result set means the
+#   row is forgotten, tombstoned, redacted, or vanished — the dict entry for
+#   that mvid is None (fail-closed).
 # ---------------------------------------------------------------------------
 
 
 async def _fetch_governance_fields(
     session: AsyncSession,
     *,
-    message_version_id: int,
-) -> dict[str, str | None] | None:
-    """Fetch text + caption for a message_version_id, with forget predicate applied.
+    mvids: Collection[int],
+) -> dict[int, dict[str, str | None] | None]:
+    """Fetch text + caption for a batch of message_version_ids.
 
-    Uses a single query that JOINs forget_events to exclude any row that has
-    become forgotten between the original search query and this re-check.
+    Issues a SINGLE query for all requested mvids using ``= ANY(:mvids)``.
+    Folds the forget/tombstone predicate into the same SELECT to close the
+    race window between the Phase 4 search result and this second-line
+    re-check.
 
-    Returns a dict with keys ``text``, ``caption`` if the row is present and
-    not forgotten/redacted.  Returns ``None`` (sentinel) if:
-    - The row is missing (race between search result and cascade delete), OR
-    - The row matches an active forget_event tombstone, OR
-    - The row has memory_policy != 'normal' or is_redacted=TRUE.
+    Returns a dict mapping each input mvid to either:
+    - ``{"text": ..., "caption": ...}`` — row present and passes all filters, OR
+    - ``None`` (sentinel) — row absent, forgotten, tombstoned, or
+      governance-excluded (fail-closed).
 
-    The caller treats ``None`` as a governance exclusion (fail-closed) and
-    increments governance_excluded_count accordingly.
+    The caller treats ``None`` entries as governance exclusions.
 
     Note: poll_question, contact_name, forward_text, forward_caption are NOT
-    stored in chat_messages columns — their governance classification is durably
-    captured in memory_policy at ingestion time (Phase 0 detect_policy).  The
-    SQL-layer filter ``cm.memory_policy='normal'`` covers these 4 fields
-    transitively.  Only text + caption need second-line re-check here.
+    stored in chat_messages columns — their classification is durably captured
+    in memory_policy at ingestion time.  Only text + caption need second-line
+    re-check here.
     """
-    row = await session.execute(
+    if not mvids:
+        return {}
+
+    mvid_list = list(mvids)
+
+    result = await session.execute(
         text(
             """
             SELECT
+                mv.id AS mvid,
                 c.text AS text,
                 c.caption AS caption
             FROM message_versions mv
             JOIN chat_messages c ON c.id = mv.chat_message_id
-            WHERE mv.id = :mvid
+            WHERE mv.id = ANY(:mvids)
               AND c.memory_policy = 'normal'
               AND c.is_redacted = FALSE
               AND mv.is_redacted = FALSE
               AND NOT EXISTS (
                   SELECT 1 FROM forget_events fe
-                  WHERE fe.status IN ('active', 'completed')
+                  WHERE fe.status IN ('pending', 'processing', 'completed')
                     AND (
                         fe.tombstone_key = 'message:' || c.chat_id::text || ':' || c.message_id::text
                         OR fe.tombstone_key = 'message_hash:' || mv.content_hash
                         OR fe.tombstone_key = 'user:' || c.user_id::text
                     )
               )
-            LIMIT 1
             """
         ),
-        {"mvid": message_version_id},
+        {"mvids": mvid_list},
     )
-    mapping = row.mappings().first()
-    if mapping is None:
-        # Row vanished, is forgotten, or is governance-excluded — fail-closed.
-        logger.warning(
-            "butler_evidence: source row absent or forgotten in governance re-check — "
-            "excluding as fail-closed",
-            extra={"message_version_id": message_version_id},
-        )
-        return None
-    return {
-        "text": mapping["text"],
-        "caption": mapping["caption"],
-    }
+
+    # Build lookup from query results
+    found: dict[int, dict[str, str | None]] = {}
+    for row in result.mappings():
+        found[int(row["mvid"])] = {"text": row["text"], "caption": row["caption"]}
+
+    # Return full mapping: requested mvids present in found get their fields,
+    # absent mvids (vanished/forgotten/excluded) get the None sentinel.
+    out: dict[int, dict[str, str | None] | None] = {}
+    for mvid in mvid_list:
+        if mvid in found:
+            out[mvid] = found[mvid]
+        else:
+            # Row is absent — vanished, forgotten, or governance-excluded.  Fail-closed.
+            logger.warning(
+                "butler_evidence: source row absent or forgotten in governance re-check — "
+                "excluding as fail-closed",
+                extra={"message_version_id": mvid},
+            )
+            out[mvid] = None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -333,10 +365,11 @@ async def build_butler_evidence(
     1. Call Phase 4/6 ``search_messages`` — returns governance-filtered hits
        (tombstoned / redacted / offrecord / nomem rows already excluded by SQL
        via memory_policy='normal' + forget_events predicate).
-    2. For each hit, fetch text + caption from the DB with the same forget
-       predicate re-applied (single query, no race window, fail-closed on
-       vanished/forgotten rows).  Call ``governance.detect_policy(text, caption)``
-       for the second-line re-check.
+    2. Pre-collect all mvids across all hits and fetch text + caption in a
+       SINGLE batched query (``= ANY(:mvids)``) with the same forget predicate
+       re-applied (no race window, fail-closed on vanished/forgotten rows).
+       Call ``governance.detect_policy(text, caption)`` for the second-line
+       re-check using dict lookups — no additional DB round-trips.
     3. For card hits: all ``card_source_message_version_ids`` are individually
        re-checked.  If ANY source mvid is absent/forgotten or fails detect_policy,
        the entire card hit is rejected.
@@ -399,21 +432,34 @@ async def build_butler_evidence(
 
     # Second-line governance filter: re-run detect_policy on text + caption
     # fetched directly from the DB (with forget predicate applied).
+    #
+    # Batch approach: collect the COMPLETE set of mvids across ALL hits first,
+    # then issue a SINGLE batched query.  Outer hit-iteration loop uses dict
+    # lookups — no additional DB calls.
+    all_mvids_to_check: set[int] = set()
+    for hit in hits:
+        all_mvids_to_check.add(hit.message_version_id)
+        card_source_mvids = getattr(hit, "card_source_message_version_ids", ()) or ()
+        all_mvids_to_check.update(card_source_mvids)
+
+    # Single batched SELECT — dict[mvid → fields | None]
+    governance_map = await _fetch_governance_fields(session, mvids=all_mvids_to_check)
+
     accepted: list[EvidenceItem] = []
     excluded_count = 0
 
     for hit in hits:
-        # For card hits: collect all mvids to check (anchor + all card source mvids).
-        card_source_mvids = tuple(getattr(hit, "card_source_message_version_ids", ()))
-        all_mvids_to_check: list[int] = [hit.message_version_id]
+        # For card hits: anchor + all card source mvids must all pass.
+        card_source_mvids = tuple(getattr(hit, "card_source_message_version_ids", ()) or ())
+        mvids_for_hit: list[int] = [hit.message_version_id]
         if card_source_mvids:
             # H-3: check ALL source mvids for card hits, not just the anchor.
-            all_mvids_to_check.extend(card_source_mvids)
+            mvids_for_hit.extend(card_source_mvids)
 
-        # Check all relevant mvids — if ANY fails, reject the entire hit.
+        # Check all relevant mvids via dict lookup — if ANY fails, reject the hit.
         hit_excluded = False
-        for mvid in all_mvids_to_check:
-            fields = await _fetch_governance_fields(session, message_version_id=mvid)
+        for mvid in mvids_for_hit:
+            fields = governance_map.get(mvid)
 
             if fields is None:
                 # Vanished or forgotten row — fail-closed.
