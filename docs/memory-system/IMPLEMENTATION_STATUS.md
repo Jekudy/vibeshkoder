@@ -693,5 +693,12 @@ sync→async cascade FLIP per RFC-001:415 conditional Neo4j approval).
   volume `neo4j_data`) — конфиг присутствует на main и выглядит корректно;
   фактический запуск отложен до окружения с поднятым Docker Desktop.
 
-<!-- updated-by-superflow:2026-05-17 -->
+## Phase 12 — Butler / action execution (IN PROGRESS, authorized 2026-05-23)
+
+| ID | Wave | Description | Status | Notes |
+|----|------|-------------|--------|-------|
+| T12-01 | 1 | Schema foundation: `butler_plans`/`butler_actions` ORM + repos + cascade + migration 073 | merged | Commits `fa606ac`+`169b8b4`+`da612c0`+`c9e9fd8`. Alembic head 068 → 073. |
+| T12-02 | 1 | `ButlerEvidenceContext` + `butler_context_hash` + `build_butler_evidence` (spec §3.6 / §4.2) | PR pending | Branch `feat/p12-t12-02-evidence`. 43 unit + 9 L11 binding tests green. Phase 11 binding 77 → 86. No flag flipped; foundation for T12-04 confirm_action + T12-08 hash replay. Tool wrapper deferred to T12-06. |
+
+<!-- updated-by-superflow:2026-05-26 -->
 <!-- phase-a-cleanup:2026-05-22 -->
