@@ -53,7 +53,11 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+if TYPE_CHECKING:
+    from bot.services.butler_evidence import ButlerEvidenceContext
+    from bot.services.butler_tools import ButlerPlan
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -2221,14 +2225,14 @@ async def plan_butler_action(
     requester_user_id: int,
     chat_id: int | None,
     query: str,
-    evidence_context: Any,  # ButlerEvidenceContext — imported lazily to avoid circular import
+    evidence_context: ButlerEvidenceContext,
     visibility_scope: Literal["member", "admin", "self"],
     config: LLMGatewayConfig,
     ledger_repo: LedgerRepoProtocol,
     provider: LLMProvider,
     allowed_tools: frozenset[str] | None = None,
     tool_manifest_version: str | None = None,
-) -> tuple[Any, int, Decimal]:  # -> tuple[ButlerPlan, ledger_id, cost_usd]
+) -> tuple[ButlerPlan, int, Decimal]:
     """Single Phase 12 LLM entry point for Butler action planning.
 
     Follows the ``extract_candidates`` placeholder-row pattern:
@@ -2531,7 +2535,7 @@ async def synthesize_butler_summary(
     requester_user_id: int,
     chat_id: int | None,
     draft_intent: str,
-    evidence_context: Any,  # ButlerEvidenceContext — imported lazily
+    evidence_context: ButlerEvidenceContext,
     config: LLMGatewayConfig,
     ledger_repo: LedgerRepoProtocol,
     provider: LLMProvider,
@@ -2687,7 +2691,7 @@ async def synthesize_butler_summary(
 def _build_butler_summary_prompt(
     *,
     draft_intent: str,
-    evidence_context: Any,
+    evidence_context: ButlerEvidenceContext,
     requester_user_id: int,
     chat_id: int | None,
 ) -> str:
@@ -2716,7 +2720,7 @@ def _build_butler_summary_prompt(
 def _build_butler_prompt(
     *,
     query: str,
-    evidence_context: Any,
+    evidence_context: ButlerEvidenceContext,
     visibility_scope: str,
     requester_user_id: int,
     chat_id: int | None,
