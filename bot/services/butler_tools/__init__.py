@@ -36,7 +36,7 @@ Spec references
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -52,7 +52,23 @@ if TYPE_CHECKING:
 
 
 class ButlerPlanError(Exception):
-    """Base exception for Butler plan validation errors."""
+    """Base exception for Butler plan validation errors.
+
+    Carries ``llm_usage_ledger_id`` so T12-04 can populate
+    ``butler_actions.llm_usage_ledger_id`` even for failed plans
+    (status='rejected'), and ``error_kind`` for downstream routing.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        llm_usage_ledger_id: int | None = None,
+        error_kind: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.llm_usage_ledger_id = llm_usage_ledger_id
+        self.error_kind = error_kind
 
 
 class ToolNotAllowedError(ButlerPlanError):
@@ -79,6 +95,11 @@ ALLOWED_BUTLER_TOOLS: frozenset[str] = frozenset(
         "suggest_card_creation",
     }
 )
+
+# Tool manifest version — semver string that is included in the planning prompt
+# body so it becomes part of prompt_hash for G3.b replay verification.
+# Bump this when tool schemas change in a backward-incompatible way (T12-06+).
+BUTLER_TOOL_MANIFEST_VERSION: str = "v1.0.0"
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +233,8 @@ class ButlerActionStep(BaseModel):
     tool_name: _ToolNameLiteral
     args: dict[str, Any]
     requires_confirmation: bool = True
-    affected_user_ids: list[int] = []
+    # tuple not list: immutable inside frozen model (M-3)
+    affected_user_ids: tuple[int, ...] = ()
     risk_level: _RiskLevel = "low"
     rollback_kind: _RollbackKind = "not_reversible"
     inverse_op_payload: dict[str, Any] | None = None
@@ -248,8 +270,9 @@ class ButlerPlan(BaseModel):
 
     # Core plan fields from spec §10 T12-03
     plan_summary: str
-    evidence_ids: list[int]
-    actions: list[ButlerActionStep]
+    # tuple not list: immutable inside frozen model (M-3)
+    evidence_ids: tuple[int, ...]
+    actions: tuple[ButlerActionStep, ...]
 
     # Gateway-metadata fields — bound at planning time
     evidence_context_hash: str
@@ -286,8 +309,22 @@ class ToolResult:
         self.error = error
 
 
+@runtime_checkable
 class ButlerTool(Protocol):
     """Protocol that every concrete Butler tool implementation must satisfy.
+
+    Spec §5.C verbatim shape (PHASE12_PLAN_REFRESH.md lines 657-665):
+
+    .. code-block:: python
+
+        class ButlerTool(Protocol):
+            name: str                      # not tool_name
+            schema_version: str
+            args_model: type[BaseModel]
+            async def validate_policy(self, context, args) -> None: ...
+            async def execute(self, plan: ButlerPlan, ctx: ButlerEvidenceContext,
+                              *, session: AsyncSession) -> ToolResult: ...
+            async def build_inverse(self, result: ToolResult) -> dict[str, object]: ...
 
     T12-06 ships implementations: RecallEvidenceTool, ScheduleMeetingTool,
     SendIntroTool, UpdateIntroTool, SuggestCardCreationTool.
@@ -296,9 +333,24 @@ class ButlerTool(Protocol):
     Hard Constraint #2: Butler must not read raw DB outside ButlerEvidenceContext.
     """
 
-    @property
-    def tool_name(self) -> str:
-        """Tool name — must be in ALLOWED_BUTLER_TOOLS."""
+    # Tool name — must be in ALLOWED_BUTLER_TOOLS (renamed from tool_name per spec §5.C)
+    name: str
+    # Semver string identifying the args schema version (e.g. "v1.0.0")
+    schema_version: str
+    # Pydantic model class for validating the tool's args dict
+    args_model: type[BaseModel]
+
+    async def validate_policy(
+        self,
+        context: "ButlerEvidenceContext",
+        args: BaseModel,
+    ) -> None:
+        """Validate governance policy BEFORE execution.
+
+        Must raise ButlerPlanError (or a subclass) if the action violates
+        any Hard Constraint (cross-user consent, off-record boundary, etc.).
+        Called BEFORE execute by T12-04 confirm_action.
+        """
         ...
 
     async def execute(
@@ -316,45 +368,81 @@ class ButlerTool(Protocol):
         """
         ...
 
+    async def build_inverse(self, result: ToolResult) -> dict[str, object]:
+        """Build a rollback/inverse operation payload for the given ToolResult.
+
+        Used to populate ``butler_action_steps.inverse_op_payload`` after
+        a successful execution so the action can be undone if needed.
+        Returns a plain dict that is JSON-serialisable.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # validate_butler_plan — enforces whitelist + per-tool args schema
 # ---------------------------------------------------------------------------
 
 
-def validate_butler_plan(plan: ButlerPlan) -> ButlerPlan:
+def validate_butler_plan(
+    plan: ButlerPlan,
+    *,
+    allowed_tools: frozenset[str] | None = None,
+) -> ButlerPlan:
     """Validate a ButlerPlan against the tool whitelist and per-tool args schemas.
 
     Enforces Hard Constraint #8 (unknown tool → REJECT before confirmation)
     and R8.f/R8.g binding acceptance criteria.
 
+    Parameters
+    ----------
+    plan:
+        The ButlerPlan to validate.
+    allowed_tools:
+        Override the default ALLOWED_BUTLER_TOOLS set for this call.
+        Useful for incident-response tooling where a per-call subset is needed.
+        Defaults to the module-level ``ALLOWED_BUTLER_TOOLS``.
+
     Steps
     -----
-    1. For each action step: reject tool_name not in ALLOWED_BUTLER_TOOLS.
-       Raises ``ToolNotAllowedError`` immediately on first violation.
+    1. For each action step: reject tool_name not in allowed_tools (defaults to
+       ALLOWED_BUTLER_TOOLS). Raises ``ToolNotAllowedError`` immediately on first
+       violation.
     2. For each action step: route step.args through TOOL_ARGS_SCHEMA[tool_name]
        .model_validate(...). Raises ``InvalidToolArgsError`` on ValidationError.
-    3. Returns the plan unchanged if all steps pass.
+    3. Replaces each step's args with the canonical model_dump() output (type-
+       coerced, defaults filled) — H-4 args canonicalisation.
+    4. Returns the validated plan with canonicalised args.
 
-    Note: ButlerPlan.actions is a list so a multi-step plan is validated in
+    Note: ButlerPlan.actions is a tuple so a multi-step plan is validated in
     full. Fail-fast on first violation (no collecting of all errors).
     """
+    _allowed = allowed_tools if allowed_tools is not None else ALLOWED_BUTLER_TOOLS
+    validated_actions: list[ButlerActionStep] = []
+
     for step in plan.actions:
         # Step 1 — tool whitelist check (this should already be enforced by
         # ButlerActionStep's Literal annotation, but validate_butler_plan is
         # the external-input guard that catches dict-constructed plans).
-        if step.tool_name not in ALLOWED_BUTLER_TOOLS:
+        if step.tool_name not in _allowed:
             raise ToolNotAllowedError(
-                f"tool_name {step.tool_name!r} is not in ALLOWED_BUTLER_TOOLS"
+                f"tool_name {step.tool_name!r} is not in allowed_tools"
             )
 
         # Step 2 — per-tool args schema validation.
         args_model_cls = TOOL_ARGS_SCHEMA[step.tool_name]
         try:
-            args_model_cls.model_validate(step.args)
+            validated_args = args_model_cls.model_validate(step.args)
         except ValidationError as exc:
             raise InvalidToolArgsError(
                 f"args for tool {step.tool_name!r} failed schema validation: {exc}"
             ) from exc
 
-    return plan
+        # Step 3 — args canonicalisation (H-4): replace raw args with the
+        # validated model's model_dump() output so downstream gets type-coerced,
+        # defaults-filled canonical form instead of the raw LLM dict.
+        step_dict = step.model_dump()
+        step_dict["args"] = validated_args.model_dump()
+        canonical_step = ButlerActionStep.model_validate(step_dict)
+        validated_actions.append(canonical_step)
+
+    return plan.model_copy(update={"actions": tuple(validated_actions)})
