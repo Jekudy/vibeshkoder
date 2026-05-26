@@ -32,6 +32,10 @@ class ButlerActionConfirmationRepo:
         expires_at: datetime,
         confirmation_message_chat_id: int | None = None,
         confirmation_message_id: int | None = None,
+        # migration 074: opaque per-confirmation token (C1 fix).
+        # Callers MUST pass a fresh secrets.token_urlsafe(32) per row.
+        # The UNIQUE index on confirmation_token prevents token re-use.
+        confirmation_token: str = "",
     ) -> ButlerActionConfirmation:
         """Insert a new butler_action_confirmations row. Flushes; caller commits."""
         row = ButlerActionConfirmation(
@@ -43,6 +47,7 @@ class ButlerActionConfirmationRepo:
             expires_at=expires_at,
             confirmation_message_chat_id=confirmation_message_chat_id,
             confirmation_message_id=confirmation_message_id,
+            confirmation_token=confirmation_token,
         )
         session.add(row)
         await session.flush()
