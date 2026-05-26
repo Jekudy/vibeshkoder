@@ -147,7 +147,7 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     070 audit triple, 071 ledger call_type CHECK, 072 rate buckets, 073 card suggestions.
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "073"
+    assert current == "074"
 
 
 # ─── Test: upgrade adds 4 review columns with correct types/nullability ──────
