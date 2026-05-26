@@ -2387,3 +2387,80 @@ async def test_cancel_action_operational_error_maps_to_cascade_in_flight() -> No
         )
 
     assert exc_info.value.error_kind == "cascade_in_flight"
+
+
+@pytest.mark.asyncio
+async def test_execute_action_operational_error_maps_to_cascade_in_flight() -> None:
+    """OperationalError from NOWAIT get_for_update in execute_action → CascadeInFlightError (F3).
+
+    Real Postgres raises OperationalError wrapping psycopg.errors.LockNotAvailable
+    when NOWAIT lock is contended during execute_action. The service must catch it and
+    raise CascadeInFlightError(error_kind='cascade_in_flight').
+    """
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    raising_repo = RaisingButlerActionRepo()
+    harness.action_repo = raising_repo
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+
+    # Confirm without contention first
+    all_confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    await svc.confirm_action(
+        action_id=action.id,
+        confirming_user_id=42,
+        confirmation_token=all_confs[0].confirmation_token,
+    )
+
+    # Now simulate NOWAIT contention on execute
+    raising_repo.raise_operational_error_ids.add(action.id)
+
+    with pytest.raises(CascadeInFlightError) as exc_info:
+        await svc.execute_action(action_id=action.id)
+
+    assert exc_info.value.error_kind == "cascade_in_flight"
+
+
+@pytest.mark.asyncio
+async def test_plan_action_chat_rate_limit_rolls_back_user_plans_day() -> None:
+    """When chat_actions_day is exceeded, user_plans_day increment is rolled back (Fix 1).
+
+    user_plans_day is successfully incremented before chat_actions_day is checked.
+    If chat_actions_day fails, the earlier user_plans_day increment must be decremented
+    so the user's daily quota is not permanently consumed.
+    """
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    rate_repo = TrackingFakeButlerRateBucketRepo(fail_on_kind="chat_actions_day")
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+        rate_bucket_repo=rate_repo,
+    )
+    svc = harness.make_service()
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.plan_action(
+            requester_user_id=42,
+            chat_id=CHAT_ID,
+            query="test",
+            visibility_scope="member",
+        )
+
+    assert exc_info.value.error_kind == "rate_limit_exceeded"
+    # user_plans_day must have been incremented first, then rolled back via decrement
+    assert ("user_plans_day", 42, rate_repo.decremented[0][2]) in [
+        (b, s, k) for b, s, k in rate_repo.decremented
+    ] or any(b == "user_plans_day" for b, _, _ in rate_repo.decremented), (
+        f"Expected user_plans_day rollback decrement, got decremented={rate_repo.decremented}"
+    )
