@@ -1941,6 +1941,20 @@ class ButlerAction(Base):
         nullable=False,
     )
     action_args_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # migration 074: query / visibility_scope / plan_payload added in T12-04 fix cycle.
+    # query: the original /butler request text forwarded to the LLM (needed for
+    #   evidence re-revalidation in confirm_action without storing it elsewhere).
+    # visibility_scope: frozen at plan time, replayed at confirm/execute for hash check.
+    # plan_payload: the full serialized ButlerPlan; allows multi-step replay in execute_action.
+    query: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    visibility_scope: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'member'")
+    )
+    plan_payload: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        server_default=text("'{}'"),
+    )
     result_payload: Mapped[dict | None] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),
         nullable=True,
@@ -2099,6 +2113,12 @@ class ButlerActionConfirmation(Base):
     confirmation_message_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     confirmation_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     preview_payload_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # migration 074: opaque per-confirmation token (secrets.token_urlsafe(32)).
+    # UNIQUE index enforced at DB level (uq_butler_action_confirmations_token).
+    # confirm_action verifies presented token == stored token; bad token → bad_token error_kind.
+    confirmation_token: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("''")
+    )
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -46,6 +46,11 @@ class ButlerActionRepo:
         confirmation_policy: str = "per_action",
         expires_at: datetime | None = None,
         llm_usage_ledger_id: int | None = None,
+        # migration 074: new columns
+        query: str = "",
+        visibility_scope: str = "member",
+        plan_payload: dict | None = None,
+        rejection_reason: str | None = None,
     ) -> ButlerAction:
         """Insert a new butler_actions row. Flushes; caller commits."""
         row = ButlerAction(
@@ -70,6 +75,10 @@ class ButlerActionRepo:
             confirmation_policy=confirmation_policy,
             expires_at=expires_at,
             llm_usage_ledger_id=llm_usage_ledger_id,
+            query=query,
+            visibility_scope=visibility_scope,
+            plan_payload=plan_payload if plan_payload is not None else {},
+            rejection_reason=rejection_reason,
         )
         session.add(row)
         await session.flush()
