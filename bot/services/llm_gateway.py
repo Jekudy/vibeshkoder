@@ -57,7 +57,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from bot.services.butler_evidence import ButlerEvidenceContext
-    from bot.services.butler_tools import ButlerPlan
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -2166,12 +2165,23 @@ async def extract_graph_triples(
 
 # ─── Phase 12 / T12-03: plan_butler_action ──────────────────────────────────
 
-# Re-export ButlerPlanError from butler_tools so callers import from ONE place.
-# The class is defined in butler_tools to keep it close to ToolNotAllowedError /
-# InvalidToolArgsError (all three are butler plan validation errors).
-# We do the import at module level here (not lazily) because the gateway's
-# __all__ re-exports it and it must be importable at module load time.
-from bot.services.butler_tools import ButlerPlanError  # noqa: E402
+# Module-level imports from butler_tools — NOT lazy/local.
+# All butler_tools classes must be imported at module load time (not inside
+# function bodies) to avoid dual-class identity failures when sys.modules is
+# cleared between tests (conftest._clear_modules used by app_env fixture).
+# Lazy local imports inside plan_butler_action would re-import butler_tools after
+# a sys.modules clear, producing new class objects that compare unequal via
+# isinstance() to the objects the test file imported at collection time.
+from bot.services.butler_tools import (  # noqa: E402
+    ALLOWED_BUTLER_TOOLS,
+    BUTLER_TOOL_MANIFEST_VERSION,
+    TOOL_ARGS_SCHEMA,
+    ButlerPlan,
+    ButlerPlanError,
+    InvalidToolArgsError,
+    ToolNotAllowedError,
+    validate_butler_plan,
+)
 
 # Butler-specific cost ceilings (§14.1).
 # The shared LLMGatewayConfig ceilings apply on top of these (defense-in-depth).
@@ -2273,17 +2283,7 @@ async def plan_butler_action(
     Hard Constraint #1 (charter): only provider SDK call allowed;
     no raw anthropic/openai imports in this function.
     """
-    # Lazy imports — avoid circular imports and keep module-level clean.
-    # Note: ButlerPlanError is already imported at module level from butler_tools.
-    from bot.services.butler_tools import (
-        BUTLER_TOOL_MANIFEST_VERSION,
-        ALLOWED_BUTLER_TOOLS,
-        ButlerPlan,
-        InvalidToolArgsError,
-        ToolNotAllowedError,
-        validate_butler_plan,
-    )
-
+    # All butler_tools symbols are imported at module level above — no lazy import.
     _allowed = allowed_tools if allowed_tools is not None else ALLOWED_BUTLER_TOOLS
     _manifest_version = (
         tool_manifest_version
@@ -2742,8 +2742,7 @@ def _build_butler_prompt(
     never reads EvidenceItem.snippet, EvidenceItem.chat_message_id, or
     any raw text field from the bundle items.
     """
-    from bot.services.butler_tools import ALLOWED_BUTLER_TOOLS, TOOL_ARGS_SCHEMA
-
+    # ALLOWED_BUTLER_TOOLS and TOOL_ARGS_SCHEMA are imported at module level above.
     evidence_ids_str = json.dumps(sorted(evidence_context.evidence_ids))
 
     # Build tool schema summary: tool_name → required fields from the pydantic model.
