@@ -47,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -2168,6 +2169,51 @@ async def extract_graph_triples(
 # __all__ re-exports it and it must be importable at module load time.
 from bot.services.butler_tools import ButlerPlanError  # noqa: E402
 
+# Butler-specific cost ceilings (§14.1).
+# The shared LLMGatewayConfig ceilings apply on top of these (defense-in-depth).
+# call_type filter: 'butler_decision' + 'butler_summary' combined for daily check.
+_BUTLER_DAILY_USD_CEILING: Decimal = Decimal(
+    os.environ.get("BUTLER_DAILY_USD_CEILING", "1.00")
+)
+_BUTLER_MONTHLY_USD_CEILING: Decimal = Decimal(
+    os.environ.get("BUTLER_MONTHLY_USD_CEILING", "10.00")
+)
+
+
+async def _butler_budget_check(
+    session: AsyncSession,
+    ledger_repo: LedgerRepoProtocol,
+    call_type: str,
+) -> bool:
+    """Check Butler-specific budget ceilings (§14.1).
+
+    Sums daily cost for both butler_decision + butler_summary call_types and
+    compares against ``BUTLER_DAILY_USD_CEILING`` ($1 default).
+
+    Monthly check: uses global monthly_cost_usd (no call_type filter) as a
+    shared-bucket proxy until T12-08 lands the per-call_type monthly filter.
+    TODO(T12-08): replace with ``monthly_cost_usd(call_type='butler_decision')``
+    + ``monthly_cost_usd(call_type='butler_summary')`` when that method lands.
+    """
+    today = datetime.now(timezone.utc).date()
+    # Daily: filter to butler call types only (decision + summary share $1/day budget)
+    daily_decision = await ledger_repo.daily_cost_usd(
+        session, day=today, call_type="butler_decision"
+    )
+    daily_summary = await ledger_repo.daily_cost_usd(
+        session, day=today, call_type="butler_summary"
+    )
+    butler_daily_total = daily_decision + daily_summary
+    if butler_daily_total >= _BUTLER_DAILY_USD_CEILING:
+        return True
+    # Monthly: shared monthly proxy (T12-08 TODO for butler-specific filter)
+    monthly_total = await ledger_repo.monthly_cost_usd(
+        session, year=today.year, month=today.month
+    )
+    if monthly_total >= _BUTLER_MONTHLY_USD_CEILING:
+        return True
+    return False
+
 
 async def plan_butler_action(
     *,
@@ -2180,29 +2226,42 @@ async def plan_butler_action(
     config: LLMGatewayConfig,
     ledger_repo: LedgerRepoProtocol,
     provider: LLMProvider,
-) -> Any:  # -> ButlerPlan (imported lazily)
+    allowed_tools: frozenset[str] | None = None,
+    tool_manifest_version: str | None = None,
+) -> tuple[Any, int, Decimal]:  # -> tuple[ButlerPlan, ledger_id, cost_usd]
     """Single Phase 12 LLM entry point for Butler action planning.
 
     Follows the ``extract_candidates`` placeholder-row pattern:
 
-    1. Budget guard (advisory lock + placeholder ledger row reservation).
+    1. Butler-specific budget guard + shared budget guard (defense-in-depth).
+       Advisory lock + placeholder ledger row reservation.
     2. Provider dispatch (OUTSIDE the lock, no global serialisation).
     3. JSON parse of provider output.
-    4. Pydantic + whitelist validation via ``validate_butler_plan``.
-    5. Ledger row updated with final cost/tokens/error.
+    4. Gateway binds 4 identity fields (C-1): requester_user_id, chat_id,
+       visibility_scope, governance_filter_version from the calling context —
+       LLM cannot forge these via prompt injection.
+    5. Fail-closed evidence_context_hash + evidence_ids verification (C-4):
+       LLM must echo back the exact sealed context_hash; any mismatch or
+       orphan evidence_id raises ButlerPlanError immediately.
+    6. Pydantic + whitelist validation via ``validate_butler_plan``.
+    7. Ledger row updated with final cost/tokens/error.
 
-    Returns a validated ``ButlerPlan`` on success.
+    Returns ``(plan, ledger_id, cost_usd)`` on success (C-3).
+    ``ledger_id`` is used by T12-04 to populate
+    ``butler_actions.llm_usage_ledger_id``.
 
-    On any error (invalid JSON, whitelist violation, schema failure, budget):
+    On any error (invalid JSON, whitelist violation, schema failure, budget,
+    hash mismatch, orphan evidence_id):
     - Ledger row is written/updated with an ``error`` field.
-    - Raises ``ButlerPlanError`` (or a subclass defined in butler_tools).
+    - Raises ``ButlerPlanError`` (or a subclass); the exception carries
+      ``llm_usage_ledger_id`` so T12-04 can record it for failed plans.
 
     Privacy invariants
     ------------------
     * The prompt NEVER includes raw ``EvidenceItem.snippet`` text.
       The gateway receives a ``ButlerEvidenceContext`` and only includes
       ``evidence_ids`` (integer identifiers), the query string, tool schemas
-      (names + field descriptions), and the context_hash.
+      (names + field descriptions), the context_hash, and the manifest version.
     * ``call_type='butler_decision'`` is written to every ledger row.
     * NULL ``llm_usage_ledger_id`` is allowed only for status IN
       ('rejected','expired','cancelled') — T12-04 contract (constraint #9).
@@ -2213,10 +2272,19 @@ async def plan_butler_action(
     # Lazy imports — avoid circular imports and keep module-level clean.
     # Note: ButlerPlanError is already imported at module level from butler_tools.
     from bot.services.butler_tools import (
+        BUTLER_TOOL_MANIFEST_VERSION,
+        ALLOWED_BUTLER_TOOLS,
         ButlerPlan,
         InvalidToolArgsError,
         ToolNotAllowedError,
         validate_butler_plan,
+    )
+
+    _allowed = allowed_tools if allowed_tools is not None else ALLOWED_BUTLER_TOOLS
+    _manifest_version = (
+        tool_manifest_version
+        if tool_manifest_version is not None
+        else BUTLER_TOOL_MANIFEST_VERSION
     )
 
     # Build deterministic prompt — includes query + evidence_ids + tool schemas.
@@ -2225,6 +2293,9 @@ async def plan_butler_action(
         query=query,
         evidence_context=evidence_context,
         visibility_scope=visibility_scope,
+        requester_user_id=requester_user_id,
+        chat_id=chat_id,
+        tool_manifest_version=_manifest_version,
     )
     prompt_hash = _prompt_hash(prompt)
 
@@ -2234,8 +2305,12 @@ async def plan_butler_action(
         await session.execute(
             _BUDGET_LOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
         )
-        over_budget = await _budget_check(session, config, ledger_repo)
-        if over_budget:
+        # Butler-specific ceiling first (defense-in-depth: shared check follows)
+        over_butler_budget = await _butler_budget_check(
+            session, ledger_repo, call_type="butler_decision"
+        )
+        over_shared_budget = await _budget_check(session, config, ledger_repo)
+        if over_butler_budget or over_shared_budget:
             row = await ledger_repo.record(
                 session,
                 qa_trace_id=None,
@@ -2253,7 +2328,9 @@ async def plan_butler_action(
                 call_type="butler_decision",
             )
             raise ButlerPlanError(
-                f"Butler monthly budget exceeded; ledger_id={row.id}"
+                f"Butler budget exceeded; ledger_id={row.id}",
+                llm_usage_ledger_id=row.id,
+                error_kind="budget_exceeded",
             )
 
         placeholder_row = await ledger_repo.record(
@@ -2297,7 +2374,9 @@ async def plan_butler_action(
             error=error_str,
         )
         raise ButlerPlanError(
-            f"Butler provider dispatch failed: {exc_type}"
+            f"Butler provider dispatch failed: {exc_type}",
+            llm_usage_ledger_id=placeholder_row.id,
+            error_kind=f"provider_error:{exc_type}",
         ) from exc
 
     latency = int((time.monotonic() - started) * 1000)
@@ -2321,16 +2400,20 @@ async def plan_butler_action(
             error="invalid_plan_json",
         )
         raise ButlerPlanError(
-            f"LLM output is not valid JSON: {exc}"
+            f"LLM output is not valid JSON: {exc}",
+            llm_usage_ledger_id=placeholder_row.id,
+            error_kind="invalid_plan_json",
         ) from exc
 
-    # If the LLM didn't echo back the correct context_hash, fill it from the
-    # sealed context so downstream replay (G3.b) can always verify.
-    # Design choice: gateway fills the hash rather than rejecting, because the
-    # LLM echoing back an opaque hash is a "best effort" contract — the sealed
-    # context is the authoritative source and the gateway owns it.
-    if raw_dict.get("evidence_context_hash") != evidence_context.context_hash:
-        raw_dict["evidence_context_hash"] = evidence_context.context_hash
+    # C-1: Gateway binds 4 identity fields BEFORE pydantic validation.
+    # LLM output for these 4 is untrusted — override unconditionally so a
+    # prompt-injected LLM cannot forge visibility_scope='admin' or a different
+    # requester_user_id. This does NOT include evidence_context_hash or
+    # evidence_ids — those are fail-closed verified below (C-4).
+    raw_dict["requester_user_id"] = requester_user_id
+    raw_dict["chat_id"] = chat_id
+    raw_dict["visibility_scope"] = visibility_scope
+    raw_dict["governance_filter_version"] = evidence_context.governance_filter_version
 
     # Validate via pydantic ButlerPlan model + whitelist.
     try:
@@ -2348,12 +2431,57 @@ async def plan_butler_action(
             error="invalid_plan_schema",
         )
         raise ButlerPlanError(
-            f"LLM output failed ButlerPlan schema validation: {exc}"
+            f"LLM output failed ButlerPlan schema validation: {exc}",
+            llm_usage_ledger_id=placeholder_row.id,
+            error_kind="invalid_plan_schema",
         ) from exc
+
+    # C-4: Fail-closed evidence_context_hash verification.
+    # The LLM must echo back the exact sealed context_hash — a mismatch means
+    # the LLM is hallucinating context, not consuming the sealed envelope.
+    if plan.evidence_context_hash != evidence_context.context_hash:
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=provider_result.request_id,
+            latency_ms=latency,
+            error="evidence_context_mismatch",
+        )
+        raise ButlerPlanError(
+            "evidence_context_hash mismatch — LLM did not consume the sealed envelope",
+            llm_usage_ledger_id=placeholder_row.id,
+            error_kind="evidence_context_mismatch",
+        )
+
+    # C-4: Fail-closed evidence_ids subset verification.
+    # Every evidence_id in the plan must be a subset of the sealed context.
+    sealed_ids = set(evidence_context.evidence_ids)
+    orphan_ids = set(plan.evidence_ids) - sealed_ids
+    if orphan_ids:
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=provider_result.request_id,
+            latency_ms=latency,
+            error="orphan_evidence_ids",
+        )
+        raise ButlerPlanError(
+            f"evidence_ids contains orphan refs not in sealed context: {orphan_ids}",
+            llm_usage_ledger_id=placeholder_row.id,
+            error_kind="orphan_evidence_ids",
+        )
 
     # Per-tool args validation via validate_butler_plan.
     try:
-        validate_butler_plan(plan)
+        plan = validate_butler_plan(plan, allowed_tools=_allowed)
     except (ButlerPlanError, ToolNotAllowedError, InvalidToolArgsError) as exc:
         # Map exception subtype to ledger error string.
         if isinstance(exc, ToolNotAllowedError):
@@ -2373,7 +2501,9 @@ async def plan_butler_action(
             latency_ms=latency,
             error=ledger_error,
         )
-        raise  # re-raise original (ToolNotAllowedError / InvalidToolArgsError / ButlerPlanError)
+        # Re-raise with ledger_id attached (C-3: callers get the id for failed plans)
+        exc.llm_usage_ledger_id = placeholder_row.id
+        raise
 
     # Success — update placeholder row with final cost/tokens.
     cost_usd = _estimate_cost(
@@ -2392,7 +2522,195 @@ async def plan_butler_action(
         latency_ms=latency,
         error=None,
     )
-    return plan
+    return plan, placeholder_row.id, cost_usd
+
+
+async def synthesize_butler_summary(
+    *,
+    session: AsyncSession,
+    requester_user_id: int,
+    chat_id: int | None,
+    draft_intent: str,
+    evidence_context: Any,  # ButlerEvidenceContext — imported lazily
+    config: LLMGatewayConfig,
+    ledger_repo: LedgerRepoProtocol,
+    provider: LLMProvider,
+) -> tuple[str, int, Decimal]:  # (summary_text, llm_usage_ledger_id, cost_usd)
+    """Butler result summariser — Phase 12 T12-03 deliverable (spec §4.3 l.282, §15 #11).
+
+    Similar advisory-lock + placeholder-row pattern as ``plan_butler_action``.
+    Uses ``call_type='butler_summary'``.
+
+    Citation-anchor enforcement: every ``mvid:N`` or ``card:N`` reference in
+    the returned text must appear in ``evidence_context.evidence_ids``.
+    Orphan citations raise ``ButlerPlanError(error_kind='unbound_citation')``.
+
+    Returns ``(summary_text, llm_usage_ledger_id, cost_usd)``.
+
+    Privacy invariant: the prompt includes only evidence_ids (integers) + draft_intent
+    + context_hash — never raw snippet content from EvidenceItem.
+    """
+    prompt = _build_butler_summary_prompt(
+        draft_intent=draft_intent,
+        evidence_context=evidence_context,
+        requester_user_id=requester_user_id,
+        chat_id=chat_id,
+    )
+    prompt_hash = _prompt_hash(prompt)
+
+    placeholder_row: Any
+    try:
+        await session.execute(
+            _BUDGET_LOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
+        )
+        over_butler_budget = await _butler_budget_check(
+            session, ledger_repo, call_type="butler_summary"
+        )
+        over_shared_budget = await _budget_check(session, config, ledger_repo)
+        if over_butler_budget or over_shared_budget:
+            row = await ledger_repo.record(
+                session,
+                qa_trace_id=None,
+                provider=config.provider,
+                model=config.model,
+                prompt_hash=prompt_hash,
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                cost_usd=Decimal("0"),
+                latency_ms=0,
+                request_id=None,
+                cache_hit=False,
+                error="budget_exceeded",
+                call_type="butler_summary",
+            )
+            raise ButlerPlanError(
+                f"Butler summary budget exceeded; ledger_id={row.id}",
+                llm_usage_ledger_id=row.id,
+                error_kind="budget_exceeded",
+            )
+
+        placeholder_row = await ledger_repo.record(
+            session,
+            qa_trace_id=None,
+            provider=config.provider,
+            model=config.model,
+            prompt_hash=prompt_hash,
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=Decimal("0"),
+            latency_ms=0,
+            request_id=None,
+            cache_hit=False,
+            error=None,
+            call_type="butler_summary",
+        )
+    finally:
+        await session.execute(
+            _BUDGET_UNLOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID}
+        )
+
+    # Provider dispatch — OUTSIDE the lock.
+    started = time.monotonic()
+    try:
+        provider_result = await provider.call(prompt=prompt, model=config.model)
+    except (ProviderTransientError, ProviderStructuralError, Exception) as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        exc_type = type(exc).__name__
+        error_str = f"provider_error:{exc_type}"
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency,
+            error=error_str,
+        )
+        raise ButlerPlanError(
+            f"Butler summary provider dispatch failed: {exc_type}",
+            llm_usage_ledger_id=placeholder_row.id,
+            error_kind=f"provider_error:{exc_type}",
+        ) from exc
+
+    latency = int((time.monotonic() - started) * 1000)
+    summary_text = provider_result.answer_text
+
+    # Citation-anchor enforcement: every mvid:N or card:N reference in the
+    # returned text must appear in evidence_context.evidence_ids.
+    sealed_ids = set(evidence_context.evidence_ids)
+    # Pattern: mvid:N or card:N where N is an integer
+    anchor_pattern = re.compile(r"(?:mvid|card):(\d+)")
+    cited_ids = {int(m) for m in anchor_pattern.findall(summary_text)}
+    orphan_citations = cited_ids - sealed_ids
+    if orphan_citations:
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=provider_result.request_id,
+            latency_ms=latency,
+            error="unbound_citation",
+        )
+        raise ButlerPlanError(
+            f"Summary contains citations outside sealed evidence_ids: {orphan_citations}",
+            llm_usage_ledger_id=placeholder_row.id,
+            error_kind="unbound_citation",
+        )
+
+    # Success — update placeholder row with final cost/tokens.
+    cost_usd = _estimate_cost(
+        config=config,
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+    )
+    await ledger_repo.update_placeholder(
+        session,
+        llm_call_id=placeholder_row.id,
+        cost_usd=cost_usd,
+        response_hash=_response_hash(summary_text),
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+        request_id=provider_result.request_id,
+        latency_ms=latency,
+        error=None,
+    )
+    return summary_text, placeholder_row.id, cost_usd
+
+
+def _build_butler_summary_prompt(
+    *,
+    draft_intent: str,
+    evidence_context: Any,
+    requester_user_id: int,
+    chat_id: int | None,
+) -> str:
+    """Build a deterministic Butler summary prompt.
+
+    Privacy invariant: NEVER includes raw snippet text from EvidenceItem.
+    Includes only: draft_intent, evidence_ids (integers), context_hash,
+    requester_user_id, chat_id.
+    """
+    evidence_ids_str = json.dumps(sorted(evidence_context.evidence_ids))
+    return (
+        f"# Butler Summary Request\n"
+        f"draft_intent: {draft_intent}\n"
+        f"requester_user_id: {requester_user_id}\n"
+        f"chat_id: {chat_id}\n"
+        f"governance_filter_version: {evidence_context.governance_filter_version}\n"
+        f"evidence_context_hash: {evidence_context.context_hash}\n"
+        f"evidence_ids: {evidence_ids_str}\n"
+        f"\n# Instructions\n"
+        f"Write a concise summary for the stated draft_intent. "
+        f"Cite evidence using mvid:N or card:N notation. "
+        f"Only cite IDs that appear in evidence_ids. Do not invent facts.\n"
+    )
 
 
 def _build_butler_prompt(
@@ -2400,16 +2718,21 @@ def _build_butler_prompt(
     query: str,
     evidence_context: Any,
     visibility_scope: str,
+    requester_user_id: int,
+    chat_id: int | None,
+    tool_manifest_version: str,
 ) -> str:
     """Build a deterministic Butler planning prompt.
 
     Privacy invariant: NEVER includes raw snippet text from EvidenceItem.
     The prompt includes ONLY:
-    - The user query
+    - The user query (no content)
+    - requester_user_id + chat_id (M-1: helps LLM set affected_user_ids correctly)
     - evidence_ids (integer list — no content)
     - The context_hash (sealed contract the LLM must echo back)
     - Available tool names + their args field names (from TOOL_ARGS_SCHEMA)
     - visibility_scope + governance_filter_version (for audit)
+    - tool_manifest_version (H-3: included in prompt_hash for G3.b replay)
 
     This guarantees the prompt cannot carry redacted or purged content, as the gateway
     never reads EvidenceItem.snippet, EvidenceItem.chat_message_id, or
@@ -2431,10 +2754,13 @@ def _build_butler_prompt(
     return (
         f"# Butler Planning Request\n"
         f"query: {query}\n"
+        f"requester_user_id: {requester_user_id}\n"
+        f"chat_id: {chat_id}\n"
         f"visibility_scope: {visibility_scope}\n"
         f"governance_filter_version: {evidence_context.governance_filter_version}\n"
         f"evidence_context_hash: {evidence_context.context_hash}\n"
         f"evidence_ids: {evidence_ids_str}\n"
+        f"tool_manifest_version: {tool_manifest_version}\n"
         f"\n# Available Tools\n{tools_str}\n"
         f"\n# Instructions\n"
         f"Return a JSON object matching ButlerPlan schema. "
@@ -2475,5 +2801,6 @@ __all__ = [
     "plan_butler_action",
     "resolve_provider",
     "synthesize_answer",
+    "synthesize_butler_summary",
     "synthesize_digest",
 ]

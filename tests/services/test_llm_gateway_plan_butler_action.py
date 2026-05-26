@@ -274,7 +274,7 @@ def _butler_config() -> LLMGatewayConfig:
 
 @pytest.mark.asyncio
 async def test_plan_butler_action_happy_path_returns_butler_plan() -> None:
-    """Happy path: valid LLM JSON → ButlerPlan returned."""
+    """Happy path: valid LLM JSON → (ButlerPlan, ledger_id, cost_usd) returned."""
     context = _make_context()
     plan_json = _valid_plan_json(context=context)
 
@@ -295,10 +295,11 @@ async def test_plan_butler_action_happy_path_returns_butler_plan() -> None:
         provider=provider,
     )
 
-    assert isinstance(result, ButlerPlan)
-    assert result.plan_summary == "Recall members who know Rust"
-    assert len(result.actions) == 1
-    assert result.actions[0].tool_name == "recall_evidence"
+    plan, ledger_id, cost_usd = result
+    assert isinstance(plan, ButlerPlan)
+    assert plan.plan_summary == "Recall members who know Rust"
+    assert len(plan.actions) == 1
+    assert plan.actions[0].tool_name == "recall_evidence"
 
 
 @pytest.mark.asyncio
@@ -375,7 +376,7 @@ async def test_plan_butler_action_result_has_matching_evidence_context_hash() ->
     ledger = FakeLedgerRepo()
     session = FakeSession()
 
-    result = await plan_butler_action(
+    plan, _ledger_id, _cost = await plan_butler_action(
         session=session,
         requester_user_id=42,
         chat_id=_CHAT_ID,
@@ -388,7 +389,7 @@ async def test_plan_butler_action_result_has_matching_evidence_context_hash() ->
     )
 
     # The LLM echoed back the correct hash.
-    assert result.evidence_context_hash == context.context_hash
+    assert plan.evidence_context_hash == context.context_hash
 
 
 # ---------------------------------------------------------------------------
@@ -801,3 +802,498 @@ async def test_plan_butler_action_prompt_does_not_include_raw_source_content() -
     assert secret_text not in prompt_sent, (
         f"Raw snippet content leaked into prompt: {prompt_sent[:200]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# C-3: plan_butler_action returns (ButlerPlan, int, Decimal) tuple
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_returns_three_tuple() -> None:
+    """plan_butler_action returns (ButlerPlan, ledger_id, cost_usd) tuple."""
+    context = _make_context()
+    plan_json = _valid_plan_json(context=context)
+
+    provider = FakeButlerProvider(answer_text=plan_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    result = await plan_butler_action(
+        session=session,
+        requester_user_id=42,
+        chat_id=_CHAT_ID,
+        query="who knows Rust?",
+        evidence_context=context,
+        visibility_scope="member",
+        config=_butler_config(),
+        ledger_repo=ledger,
+        provider=provider,
+    )
+
+    assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
+    assert len(result) == 3, f"Expected 3-tuple, got {len(result)}-tuple"
+    plan, ledger_id, cost_usd = result
+    from bot.services.butler_tools import ButlerPlan
+    assert isinstance(plan, ButlerPlan)
+    assert isinstance(ledger_id, int)
+    assert ledger_id > 0
+    assert isinstance(cost_usd, Decimal)
+    assert cost_usd >= Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_tuple_ledger_id_matches_written_row() -> None:
+    """The ledger_id in the tuple matches the actual ledger row id."""
+    context = _make_context()
+    plan_json = _valid_plan_json(context=context)
+
+    provider = FakeButlerProvider(answer_text=plan_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    _plan, ledger_id, _cost = await plan_butler_action(
+        session=session,
+        requester_user_id=42,
+        chat_id=_CHAT_ID,
+        query="who knows Rust?",
+        evidence_context=context,
+        visibility_scope="member",
+        config=_butler_config(),
+        ledger_repo=ledger,
+        provider=provider,
+    )
+
+    # The returned ledger_id must match a row in the ledger
+    matching = [r for r in ledger.rows if r.id == ledger_id]
+    assert len(matching) == 1, f"Expected row with id={ledger_id} in ledger"
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_butler_plan_error_carries_ledger_id() -> None:
+    """ButlerPlanError raised on validation failure carries the ledger_id."""
+    context = _make_context()
+    # Supply invalid JSON so a ButlerPlanError is raised
+    provider = FakeButlerProvider(answer_text="not json at all")
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    with pytest.raises(ButlerPlanError) as exc_info:
+        await plan_butler_action(
+            session=session,
+            requester_user_id=42,
+            chat_id=_CHAT_ID,
+            query="who knows Rust?",
+            evidence_context=context,
+            visibility_scope="member",
+            config=_butler_config(),
+            ledger_repo=ledger,
+            provider=provider,
+        )
+
+    # The exception must carry the ledger_id
+    assert exc_info.value.llm_usage_ledger_id is not None
+    assert exc_info.value.llm_usage_ledger_id > 0
+
+
+# ---------------------------------------------------------------------------
+# C-1: gateway binds identity fields (LLM cannot forge them)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_gateway_binds_identity_fields_over_llm_output() -> None:
+    """LLM returning forged visibility_scope or requester_user_id is overridden by gateway."""
+    context = _make_context(mvids=(10, 11))
+    # LLM attempts to forge admin scope and a different requester_user_id
+    forged_json = json.dumps(
+        {
+            "plan_summary": "Forged plan",
+            "evidence_ids": list(context.evidence_ids),
+            "actions": [
+                {
+                    "tool_name": "recall_evidence",
+                    "args": {"query": "who knows Rust?"},
+                    "requires_confirmation": True,
+                    "affected_user_ids": [],
+                    "risk_level": "low",
+                    "rollback_kind": "not_reversible",
+                    "inverse_op_payload": None,
+                }
+            ],
+            "evidence_context_hash": context.context_hash,
+            "requester_user_id": 99999,  # FORGED — should be overridden to 42
+            "chat_id": _CHAT_ID,
+            "visibility_scope": "admin",  # FORGED — should be overridden to "member"
+            "governance_filter_version": "evil-v99",  # FORGED
+            "rationale": None,
+        }
+    )
+
+    provider = FakeButlerProvider(answer_text=forged_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    plan, _, _ = await plan_butler_action(
+        session=session,
+        requester_user_id=42,
+        chat_id=_CHAT_ID,
+        query="who knows Rust?",
+        evidence_context=context,
+        visibility_scope="member",
+        config=_butler_config(),
+        ledger_repo=ledger,
+        provider=provider,
+    )
+
+    # Gateway must override LLM-supplied identity fields
+    assert plan.requester_user_id == 42, f"Expected 42, got {plan.requester_user_id}"
+    assert plan.visibility_scope == "member", f"Expected 'member', got {plan.visibility_scope}"
+    assert plan.governance_filter_version == context.governance_filter_version, (
+        f"Expected {context.governance_filter_version!r}, got {plan.governance_filter_version!r}"
+    )
+    assert plan.chat_id == _CHAT_ID
+
+
+# ---------------------------------------------------------------------------
+# C-4: evidence_context_hash + evidence_ids fail-closed verification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_raises_on_evidence_context_hash_mismatch() -> None:
+    """LLM returns wrong evidence_context_hash → ButlerPlanError (fail-closed)."""
+    context = _make_context(mvids=(10, 11))
+
+    # LLM echoes a completely different hash
+    wrong_hash_json = json.dumps(
+        {
+            "plan_summary": "Mismatch plan",
+            "evidence_ids": list(context.evidence_ids),
+            "actions": [
+                {
+                    "tool_name": "recall_evidence",
+                    "args": {"query": "who knows Rust?"},
+                    "requires_confirmation": True,
+                    "affected_user_ids": [],
+                    "risk_level": "low",
+                    "rollback_kind": "not_reversible",
+                    "inverse_op_payload": None,
+                }
+            ],
+            "evidence_context_hash": "WRONG_HASH_HALLUCINATED",  # mismatch
+            "requester_user_id": 42,
+            "chat_id": _CHAT_ID,
+            "visibility_scope": "member",
+            "governance_filter_version": "test-v1",
+            "rationale": None,
+        }
+    )
+
+    provider = FakeButlerProvider(answer_text=wrong_hash_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    with pytest.raises(ButlerPlanError) as exc_info:
+        await plan_butler_action(
+            session=session,
+            requester_user_id=42,
+            chat_id=_CHAT_ID,
+            query="who knows Rust?",
+            evidence_context=context,
+            visibility_scope="member",
+            config=_butler_config(),
+            ledger_repo=ledger,
+            provider=provider,
+        )
+
+    assert exc_info.value.error_kind == "evidence_context_mismatch"
+    # Provider should have been called once (mismatch checked post-dispatch)
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_hash_mismatch_writes_error_to_ledger() -> None:
+    """evidence_context_hash mismatch updates ledger with error."""
+    context = _make_context(mvids=(10, 11))
+    wrong_hash_json = json.dumps(
+        {
+            "plan_summary": "Mismatch plan",
+            "evidence_ids": list(context.evidence_ids),
+            "actions": [
+                {
+                    "tool_name": "recall_evidence",
+                    "args": {"query": "who knows Rust?"},
+                    "requires_confirmation": True,
+                    "affected_user_ids": [],
+                    "risk_level": "low",
+                    "rollback_kind": "not_reversible",
+                    "inverse_op_payload": None,
+                }
+            ],
+            "evidence_context_hash": "WRONG_HASH",
+            "requester_user_id": 42,
+            "chat_id": _CHAT_ID,
+            "visibility_scope": "member",
+            "governance_filter_version": "test-v1",
+            "rationale": None,
+        }
+    )
+
+    provider = FakeButlerProvider(answer_text=wrong_hash_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    with pytest.raises(ButlerPlanError):
+        await plan_butler_action(
+            session=session,
+            requester_user_id=42,
+            chat_id=_CHAT_ID,
+            query="who knows Rust?",
+            evidence_context=context,
+            visibility_scope="member",
+            config=_butler_config(),
+            ledger_repo=ledger,
+            provider=provider,
+        )
+
+    row = ledger.rows[-1]
+    assert row.error == "evidence_context_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_raises_on_orphan_evidence_ids() -> None:
+    """LLM references evidence_id not in sealed context → ButlerPlanError (fail-closed)."""
+    context = _make_context(mvids=(10, 11))
+    # LLM returns evidence_ids containing 999 which is not in sealed context (10, 11)
+    orphan_json = json.dumps(
+        {
+            "plan_summary": "Orphan plan",
+            "evidence_ids": [10, 11, 999],  # 999 is orphan
+            "actions": [
+                {
+                    "tool_name": "recall_evidence",
+                    "args": {"query": "who knows Rust?"},
+                    "requires_confirmation": True,
+                    "affected_user_ids": [],
+                    "risk_level": "low",
+                    "rollback_kind": "not_reversible",
+                    "inverse_op_payload": None,
+                }
+            ],
+            "evidence_context_hash": context.context_hash,
+            "requester_user_id": 42,
+            "chat_id": _CHAT_ID,
+            "visibility_scope": "member",
+            "governance_filter_version": "test-v1",
+            "rationale": None,
+        }
+    )
+
+    provider = FakeButlerProvider(answer_text=orphan_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    with pytest.raises(ButlerPlanError) as exc_info:
+        await plan_butler_action(
+            session=session,
+            requester_user_id=42,
+            chat_id=_CHAT_ID,
+            query="who knows Rust?",
+            evidence_context=context,
+            visibility_scope="member",
+            config=_butler_config(),
+            ledger_repo=ledger,
+            provider=provider,
+        )
+
+    assert exc_info.value.error_kind == "orphan_evidence_ids"
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_orphan_evidence_ids_writes_error_to_ledger() -> None:
+    """Orphan evidence_id updates ledger with error='orphan_evidence_ids'."""
+    context = _make_context(mvids=(10, 11))
+    orphan_json = json.dumps(
+        {
+            "plan_summary": "Orphan plan",
+            "evidence_ids": [10, 999],  # 999 is orphan
+            "actions": [
+                {
+                    "tool_name": "recall_evidence",
+                    "args": {"query": "test"},
+                    "requires_confirmation": True,
+                    "affected_user_ids": [],
+                    "risk_level": "low",
+                    "rollback_kind": "not_reversible",
+                    "inverse_op_payload": None,
+                }
+            ],
+            "evidence_context_hash": context.context_hash,
+            "requester_user_id": 42,
+            "chat_id": _CHAT_ID,
+            "visibility_scope": "member",
+            "governance_filter_version": "test-v1",
+            "rationale": None,
+        }
+    )
+
+    provider = FakeButlerProvider(answer_text=orphan_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    with pytest.raises(ButlerPlanError):
+        await plan_butler_action(
+            session=session,
+            requester_user_id=42,
+            chat_id=_CHAT_ID,
+            query="who knows Rust?",
+            evidence_context=context,
+            visibility_scope="member",
+            config=_butler_config(),
+            ledger_repo=ledger,
+            provider=provider,
+        )
+
+    row = ledger.rows[-1]
+    assert row.error == "orphan_evidence_ids"
+
+
+# ---------------------------------------------------------------------------
+# H-2: Butler-specific cost guard (daily $1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_butler_daily_ceiling_fires() -> None:
+    """Butler-specific daily $1 ceiling fires before provider dispatch."""
+    context = _make_context()
+    plan_json = _valid_plan_json(context=context)
+
+    provider = FakeButlerProvider(answer_text=plan_json)
+    from decimal import Decimal as D
+
+    # Pre-load butler daily cost AT the $1 ceiling
+    ledger = FakeLedgerRepo(daily_cost=D("1.00"), monthly_cost=D("0"))
+    session = FakeSession()
+    config = LLMGatewayConfig(
+        provider="anthropic",
+        model="claude-haiku-4-5-20251001",
+        daily_ceiling_usd=D("100.00"),  # shared ceiling high — not the blocker
+        monthly_ceiling_usd=D("100.00"),
+        prompt_template_version="v1.0.0",
+    )
+
+    with pytest.raises(ButlerPlanError):
+        await plan_butler_action(
+            session=session,
+            requester_user_id=42,
+            chat_id=_CHAT_ID,
+            query="who knows Rust?",
+            evidence_context=context,
+            visibility_scope="member",
+            config=config,
+            ledger_repo=ledger,
+            provider=provider,
+        )
+
+    assert len(provider.calls) == 0, "Provider must not be called when butler ceiling exceeded"
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_butler_daily_ceiling_uses_call_type_filter() -> None:
+    """Butler daily_cost_usd check is called with call_type='butler_decision'."""
+    context = _make_context()
+    plan_json = _valid_plan_json(context=context)
+
+    # Track calls to daily_cost_usd to verify call_type param
+    call_type_seen: list[str | None] = []
+
+    class TrackingLedgerRepo(FakeLedgerRepo):
+        async def daily_cost_usd(
+            self, session: Any, *, day: Any, call_type: str | None = None
+        ) -> Decimal:
+            call_type_seen.append(call_type)
+            return await super().daily_cost_usd(session, day=day, call_type=call_type)
+
+    provider = FakeButlerProvider(answer_text=plan_json)
+    ledger = TrackingLedgerRepo()
+    session = FakeSession()
+
+    await plan_butler_action(
+        session=session,
+        requester_user_id=42,
+        chat_id=_CHAT_ID,
+        query="who knows Rust?",
+        evidence_context=context,
+        visibility_scope="member",
+        config=_butler_config(),
+        ledger_repo=ledger,
+        provider=provider,
+    )
+
+    # At least one call_type='butler_decision' should appear
+    assert "butler_decision" in call_type_seen, (
+        f"Expected 'butler_decision' call_type in daily_cost_usd calls; got {call_type_seen}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# H-3: allowed_tools + tool_manifest_version params in plan_butler_action
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_prompt_includes_tool_manifest_version() -> None:
+    """Prompt body includes the tool_manifest_version for G3.b replay."""
+    context = _make_context()
+    plan_json = _valid_plan_json(context=context)
+
+    provider = FakeButlerProvider(answer_text=plan_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    await plan_butler_action(
+        session=session,
+        requester_user_id=42,
+        chat_id=_CHAT_ID,
+        query="who knows Rust?",
+        evidence_context=context,
+        visibility_scope="member",
+        config=_butler_config(),
+        ledger_repo=ledger,
+        provider=provider,
+    )
+
+    prompt_sent = provider.calls[0]["prompt"]
+    # The manifest version (at least something version-like) should appear in prompt
+    assert "v1.0.0" in prompt_sent, (
+        f"Expected tool_manifest_version in prompt; prompt={prompt_sent[:300]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_prompt_includes_requester_and_chat() -> None:
+    """Prompt body includes requester_user_id and chat_id (M-1)."""
+    context = _make_context()
+    plan_json = _valid_plan_json(context=context)
+
+    provider = FakeButlerProvider(answer_text=plan_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    await plan_butler_action(
+        session=session,
+        requester_user_id=42,
+        chat_id=_CHAT_ID,
+        query="who knows Rust?",
+        evidence_context=context,
+        visibility_scope="member",
+        config=_butler_config(),
+        ledger_repo=ledger,
+        provider=provider,
+    )
+
+    prompt_sent = provider.calls[0]["prompt"]
+    assert "42" in prompt_sent, "requester_user_id=42 should appear in prompt"
+    assert str(_CHAT_ID) in prompt_sent, "chat_id should appear in prompt"
