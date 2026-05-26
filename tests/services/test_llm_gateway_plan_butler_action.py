@@ -12,7 +12,7 @@ Covers:
     ledger row written with error.
   - Monthly cost guard fires when budget would be exceeded → ButlerPlanError raised;
     ledger row written with error='budget_exceeded'.
-  - Prompt sent to provider does NOT include raw forgotten content.
+  - Prompt sent to provider does NOT include raw redacted/purged source content.
   - ButlerPlan returned has evidence_context_hash == evidence_context.context_hash.
 """
 
@@ -704,13 +704,13 @@ async def test_plan_butler_action_budget_exceeded_still_writes_ledger_row() -> N
 
 
 # ---------------------------------------------------------------------------
-# Privacy: prompt does not include raw forgotten content
+# Privacy: prompt does not include raw source snippet content
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_plan_butler_action_prompt_does_not_include_raw_source_content() -> None:
-    """The prompt sent to the provider does NOT include raw forgotten content.
+    """The prompt sent to the provider does NOT include raw source snippet content.
 
     The gateway receives a ButlerEvidenceContext (sealed envelope).
     It must NOT dump raw snippet text from the bundle items into the prompt body.
