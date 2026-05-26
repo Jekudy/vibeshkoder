@@ -122,6 +122,14 @@ is_allowed_path() {
   # describes the policy by name, so it must mention the canonical terms.
   [[ "$path" == "docs/rollout-fragments/phase12/t12-02.md" ]] && return 0
 
+  # T12-04 rollout fragment — operator-facing doc documenting the
+  # ButlerService state machine. Same rationale as the t12-02.md entry:
+  # the doc names canonical privacy literals (Hard Constraint #3) as
+  # policy explanation, not as a leak vector. The orchestrator code
+  # itself (bot/services/butler.py) is NOT allowlisted — only the
+  # documenting rollout fragment.
+  [[ "$path" == "docs/rollout-fragments/phase12/t12-04.md" ]] && return 0
+
   # T9-08 Phase 11 binding tests for wiki — name the canonical privacy
   # literals in docstrings, assertion messages, and seed-data SQL because
   # they ENFORCE the policy by name. Same rationale as test_digest_leakage.py
