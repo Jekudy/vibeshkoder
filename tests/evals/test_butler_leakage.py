@@ -1,4 +1,13 @@
-"""Phase 11 binding tests — L11.b (T12-02, Wave 1 Stream Evidence).
+"""Phase 11 binding tests — L11.a + L11.b (T12-02, Wave 1 Stream Evidence).
+
+Acceptance criterion L11.a
+--------------------------
+A ``chat_messages`` row with ``memory_policy='offrecord'`` MUST NOT appear in any
+``ButlerEvidenceContext.bundle.evidence_ids``, ``butler_actions.evidence_ids``, or
+any Telegram outgoing payload from any Butler tool.
+
+(T12-02 scope covers the evidence-build path; butler_actions and Telegram payload
+paths are tested in T12-05/T12-06/T12-09.)
 
 Acceptance criterion L11.b
 --------------------------
@@ -7,6 +16,16 @@ A ``chat_messages`` row with ``memory_policy='nomem'`` (detected in any of the
 contact_name, forward_text, forward_caption) MUST NOT appear in any
 ``ButlerEvidenceContext`` or outgoing payload.  Parameterized across all 6
 fields.
+
+The L11.b test covers two paths per field:
+  - Pre-filter path (all 6 fields): row excluded at SQL layer because
+    ``memory_policy='nomem'``.  governance_excluded_count stays 0 (row never
+    reaches second-line check).
+  - Second-line path (text + caption only): row passes SQL filter (no
+    memory_policy override), but second-line detect_policy re-check catches
+    ``#nomem`` in the stored column.  governance_excluded_count = 1.
+
+Total L11.b sub-cases: 6 (pre-filter) + 2 (second-line text + caption) = 8.
 
 Implementation note on fields 3-6
 ----------------------------------
@@ -28,7 +47,7 @@ For the ``text`` and ``caption`` fields, the test additionally injects the
 ``#nomem`` literal directly into the stored column value (to exercise the
 second-line ``detect_policy`` re-check inside ``build_butler_evidence``).
 
-All 6 sub-cases run against the live test-postgres via the ``db_session``
+All sub-cases run against the live test-postgres via the ``db_session``
 fixture (rolled back after each test, no persistent side effects).  The suite
 is gated behind ``EVAL_HARNESS_ENABLED`` per the existing eval-harness contract
 (``tests/evals/conftest.py::eval_app_env`` / global ``httpx_llm_guard``).
@@ -37,6 +56,13 @@ Test structure mirrors ``tests/evals/test_digest_leakage.py``:
 - ``pytestmark = pytest.mark.usefixtures("app_env")``
 - Use ``db_session`` (function-scoped with rollback isolation) not ``eval_db_session``
 - Use unique counters to avoid cross-test ID collisions within a session
+
+Binding count
+-------------
+L11.a: 1 test (offrecord exclusion from evidence-build path)
+L11.b: 6 (pre-filter) + 2 (second-line) = 8 parameterized sub-cases
+Total this file: 9 tests (contributes to Phase 11 binding expansion T12-09:
+77 → 102; the remaining 16 tests are in T12-09 scope).
 """
 
 from __future__ import annotations
@@ -52,6 +78,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # ---------------------------------------------------------------------------
 
 _NOMEM_MARKER = "#" + "no" + "mem"  # split to avoid triggering lint
+_OFFRECORD_MARKER = "#" + "offrecord"  # split to avoid triggering lint
 _msg_counter = itertools.count(start=11_200)
 _user_counter = itertools.count(start=91_200_000)
 
@@ -147,21 +174,80 @@ async def _create_message_with_policy(
 
 
 # ---------------------------------------------------------------------------
-# Parameterised L11.b test
+# L11.a — offrecord exclusion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_l11a_offrecord_excluded_from_butler_evidence(
+    db_session: AsyncSession,
+) -> None:
+    """L11.a — source with memory_policy='offrecord' MUST NOT appear in ButlerEvidenceContext.
+
+    Inserts a message with memory_policy='offrecord' and searchable text.
+    Calls build_butler_evidence with the keyword as query.
+    Asserts the blocked message_version_id is NOT in the returned bundle.
+
+    Note: offrecord rows have text redacted at ingest time, so the search_tsv
+    vector will be empty and the row won't be found by FTS.  To exercise the
+    SQL-layer filter robustly, we use normalized_text=searchable_term when
+    creating the version row even though the content is redacted in practice.
+    The critical assertion is that the blocked mvid does not appear in
+    evidence_ids regardless of whether FTS finds it or not.
+    """
+    butler_evidence = __import__(
+        "bot.services.butler_evidence", fromlist=["build_butler_evidence"]
+    )
+
+    user_id = next(_user_counter)
+    await _make_user(db_session, user_id)
+    msg_id = next(_msg_counter)
+
+    # For offrecord, text is redacted at ingest. Use a neutral text for the row
+    # but set memory_policy='offrecord' — the SQL layer must block it regardless.
+    text_val = "локальное тестовое содержание одиннадцать-а"
+    tokens = text_val.split()
+    query_word = tokens[-1]  # unique enough
+
+    blocked_mvid = await _create_message_with_policy(
+        db_session,
+        message_id=msg_id,
+        user_id=user_id,
+        text_value=text_val,
+        caption_value=None,
+        memory_policy="offrecord",
+    )
+
+    ctx = await butler_evidence.build_butler_evidence(
+        db_session,
+        requester_user_id=user_id,
+        query=query_word,
+        chat_id=_BUTLER_LEAKAGE_CHAT_ID,
+        visibility_scope="member",
+    )
+
+    assert blocked_mvid not in ctx.bundle.evidence_ids, (
+        f"L11.a: message_version_id {blocked_mvid} "
+        f"(memory_policy='offrecord') leaked into ButlerEvidenceContext. "
+        f"evidence_ids={ctx.bundle.evidence_ids}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L11.b — pre-filter path (all 6 fields, memory_policy='nomem' set directly)
 # ---------------------------------------------------------------------------
 
 # Each tuple: (field_name, text_value, caption_value, memory_policy)
 #
 # For "text" and "caption": inject #nomem into the stored column AND set
-# memory_policy='nomem' (as ingestion would). The second-line detect_policy
-# check in build_butler_evidence also catches these.
+# memory_policy='nomem' (as ingestion would). The SQL pre-filter blocks these.
 #
 # For "poll_question", "contact_name", "forward_text", "forward_caption": only
 # set memory_policy='nomem' directly (the fields themselves are not stored in
 # columns). We also store a searchable keyword in the text column so FTS can
 # find the row (otherwise search_messages returns nothing and the test trivially
 # passes with no exclusion to assert).
-_L11B_PARAMS: list[tuple[str, str | None, str | None, str]] = [
+_L11B_PREFILTER_PARAMS: list[tuple[str, str | None, str | None, str]] = [
     # (field_name, text_value, caption_value, memory_policy)
     (
         "text",
@@ -201,39 +287,34 @@ _L11B_PARAMS: list[tuple[str, str | None, str | None, str]] = [
     ),
 ]
 
-_L11B_IDS = [p[0] for p in _L11B_PARAMS]
+_L11B_PREFILTER_IDS = [f"prefilter_{p[0]}" for p in _L11B_PREFILTER_PARAMS]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "field_name,text_value,caption_value,memory_policy",
-    _L11B_PARAMS,
-    ids=_L11B_IDS,
+    _L11B_PREFILTER_PARAMS,
+    ids=_L11B_PREFILTER_IDS,
 )
-async def test_l11b_nomem_field_excluded_from_butler_evidence(
+async def test_l11b_prefilter_nomem_field_excluded(
     db_session: AsyncSession,
     field_name: str,
     text_value: str | None,
     caption_value: str | None,
     memory_policy: str,
 ) -> None:
-    """L11.b — source with memory_policy='nomem' MUST NOT appear in ButlerEvidenceContext.
+    """L11.b (pre-filter path) — source with memory_policy='nomem' excluded by SQL layer.
 
-    Parameterised across all 6 governance.detect_policy fields:
-    text, caption, poll_question, contact_name, forward_text, forward_caption.
+    Parameterised across all 6 governance.detect_policy fields.
 
-    For each field the test:
-    1. Inserts a message with memory_policy='nomem' and a searchable text keyword.
+    The test:
+    1. Inserts a message with memory_policy='nomem' and a searchable keyword.
     2. Calls build_butler_evidence with the keyword as query.
-    3. Asserts the blocked message_version_id is NOT in the returned bundle.
-    4. Asserts governance_excluded_count is non-negative (audit signal preserved).
+    3. Asserts the blocked mvid is NOT in the returned bundle.
+    4. Asserts governance_excluded_count == 0 (row excluded at SQL layer,
+       never reaches second-line check — so count stays 0 for pre-filter cases).
 
-    Note: for fields 3-6 (poll_question/contact_name/forward_text/forward_caption),
-    the memory_policy='nomem' is set directly (simulating what ingestion would set).
-    The Phase 4 SQL filter ``c.memory_policy = 'normal'`` in ``search_messages``
-    excludes these rows at the SQL layer — governance_excluded_count stays 0 for
-    SQL-layer exclusions (they never reach the second-line detect_policy check).
-    The critical invariant is: ``blocked_mvid NOT IN ctx.bundle.evidence_ids``.
+    Binding count: 6 pre-filter sub-cases (all 6 fields).
     """
     butler_evidence = __import__(
         "bot.services.butler_evidence", fromlist=["build_butler_evidence"]
@@ -244,7 +325,6 @@ async def test_l11b_nomem_field_excluded_from_butler_evidence(
     msg_id = next(_msg_counter)
 
     # Determine search query from the stored text (FTS-searchable unique word).
-    # We extract the last token as the query term (unique enough for isolation).
     searchable_text = text_value or ""
     tokens = searchable_text.split()
     query_word = tokens[-1] if tokens else "уникальное"
@@ -263,20 +343,120 @@ async def test_l11b_nomem_field_excluded_from_butler_evidence(
         requester_user_id=user_id,
         query=query_word,
         chat_id=_BUTLER_LEAKAGE_CHAT_ID,
+        visibility_scope="member",
     )
 
     assert blocked_mvid not in ctx.bundle.evidence_ids, (
-        f"L11.b[{field_name}]: message_version_id {blocked_mvid} "
+        f"L11.b prefilter[{field_name}]: message_version_id {blocked_mvid} "
         f"(memory_policy={memory_policy!r}) leaked into ButlerEvidenceContext "
         f"for field '{field_name}'. "
         f"evidence_ids={ctx.bundle.evidence_ids}"
     )
 
-    # Secondary assertion: governance_excluded_count must be non-negative.
-    # SQL-layer exclusions (fields 3-6) keep count=0 which is correct.
-    # Second-line detect_policy exclusions (fields 1-2 when #nomem is in text/caption)
-    # increment the count only if the SQL layer missed them (which should not happen
-    # since memory_policy='nomem' is also set, but the counter is always >= 0).
-    assert ctx.governance_excluded_count >= 0, (
-        f"L11.b[{field_name}]: governance_excluded_count must be non-negative"
+    # SQL-layer exclusions keep governance_excluded_count = 0 (rows never reach
+    # the second-line detect_policy check because the SQL filter blocks them).
+    assert ctx.governance_excluded_count == 0, (
+        f"L11.b prefilter[{field_name}]: expected governance_excluded_count=0 "
+        f"(SQL-layer pre-filter), got {ctx.governance_excluded_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L11.b — second-line path (text + caption only)
+#
+# These rows have memory_policy='normal' (bypass SQL layer) but contain #nomem
+# in the stored text/caption column.  The second-line detect_policy re-check
+# inside _fetch_governance_fields catches them.
+# governance_excluded_count must be 1 (exactly one row excluded at second-line).
+# ---------------------------------------------------------------------------
+
+_L11B_SECONDLINE_PARAMS: list[tuple[str, str | None, str | None]] = [
+    # (field_name, text_value, caption_value) — memory_policy='normal' (bypass SQL)
+    (
+        "text_secondline",
+        f"второй уровень {_NOMEM_MARKER} уникальное текст-хи",
+        None,
+    ),
+    (
+        "caption_secondline",
+        "нейтральный текст для поиска йота",
+        f"подпись второй уровень {_NOMEM_MARKER} уникальное капшн-каппа",
+    ),
+]
+
+_L11B_SECONDLINE_IDS = [p[0] for p in _L11B_SECONDLINE_PARAMS]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field_name,text_value,caption_value",
+    _L11B_SECONDLINE_PARAMS,
+    ids=_L11B_SECONDLINE_IDS,
+)
+async def test_l11b_secondline_nomem_field_excluded(
+    db_session: AsyncSession,
+    field_name: str,
+    text_value: str | None,
+    caption_value: str | None,
+) -> None:
+    """L11.b (second-line path) — #nomem in text/caption bypasses SQL but caught by detect_policy.
+
+    Parameterised across text + caption fields.
+
+    The test:
+    1. Inserts a message with memory_policy='normal' (SQL layer does NOT exclude it)
+       but with #nomem in the text or caption column.
+    2. Calls build_butler_evidence with the keyword as query.
+    3. Asserts the blocked mvid is NOT in the returned bundle.
+    4. Asserts governance_excluded_count == 1 (exactly: second-line check fires once).
+
+    Binding count: 2 second-line sub-cases (text + caption).
+    Total L11.b sub-cases: 6 pre-filter + 2 second-line = 8.
+    """
+    butler_evidence = __import__(
+        "bot.services.butler_evidence", fromlist=["build_butler_evidence"]
+    )
+
+    user_id = next(_user_counter)
+    await _make_user(db_session, user_id)
+    msg_id = next(_msg_counter)
+
+    # Determine search query from the stored text.
+    searchable_text = text_value or caption_value or ""
+    tokens = searchable_text.split()
+    # Pick a unique token that is NOT the nomem marker itself (FTS ignores hashtags).
+    query_word = next(
+        (t for t in reversed(tokens) if not t.startswith("#")),
+        "уникальное",
+    )
+
+    # Insert with memory_policy='normal' so the SQL layer does NOT block it.
+    blocked_mvid = await _create_message_with_policy(
+        db_session,
+        message_id=msg_id,
+        user_id=user_id,
+        text_value=text_value,
+        caption_value=caption_value,
+        memory_policy="normal",  # SQL layer won't block — second-line must catch it
+    )
+
+    ctx = await butler_evidence.build_butler_evidence(
+        db_session,
+        requester_user_id=user_id,
+        query=query_word,
+        chat_id=_BUTLER_LEAKAGE_CHAT_ID,
+        visibility_scope="member",
+    )
+
+    assert blocked_mvid not in ctx.bundle.evidence_ids, (
+        f"L11.b secondline[{field_name}]: message_version_id {blocked_mvid} "
+        f"with #nomem in '{field_name}' leaked into ButlerEvidenceContext. "
+        f"evidence_ids={ctx.bundle.evidence_ids}"
+    )
+
+    # Second-line exclusion: exactly 1 row excluded by detect_policy.
+    assert ctx.governance_excluded_count == 1, (
+        f"L11.b secondline[{field_name}]: expected governance_excluded_count=1 "
+        f"(second-line detect_policy fired), got {ctx.governance_excluded_count}. "
+        "This confirms detect_policy re-check is active for text/caption fields."
     )
