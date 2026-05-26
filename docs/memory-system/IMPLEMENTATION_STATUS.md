@@ -699,6 +699,7 @@ sync→async cascade FLIP per RFC-001:415 conditional Neo4j approval).
 |----|------|-------------|--------|-------|
 | T12-01 | 1 | Schema foundation: `butler_plans`/`butler_actions` ORM + repos + cascade + migration 073 | merged | Commits `fa606ac`+`169b8b4`+`da612c0`+`c9e9fd8`. Alembic head 068 → 073. |
 | T12-02 | 1 | `ButlerEvidenceContext` + `butler_context_hash` + `build_butler_evidence` (spec §3.6 / §4.2) | PR pending | Branch `feat/p12-t12-02-evidence`. 43 unit + 9 L11 binding tests green. Phase 11 binding 77 → 86. No flag flipped; foundation for T12-04 confirm_action + T12-08 hash replay. Tool wrapper deferred to T12-06. |
+| T12-03 | 1 | Butler tools registry + LLM gateway entry points: `ButlerTool` Protocol (§5.C), `ButlerPlan` pydantic v2 + `ALLOWED_BUTLER_TOOLS` frozenset (5 names), `validate_butler_plan`, `plan_butler_action` (`call_type='butler_decision'`) + `synthesize_butler_summary` (`call_type='butler_summary'`) in `llm_gateway.py` | PR pending | Branch `feat/p12-t12-03-toolreg`. Commits `b17509f`..`7de6e18`. 77 unit + gateway tests green (44 registry + 26 plan + 7 synthesize). Phase 11 binding **86 → 86** (T12-03 adds no binding tests; L12/C10/I9/R8/G3 family lands in T12-09). No flag flipped; foundation for T12-04 confirm_action + T12-06 tool wrappers + T12-08 hash replay. |
 
 <!-- updated-by-superflow:2026-05-26 -->
 <!-- phase-a-cleanup:2026-05-22 -->
