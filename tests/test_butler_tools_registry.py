@@ -221,7 +221,12 @@ def test_validate_butler_plan_rejects_invalid_args_suggest_card_creation() -> No
 def test_validate_butler_plan_accepts_recall_evidence() -> None:
     plan = _make_plan("recall_evidence", {"query": "who knows Python?"})
     result = validate_butler_plan(plan)
-    assert result is plan  # returns the plan unchanged
+    # Returns a plan with the same core fields (args may be canonical model_dump)
+    assert isinstance(result, ButlerPlan)
+    assert result.plan_summary == plan.plan_summary
+    assert result.evidence_ids == plan.evidence_ids
+    assert len(result.actions) == 1
+    assert result.actions[0].tool_name == "recall_evidence"
 
 
 def test_validate_butler_plan_accepts_schedule_meeting() -> None:
@@ -230,7 +235,8 @@ def test_validate_butler_plan_accepts_schedule_meeting() -> None:
         {"topic": "intro sync", "proposed_time_text": "Friday 2pm"},
     )
     result = validate_butler_plan(plan)
-    assert result is plan
+    assert isinstance(result, ButlerPlan)
+    assert result.actions[0].tool_name == "schedule_meeting"
 
 
 def test_validate_butler_plan_accepts_send_intro() -> None:
@@ -239,7 +245,8 @@ def test_validate_butler_plan_accepts_send_intro() -> None:
         {"target_user_id": 999, "intro_text": "Meet Alice, she knows Rust!"},
     )
     result = validate_butler_plan(plan)
-    assert result is plan
+    assert isinstance(result, ButlerPlan)
+    assert result.actions[0].tool_name == "send_intro"
 
 
 def test_validate_butler_plan_accepts_update_intro() -> None:
@@ -248,7 +255,8 @@ def test_validate_butler_plan_accepts_update_intro() -> None:
         {"message_id": 555, "new_intro_text": "Updated intro"},
     )
     result = validate_butler_plan(plan)
-    assert result is plan
+    assert isinstance(result, ButlerPlan)
+    assert result.actions[0].tool_name == "update_intro"
 
 
 def test_validate_butler_plan_accepts_suggest_card_creation() -> None:
@@ -261,7 +269,8 @@ def test_validate_butler_plan_accepts_suggest_card_creation() -> None:
         },
     )
     result = validate_butler_plan(plan)
-    assert result is plan
+    assert isinstance(result, ButlerPlan)
+    assert result.actions[0].tool_name == "suggest_card_creation"
 
 
 # ---------------------------------------------------------------------------
@@ -398,3 +407,114 @@ def test_suggest_card_creation_args_requires_title() -> None:
 
     with pytest.raises(ValidationError):
         SuggestCardCreationArgs(summary="summarising")  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
+# ButlerTool Protocol shape — H-1 (spec §5.C)
+# ---------------------------------------------------------------------------
+
+
+def _butler_tool_members() -> frozenset[str]:
+    """Return the set of Protocol member names from ButlerTool.__protocol_attrs__."""
+    from bot.services.butler_tools import ButlerTool
+
+    # __protocol_attrs__ is set by the typing module on Protocol subclasses and
+    # contains all abstract member names (attributes + methods).
+    return frozenset(getattr(ButlerTool, "__protocol_attrs__", set()))
+
+
+def test_butler_tool_protocol_has_name_attribute() -> None:
+    assert "name" in _butler_tool_members()
+
+
+def test_butler_tool_protocol_has_schema_version_attribute() -> None:
+    assert "schema_version" in _butler_tool_members()
+
+
+def test_butler_tool_protocol_has_args_model_attribute() -> None:
+    assert "args_model" in _butler_tool_members()
+
+
+def test_butler_tool_protocol_has_validate_policy_method() -> None:
+    from bot.services.butler_tools import ButlerTool
+
+    assert hasattr(ButlerTool, "validate_policy")
+
+
+def test_butler_tool_protocol_has_build_inverse_method() -> None:
+    from bot.services.butler_tools import ButlerTool
+
+    assert hasattr(ButlerTool, "build_inverse")
+
+
+def test_butler_tool_protocol_has_execute_method() -> None:
+    from bot.services.butler_tools import ButlerTool
+
+    assert hasattr(ButlerTool, "execute")
+
+
+# ---------------------------------------------------------------------------
+# BUTLER_TOOL_MANIFEST_VERSION constant — H-3
+# ---------------------------------------------------------------------------
+
+
+def test_butler_tool_manifest_version_is_str() -> None:
+    from bot.services.butler_tools import BUTLER_TOOL_MANIFEST_VERSION
+
+    assert isinstance(BUTLER_TOOL_MANIFEST_VERSION, str)
+    assert BUTLER_TOOL_MANIFEST_VERSION  # non-empty
+
+
+# ---------------------------------------------------------------------------
+# ButlerPlanError carries ledger_id and error_kind — C-3
+# ---------------------------------------------------------------------------
+
+
+def test_butler_plan_error_carries_llm_usage_ledger_id() -> None:
+    err = ButlerPlanError("some error", llm_usage_ledger_id=42, error_kind="some_kind")
+    assert err.llm_usage_ledger_id == 42
+    assert err.error_kind == "some_kind"
+
+
+def test_butler_plan_error_defaults_ledger_id_to_none() -> None:
+    err = ButlerPlanError("plain error")
+    assert err.llm_usage_ledger_id is None
+    assert err.error_kind is None
+
+
+# ---------------------------------------------------------------------------
+# H-4: args canonicalisation in validate_butler_plan
+# ---------------------------------------------------------------------------
+
+
+def test_validate_butler_plan_args_are_canonical_after_validation() -> None:
+    """After validate_butler_plan, step.args is the canonical model_dump form."""
+    # ScheduleMeetingArgs has participant_user_ids: list[int] = []
+    # If we pass the raw dict without it, the canonical form should include the default.
+    plan = _make_plan(
+        "schedule_meeting",
+        {"topic": "team sync"},  # omit optional proposed_time_text + participant_user_ids
+    )
+    result = validate_butler_plan(plan)
+    canonical_args = result.actions[0].args
+    # The canonical form from ScheduleMeetingArgs.model_dump() should include defaults
+    assert "topic" in canonical_args
+    assert canonical_args["topic"] == "team sync"
+    # Default fields should be present in canonical dump
+    assert "participant_user_ids" in canonical_args
+    assert "proposed_time_text" in canonical_args
+
+
+# ---------------------------------------------------------------------------
+# M-3: ButlerPlan uses tuple types
+# ---------------------------------------------------------------------------
+
+
+def test_butler_plan_evidence_ids_is_tuple() -> None:
+    plan = _make_plan("recall_evidence", {"query": "test"}, evidence_ids=[1, 2, 3])
+    assert isinstance(plan.evidence_ids, tuple)
+
+
+def test_butler_plan_actions_is_tuple() -> None:
+    plan = _make_plan("recall_evidence", {"query": "test"})
+    assert isinstance(plan.actions, tuple)
