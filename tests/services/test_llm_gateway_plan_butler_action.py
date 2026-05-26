@@ -486,7 +486,7 @@ async def test_plan_butler_action_raises_tool_not_allowed_on_forbidden_tool() ->
     ledger = FakeLedgerRepo()
     session = FakeSession()
 
-    with pytest.raises((ToolNotAllowedError, ButlerPlanError)):
+    with pytest.raises((ToolNotAllowedError, ButlerPlanError)) as excinfo:
         await plan_butler_action(
             session=session,
             requester_user_id=42,
@@ -498,6 +498,66 @@ async def test_plan_butler_action_raises_tool_not_allowed_on_forbidden_tool() ->
             ledger_repo=ledger,
             provider=provider,
         )
+    assert excinfo.value.error_kind == "tool_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_plan_butler_action_unknown_tool_name_has_error_kind_tool_not_allowed() -> None:
+    """Unknown tool_name must produce error_kind='tool_not_allowed', not 'invalid_plan_schema'.
+
+    HIGH fix: before Option A, ButlerActionStep.tool_name was Literal[...] so pydantic
+    raised a ValidationError before validate_butler_plan ran, tagging the error as
+    'invalid_plan_schema'. After Option A (tool_name: str), pydantic accepts any string
+    and validate_butler_plan is the sole source of the allowlist check, raising
+    ToolNotAllowedError(error_kind='tool_not_allowed').
+    """
+    context = _make_context()
+    bad_json = json.dumps(
+        {
+            "plan_summary": "Evil plan",
+            "evidence_ids": list(context.evidence_ids),
+            "actions": [
+                {
+                    "tool_name": "send_email",  # NOT in allowlist
+                    "args": {"to": "victim@example.com"},
+                    "requires_confirmation": False,
+                    "affected_user_ids": [],
+                    "risk_level": "high",
+                    "rollback_kind": "not_reversible",
+                    "inverse_op_payload": None,
+                }
+            ],
+            "evidence_context_hash": context.context_hash,
+            "requester_user_id": 42,
+            "chat_id": _CHAT_ID,
+            "visibility_scope": "member",
+            "governance_filter_version": "test-v1",
+            "rationale": None,
+        }
+    )
+
+    provider = FakeButlerProvider(answer_text=bad_json)
+    ledger = FakeLedgerRepo()
+    session = FakeSession()
+
+    with pytest.raises((ToolNotAllowedError, ButlerPlanError)) as excinfo:
+        await plan_butler_action(
+            session=session,
+            requester_user_id=42,
+            chat_id=_CHAT_ID,
+            query="who knows Rust?",
+            evidence_context=context,
+            visibility_scope="member",
+            config=_butler_config(),
+            ledger_repo=ledger,
+            provider=provider,
+        )
+
+    assert excinfo.value.error_kind == "tool_not_allowed", (
+        f"Expected error_kind='tool_not_allowed' but got {excinfo.value.error_kind!r}. "
+        "ButlerActionStep.tool_name must be str (not Literal) so pydantic accepts any "
+        "string and validate_butler_plan raises ToolNotAllowedError, not a schema error."
+    )
 
 
 @pytest.mark.asyncio
@@ -570,7 +630,7 @@ async def test_plan_butler_action_raises_invalid_tool_args_on_schema_violation()
     ledger = FakeLedgerRepo()
     session = FakeSession()
 
-    with pytest.raises((InvalidToolArgsError, ButlerPlanError)):
+    with pytest.raises((InvalidToolArgsError, ButlerPlanError)) as excinfo:
         await plan_butler_action(
             session=session,
             requester_user_id=42,
@@ -582,6 +642,7 @@ async def test_plan_butler_action_raises_invalid_tool_args_on_schema_violation()
             ledger_repo=ledger,
             provider=provider,
         )
+    assert excinfo.value.error_kind == "invalid_args"
 
 
 @pytest.mark.asyncio
@@ -598,7 +659,7 @@ async def test_plan_butler_action_writes_ledger_row_with_error_on_schema_violati
     ledger = FakeLedgerRepo()
     session = FakeSession()
 
-    with pytest.raises((InvalidToolArgsError, ButlerPlanError)):
+    with pytest.raises((InvalidToolArgsError, ButlerPlanError)) as excinfo:
         await plan_butler_action(
             session=session,
             requester_user_id=42,
@@ -611,6 +672,7 @@ async def test_plan_butler_action_writes_ledger_row_with_error_on_schema_violati
             provider=provider,
         )
 
+    assert excinfo.value.error_kind == "invalid_args"
     assert len(ledger.rows) >= 1
     row = ledger.rows[-1]
     assert row.error is not None
@@ -646,7 +708,7 @@ async def test_plan_butler_action_raises_when_monthly_budget_exceeded() -> None:
         prompt_template_version="v1.0.0",
     )
 
-    with pytest.raises(ButlerPlanError):
+    with pytest.raises(ButlerPlanError) as excinfo:
         await plan_butler_action(
             session=session,
             requester_user_id=42,
@@ -659,6 +721,7 @@ async def test_plan_butler_action_raises_when_monthly_budget_exceeded() -> None:
             provider=provider,
         )
 
+    assert excinfo.value.error_kind == "budget_exceeded"
     # Provider must NOT have been called (budget guard fires pre-dispatch)
     assert len(provider.calls) == 0
 
@@ -686,7 +749,7 @@ async def test_plan_butler_action_budget_exceeded_still_writes_ledger_row() -> N
         prompt_template_version="v1.0.0",
     )
 
-    with pytest.raises(ButlerPlanError):
+    with pytest.raises(ButlerPlanError) as excinfo:
         await plan_butler_action(
             session=session,
             requester_user_id=42,
@@ -699,6 +762,7 @@ async def test_plan_butler_action_budget_exceeded_still_writes_ledger_row() -> N
             provider=provider,
         )
 
+    assert excinfo.value.error_kind == "budget_exceeded"
     assert len(ledger.rows) >= 1
     row = ledger.rows[-1]
     assert row.error == "budget_exceeded"
@@ -1142,7 +1206,7 @@ async def test_plan_butler_action_orphan_evidence_ids_writes_error_to_ledger() -
     ledger = FakeLedgerRepo()
     session = FakeSession()
 
-    with pytest.raises(ButlerPlanError):
+    with pytest.raises(ButlerPlanError) as excinfo:
         await plan_butler_action(
             session=session,
             requester_user_id=42,
@@ -1155,6 +1219,7 @@ async def test_plan_butler_action_orphan_evidence_ids_writes_error_to_ledger() -
             provider=provider,
         )
 
+    assert excinfo.value.error_kind == "orphan_evidence_ids"
     row = ledger.rows[-1]
     assert row.error == "orphan_evidence_ids"
 
