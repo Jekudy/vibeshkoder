@@ -107,6 +107,13 @@ is_allowed_path() {
   # test_wiki_leakage.py / test_graph_leakage.py allowlist entries above.
   [[ "$path" == "tests/evals/test_butler_leakage.py" ]] && return 0
 
+  # T12-02 butler_evidence.py — the canonical governance pre-filter for the
+  # Butler evidence-build path. Docstrings and inline comments name the
+  # privacy policy literals because the file IS the policy enforcer — it
+  # calls detect_policy and excludes non-normal rows from Butler evidence.
+  # Same rationale as forget_cascade.py / digest_redactor.py above.
+  [[ "$path" == "bot/services/butler_evidence.py" ]] && return 0
+
   # T9-08 Phase 11 binding tests for wiki — name the canonical privacy
   # literals in docstrings, assertion messages, and seed-data SQL because
   # they ENFORCE the policy by name. Same rationale as test_digest_leakage.py
