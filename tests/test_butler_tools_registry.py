@@ -327,18 +327,53 @@ def test_butler_action_step_has_spec_fields() -> None:
         assert f in fields, f"Missing spec field on ButlerActionStep: {f!r}"
 
 
-def test_butler_action_step_tool_name_restricted_to_allowed() -> None:
-    from pydantic import ValidationError
+def test_butler_action_step_tool_name_accepts_any_string_restriction_is_in_validate() -> None:
+    """After Option A: ButlerActionStep.tool_name is plain str, not Literal[...].
 
-    with pytest.raises(ValidationError):
-        ButlerActionStep(
-            tool_name="unknown_tool",
-            args={},
-            requires_confirmation=True,
-            affected_user_ids=[],
-            risk_level="low",
-            rollback_kind="not_reversible",
-        )
+    Pydantic accepts any string — the allowlist is enforced exclusively in
+    validate_butler_plan (ToolNotAllowedError), not at model construction time.
+    This test confirms the design: pydantic does NOT raise ValidationError on
+    an unknown tool_name; rejection happens when validate_butler_plan is called.
+    """
+    # pydantic must NOT raise — plain str accepts anything
+    step = ButlerActionStep(
+        tool_name="unknown_tool",  # not in ALLOWED_BUTLER_TOOLS
+        args={},
+        requires_confirmation=True,
+        affected_user_ids=[],
+        risk_level="low",
+        rollback_kind="not_reversible",
+    )
+    assert step.tool_name == "unknown_tool"
+
+    # But validate_butler_plan must reject with ToolNotAllowedError
+    from bot.services.butler_tools import ToolNotAllowedError, validate_butler_plan
+
+    # Manually inject an unknown tool step
+    step_dict = {
+        "tool_name": "unknown_tool",
+        "args": {},
+        "requires_confirmation": True,
+        "affected_user_ids": [],
+        "risk_level": "low",
+        "rollback_kind": "not_reversible",
+        "inverse_op_payload": None,
+    }
+    from bot.services.butler_tools import ButlerPlan
+    plan_with_unknown_step = ButlerPlan.model_validate({
+        "plan_summary": "test",
+        "evidence_ids": [],
+        "actions": [step_dict],
+        "evidence_context_hash": "abc",
+        "requester_user_id": 1,
+        "chat_id": None,
+        "visibility_scope": "member",
+        "governance_filter_version": "v1",
+        "rationale": None,
+    })
+    with pytest.raises(ToolNotAllowedError) as excinfo:
+        validate_butler_plan(plan_with_unknown_step)
+    assert excinfo.value.error_kind == "tool_not_allowed"
 
 
 def test_butler_action_step_risk_level_restricted() -> None:
@@ -503,6 +538,27 @@ def test_validate_butler_plan_args_are_canonical_after_validation() -> None:
     # Default fields should be present in canonical dump
     assert "participant_user_ids" in canonical_args
     assert "proposed_time_text" in canonical_args
+
+
+def test_validate_butler_plan_coerces_string_to_int_for_int_fields() -> None:
+    """LLM often returns numeric values as JSON strings; validate_butler_plan must coerce.
+
+    M-B: pydantic v2 in default (lax) mode coerces str → int for int-typed fields.
+    After validate_butler_plan, step.args['target_user_id'] must be Python int 42,
+    not the string "42" that the LLM returned.
+    """
+    plan = _make_plan(
+        "send_intro",
+        {"target_user_id": "42", "intro_text": "Hello"},  # target_user_id as string
+    )
+    result = validate_butler_plan(plan)
+    canonical_args = result.actions[0].args
+    # After canonicalisation, the int field must be int, not str
+    assert canonical_args["target_user_id"] == 42
+    assert isinstance(canonical_args["target_user_id"], int), (
+        f"Expected int but got {type(canonical_args['target_user_id']).__name__!r}. "
+        "Pydantic v2 should coerce string '42' → int 42."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -186,12 +186,16 @@ async def test_synthesize_butler_summary_accepts_valid_mvid_citations() -> None:
 
 @pytest.mark.asyncio
 async def test_synthesize_butler_summary_accepts_valid_card_citations() -> None:
-    """Citation anchors for card:N referencing valid card IDs pass."""
-    # Build a context without card sources for simplicity — card:N check is positional
+    """Citation anchors using card:N prefix referencing valid IDs pass.
+
+    M-C fix: the fixture must actually use ``card:N`` notation (not ``mvid:N``)
+    to exercise the card citation path. The gateway matches both ``mvid:N`` and
+    ``card:N`` against evidence_context.evidence_ids — so ``card:10`` is valid
+    when 10 is in evidence_ids.
+    """
     context = _make_context(mvids=(10,))
-    # card:10 references mvid 10 indirectly — here we just verify card: prefix works
-    # The implementation should allow any card:N present in evidence_ids (same ints)
-    good_summary = "See evidence (mvid:10) for details."
+    # Use card:10 — must be in evidence_ids (which contains 10)
+    good_summary = "See knowledge card (card:10) for details."
 
     provider = FakeSummaryProvider(answer_text=good_summary)
     ledger = FakeLedgerRepo()
