@@ -420,6 +420,7 @@ class TestGovernanceExcludedCount:
 
         # Patch search_messages to return our hit.
         # Patch _fetch_governance_fields to return governance-triggering data.
+        # New batched signature: returns dict[int, fields | None].
         with (
             patch(
                 "bot.services.butler_evidence.search_messages",
@@ -430,8 +431,7 @@ class TestGovernanceExcludedCount:
                 "bot.services.butler_evidence._fetch_governance_fields",
                 new_callable=AsyncMock,
                 return_value={
-                    "text": f"hello {_NOMEM}",
-                    "caption": None,
+                    101: {"text": f"hello {_NOMEM}", "caption": None},
                 },
             ),
         ):
@@ -476,9 +476,9 @@ class TestGovernanceExcludedCount:
             patch(
                 "bot.services.butler_evidence._fetch_governance_fields",
                 new_callable=AsyncMock,
+                # New batched signature: dict[int, fields | None]
                 return_value={
-                    "text": "totally normal content",
-                    "caption": None,
+                    102: {"text": "totally normal content", "caption": None},
                 },
             ),
         ):
@@ -502,7 +502,7 @@ class TestGovernanceExcludedCount:
 class TestVanishedRowFailClosed:
     @pytest.mark.asyncio
     async def test_vanished_row_excluded_and_count_incremented(self) -> None:
-        """When _fetch_governance_fields returns None (row vanished), source is excluded + count incremented."""
+        """When _fetch_governance_fields returns {mvid: None} (row vanished), source is excluded + count incremented."""
         from bot.services.butler_evidence import build_butler_evidence
         from bot.services.search import SearchHit
 
@@ -520,7 +520,8 @@ class TestVanishedRowFailClosed:
 
         mock_session = MagicMock()
 
-        # _fetch_governance_fields returns None to signal vanished row
+        # _fetch_governance_fields returns {mvid: None} to signal vanished row.
+        # New batched signature: dict[int, fields | None].
         with (
             patch(
                 "bot.services.butler_evidence.search_messages",
@@ -530,7 +531,7 @@ class TestVanishedRowFailClosed:
             patch(
                 "bot.services.butler_evidence._fetch_governance_fields",
                 new_callable=AsyncMock,
-                return_value=None,  # sentinel for vanished row
+                return_value={999: None},  # sentinel: row vanished
             ),
         ):
             ctx = await build_butler_evidence(
@@ -545,3 +546,214 @@ class TestVanishedRowFailClosed:
         assert 999 not in ctx.bundle.evidence_ids
         # Count must be incremented
         assert ctx.governance_excluded_count == 1
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL: forget_event status set must be ('pending','processing','completed')
+#
+# The SQL predicate in _fetch_governance_fields must use exactly these 3 status
+# values, matching the canonical search.py predicate.  'active' is not a valid
+# status (models.py CheckConstraint allows only pending/processing/completed/failed).
+#
+# These tests verify that the correct statuses appear in the SQL string — they
+# inspect the module-level SQL rather than executing against a DB.
+# ---------------------------------------------------------------------------
+
+
+class TestForgetEventStatusSet:
+    """The forget_event status predicate must use ('pending','processing','completed')."""
+
+    def test_sql_contains_pending_status(self) -> None:
+        """'pending' must be in the forget_events status predicate."""
+        import inspect
+        from bot.services import butler_evidence as be_module
+
+        src = inspect.getsource(be_module)
+        # The predicate must contain 'pending'
+        assert "'pending'" in src, (
+            "forget_events status predicate missing 'pending' — "
+            "rows with pending tombstones won't be excluded"
+        )
+
+    def test_sql_contains_processing_status(self) -> None:
+        """'processing' must be in the forget_events status predicate."""
+        import inspect
+        from bot.services import butler_evidence as be_module
+
+        src = inspect.getsource(be_module)
+        assert "'processing'" in src, (
+            "forget_events status predicate missing 'processing' — "
+            "rows with in-flight tombstones won't be excluded"
+        )
+
+    def test_sql_does_not_contain_active_status(self) -> None:
+        """'active' is NOT a valid forget_events status — must not appear in the predicate."""
+        import inspect
+        from bot.services import butler_evidence as be_module
+
+        src = inspect.getsource(be_module)
+        # 'active' should not appear as a status value in any IN clause
+        # We check specifically for "'active'" (quoted, as it would appear in SQL)
+        assert "'active'" not in src, (
+            "forget_events status predicate contains invalid status 'active' — "
+            "this status does not exist in the schema CheckConstraint"
+        )
+
+
+# ---------------------------------------------------------------------------
+# HIGH: _fetch_governance_fields must be called exactly ONCE (batched)
+# for a multi-source hit (anchor + card sources).
+#
+# The refactored helper accepts a Collection[int] and returns dict[int, Row|None].
+# build_butler_evidence must pre-collect ALL mvids across ALL hits, call the
+# helper ONCE, then use dict-lookups in the loop.
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedGovernanceFetch:
+    """_fetch_governance_fields must be called exactly once for a multi-hit request."""
+
+    @pytest.mark.asyncio
+    async def test_helper_called_once_for_single_message_hit(self) -> None:
+        """Single message hit: helper called once (with a set containing 1 mvid)."""
+        from unittest.mock import AsyncMock, patch
+
+        from bot.services.butler_evidence import build_butler_evidence
+        from bot.services.search import SearchHit
+
+        hit = SearchHit(
+            message_version_id=201,
+            chat_message_id=1201,
+            chat_id=_CHAT_ID,
+            message_id=2201,
+            user_id=11,
+            snippet="batch test",
+            ts_rank=0.8,
+            captured_at=datetime(2026, 5, 26, tzinfo=timezone.utc),
+            message_date=datetime(2026, 5, 26, tzinfo=timezone.utc),
+        )
+        mock_session = MagicMock()
+
+        with (
+            patch(
+                "bot.services.butler_evidence.search_messages",
+                new_callable=AsyncMock,
+                return_value=[hit],
+            ),
+            patch(
+                "bot.services.butler_evidence._fetch_governance_fields",
+                new_callable=AsyncMock,
+                return_value={201: {"text": "normal content", "caption": None}},
+            ) as mock_fetch,
+        ):
+            await build_butler_evidence(
+                mock_session,
+                requester_user_id=1,
+                query="batch test",
+                chat_id=_CHAT_ID,
+                visibility_scope="member",
+            )
+
+        assert mock_fetch.call_count == 1, (
+            f"Expected _fetch_governance_fields called once (batched), "
+            f"got {mock_fetch.call_count} calls"
+        )
+
+    @pytest.mark.asyncio
+    async def test_helper_called_once_for_multiple_hits(self) -> None:
+        """Three independent message hits: helper still called exactly once."""
+        from unittest.mock import AsyncMock, patch
+
+        from bot.services.butler_evidence import build_butler_evidence
+        from bot.services.search import SearchHit
+
+        hits = [
+            SearchHit(
+                message_version_id=301 + i,
+                chat_message_id=1301 + i,
+                chat_id=_CHAT_ID,
+                message_id=2301 + i,
+                user_id=12,
+                snippet=f"hit {i}",
+                ts_rank=0.8,
+                captured_at=datetime(2026, 5, 26, tzinfo=timezone.utc),
+                message_date=datetime(2026, 5, 26, tzinfo=timezone.utc),
+            )
+            for i in range(3)
+        ]
+        mock_session = MagicMock()
+
+        with (
+            patch(
+                "bot.services.butler_evidence.search_messages",
+                new_callable=AsyncMock,
+                return_value=hits,
+            ),
+            patch(
+                "bot.services.butler_evidence._fetch_governance_fields",
+                new_callable=AsyncMock,
+                return_value={
+                    301: {"text": "normal", "caption": None},
+                    302: {"text": "normal", "caption": None},
+                    303: {"text": "normal", "caption": None},
+                },
+            ) as mock_fetch,
+        ):
+            ctx = await build_butler_evidence(
+                mock_session,
+                requester_user_id=1,
+                query="multi hit",
+                chat_id=_CHAT_ID,
+                visibility_scope="member",
+            )
+
+        assert mock_fetch.call_count == 1, (
+            f"Expected _fetch_governance_fields called once for 3 hits (batched), "
+            f"got {mock_fetch.call_count} calls"
+        )
+        # All 3 hits pass governance → 3 items
+        assert len(ctx.bundle.items) == 3
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM: visibility_scope runtime validation via __post_init__
+# ---------------------------------------------------------------------------
+
+
+class TestVisibilityScopeValidation:
+    """ButlerEvidenceContext.__post_init__ must validate visibility_scope at construction time."""
+
+    def test_member_scope_accepted(self) -> None:
+        """'member' is a valid visibility_scope — must not raise."""
+        ctx = _make_ctx(visibility_scope="member")
+        assert ctx.visibility_scope == "member"
+
+    def test_admin_scope_accepted(self) -> None:
+        """'admin' is a valid visibility_scope — must not raise."""
+        ctx = _make_ctx(visibility_scope="admin")
+        assert ctx.visibility_scope == "admin"
+
+    def test_self_scope_accepted(self) -> None:
+        """'self' is a valid visibility_scope — must not raise."""
+        ctx = _make_ctx(visibility_scope="self")
+        assert ctx.visibility_scope == "self"
+
+    def test_invalid_admins_raises_value_error(self) -> None:
+        """'admins' (typo) must raise ValueError at construction time."""
+        with pytest.raises(ValueError, match="visibility_scope must be one of"):
+            _make_ctx(visibility_scope="admins")
+
+    def test_invalid_guest_raises_value_error(self) -> None:
+        """'guest' is not a valid scope — must raise ValueError."""
+        with pytest.raises(ValueError, match="visibility_scope must be one of"):
+            _make_ctx(visibility_scope="guest")
+
+    def test_empty_string_raises_value_error(self) -> None:
+        """Empty string is not a valid scope — must raise ValueError."""
+        with pytest.raises(ValueError, match="visibility_scope must be one of"):
+            _make_ctx(visibility_scope="")
+
+    def test_uppercase_member_raises_value_error(self) -> None:
+        """'MEMBER' is case-sensitive — must raise ValueError."""
+        with pytest.raises(ValueError, match="visibility_scope must be one of"):
+            _make_ctx(visibility_scope="MEMBER")
