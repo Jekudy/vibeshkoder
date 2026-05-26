@@ -32,6 +32,7 @@ from bot.services.butler import (
     ButlerActionError,
     ButlerActionExpiredError,
     ButlerActionRejectedError,
+    ButlerService,
     CascadeInFlightError,
     EvidenceStaleError,
     MembershipRevokedError,
@@ -41,6 +42,7 @@ from bot.services.butler_tools import (
     ButlerActionStep,
     ButlerPlan,
     ButlerPlanError,
+    InvalidToolArgsError,
     ToolNotAllowedError,
 )
 from bot.services.evidence import EvidenceBundle, EvidenceItem
@@ -648,7 +650,6 @@ class _ButlerServiceTestHarness:
     session: FakeSession = field(default_factory=FakeSession)
 
     def make_service(self):
-        from bot.services.butler import ButlerService
         return ButlerService(
             session=self.session,
             ledger_repo=self.ledger_repo,
@@ -755,7 +756,6 @@ async def test_plan_action_rejection_tool_not_allowed_writes_rejected_row() -> N
     )
     svc = harness.make_service()
 
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError) as exc_info:
         await svc.plan_action(
             requester_user_id=42,
@@ -788,7 +788,6 @@ async def test_plan_action_rejection_tool_not_allowed_null_ledger_allowed() -> N
     )
     svc = harness.make_service()
 
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError):
         await svc.plan_action(
             requester_user_id=42,
@@ -805,7 +804,6 @@ async def test_plan_action_rejection_tool_not_allowed_null_ledger_allowed() -> N
 @pytest.mark.asyncio
 async def test_plan_action_rejection_invalid_args() -> None:
     """plan_action with invalid_args error → rejected row with error_kind='invalid_args'."""
-    from bot.services.butler_tools import InvalidToolArgsError
     ctx = _make_context()
     harness = _ButlerServiceTestHarness(
         gateway=FakeLLMGateway(
@@ -819,7 +817,6 @@ async def test_plan_action_rejection_invalid_args() -> None:
     )
     svc = harness.make_service()
 
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError) as exc_info:
         await svc.plan_action(
             requester_user_id=42,
@@ -850,7 +847,6 @@ async def test_plan_action_rejection_evidence_context_mismatch() -> None:
     )
     svc = harness.make_service()
 
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError) as exc_info:
         await svc.plan_action(
             requester_user_id=42,
@@ -880,7 +876,6 @@ async def test_plan_action_rejection_orphan_evidence_ids() -> None:
     )
     svc = harness.make_service()
 
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError) as exc_info:
         await svc.plan_action(
             requester_user_id=42,
@@ -908,7 +903,6 @@ async def test_plan_action_rejection_budget_exceeded() -> None:
     )
     svc = harness.make_service()
 
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError) as exc_info:
         await svc.plan_action(
             requester_user_id=42,
@@ -935,7 +929,6 @@ async def test_plan_action_rejection_rate_limit_exceeded() -> None:
     )
     svc = harness.make_service()
 
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError) as exc_info:
         await svc.plan_action(
             requester_user_id=42,
@@ -966,7 +959,6 @@ async def test_plan_action_rejection_membership_revoked() -> None:
     )
     svc = harness.make_service()
 
-    from bot.services.butler import ButlerActionError, MembershipRevokedError
     with pytest.raises((ButlerActionError, MembershipRevokedError)) as exc_info:
         await svc.plan_action(
             requester_user_id=42,
@@ -1073,7 +1065,6 @@ async def test_confirm_action_reject_bad_token() -> None:
         visibility_scope="member",
     )
 
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError) as exc_info:
         await svc.confirm_action(
             action_id=action.id,
@@ -1145,7 +1136,6 @@ async def test_confirm_action_reject_already_confirmed() -> None:
     )
 
     # Second attempt with same token → idempotency guard
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError) as exc_info:
         await svc.confirm_action(
             action_id=action.id,
@@ -1177,7 +1167,6 @@ async def test_confirm_action_cascade_in_flight_raises() -> None:
     # Simulate cascade holding the lock on this action row
     harness.action_repo.locked_ids.add(action.id)
 
-    from bot.services.butler import CascadeInFlightError
     with pytest.raises(CascadeInFlightError) as exc_info:
         await svc.confirm_action(
             action_id=action.id,
@@ -1443,7 +1432,6 @@ async def test_cancel_action_other_user_forbidden() -> None:
         visibility_scope="member",
     )
 
-    from bot.services.butler import ButlerActionError
     with pytest.raises(ButlerActionError) as exc_info:
         await svc.cancel_action(
             action_id=action.id,
@@ -1571,14 +1559,12 @@ async def test_expire_action_not_expired_yet_does_nothing() -> None:
 
 def test_butler_action_error_carries_error_kind() -> None:
     """ButlerActionError carries error_kind attribute."""
-    from bot.services.butler import ButlerActionError
     err = ButlerActionError("test", error_kind="tool_not_allowed")
     assert err.error_kind == "tool_not_allowed"
 
 
 def test_butler_action_expired_error_is_subclass() -> None:
     """ButlerActionExpiredError is a subclass of ButlerActionError."""
-    from bot.services.butler import ButlerActionError
     err = ButlerActionExpiredError("expired", error_kind="expired")
     assert isinstance(err, ButlerActionError)
     assert err.error_kind == "expired"
@@ -1586,28 +1572,24 @@ def test_butler_action_expired_error_is_subclass() -> None:
 
 def test_butler_action_rejected_error_is_subclass() -> None:
     """ButlerActionRejectedError is a subclass of ButlerActionError."""
-    from bot.services.butler import ButlerActionError, ButlerActionRejectedError
     err = ButlerActionRejectedError("rejected", error_kind="forbidden")
     assert isinstance(err, ButlerActionError)
 
 
 def test_evidence_stale_error_is_subclass() -> None:
     """EvidenceStaleError is a subclass of ButlerActionError."""
-    from bot.services.butler import ButlerActionError
     err = EvidenceStaleError("stale", error_kind="evidence_stale")
     assert isinstance(err, ButlerActionError)
 
 
 def test_cascade_in_flight_error_is_subclass() -> None:
     """CascadeInFlightError is a subclass of ButlerActionError."""
-    from bot.services.butler import ButlerActionError, CascadeInFlightError
     err = CascadeInFlightError("locked", error_kind="cascade_in_flight")
     assert isinstance(err, ButlerActionError)
 
 
 def test_membership_revoked_error_is_subclass() -> None:
     """MembershipRevokedError is a subclass of ButlerActionError."""
-    from bot.services.butler import ButlerActionError, MembershipRevokedError
     err = MembershipRevokedError("revoked", error_kind="membership_revoked")
     assert isinstance(err, ButlerActionError)
 
@@ -1620,7 +1602,6 @@ def test_membership_revoked_error_is_subclass() -> None:
 @pytest.mark.asyncio
 async def test_cascade_in_flight_error_has_cascade_in_flight_kind() -> None:
     """The CascadeInFlightError raised when row is locked has error_kind='cascade_in_flight'."""
-    from bot.services.butler import CascadeInFlightError
     ctx = _make_context()
     plan = _valid_plan(ctx)
     harness = _ButlerServiceTestHarness(
