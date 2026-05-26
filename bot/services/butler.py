@@ -73,6 +73,8 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
+from sqlalchemy.exc import OperationalError as _SAOperationalError
+
 # butler_tools does NOT import from butler — no circular import risk.
 # Must be module-level (not lazy-imported inside except blocks) so that
 # isinstance(exc, ButlerPlanError) uses the same class object as the exc
@@ -317,6 +319,11 @@ class ButlerService:
                 )
 
         # Step 1 — rate-checks (pre-LLM, no ledger yet).
+        # H1: track every successfully-incremented bucket so we can roll back if a
+        # later rate-check in this same call fails.  Each entry is a dict of kwargs
+        # for ButlerRateBucketRepo.decrement.
+        _incremented_buckets: list[dict] = []
+
         bucket_key = _msk_day_bucket_key(now)
         win_start, win_end = _msk_day_window(now)
 
@@ -357,6 +364,9 @@ class ButlerService:
                 error_kind="rate_limit_exceeded",
                 action_id=action_row.id,
             )
+        _incremented_buckets.append(
+            {"bucket_kind": "user_plans_day", "scope_id": requester_user_id, "bucket_key": bucket_key}
+        )
 
         # chat_actions_day (H3)
         chat_rate_ok = await self._rate_bucket_repo.try_increment(
@@ -395,6 +405,9 @@ class ButlerService:
                 error_kind="rate_limit_exceeded",
                 action_id=action_row.id,
             )
+        _incremented_buckets.append(
+            {"bucket_kind": "chat_actions_day", "scope_id": effective_chat_id, "bucket_key": bucket_key}
+        )
 
         # Step 2 — build evidence context
         evidence_context = await self._evidence_builder.build_butler_evidence(
@@ -490,6 +503,11 @@ class ButlerService:
             ceiling=getattr(self._settings, "tool_hour_ceiling", _TOOL_HOUR_CEILING),
         )
         if not tool_rate_ok:
+            # H1: roll back prior increments so the user's daily counters are not
+            # permanently consumed when the per-tool ceiling blocks this request.
+            for _bucket in _incremented_buckets:
+                await self._rate_bucket_repo.decrement(self._session, **_bucket)
+
             action_row = await self._action_repo.create(
                 self._session,
                 requester_tg_id=requester_user_id,
@@ -624,10 +642,17 @@ class ButlerService:
         7. Return action row.
         """
         # Step 1 — acquire FOR UPDATE (cascade-vs-callback race protection, C4)
-        # Real DB: SELECT FOR UPDATE NOWAIT raises lock_not_available if cascade in flight.
-        # Fake (tests): get_for_update returns None when action_id in locked_ids.
+        # Real DB: SELECT FOR UPDATE NOWAIT raises OperationalError (LockNotAvailable)
+        # if cascade holds the lock. Fake (tests): returns None when locked_ids contains it.
         # Both paths → CascadeInFlightError (fail-closed).
-        action = await self._action_repo.get_for_update(self._session, action_id)
+        try:
+            action = await self._action_repo.get_for_update(self._session, action_id)
+        except _SAOperationalError as exc:
+            raise CascadeInFlightError(
+                f"butler_actions(id={action_id}) locked by cascade (NOWAIT) — try again",
+                error_kind="cascade_in_flight",
+                action_id=action_id,
+            ) from exc
         if action is None:
             raise CascadeInFlightError(
                 f"butler_actions(id={action_id}) locked by cascade — try again",
@@ -736,9 +761,18 @@ class ButlerService:
             # Partial — return action unchanged
             return action
 
-        # 6a — revalidate evidence hash using stored query + visibility_scope (C2)
-        stored_query = getattr(action, "query", "")
-        stored_visibility = getattr(action, "visibility_scope", "member")
+        # 6a — revalidate evidence hash using stored query + visibility_scope (C2).
+        # After migration 074, both columns are NOT NULL with server_default.
+        # A None value means a schema invariant is broken — raise immediately instead
+        # of silently masking the bug with a getattr default.
+        if action.query is None or action.visibility_scope is None:
+            raise ButlerActionError(
+                f"action {action.id} missing query/visibility_scope post-migration-074",
+                error_kind="invariant_broken",
+                action_id=action.id,
+            )
+        stored_query = action.query
+        stored_visibility = action.visibility_scope
         revalidated_context = await self._evidence_builder.build_butler_evidence(
             session=self._session,
             requester_user_id=action.requester_tg_id,
@@ -803,7 +837,14 @@ class ButlerService:
            f. On failure → mark action status='execution_failed' (C5) + return.
         5. On all success → action status='succeeded'.
         """
-        action = await self._action_repo.get_for_update(self._session, action_id)
+        try:
+            action = await self._action_repo.get_for_update(self._session, action_id)
+        except _SAOperationalError as exc:
+            raise CascadeInFlightError(
+                f"butler_actions(id={action_id}) locked by cascade (NOWAIT) — try again",
+                error_kind="cascade_in_flight",
+                action_id=action_id,
+            ) from exc
         if action is None:
             raise CascadeInFlightError(
                 f"butler_actions(id={action_id}) locked",
@@ -973,17 +1014,21 @@ class ButlerService:
         """Extract plan steps from the action row (C3 — plan_payload replay).
 
         Reads action.plan_payload['actions'] (the stored ButlerPlan serialization).
-        If plan_payload is missing or empty (should not happen via plan_action), falls
-        back to a single step synthesized from action.tool_name + action.action_args
-        (only reachable via direct DB row insertion in tests, never via normal flow).
+        Migration 074 makes plan_payload NOT NULL with default '{}'::jsonb.
+        plan_action always writes plan.model_dump() which contains 'actions'.
+        Missing 'actions' key means a schema invariant is broken — raise immediately.
+        Test fixtures that create butler_actions rows directly MUST include a valid
+        plan_payload (use plan.model_dump() shape).
         """
-        plan_payload = getattr(action, "plan_payload", None)
-        if plan_payload and isinstance(plan_payload, dict):
-            steps = plan_payload.get("actions", [])
-            if steps:
-                return steps
-        # Fallback: synthesize single step (test/legacy path — should not occur in prod)
-        return [{"tool_name": action.tool_name, "args": action.action_args}]
+        plan_payload = action.plan_payload
+        if not plan_payload or "actions" not in plan_payload:
+            raise ButlerActionError(
+                f"action {action.id} has invalid plan_payload — missing 'actions' key",
+                error_kind="invariant_broken",
+                action_id=action.id,
+            )
+        steps = plan_payload["actions"]
+        return steps
 
     # -----------------------------------------------------------------------
     # cancel_action
@@ -1008,8 +1053,16 @@ class ButlerService:
         than trusting the is_admin caller flag (caller flag still accepted as fallback
         when user_repo is None, e.g. in test doubles).
         """
-        # H2: acquire FOR UPDATE to coordinate with cascade
-        action = await self._action_repo.get_for_update(self._session, action_id)
+        # H2: acquire FOR UPDATE (NOWAIT) to coordinate with cascade.
+        # OperationalError (NOWAIT lock contention) → CascadeInFlightError.
+        try:
+            action = await self._action_repo.get_for_update(self._session, action_id)
+        except _SAOperationalError as exc:
+            raise CascadeInFlightError(
+                f"butler_actions(id={action_id}) locked by cascade (NOWAIT) — try again",
+                error_kind="cascade_in_flight",
+                action_id=action_id,
+            ) from exc
         if action is None:
             raise CascadeInFlightError(
                 f"butler_actions(id={action_id}) locked by cascade",
