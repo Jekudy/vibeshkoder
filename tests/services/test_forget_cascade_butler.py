@@ -16,6 +16,7 @@ Tests do NOT rely on Bot threading (no Telegram side effects in T12-01).
 from __future__ import annotations
 
 import itertools
+import secrets
 from datetime import datetime, timezone
 
 import pytest
@@ -264,6 +265,7 @@ async def test_cascade_butler_confirmations_pending_expired(db_session) -> None:
         status="pending",
         preview_payload_hash="pph123",
         expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        confirmation_token=secrets.token_urlsafe(32),
     )
     db_session.add(conf)
     await db_session.flush()
