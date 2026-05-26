@@ -15,6 +15,7 @@ Tests do NOT call session.commit().
 from __future__ import annotations
 
 import itertools
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -310,6 +311,7 @@ async def test_butler_confirmation_repo_create(db_session) -> None:
         status="pending",
         preview_payload_hash="pph",
         expires_at=_future(),
+        confirmation_token=secrets.token_urlsafe(32),
     )
     assert conf.id is not None
     assert conf.status == "pending"
@@ -332,6 +334,7 @@ async def test_butler_confirmation_repo_mark_resolved_confirmed(db_session) -> N
         status="pending",
         preview_payload_hash="pph",
         expires_at=_future(),
+        confirmation_token=secrets.token_urlsafe(32),
     )
 
     await ButlerActionConfirmationRepo.mark_resolved(
@@ -368,6 +371,7 @@ async def test_butler_confirmation_repo_list_pending_for_user(db_session) -> Non
             status="pending",
             preview_payload_hash="h",
             expires_at=_future(),
+            confirmation_token=secrets.token_urlsafe(32),
         )
     # Confirmed (should not appear in pending list).
     conf = await ButlerActionConfirmationRepo.create(
@@ -378,6 +382,7 @@ async def test_butler_confirmation_repo_list_pending_for_user(db_session) -> Non
         status="pending",
         preview_payload_hash="h2",
         expires_at=_future(),
+        confirmation_token=secrets.token_urlsafe(32),
     )
     await ButlerActionConfirmationRepo.mark_resolved(db_session, conf.id, status="confirmed")
 
@@ -541,6 +546,7 @@ async def test_butler_confirmation_get_for_action_user_found(db_session) -> None
         status="pending",
         preview_payload_hash="pph",
         expires_at=_future(),
+        confirmation_token=secrets.token_urlsafe(32),
     )
 
     row = await ButlerActionConfirmationRepo.get_for_action_user(db_session, action_id, tg_id)
@@ -577,6 +583,7 @@ async def test_butler_confirmation_list_for_action_multiple(db_session) -> None:
             status="pending",
             preview_payload_hash="h",
             expires_at=_future(),
+            confirmation_token=secrets.token_urlsafe(32),
         )
     # One for a different action (must not appear).
     await ButlerActionConfirmationRepo.create(
@@ -587,6 +594,7 @@ async def test_butler_confirmation_list_for_action_multiple(db_session) -> None:
         status="pending",
         preview_payload_hash="h2",
         expires_at=_future(),
+        confirmation_token=secrets.token_urlsafe(32),
     )
 
     rows = await ButlerActionConfirmationRepo.list_for_action(db_session, action_id)
@@ -618,6 +626,7 @@ async def test_butler_confirmation_mark_all_for_action_only_pending(db_session) 
         status="pending",
         preview_payload_hash="h1",
         expires_at=_future(),
+        confirmation_token=secrets.token_urlsafe(32),
     )
     conf_b = await ButlerActionConfirmationRepo.create(
         db_session,
@@ -627,6 +636,7 @@ async def test_butler_confirmation_mark_all_for_action_only_pending(db_session) 
         status="pending",
         preview_payload_hash="h2",
         expires_at=_future(),
+        confirmation_token=secrets.token_urlsafe(32),
     )
     # Pre-confirm one row so it should be preserved.
     await ButlerActionConfirmationRepo.mark_resolved(db_session, conf_b.id, status="confirmed")
@@ -667,6 +677,7 @@ async def test_butler_confirmation_mark_all_for_action_count(db_session) -> None
             status="pending",
             preview_payload_hash="h",
             expires_at=_future(),
+            confirmation_token=secrets.token_urlsafe(32),
         )
 
     count = await ButlerActionConfirmationRepo.mark_all_for_action(
@@ -753,3 +764,95 @@ async def test_butler_invocation_update_to_failed(db_session) -> None:
     assert fetched.error_code == "timeout"
     assert fetched.error_context == {"detail": "network"}
     assert fetched.finished_at is not None
+
+
+# ── New columns (migration 074) ───────────────────────────────────────────────
+
+
+async def test_butler_action_repo_create_stores_query_visibility_plan_payload(db_session) -> None:
+    """ButlerActionRepo.create stores query, visibility_scope, plan_payload (migration 074)."""
+    from bot.db.repos.butler_action import ButlerActionRepo
+
+    plan_data = {"actions": [{"tool_name": "recall_evidence", "args": {}}]}
+    row = await ButlerActionRepo.create(
+        db_session,
+        requester_tg_id=_next_id(),
+        chat_id=_next_id(),
+        action_type="recall",
+        status="rejected",
+        tool_name="recall_evidence",
+        tool_manifest_version="1.0",
+        governance_filter_version="v1",
+        evidence_context_hash="abc",
+        plan_summary="plan",
+        action_args={},
+        action_args_hash="h",
+        rollback_kind="not_reversible",
+        risk_level="low",
+        query="who knows Rust?",
+        visibility_scope="member",
+        plan_payload=plan_data,
+        rejection_reason="test_rejection",
+    )
+    assert row.id is not None
+    assert row.query == "who knows Rust?"
+    assert row.visibility_scope == "member"
+    assert row.plan_payload == plan_data
+    assert row.rejection_reason == "test_rejection"
+
+
+async def test_butler_action_confirmation_repo_create_with_token(db_session) -> None:
+    """ButlerActionConfirmationRepo.create stores confirmation_token (migration 074)."""
+    import secrets
+
+    from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
+
+    action_id = await _create_action(db_session)
+    token = secrets.token_urlsafe(32)
+    row = await ButlerActionConfirmationRepo.create(
+        db_session,
+        action_id=action_id,
+        confirmer_tg_id=_next_id(),
+        confirmation_role="requester",
+        status="pending",
+        preview_payload_hash="pph",
+        expires_at=_future(),
+        confirmation_token=token,
+    )
+    assert row.id is not None
+    assert row.confirmation_token == token
+
+
+async def test_butler_action_confirmation_token_unique(db_session) -> None:
+    """Two confirmation rows for the same action get distinct tokens; UNIQUE enforced."""
+    import secrets
+
+    from sqlalchemy.exc import IntegrityError
+
+    from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
+
+    action_id = await _create_action(db_session)
+    token = secrets.token_urlsafe(32)
+
+    await ButlerActionConfirmationRepo.create(
+        db_session,
+        action_id=action_id,
+        confirmer_tg_id=_next_id(),
+        confirmation_role="requester",
+        status="pending",
+        preview_payload_hash="pph",
+        expires_at=_future(),
+        confirmation_token=token,
+    )
+    # Re-using the same token on a second row must raise IntegrityError (UNIQUE violation)
+    with pytest.raises(IntegrityError):
+        await ButlerActionConfirmationRepo.create(
+            db_session,
+            action_id=action_id,
+            confirmer_tg_id=_next_id(),
+            confirmation_role="affected_user",
+            status="pending",
+            preview_payload_hash="pph2",
+            expires_at=_future(),
+            confirmation_token=token,
+        )

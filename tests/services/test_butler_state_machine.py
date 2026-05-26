@@ -28,6 +28,14 @@ from typing import Any
 
 import pytest
 
+from bot.services.butler import (
+    ButlerActionError,
+    ButlerActionExpiredError,
+    ButlerActionRejectedError,
+    CascadeInFlightError,
+    EvidenceStaleError,
+    MembershipRevokedError,
+)
 from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
 from bot.services.butler_tools import (
     ButlerActionStep,
@@ -156,8 +164,11 @@ class FakeButlerAction:
     inverse_op_payload: dict | None = None
     action_uuid: uuid.UUID = field(default_factory=uuid.uuid4)
     parent_action_id: int | None = None
-    plan_payload: dict | None = None  # serialized plan JSON
+    plan_payload: dict | None = None  # serialized plan JSON (C3)
     approved_card_source_ids: list = field(default_factory=list)
+    # migration 074 fields (C2): stored on row at plan time; used by confirm/execute
+    query: str = ""
+    visibility_scope: str = "member"
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -231,6 +242,10 @@ class FakeButlerActionRepo:
         expires_at: datetime | None = None,
         llm_usage_ledger_id: int | None = None,
         rejection_reason: str | None = None,
+        # migration 074 kwargs (C2/C3)
+        query: str = "",
+        visibility_scope: str = "member",
+        plan_payload: dict | None = None,
     ) -> FakeButlerAction:
         row = FakeButlerAction(
             id=self._next_id,
@@ -253,7 +268,11 @@ class FakeButlerActionRepo:
             expires_at=expires_at,
             llm_usage_ledger_id=llm_usage_ledger_id,
             rejection_reason=rejection_reason,
+            plan_payload=plan_payload if plan_payload is not None else {},
         )
+        # Store query and visibility_scope as attributes (C2)
+        row.query = query  # type: ignore[attr-defined]
+        row.visibility_scope = visibility_scope  # type: ignore[attr-defined]
         self._rows[self._next_id] = row
         self._next_id += 1
         return row
@@ -329,6 +348,8 @@ class FakeButlerActionConfirmationRepo:
         expires_at: datetime,
         confirmation_message_chat_id: int | None = None,
         confirmation_message_id: int | None = None,
+        # C1: confirmation_token from service (secrets.token_urlsafe(32))
+        confirmation_token: str = "",
     ) -> FakeButlerActionConfirmation:
         row = FakeButlerActionConfirmation(
             id=self._next_id,
@@ -338,6 +359,7 @@ class FakeButlerActionConfirmationRepo:
             status=status,
             preview_payload_hash=preview_payload_hash,
             expires_at=expires_at,
+            confirmation_token=confirmation_token,
         )
         self._rows[self._next_id] = row
         self._next_id += 1
@@ -495,6 +517,29 @@ class FakeLedgerRepo:
         return Decimal("0")
 
 
+@dataclass
+class _FakeUser:
+    """Minimal user object for H1/M2 tests."""
+    telegram_id: int
+    is_member: bool = True
+    is_admin: bool = False
+
+
+class FakeUserRepo:
+    """Fake UserRepo for membership pre-check (H1) and admin verification (M2)."""
+
+    def __init__(self, *, members: set[int] | None = None, admins: set[int] | None = None) -> None:
+        self._members: set[int] = members if members is not None else set()
+        self._admins: set[int] = admins if admins is not None else set()
+
+    async def get(self, session: Any, user_id: int) -> _FakeUser | None:
+        if user_id in self._admins:
+            return _FakeUser(telegram_id=user_id, is_member=True, is_admin=True)
+        if user_id in self._members:
+            return _FakeUser(telegram_id=user_id, is_member=True, is_admin=False)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Fake gateway + evidence builder
 # ---------------------------------------------------------------------------
@@ -594,6 +639,9 @@ class _ButlerServiceTestHarness:
         default_factory=FakeButlerRateBucketRepo
     )
     ledger_repo: FakeLedgerRepo = field(default_factory=FakeLedgerRepo)
+    # user_repo=None means membership check is skipped (default for tests that
+    # don't exercise H1/M2 paths).  Set to FakeUserRepo(...) to test those paths.
+    user_repo: FakeUserRepo | None = None
     gateway: FakeLLMGateway = field(default_factory=FakeLLMGateway)
     evidence_builder: FakeEvidenceBuilder = field(default_factory=FakeEvidenceBuilder)
     settings: FakeSettings = field(default_factory=FakeSettings)
@@ -608,6 +656,7 @@ class _ButlerServiceTestHarness:
             butler_action_confirmation_repo=self.confirmation_repo,
             butler_tool_invocation_repo=self.invocation_repo,
             butler_rate_bucket_repo=self.rate_bucket_repo,
+            user_repo=self.user_repo,
             llm_gateway=self.gateway,
             evidence_builder=self.evidence_builder,
             settings=self.settings,
@@ -963,12 +1012,13 @@ async def test_confirm_action_happy_single_confirmation() -> None:
         confirmation_token=conf.confirmation_token,
     )
 
-    assert result.status == "pending_execution"
+    # C5: 'confirmed' (matches DB CHECK enum), not 'pending_execution'
+    assert result.status == "confirmed"
 
 
 @pytest.mark.asyncio
 async def test_confirm_action_multi_confirmation_partial_then_full() -> None:
-    """Multi-confirmation: partial confirmation keeps pending_confirmation; all confirmed → pending_execution."""
+    """Multi-confirmation: partial confirmation keeps pending_confirmation; all confirmed → 'confirmed'."""
     ctx = _make_context()
     plan = _valid_plan(ctx, tool_name="send_intro", affected_user_ids=(99,))
     harness = _ButlerServiceTestHarness(
@@ -995,14 +1045,14 @@ async def test_confirm_action_multi_confirmation_partial_then_full() -> None:
     )
     assert result.status == "pending_confirmation"  # affected user hasn't confirmed yet
 
-    # affected user confirms — now all confirmed → pending_execution
+    # affected user confirms — now all confirmed → 'confirmed' (C5: matches DB CHECK enum)
     affected_conf = next(c for c in all_confs if c.confirmer_tg_id == 99)
     result2 = await svc.confirm_action(
         action_id=action.id,
         confirming_user_id=99,
         confirmation_token=affected_conf.confirmation_token,
     )
-    assert result2.status == "pending_execution"
+    assert result2.status == "confirmed"
 
 
 @pytest.mark.asyncio
@@ -1056,7 +1106,6 @@ async def test_confirm_action_reject_expired_action() -> None:
     action.status = "expired"
     action.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
 
-    from bot.services.butler import ButlerActionExpiredError
     with pytest.raises(ButlerActionExpiredError) as exc_info:
         await svc.confirm_action(
             action_id=action.id,
@@ -1164,7 +1213,6 @@ async def test_confirm_action_evidence_stale() -> None:
     all_confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
     conf = all_confs[0]
 
-    from bot.services.butler import EvidenceStaleError
     with pytest.raises(EvidenceStaleError) as exc_info:
         await svc.confirm_action(
             action_id=action.id,
@@ -1249,7 +1297,7 @@ async def test_execute_action_happy_path_succeeds() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_action_tool_failure_marks_action_failed() -> None:
-    """execute_action with tool failure → action.status='failed'."""
+    """execute_action with tool failure → action.status='execution_failed' (DB enum, C5)."""
     ctx = _make_context()
     plan = _valid_plan(ctx)
     harness = _ButlerServiceTestHarness(
@@ -1277,7 +1325,8 @@ async def test_execute_action_tool_failure_marks_action_failed() -> None:
         tool_registry={"recall_evidence": failing_tool},
     )
 
-    assert result.status == "failed"
+    # C5: 'execution_failed' matches DB CHECK enum, not 'failed'
+    assert result.status == "execution_failed"
     assert result.error_code == "tool_error_xyz"
 
 
@@ -1529,7 +1578,7 @@ def test_butler_action_error_carries_error_kind() -> None:
 
 def test_butler_action_expired_error_is_subclass() -> None:
     """ButlerActionExpiredError is a subclass of ButlerActionError."""
-    from bot.services.butler import ButlerActionError, ButlerActionExpiredError
+    from bot.services.butler import ButlerActionError
     err = ButlerActionExpiredError("expired", error_kind="expired")
     assert isinstance(err, ButlerActionError)
     assert err.error_kind == "expired"
@@ -1544,7 +1593,7 @@ def test_butler_action_rejected_error_is_subclass() -> None:
 
 def test_evidence_stale_error_is_subclass() -> None:
     """EvidenceStaleError is a subclass of ButlerActionError."""
-    from bot.services.butler import ButlerActionError, EvidenceStaleError
+    from bot.services.butler import ButlerActionError
     err = EvidenceStaleError("stale", error_kind="evidence_stale")
     assert isinstance(err, ButlerActionError)
 
@@ -1625,3 +1674,398 @@ async def test_plan_action_ledger_id_populated_post_plan() -> None:
     stored = await harness.action_repo.get(harness.session, action.id)
     assert stored is not None
     assert stored.llm_usage_ledger_id == 42
+
+
+# ===========================================================================
+# New tests for T12-04 fix cycle
+# ===========================================================================
+
+
+# ── C1: confirmation_token storage + verification ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_action_generates_distinct_confirmation_tokens() -> None:
+    """plan_action generates a unique token per confirmation row (C1)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx, tool_name="send_intro", affected_user_ids=(99,))
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="introduce me",
+        visibility_scope="member",
+    )
+
+    confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    assert len(confs) == 2
+    tokens = {c.confirmation_token for c in confs}
+    # All tokens must be non-empty and distinct
+    assert all(t != "" for t in tokens)
+    assert len(tokens) == 2  # distinct tokens
+
+
+@pytest.mark.asyncio
+async def test_confirm_action_wrong_token_raises_bad_token() -> None:
+    """confirm_action with wrong token → error_kind='bad_token' (C1)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.confirm_action(
+            action_id=action.id,
+            confirming_user_id=42,
+            confirmation_token="WRONG-TOKEN-THAT-NEVER-MATCHES",
+        )
+
+    assert exc_info.value.error_kind == "bad_token"
+
+
+# ── C2/C3: query/visibility_scope/plan_payload stored + replayed ─────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_action_stores_query_and_visibility_scope() -> None:
+    """plan_action stores query and visibility_scope on the action row (C2)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="who knows Rust?",
+        visibility_scope="admin",
+    )
+
+    assert action.query == "who knows Rust?"
+    assert action.visibility_scope == "admin"
+
+
+@pytest.mark.asyncio
+async def test_plan_action_stores_plan_payload() -> None:
+    """plan_action stores the serialized plan as plan_payload (C3)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+
+    # plan_payload must be a non-empty dict (serialized plan)
+    assert action.plan_payload is not None
+    assert isinstance(action.plan_payload, dict)
+    # Contains the serialized plan actions
+    assert "actions" in action.plan_payload or len(action.plan_payload) > 0
+
+
+# ── C6: execute_action re-checks affected confirmations ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_action_rejects_if_affected_consent_revoked() -> None:
+    """execute_action fails with affected_user_consent_revoked if consent was revoked (C6)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx, tool_name="send_intro", affected_user_ids=(99,))
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="introduce me",
+        visibility_scope="member",
+    )
+
+    # Both requester (42) and affected user (99) confirm
+    all_confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    requester_conf = next(c for c in all_confs if c.confirmer_tg_id == 42)
+    affected_conf = next(c for c in all_confs if c.confirmer_tg_id == 99)
+
+    await svc.confirm_action(
+        action_id=action.id,
+        confirming_user_id=42,
+        confirmation_token=requester_conf.confirmation_token,
+    )
+    await svc.confirm_action(
+        action_id=action.id,
+        confirming_user_id=99,
+        confirmation_token=affected_conf.confirmation_token,
+    )
+
+    # Action is now 'confirmed'; simulate consent revocation by flipping affected_user back
+    affected_conf.status = "rejected"  # cascade or cancel revoked consent
+
+    with pytest.raises(ButlerActionRejectedError) as exc_info:
+        await svc.execute_action(action_id=action.id)
+
+    assert exc_info.value.error_kind == "affected_user_consent_revoked"
+
+
+# ── H1: membership pre-check ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_action_rejects_non_member_before_llm_call() -> None:
+    """plan_action rejects a non-member before building evidence or calling LLM (H1)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    # user_repo knows user 42 is NOT a member
+    user_repo = FakeUserRepo(members=set(), admins=set())
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+        user_repo=user_repo,
+    )
+    svc = harness.make_service()
+
+    with pytest.raises(MembershipRevokedError) as exc_info:
+        await svc.plan_action(
+            requester_user_id=42,
+            chat_id=CHAT_ID,
+            query="test",
+            visibility_scope="member",
+        )
+
+    assert exc_info.value.error_kind == "membership_revoked"
+    # An audit row must have been written (status='rejected')
+    rows = [r for r in harness.action_repo._rows.values()]
+    assert len(rows) == 1
+    assert rows[0].status == "rejected"
+    assert rows[0].rejection_reason == "membership_revoked"
+
+
+@pytest.mark.asyncio
+async def test_plan_action_member_proceeds_normally() -> None:
+    """plan_action proceeds for a known member when user_repo is wired (H1)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    user_repo = FakeUserRepo(members={42}, admins=set())
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+        user_repo=user_repo,
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+
+    assert action.status == "pending_confirmation"
+
+
+# ── H2: cancel_action uses FOR UPDATE ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_action_cascade_in_flight_raises() -> None:
+    """cancel_action when cascade holds FOR UPDATE → CascadeInFlightError (H2)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+
+    # Simulate cascade holding the lock
+    harness.action_repo.locked_ids.add(action.id)
+
+    with pytest.raises(CascadeInFlightError) as exc_info:
+        await svc.cancel_action(
+            action_id=action.id,
+            cancelling_user_id=42,
+            is_admin=False,
+        )
+
+    assert exc_info.value.error_kind == "cascade_in_flight"
+
+
+# ── H3: rate-bucket completeness ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_action_checks_chat_actions_day_bucket() -> None:
+    """plan_action checks chat_actions_day rate bucket (H3)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    # Fail on chat_actions_day bucket
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+        rate_bucket_repo=FakeButlerRateBucketRepo(fail_on_tool="chat_actions_day"),
+    )
+    svc = harness.make_service()
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.plan_action(
+            requester_user_id=42,
+            chat_id=CHAT_ID,
+            query="test",
+            visibility_scope="member",
+        )
+
+    assert exc_info.value.error_kind == "rate_limit_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_plan_action_checks_tool_hour_bucket() -> None:
+    """plan_action checks tool_hour rate bucket for the primary tool (H3)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    # Fail on tool_hour:recall_evidence bucket
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+        rate_bucket_repo=FakeButlerRateBucketRepo(fail_on_tool="tool_hour:recall_evidence"),
+    )
+    svc = harness.make_service()
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.plan_action(
+            requester_user_id=42,
+            chat_id=CHAT_ID,
+            query="test",
+            visibility_scope="member",
+        )
+
+    assert exc_info.value.error_kind == "rate_limit_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_execute_action_checks_user_execs_day_bucket() -> None:
+    """execute_action checks user_execs_day rate bucket before executing (H3)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    # Fail only on user_execs_day (so plan + confirm succeed)
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+        rate_bucket_repo=FakeButlerRateBucketRepo(fail_on_tool="user_execs_day"),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+    all_confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    await svc.confirm_action(
+        action_id=action.id,
+        confirming_user_id=42,
+        confirmation_token=all_confs[0].confirmation_token,
+    )
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.execute_action(action_id=action.id)
+
+    assert exc_info.value.error_kind == "rate_limit_exceeded"
+
+
+# ── M2: cancel_action admin verification via user_repo ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_action_admin_verified_via_user_repo() -> None:
+    """cancel_action verifies admin status via user_repo when available (M2)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    # user 999 is an admin in the user_repo
+    user_repo = FakeUserRepo(members={42}, admins={999})
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+        user_repo=user_repo,
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+
+    # Admin (999) cancels — should succeed
+    result = await svc.cancel_action(
+        action_id=action.id,
+        cancelling_user_id=999,
+        is_admin=False,  # service must verify via user_repo, not this flag
+    )
+    assert result.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_action_non_admin_forbidden_via_user_repo() -> None:
+    """cancel_action with user_repo: non-admin, non-requester → forbidden (M2)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx)
+    # user 888 is just a member, not an admin
+    user_repo = FakeUserRepo(members={42, 888}, admins=set())
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+        user_repo=user_repo,
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
+
+    with pytest.raises(ButlerActionRejectedError) as exc_info:
+        await svc.cancel_action(
+            action_id=action.id,
+            cancelling_user_id=888,  # member but not admin or requester
+            is_admin=True,  # caller passes True, but user_repo says they're not admin
+        )
+
+    assert exc_info.value.error_kind == "forbidden"
