@@ -36,6 +36,12 @@ _OFFRECORD_PATTERN = re.compile(r"(?i)(?<![\w])#offrecord(?!\w)")
 
 _DETECTED_BY = "deterministic_token_match_v1"
 
+# Version string for the governance filter.  Frozen into ButlerEvidenceContext
+# (T12-02) so the hash is stable across replays.  Bump if detect_policy logic
+# changes in a way that would produce different policy outcomes for the same
+# inputs (e.g. new patterns, new fields).
+GOVERNANCE_FILTER_VERSION = "phase12-v1"
+
 
 def _contains(pattern: re.Pattern[str], value: str | None) -> bool:
     if not value:
