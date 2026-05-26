@@ -500,3 +500,256 @@ async def test_butler_card_suggestion_repo_link_not_found(db_session) -> None:
         await ButlerCardSuggestionRepo.link_to_extraction_candidate(
             db_session, 999999999, uuid.uuid4()
         )
+
+
+# ── ButlerActionRepo.get_for_update (T12-04) ─────────────────────────────────
+
+
+async def test_butler_action_repo_get_for_update_found(db_session) -> None:
+    """get_for_update returns the action row when it exists."""
+    from bot.db.repos.butler_action import ButlerActionRepo
+
+    action_id = await _create_action(db_session, status="rejected")
+    row = await ButlerActionRepo.get_for_update(db_session, action_id)
+    assert row is not None
+    assert row.id == action_id
+
+
+async def test_butler_action_repo_get_for_update_missing(db_session) -> None:
+    """get_for_update returns None for a non-existent id."""
+    from bot.db.repos.butler_action import ButlerActionRepo
+
+    result = await ButlerActionRepo.get_for_update(db_session, 999999991)
+    assert result is None
+
+
+# ── ButlerActionConfirmationRepo new accessors (T12-04) ──────────────────────
+
+
+async def test_butler_confirmation_get_for_action_user_found(db_session) -> None:
+    """get_for_action_user returns the row matching (action_id, confirmer_tg_id)."""
+    from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
+
+    action_id = await _create_action(db_session)
+    tg_id = _next_id()
+
+    await ButlerActionConfirmationRepo.create(
+        db_session,
+        action_id=action_id,
+        confirmer_tg_id=tg_id,
+        confirmation_role="requester",
+        status="pending",
+        preview_payload_hash="pph",
+        expires_at=_future(),
+    )
+
+    row = await ButlerActionConfirmationRepo.get_for_action_user(db_session, action_id, tg_id)
+    assert row is not None
+    assert row.action_id == action_id
+    assert row.confirmer_tg_id == tg_id
+
+
+async def test_butler_confirmation_get_for_action_user_missing(db_session) -> None:
+    """get_for_action_user returns None when (action_id, user_id) pair absent."""
+    from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
+
+    action_id = await _create_action(db_session)
+    result = await ButlerActionConfirmationRepo.get_for_action_user(
+        db_session, action_id, _next_id()
+    )
+    assert result is None
+
+
+async def test_butler_confirmation_list_for_action_multiple(db_session) -> None:
+    """list_for_action returns all confirmation rows for a given action_id."""
+    from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
+
+    action_id = await _create_action(db_session)
+    other_action_id = await _create_action(db_session)
+
+    # Two confirmations for the target action.
+    for role in ("requester", "affected_user"):
+        await ButlerActionConfirmationRepo.create(
+            db_session,
+            action_id=action_id,
+            confirmer_tg_id=_next_id(),
+            confirmation_role=role,
+            status="pending",
+            preview_payload_hash="h",
+            expires_at=_future(),
+        )
+    # One for a different action (must not appear).
+    await ButlerActionConfirmationRepo.create(
+        db_session,
+        action_id=other_action_id,
+        confirmer_tg_id=_next_id(),
+        confirmation_role="requester",
+        status="pending",
+        preview_payload_hash="h2",
+        expires_at=_future(),
+    )
+
+    rows = await ButlerActionConfirmationRepo.list_for_action(db_session, action_id)
+    assert len(rows) == 2
+    assert all(r.action_id == action_id for r in rows)
+
+
+async def test_butler_confirmation_list_for_action_empty(db_session) -> None:
+    """list_for_action returns empty list when action has no confirmation rows."""
+    from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
+
+    action_id = await _create_action(db_session)
+    rows = await ButlerActionConfirmationRepo.list_for_action(db_session, action_id)
+    assert rows == []
+
+
+async def test_butler_confirmation_mark_all_for_action_only_pending(db_session) -> None:
+    """mark_all_for_action only transitions 'pending' rows; confirmed rows untouched."""
+    from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
+
+    action_id = await _create_action(db_session)
+
+    # Create two pending confirmations.
+    conf_a = await ButlerActionConfirmationRepo.create(
+        db_session,
+        action_id=action_id,
+        confirmer_tg_id=_next_id(),
+        confirmation_role="requester",
+        status="pending",
+        preview_payload_hash="h1",
+        expires_at=_future(),
+    )
+    conf_b = await ButlerActionConfirmationRepo.create(
+        db_session,
+        action_id=action_id,
+        confirmer_tg_id=_next_id(),
+        confirmation_role="affected_user",
+        status="pending",
+        preview_payload_hash="h2",
+        expires_at=_future(),
+    )
+    # Pre-confirm one row so it should be preserved.
+    await ButlerActionConfirmationRepo.mark_resolved(db_session, conf_b.id, status="confirmed")
+
+    count = await ButlerActionConfirmationRepo.mark_all_for_action(
+        db_session, action_id, status="cancelled"
+    )
+    # Only conf_a (pending) should have been flipped.
+    assert count == 1
+
+    from bot.db.models import ButlerActionConfirmation
+    from sqlalchemy import select
+
+    rows = (
+        await db_session.execute(
+            select(ButlerActionConfirmation).where(
+                ButlerActionConfirmation.action_id == action_id
+            )
+        )
+    ).scalars().all()
+    statuses = {r.id: r.status for r in rows}
+    assert statuses[conf_a.id] == "cancelled"
+    assert statuses[conf_b.id] == "confirmed"
+
+
+async def test_butler_confirmation_mark_all_for_action_count(db_session) -> None:
+    """mark_all_for_action returns correct count of rows transitioned."""
+    from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
+
+    action_id = await _create_action(db_session)
+
+    for _ in range(3):
+        await ButlerActionConfirmationRepo.create(
+            db_session,
+            action_id=action_id,
+            confirmer_tg_id=_next_id(),
+            confirmation_role="requester",
+            status="pending",
+            preview_payload_hash="h",
+            expires_at=_future(),
+        )
+
+    count = await ButlerActionConfirmationRepo.mark_all_for_action(
+        db_session, action_id, status="cancelled"
+    )
+    assert count == 3
+
+
+# ── ButlerToolInvocationRepo.update_invocation (T12-04) ──────────────────────
+
+
+async def test_butler_invocation_update_to_succeeded(db_session) -> None:
+    """update_invocation transitions running → succeeded and persists payload."""
+    from bot.db.repos.butler_tool_invocation import ButlerToolInvocationRepo
+
+    action_id = await _create_action(db_session)
+    inv = await ButlerToolInvocationRepo.create(
+        db_session,
+        action_id=action_id,
+        tool_name="send_intro",
+        idempotency_key=f"ik-succ-{_next_id()}",
+        request_payload={"arg": "val"},
+        request_payload_hash="rph",
+        status="running",
+    )
+
+    rowcount = await ButlerToolInvocationRepo.update_invocation(
+        db_session,
+        inv.id,
+        status="succeeded",
+        response_payload={"result": "ok"},
+        response_payload_hash="rph2",
+        finished_at=_now(),
+    )
+    assert rowcount == 1
+
+    from bot.db.models import ButlerToolInvocation
+    from sqlalchemy import select
+
+    fetched = (
+        await db_session.execute(
+            select(ButlerToolInvocation).where(ButlerToolInvocation.id == inv.id)
+        )
+    ).scalar_one()
+    assert fetched.status == "succeeded"
+    assert fetched.response_payload == {"result": "ok"}
+    assert fetched.finished_at is not None
+
+
+async def test_butler_invocation_update_to_failed(db_session) -> None:
+    """update_invocation transitions running → failed and persists error fields."""
+    from bot.db.repos.butler_tool_invocation import ButlerToolInvocationRepo
+
+    action_id = await _create_action(db_session)
+    inv = await ButlerToolInvocationRepo.create(
+        db_session,
+        action_id=action_id,
+        tool_name="recall_evidence",
+        idempotency_key=f"ik-fail-{_next_id()}",
+        request_payload={},
+        request_payload_hash="rph",
+        status="running",
+    )
+
+    rowcount = await ButlerToolInvocationRepo.update_invocation(
+        db_session,
+        inv.id,
+        status="failed",
+        error_code="timeout",
+        error_context={"detail": "network"},
+        finished_at=_now(),
+    )
+    assert rowcount == 1
+
+    from bot.db.models import ButlerToolInvocation
+    from sqlalchemy import select
+
+    fetched = (
+        await db_session.execute(
+            select(ButlerToolInvocation).where(ButlerToolInvocation.id == inv.id)
+        )
+    ).scalar_one()
+    assert fetched.status == "failed"
+    assert fetched.error_code == "timeout"
+    assert fetched.error_context == {"detail": "network"}
+    assert fetched.finished_at is not None

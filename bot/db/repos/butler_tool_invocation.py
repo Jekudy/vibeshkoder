@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import select
+from datetime import datetime
+
+from sqlalchemy import select, update
 
 from bot.db.models import ButlerToolInvocation
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,3 +60,54 @@ class ButlerToolInvocationRepo:
             .order_by(ButlerToolInvocation.started_at.asc())
         )
         return list(result.scalars().all())
+
+    @staticmethod
+    async def update_invocation(
+        session: AsyncSession,
+        invocation_id: int,
+        *,
+        status: str,
+        response_payload: dict | None = None,
+        response_payload_hash: str | None = None,
+        finished_at: datetime | None = None,
+        error_code: str | None = None,
+        error_context: dict | None = None,
+    ) -> int:
+        """Update an invocation row mid/post-execute.
+
+        status must be one of the CHECK enum values
+        ('pending','running','succeeded','failed','rolled_back').
+
+        Used by ButlerService.execute_action after each tool's
+        validate_policy / execute call.
+        Returns rowcount (should be 1). Raises LookupError if row absent.
+        Flushes; caller commits.
+        """
+        values: dict = {"status": status}
+        if response_payload is not None:
+            values["response_payload"] = response_payload
+        if response_payload_hash is not None:
+            values["response_payload_hash"] = response_payload_hash
+        if finished_at is not None:
+            values["finished_at"] = finished_at
+        if error_code is not None:
+            values["error_code"] = error_code
+        if error_context is not None:
+            values["error_context"] = error_context
+
+        stmt = (
+            update(ButlerToolInvocation)
+            .where(ButlerToolInvocation.id == invocation_id)
+            .values(**values)
+        )
+        result = await session.execute(stmt)
+        rowcount: int = result.rowcount
+        if rowcount == 0:
+            raise LookupError(
+                f"ButlerToolInvocation(id={invocation_id}) not found — row missing"
+            )
+        await session.flush()
+        _log.debug(
+            "butler_tool_invocations: updated id=%s status=%s", invocation_id, status
+        )
+        return rowcount

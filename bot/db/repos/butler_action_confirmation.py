@@ -87,6 +87,73 @@ class ButlerActionConfirmationRepo:
         return rowcount
 
     @staticmethod
+    async def get_for_action_user(
+        session: AsyncSession,
+        action_id: int,
+        confirmer_tg_id: int,
+    ) -> ButlerActionConfirmation | None:
+        """Fetch confirmation row for (action_id, confirmer_tg_id).
+
+        Used by confirm_action token check.
+        """
+        result = await session.execute(
+            select(ButlerActionConfirmation).where(
+                ButlerActionConfirmation.action_id == action_id,
+                ButlerActionConfirmation.confirmer_tg_id == confirmer_tg_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def list_for_action(
+        session: AsyncSession,
+        action_id: int,
+    ) -> list[ButlerActionConfirmation]:
+        """List all confirmation rows for an action.
+
+        Used to check if all required parties have confirmed.
+        """
+        result = await session.execute(
+            select(ButlerActionConfirmation).where(
+                ButlerActionConfirmation.action_id == action_id
+            )
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def mark_all_for_action(
+        session: AsyncSession,
+        action_id: int,
+        *,
+        status: str,
+    ) -> int:
+        """Bulk transition: all pending confirmations for action → given status.
+
+        Returns count of rows updated. Used by cancel_action.
+        Only rows currently in 'pending' status are transitioned.
+        Flushes; caller commits.
+        """
+        stmt = (
+            update(ButlerActionConfirmation)
+            .where(
+                ButlerActionConfirmation.action_id == action_id,
+                ButlerActionConfirmation.status == "pending",
+            )
+            .values(status=status)
+        )
+        result = await session.execute(stmt)
+        rowcount: int = result.rowcount
+        if rowcount:
+            await session.flush()
+        _log.debug(
+            "butler_action_confirmations: marked %d rows action_id=%s status=%s",
+            rowcount,
+            action_id,
+            status,
+        )
+        return rowcount
+
+    @staticmethod
     async def list_pending_for_user(
         session: AsyncSession,
         confirmer_tg_id: int,

@@ -85,6 +85,21 @@ class ButlerActionRepo:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def get_for_update(session: AsyncSession, action_id: int) -> ButlerAction | None:
+        """SELECT FOR UPDATE on butler_actions row. Returns None if row absent.
+
+        Used by ButlerService.confirm_action / execute_action / cancel_action /
+        expire_action to coordinate with ``_cascade_butler_actions`` per §3.6 step 5
+        (cascade holds an advisory lock; this matches via SELECT FOR UPDATE row lock).
+        """
+        result = await session.execute(
+            select(ButlerAction)
+            .where(ButlerAction.id == action_id)
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
     async def update_status(
         session: AsyncSession,
         action_id: int,
