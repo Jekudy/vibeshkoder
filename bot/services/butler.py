@@ -400,6 +400,9 @@ class ButlerService:
                 visibility_scope=visibility_scope,
                 plan_payload={},
             )
+            # H1: roll back prior increments (user_plans_day already consumed).
+            for _bucket in _incremented_buckets:
+                await self._rate_bucket_repo.decrement(self._session, **_bucket)
             raise ButlerActionError(
                 f"chat rate limit exceeded for chat {effective_chat_id}",
                 error_kind="rate_limit_exceeded",
