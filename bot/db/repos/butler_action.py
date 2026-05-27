@@ -205,6 +205,33 @@ class ButlerActionRepo:
         return list(result.scalars().all())
 
     @staticmethod
+    async def get_pending_past_ttl(
+        session: AsyncSession,
+        *,
+        now: datetime | None = None,
+    ) -> list[ButlerAction]:
+        """Return all ``pending_confirmation`` rows where ``expires_at <= now``.
+
+        Used by the TTL expiry worker tick (T12-08) to identify stale actions
+        that should be transitioned to ``expired`` status via
+        ``ButlerService.expire_action``.
+
+        Ordered by ``expires_at`` ascending so the oldest stale actions are
+        processed first.
+        """
+        cutoff = now if now is not None else datetime.now(timezone.utc)
+        stmt = (
+            select(ButlerAction)
+            .where(
+                ButlerAction.status == "pending_confirmation",
+                ButlerAction.expires_at <= cutoff,
+            )
+            .order_by(ButlerAction.expires_at.asc())
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+
+    @staticmethod
     async def mark_expired_past_ttl(
         session: AsyncSession,
         now: datetime | None = None,

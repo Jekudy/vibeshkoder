@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -15,6 +17,7 @@ from bot.db.repos.intro import IntroRepo
 from bot.db.repos.llm_usage_ledger import LedgerRepo
 from bot.db.repos.user import UserRepo
 from bot.html_escape import html_escape
+from bot.db.repos.butler_action import ButlerActionRepo
 from bot.services.extractor import extraction_scheduler_tick
 from bot.services.forget_cascade import cascade_worker_tick
 from bot.services.graph_projector import default_projector_config, project_incremental
@@ -879,6 +882,97 @@ async def graph_purge_worker_job() -> None:
         logger.exception("graph_purge_worker_job: session setup failed")
 
 
+# ─── T12-08: Butler TTL expiry worker ───────────────────────────────────────
+
+
+async def _query_pending_past_ttl(session: Any, *, now: datetime) -> list:
+    """Thin helper so tests can patch without reaching into the repo directly."""
+    return await ButlerActionRepo.get_pending_past_ttl(session, now=now)
+
+
+async def butler_expire_tick(*, bot: Bot, session: Any) -> int:
+    """Inner tick: expire all pending_confirmation actions past their TTL.
+
+    Returns the count of actions expired. Callers own session + commit.
+
+    The session parameter is accepted for injection in tests (callers pass
+    the active session so the tick participates in the same transaction).
+    """
+    now = datetime.now(timezone.utc)
+    stale_actions = await _query_pending_past_ttl(session, now=now)
+    if not stale_actions:
+        await session.commit()
+        return 0
+
+    from bot.services.butler import ButlerService
+    from bot.db.repos.butler_action import ButlerActionRepo as _ActionRepo
+    from bot.db.repos.butler_rate_bucket import ButlerRateBucketRepo
+
+    expired_count = 0
+    for action in stale_actions:
+        # ButlerService.expire_action is idempotent — safe to call on already-expired rows.
+        svc = ButlerService(
+            session=session,
+            ledger_repo=None,  # type: ignore[arg-type]  # not needed for expire_action
+            butler_action_repo=_ActionRepo,
+            butler_action_confirmation_repo=None,  # type: ignore[arg-type]
+            butler_tool_invocation_repo=None,  # type: ignore[arg-type]
+            butler_rate_bucket_repo=ButlerRateBucketRepo,
+            user_repo=None,
+            llm_gateway=None,  # type: ignore[arg-type]
+            evidence_builder=None,  # type: ignore[arg-type]
+            settings=None,  # type: ignore[arg-type]
+        )
+        try:
+            updated = await svc.expire_action(action_id=action.id)
+            if getattr(updated, "status", None) == "expired":
+                expired_count += 1
+        except Exception:
+            logger.exception(
+                "butler_expire_tick: expire_action failed for action_id=%s", action.id
+            )
+
+    await session.commit()
+    if expired_count:
+        logger.info("butler_expire_tick: expired %d actions", expired_count)
+    return expired_count
+
+
+async def butler_expire_tick_job(bot: Bot) -> None:
+    """APScheduler wrapper for the Butler TTL expiry worker.
+
+    Per PHASE12_PLAN_REFRESH.md §T12-08. Strict no-op when the master flag
+    ``memory.butler.enabled`` is OFF. Interval configured via
+    ``BUTLER_EXPIRE_TICK_SECONDS`` (default 60s).
+
+    Wraps butler_expire_tick in try/except so apscheduler never stops firing.
+    F2 pattern: bot threaded through via scheduler args=[bot] so Telegram
+    side-effects (e.g. future keyboard editing) can be added without re-wiring.
+    """
+    try:
+        async with async_session() as session:
+            from bot.db.repos.feature_flag import FeatureFlagRepo
+
+            flag_enabled = await FeatureFlagRepo.get(session, "memory.butler.enabled")
+            if not flag_enabled:
+                logger.debug("butler_expire_tick_job: flag disabled, skipping")
+                return
+
+            try:
+                expired = await butler_expire_tick(bot=bot, session=session)
+                logger.debug("butler_expire_tick_job: expired=%d", expired)
+            except Exception:
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception("butler_expire_tick_job: rollback failed")
+                logger.exception("butler_expire_tick_job: tick crashed")
+    except Exception:
+        # Catch-all — apscheduler must never see an exception or it would
+        # mark the job as failed and stop firing.
+        logger.exception("butler_expire_tick_job: session setup failed")
+
+
 def start_scheduler(bot: Bot) -> None:
     """Configure and start the scheduler."""
     scheduler.add_job(
@@ -1046,6 +1140,23 @@ def start_scheduler(bot: Bot) -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=60,
+    )
+    # T12-08: Butler TTL expiry worker. Default 60s interval; gated by
+    # ``memory.butler.enabled`` feature flag (default OFF) in the job body.
+    # F2 pattern: bot threaded through args=[bot] per T7 FHR fix df4bb71.
+    butler_expire_tick_seconds = int(
+        os.environ.get("BUTLER_EXPIRE_TICK_SECONDS", "60")
+    )
+    scheduler.add_job(
+        butler_expire_tick_job,
+        "interval",
+        seconds=butler_expire_tick_seconds,
+        args=[bot],
+        id="butler_expire_tick",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
     )
     scheduler.start()
     logger.info("Scheduler started")

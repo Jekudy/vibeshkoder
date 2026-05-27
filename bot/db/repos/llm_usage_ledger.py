@@ -113,10 +113,15 @@ class LedgerRepo:
         *,
         year: int,
         month: int,
+        call_type: str | None = None,
     ) -> Decimal:
         """SUM(cost_usd) WHERE created_at within (year, month) UTC.
 
         UTC-bounded. Zero rows => ``Decimal("0")`` (NEVER ``None``).
+
+        ``call_type=None`` sums across all call types (backwards-compatible default).
+        Pass ``call_type='butler_decision'`` to isolate butler decision costs from
+        other LLM costs. Mirrors ``daily_cost_usd`` signature per C9 / T12-08.
         """
         month_start = datetime.combine(date(year, month, 1), time(0), tzinfo=timezone.utc)
         _, days_in_month = monthrange(year, month)
@@ -124,11 +129,15 @@ class LedgerRepo:
         next_month_date = date.fromordinal(month_end_date.toordinal() + 1)
         month_end = datetime.combine(next_month_date, time(0), tzinfo=timezone.utc)
 
+        filters = [
+            LlmUsageLedger.created_at >= month_start,
+            LlmUsageLedger.created_at < month_end,
+        ]
+        if call_type is not None:
+            filters.append(LlmUsageLedger.call_type == call_type)
+
         result = await session.execute(
-            select(func.sum(LlmUsageLedger.cost_usd)).where(
-                LlmUsageLedger.created_at >= month_start,
-                LlmUsageLedger.created_at < month_end,
-            )
+            select(func.sum(LlmUsageLedger.cost_usd)).where(*filters)
         )
         total = result.scalar_one_or_none()
         return Decimal(str(total)) if total is not None else Decimal("0")
