@@ -1,0 +1,707 @@
+"""Behaviour tests for ButlerService.execute_undo (T12-07).
+
+TDD — tests written before/alongside the execute_undo implementation.
+
+Test inventory
+--------------
+1.  not_reversible_skipped          — rollback_kind=not_reversible → skipped audit row
+2.  delete_message_happy            — rollback_kind=delete_message → bot.delete_message called
+3.  edit_message_happy              — rollback_kind=edit_message → bot.edit_message_text called
+4.  followup_correction_happy       — rollback_kind=followup_correction → bot.send_message called
+5.  cancel_pending_happy            — rollback_kind=cancel_pending → card suggestion repo updated
+6.  delete_message_bot_failure      — bot.delete_message raises → audit row status=failed
+7.  auth_non_requester_non_admin    — wrong user → ButlerActionError(forbidden)
+8.  wrong_status_pending            — action.status='pending_confirmation' → ButlerActionError(wrong_status)
+9.  ttl_expired                     — action.succeeded_at more than TTL ago → ButlerActionError(ttl_expired)
+10. idempotency_already_undone      — second call → returns existing summary, no double-side-effect
+11. cascade_in_flight               — action row locked → CascadeInFlightError
+12. lifo_order                      — two invocations → undo executed in REVERSE order
+
+Combined mode: these tests can run alongside test_butler_state_machine.py
+without class identity failures (module-level imports).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+# Module-level imports for all exception classes — prevents class identity failures
+# in combined-mode CI (see commit db33b1c, T12-04 fix cycle).
+from bot.services.butler import (
+    ButlerActionError,
+    ButlerActionExpiredError,
+    ButlerActionRejectedError,
+    ButlerService,
+    CascadeInFlightError,
+    EvidenceStaleError,
+    MembershipRevokedError,
+)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+REQUESTER_ID = 42
+OTHER_USER_ID = 99
+CHAT_ID = -100_999_888_777
+ACTION_ID = 1
+INVOCATION_ID_1 = 10
+INVOCATION_ID_2 = 11
+
+# Default TTL minutes for undo (must match service default)
+BUTLER_UNDO_TTL_MINUTES = 60
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _past(minutes: int) -> datetime:
+    return _now() - timedelta(minutes=minutes)
+
+
+# ---------------------------------------------------------------------------
+# Fake ORM rows
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeButlerAction:
+    id: int
+    requester_tg_id: int
+    chat_id: int = CHAT_ID
+    action_type: str = "recall"
+    status: str = "succeeded"
+    tool_name: str = "recall_evidence"
+    tool_manifest_version: str = "v1.0.0"
+    governance_filter_version: str = "test-v1"
+    evidence_context_hash: str = "abc123"
+    evidence_ids: list = field(default_factory=list)
+    plan_summary: str = "Test plan"
+    action_args: dict = field(default_factory=dict)
+    action_args_hash: str = ""
+    rollback_kind: str = "not_reversible"
+    risk_level: str = "low"
+    requires_confirmation: bool = True
+    confirmation_policy: str = "per_action"
+    expires_at: datetime | None = None
+    confirmed_at: datetime | None = None
+    executed_at: datetime | None = field(default_factory=_now)
+    undone_at: datetime | None = None
+    rejection_reason: str | None = None
+    error_code: str | None = None
+    error_context: dict | None = None
+    llm_usage_ledger_id: int | None = 1
+    result_payload: dict | None = None
+    result_payload_hash: str | None = None
+    inverse_op_payload: dict | None = None
+    action_uuid: uuid.UUID = field(default_factory=uuid.uuid4)
+    parent_action_id: int | None = None
+    plan_payload: dict = field(default_factory=dict)
+    approved_card_source_ids: list = field(default_factory=list)
+    query: str = "test query"
+    visibility_scope: str = "member"
+    created_at: datetime = field(default_factory=_now)
+    updated_at: datetime = field(default_factory=_now)
+    # succeeded_at is used for TTL check — using executed_at as proxy
+    succeeded_at: datetime | None = field(default_factory=_now)
+
+
+@dataclass
+class FakeButlerToolInvocation:
+    id: int
+    action_id: int
+    tool_name: str
+    idempotency_key: str
+    request_payload: dict
+    request_payload_hash: str
+    status: str = "succeeded"
+    invocation_seq: int = 1
+    response_payload: dict | None = None
+    response_payload_hash: str | None = None
+    started_at: datetime = field(default_factory=_now)
+    finished_at: datetime | None = None
+    error_code: str | None = None
+    error_context: dict | None = None
+    posted_message_id: int | None = None
+    # inverse_op_payload stores rollback info for this invocation
+    inverse_op_payload: dict | None = None
+
+
+@dataclass
+class FakeButlerUndoInvocation:
+    id: int
+    butler_action_id: int
+    butler_tool_invocation_id: int
+    requester_user_id: int
+    rollback_kind: str
+    status: str = "pending"
+    error_kind: str | None = None
+    error_message: str | None = None
+    created_at: datetime = field(default_factory=_now)
+
+
+@dataclass
+class FakeButlerCardSuggestion:
+    id: int
+    butler_action_id: int
+    status: str = "pending"
+
+
+# ---------------------------------------------------------------------------
+# Fake repos
+# ---------------------------------------------------------------------------
+
+
+class FakeButlerActionRepo:
+    def __init__(self, action: FakeButlerAction | None = None) -> None:
+        self._action = action
+        self.locked = False
+        self.updates: list[dict] = []
+
+    async def get(self, session: Any, action_id: int) -> FakeButlerAction | None:
+        return self._action if (self._action and self._action.id == action_id) else None
+
+    async def get_for_update(self, session: Any, action_id: int) -> FakeButlerAction | None:
+        if self.locked:
+            return None  # simulate cascade holding lock
+        return self._action if (self._action and self._action.id == action_id) else None
+
+    async def update_status(self, session: Any, action_id: int, **kwargs: Any) -> int:
+        self.updates.append({"action_id": action_id, **kwargs})
+        if self._action and self._action.id == action_id:
+            if "status" in kwargs:
+                self._action.status = kwargs["status"]
+            if "undone_at" in kwargs:
+                self._action.undone_at = kwargs["undone_at"]
+        return 1
+
+
+class FakeButlerToolInvocationRepo:
+    def __init__(self, invocations: list[FakeButlerToolInvocation] | None = None) -> None:
+        self._invocations: list[FakeButlerToolInvocation] = invocations or []
+        self.updates: list[dict] = []
+
+    async def list_for_action(self, session: Any, action_id: int) -> list[FakeButlerToolInvocation]:
+        return [inv for inv in self._invocations if inv.action_id == action_id]
+
+
+class FakeButlerUndoInvocationRepo:
+    def __init__(self) -> None:
+        self._rows: dict[tuple[int, int], FakeButlerUndoInvocation] = {}
+        self._next_id = 100
+        self.creates: list[dict] = []
+        self.updates: list[dict] = []
+
+    async def create(
+        self,
+        session: Any,
+        *,
+        butler_action_id: int,
+        butler_tool_invocation_id: int,
+        requester_user_id: int,
+        rollback_kind: str,
+        status: str = "pending",
+        error_kind: str | None = None,
+        error_message: str | None = None,
+    ) -> FakeButlerUndoInvocation:
+        self.creates.append({
+            "butler_action_id": butler_action_id,
+            "butler_tool_invocation_id": butler_tool_invocation_id,
+            "rollback_kind": rollback_kind,
+            "status": status,
+        })
+        row = FakeButlerUndoInvocation(
+            id=self._next_id,
+            butler_action_id=butler_action_id,
+            butler_tool_invocation_id=butler_tool_invocation_id,
+            requester_user_id=requester_user_id,
+            rollback_kind=rollback_kind,
+            status=status,
+            error_kind=error_kind,
+            error_message=error_message,
+        )
+        self._rows[(butler_action_id, butler_tool_invocation_id)] = row
+        self._next_id += 1
+        return row
+
+    async def find_by_action_and_invocation(
+        self,
+        session: Any,
+        butler_action_id: int,
+        butler_tool_invocation_id: int,
+    ) -> FakeButlerUndoInvocation | None:
+        return self._rows.get((butler_action_id, butler_tool_invocation_id))
+
+    async def list_by_action(
+        self, session: Any, butler_action_id: int
+    ) -> list[FakeButlerUndoInvocation]:
+        return [r for r in self._rows.values() if r.butler_action_id == butler_action_id]
+
+    async def update_status(
+        self,
+        session: Any,
+        undo_invocation_id: int,
+        *,
+        status: str,
+        error_kind: str | None = None,
+        error_message: str | None = None,
+    ) -> int:
+        self.updates.append({
+            "id": undo_invocation_id,
+            "status": status,
+            "error_kind": error_kind,
+        })
+        for row in self._rows.values():
+            if row.id == undo_invocation_id:
+                row.status = status
+                if error_kind is not None:
+                    row.error_kind = error_kind
+                if error_message is not None:
+                    row.error_message = error_message
+                return 1
+        raise LookupError(f"ButlerUndoInvocation(id={undo_invocation_id}) not found")
+
+
+class FakeButlerCardSuggestionRepo:
+    def __init__(self, suggestion: FakeButlerCardSuggestion | None = None) -> None:
+        self._suggestion = suggestion
+        self.updates: list[dict] = []
+
+    async def get_for_action(self, session: Any, butler_action_id: int) -> FakeButlerCardSuggestion | None:
+        return self._suggestion
+
+    async def dismiss_by_undo(self, session: Any, butler_action_id: int) -> int:
+        self.updates.append({"butler_action_id": butler_action_id, "action": "dismiss_by_undo"})
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Factory helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_action(
+    *,
+    requester_tg_id: int = REQUESTER_ID,
+    status: str = "succeeded",
+    succeeded_at: datetime | None = None,
+    inverse_op_payload: dict | None = None,
+) -> FakeButlerAction:
+    action = FakeButlerAction(
+        id=ACTION_ID,
+        requester_tg_id=requester_tg_id,
+        status=status,
+        executed_at=succeeded_at or _now(),
+    )
+    action.succeeded_at = succeeded_at or _now()
+    action.inverse_op_payload = inverse_op_payload
+    return action
+
+
+def _make_invocation(
+    *,
+    inv_id: int = INVOCATION_ID_1,
+    rollback_kind: str = "not_reversible",
+    inverse_op_payload: dict | None = None,
+) -> FakeButlerToolInvocation:
+    payload = inverse_op_payload or {"rollback_kind": rollback_kind}
+    return FakeButlerToolInvocation(
+        id=inv_id,
+        action_id=ACTION_ID,
+        tool_name="recall_evidence",
+        idempotency_key=f"butler:{ACTION_ID}:recall_evidence:{inv_id}",
+        request_payload={},
+        request_payload_hash="",
+        inverse_op_payload=payload,
+    )
+
+
+def _make_service(
+    action: FakeButlerAction | None = None,
+    invocations: list | None = None,
+    undo_repo: FakeButlerUndoInvocationRepo | None = None,
+    card_suggestion_repo: FakeButlerCardSuggestionRepo | None = None,
+    locked: bool = False,
+) -> ButlerService:
+    """Build a ButlerService with fake repos wired for undo testing."""
+    action_repo = FakeButlerActionRepo(action)
+    action_repo.locked = locked
+
+    invocation_repo = FakeButlerToolInvocationRepo(invocations or [])
+    undo_inv_repo = undo_repo or FakeButlerUndoInvocationRepo()
+    card_sugg_repo = card_suggestion_repo or FakeButlerCardSuggestionRepo()
+
+    # Stub the unused collaborators
+    session = AsyncMock()
+    ledger_repo = MagicMock()
+    confirmation_repo = MagicMock()
+    rate_bucket_repo = MagicMock()
+    user_repo = MagicMock()
+    llm_gateway = MagicMock()
+    evidence_builder = MagicMock()
+    settings = MagicMock()
+
+    svc = ButlerService(
+        session=session,
+        ledger_repo=ledger_repo,
+        butler_action_repo=action_repo,
+        butler_action_confirmation_repo=confirmation_repo,
+        butler_tool_invocation_repo=invocation_repo,
+        butler_rate_bucket_repo=rate_bucket_repo,
+        user_repo=user_repo,
+        llm_gateway=llm_gateway,
+        evidence_builder=evidence_builder,
+        settings=settings,
+    )
+    # Inject undo-specific repos
+    svc._undo_invocation_repo = undo_inv_repo  # type: ignore[attr-defined]
+    svc._card_suggestion_repo = card_sugg_repo  # type: ignore[attr-defined]
+    return svc
+
+
+# ---------------------------------------------------------------------------
+# Test 1: not_reversible → skipped audit row
+# ---------------------------------------------------------------------------
+
+
+def test_not_reversible_skipped() -> None:
+    """rollback_kind=not_reversible → skipped audit row, no side effects."""
+    inv = _make_invocation(rollback_kind="not_reversible", inverse_op_payload={"rollback_kind": "not_reversible"})
+    action = _make_action()
+    undo_repo = FakeButlerUndoInvocationRepo()
+    bot = AsyncMock()
+
+    svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo)
+
+    summary = asyncio.run(
+        svc.execute_undo(
+            action_id=ACTION_ID,
+            requester_user_id=REQUESTER_ID,
+            bot=bot,
+        )
+    )
+
+    # Audit row created (initially pending) then updated to skipped_not_reversible
+    assert len(undo_repo.creates) == 1
+    assert undo_repo.creates[0]["rollback_kind"] == "not_reversible"
+    # The row is updated to skipped_not_reversible via update_status
+    assert any(u["status"] == "skipped_not_reversible" for u in undo_repo.updates)
+
+    # No Telegram calls
+    bot.delete_message.assert_not_awaited()
+    bot.edit_message_text.assert_not_awaited()
+    bot.send_message.assert_not_awaited()
+
+    # Summary reports the skipped step
+    assert summary is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 2: delete_message happy path
+# ---------------------------------------------------------------------------
+
+
+def test_delete_message_happy() -> None:
+    """rollback_kind=delete_message → bot.delete_message called with payload data."""
+    inv = _make_invocation(
+        rollback_kind="delete_message",
+        inverse_op_payload={"rollback_kind": "delete_message", "chat_id": CHAT_ID, "message_id": 9999},
+    )
+    action = _make_action()
+    undo_repo = FakeButlerUndoInvocationRepo()
+    bot = AsyncMock()
+
+    svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo)
+
+    asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
+
+    bot.delete_message.assert_awaited_once_with(chat_id=CHAT_ID, message_id=9999)
+
+    # Audit row created with succeeded status
+    assert len(undo_repo.creates) == 1
+    assert undo_repo.creates[0]["status"] == "pending"
+    # Status updated to succeeded
+    assert any(u["status"] == "succeeded" for u in undo_repo.updates)
+
+
+# ---------------------------------------------------------------------------
+# Test 3: edit_message happy path
+# ---------------------------------------------------------------------------
+
+
+def test_edit_message_happy() -> None:
+    """rollback_kind=edit_message → bot.edit_message_text called with prior_text."""
+    inv = _make_invocation(
+        rollback_kind="edit_message",
+        inverse_op_payload={
+            "rollback_kind": "edit_message",
+            "chat_id": CHAT_ID,
+            "message_id": 8888,
+            "prior_text": "original text",
+        },
+    )
+    action = _make_action()
+    undo_repo = FakeButlerUndoInvocationRepo()
+    bot = AsyncMock()
+
+    svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo)
+
+    asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
+
+    bot.edit_message_text.assert_awaited_once_with(
+        chat_id=CHAT_ID, message_id=8888, text="original text"
+    )
+    assert any(u["status"] == "succeeded" for u in undo_repo.updates)
+
+
+# ---------------------------------------------------------------------------
+# Test 4: followup_correction happy path
+# ---------------------------------------------------------------------------
+
+
+def test_followup_correction_happy() -> None:
+    """rollback_kind=followup_correction → bot.send_message called with correction_text."""
+    inv = _make_invocation(
+        rollback_kind="followup_correction",
+        inverse_op_payload={
+            "rollback_kind": "followup_correction",
+            "chat_id": CHAT_ID,
+            "correction_text": "This was a correction.",
+        },
+    )
+    action = _make_action()
+    undo_repo = FakeButlerUndoInvocationRepo()
+    bot = AsyncMock()
+
+    svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo)
+
+    asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
+
+    bot.send_message.assert_awaited_once_with(chat_id=CHAT_ID, text="This was a correction.")
+    assert any(u["status"] == "succeeded" for u in undo_repo.updates)
+
+
+# ---------------------------------------------------------------------------
+# Test 5: cancel_pending happy path
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_pending_happy() -> None:
+    """rollback_kind=cancel_pending → card suggestion repo updated."""
+    inv = _make_invocation(
+        rollback_kind="cancel_pending",
+        inverse_op_payload={"rollback_kind": "cancel_pending", "butler_action_id": ACTION_ID},
+    )
+    action = _make_action()
+    undo_repo = FakeButlerUndoInvocationRepo()
+    card_sugg_repo = FakeButlerCardSuggestionRepo(
+        FakeButlerCardSuggestion(id=55, butler_action_id=ACTION_ID)
+    )
+    bot = AsyncMock()
+
+    svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo, card_suggestion_repo=card_sugg_repo)
+
+    asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
+
+    assert len(card_sugg_repo.updates) == 1
+    assert card_sugg_repo.updates[0]["action"] == "dismiss_by_undo"
+    assert any(u["status"] == "succeeded" for u in undo_repo.updates)
+
+
+# ---------------------------------------------------------------------------
+# Test 6: delete_message bot failure → audit row status=failed
+# ---------------------------------------------------------------------------
+
+
+def test_delete_message_bot_failure() -> None:
+    """bot.delete_message raises TelegramError → audit row status=failed, undo continues."""
+    inv = _make_invocation(
+        rollback_kind="delete_message",
+        inverse_op_payload={"rollback_kind": "delete_message", "chat_id": CHAT_ID, "message_id": 7777},
+    )
+    action = _make_action()
+    undo_repo = FakeButlerUndoInvocationRepo()
+    bot = AsyncMock()
+    bot.delete_message.side_effect = RuntimeError("Telegram error")
+
+    svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo)
+
+    # Should NOT raise — failure is recorded in audit row
+    summary = asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
+
+    assert summary is not None
+    # Audit row updated to failed
+    assert any(u["status"] == "failed" for u in undo_repo.updates)
+
+
+# ---------------------------------------------------------------------------
+# Test 7: auth failure — non-requester non-admin
+# ---------------------------------------------------------------------------
+
+
+def test_auth_non_requester_non_admin() -> None:
+    """Non-requester non-admin → ButlerActionError(forbidden)."""
+    action = _make_action(requester_tg_id=REQUESTER_ID)
+    svc = _make_service(action=action)
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        asyncio.run(
+            svc.execute_undo(
+                action_id=ACTION_ID,
+                requester_user_id=OTHER_USER_ID,
+                is_admin=False,
+                bot=AsyncMock(),
+            )
+        )
+
+    assert exc_info.value.error_kind == "forbidden"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: wrong status — action is pending_confirmation
+# ---------------------------------------------------------------------------
+
+
+def test_wrong_status_pending() -> None:
+    """Undo on pending_confirmation action → ButlerActionError(wrong_status)."""
+    action = _make_action(status="pending_confirmation")
+    svc = _make_service(action=action)
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        asyncio.run(
+            svc.execute_undo(
+                action_id=ACTION_ID,
+                requester_user_id=REQUESTER_ID,
+                bot=AsyncMock(),
+            )
+        )
+
+    assert exc_info.value.error_kind == "wrong_status"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: TTL expired — succeeded_at more than 60 min ago
+# ---------------------------------------------------------------------------
+
+
+def test_ttl_expired() -> None:
+    """Undo after TTL window → ButlerActionError(ttl_expired)."""
+    action = _make_action(succeeded_at=_past(BUTLER_UNDO_TTL_MINUTES + 1))
+    svc = _make_service(action=action)
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        asyncio.run(
+            svc.execute_undo(
+                action_id=ACTION_ID,
+                requester_user_id=REQUESTER_ID,
+                bot=AsyncMock(),
+            )
+        )
+
+    assert exc_info.value.error_kind == "ttl_expired"
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Idempotency — second call returns existing summary, no double-side-effect
+# ---------------------------------------------------------------------------
+
+
+def test_idempotency_already_undone() -> None:
+    """Second /butler_undo call → returns existing summary, bot not called again."""
+    inv = _make_invocation(
+        rollback_kind="delete_message",
+        inverse_op_payload={"rollback_kind": "delete_message", "chat_id": CHAT_ID, "message_id": 6666},
+    )
+    action = _make_action(status="undone")
+    undo_repo = FakeButlerUndoInvocationRepo()
+    bot = AsyncMock()
+
+    # Pre-populate the undo repo with an existing succeeded row
+    existing_undo = FakeButlerUndoInvocation(
+        id=200,
+        butler_action_id=ACTION_ID,
+        butler_tool_invocation_id=INVOCATION_ID_1,
+        requester_user_id=REQUESTER_ID,
+        rollback_kind="delete_message",
+        status="succeeded",
+    )
+    undo_repo._rows[(ACTION_ID, INVOCATION_ID_1)] = existing_undo
+
+    svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo)
+
+    summary = asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
+
+    # No new audit rows created (idempotency)
+    assert len(undo_repo.creates) == 0
+    # No Telegram calls
+    bot.delete_message.assert_not_awaited()
+    assert summary is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Cascade in-flight
+# ---------------------------------------------------------------------------
+
+
+def test_cascade_in_flight() -> None:
+    """Parent action row locked by cascade → CascadeInFlightError."""
+    action = _make_action()
+    svc = _make_service(action=action, locked=True)
+
+    with pytest.raises(CascadeInFlightError):
+        asyncio.run(
+            svc.execute_undo(
+                action_id=ACTION_ID,
+                requester_user_id=REQUESTER_ID,
+                bot=AsyncMock(),
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 12: LIFO order — two invocations processed in reverse order
+# ---------------------------------------------------------------------------
+
+
+def test_lifo_order() -> None:
+    """Two invocations → undo executed in REVERSE order (LIFO)."""
+    call_order: list[int] = []
+
+    inv1 = _make_invocation(
+        inv_id=INVOCATION_ID_1,
+        rollback_kind="delete_message",
+        inverse_op_payload={"rollback_kind": "delete_message", "chat_id": CHAT_ID, "message_id": 1001},
+    )
+    inv2 = _make_invocation(
+        inv_id=INVOCATION_ID_2,
+        rollback_kind="delete_message",
+        inverse_op_payload={"rollback_kind": "delete_message", "chat_id": CHAT_ID, "message_id": 1002},
+    )
+    # Set invocation_seq so LIFO can be determined
+    inv1.invocation_seq = 1
+    inv2.invocation_seq = 2
+
+    action = _make_action()
+    undo_repo = FakeButlerUndoInvocationRepo()
+    bot = AsyncMock()
+
+    async def _track_delete(*, chat_id: int, message_id: int) -> None:
+        call_order.append(message_id)
+
+    bot.delete_message.side_effect = _track_delete
+
+    svc = _make_service(action=action, invocations=[inv1, inv2], undo_repo=undo_repo)
+
+    asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
+
+    # LIFO: inv2 (message_id=1002) undone BEFORE inv1 (message_id=1001)
+    assert call_order == [1002, 1001], f"Expected LIFO [1002, 1001], got {call_order}"

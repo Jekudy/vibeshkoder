@@ -34,13 +34,19 @@ def _next_id() -> int:
 
 
 def test_cascade_layer_order_ends_with_butler_layers() -> None:
-    """CASCADE_LAYER_ORDER must end with butler layers in: confirmations → invocations → actions."""
+    """CASCADE_LAYER_ORDER must end with butler layers in: confirmations → invocations → undo_invocations → actions.
+
+    T12-07 added butler_undo_invocations between butler_tool_invocations and
+    butler_actions — FK dependency: undo rows reference tool invocation ids and
+    must be processed before the parent action row is masked.
+    """
     from bot.services.forget_cascade import CASCADE_LAYER_ORDER
 
-    tail = list(CASCADE_LAYER_ORDER[-3:])
+    tail = list(CASCADE_LAYER_ORDER[-4:])
     assert tail == [
         "butler_action_confirmations",
         "butler_tool_invocations",
+        "butler_undo_invocations",
         "butler_actions",
     ], f"Unexpected tail: {tail}"
 
@@ -59,12 +65,13 @@ def test_cascade_layer_order_butler_after_graph_nodes() -> None:
 
 
 def test_layer_funcs_contains_butler_keys() -> None:
-    """_LAYER_FUNCS must contain all 3 butler layer keys."""
+    """_LAYER_FUNCS must contain all butler layer keys (T12-01 + T12-07)."""
     from bot.services.forget_cascade import _LAYER_FUNCS  # type: ignore[attr-defined]
 
     for key in (
         "butler_action_confirmations",
         "butler_tool_invocations",
+        "butler_undo_invocations",
         "butler_actions",
     ):
         assert key in _LAYER_FUNCS, f"Missing key in _LAYER_FUNCS: {key}"

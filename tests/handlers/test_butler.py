@@ -680,7 +680,7 @@ def test_butler_status_happy(app_env, monkeypatch) -> None:
 
 
 def test_butler_undo_stub(app_env, monkeypatch) -> None:
-    """/butler_undo → stub message (T12-07 scope)."""
+    """/butler_undo with undo flag OFF → stub message for members (T12-07)."""
     handler = import_module("bot.handlers.butler")
 
     uid = _random_tg_id()
@@ -688,8 +688,19 @@ def test_butler_undo_stub(app_env, monkeypatch) -> None:
     command.args = "1"
     session = _make_session()
 
+    # Master flag ON, undo sub-flag OFF — returns stub message
+    def _flag_side_effect(session, flag_name: str):
+        if flag_name == handler.BUTLER_UNDO_FLAG:
+            import asyncio as _asyncio
+            async def _false():
+                return False
+            return _false()
+        async def _true():
+            return True
+        return _true()
+
     monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", AsyncMock(return_value=True)
+        handler.FeatureFlagRepo, "get", _flag_side_effect
     )
     member = _make_user(uid, is_member=True)
     monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=member))
@@ -699,6 +710,128 @@ def test_butler_undo_stub(app_env, monkeypatch) -> None:
     message.reply.assert_awaited_once()
     reply_text = message.reply.call_args[0][0]
     assert "обновлен" in reply_text.lower() or "undo" in reply_text.lower() or "отмен" in reply_text.lower()
+
+
+def test_butler_undo_happy_path(app_env, monkeypatch) -> None:
+    """/butler_undo with undo flag ON + execute_undo success → undo summary rendered."""
+    handler = import_module("bot.handlers.butler")
+
+    uid = _random_tg_id()
+    message, command = _make_message(user_id=uid)
+    command.args = "42"
+    session = _make_session()
+
+    # Both flags ON
+    monkeypatch.setattr(
+        handler.FeatureFlagRepo, "get", AsyncMock(return_value=True)
+    )
+    member = _make_user(uid, is_member=True)
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=member))
+
+    # Stub execute_undo → returns a success summary
+    mock_summary = {"action_id": 42, "status": "undone", "steps": []}
+    mock_butler = MagicMock()
+    mock_butler.execute_undo = AsyncMock(return_value=mock_summary)
+    monkeypatch.setattr(handler, "_build_undo_service", lambda s: mock_butler)
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    mock_butler.execute_undo.assert_awaited_once()
+    message.reply.assert_awaited_once()
+    reply_text = message.reply.call_args[0][0]
+    # Should contain undo summary content
+    assert "откат" in reply_text.lower() or "undo" in reply_text.lower() or "✅" in reply_text or "🔄" in reply_text
+
+
+def test_butler_undo_forbidden(app_env, monkeypatch) -> None:
+    """/butler_undo with wrong user → forbidden message."""
+    handler = import_module("bot.handlers.butler")
+
+    from bot.services.butler import ButlerActionRejectedError
+
+    uid = _random_tg_id()
+    message, command = _make_message(user_id=uid)
+    command.args = "42"
+    session = _make_session()
+
+    monkeypatch.setattr(
+        handler.FeatureFlagRepo, "get", AsyncMock(return_value=True)
+    )
+    member = _make_user(uid, is_member=True)
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=member))
+
+    mock_butler = MagicMock()
+    mock_butler.execute_undo = AsyncMock(
+        side_effect=ButlerActionRejectedError("forbidden", error_kind="forbidden", action_id=42)
+    )
+    monkeypatch.setattr(handler, "_build_undo_service", lambda s: mock_butler)
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    session.rollback.assert_awaited()
+    message.reply.assert_awaited_once()
+    reply_text = message.reply.call_args[0][0]
+    assert "прав" in reply_text.lower() or "forbidden" in reply_text.lower() or "нет" in reply_text.lower()
+
+
+def test_butler_undo_ttl_expired(app_env, monkeypatch) -> None:
+    """/butler_undo after TTL → ttl_expired message."""
+    handler = import_module("bot.handlers.butler")
+
+    from bot.services.butler import ButlerActionError
+
+    uid = _random_tg_id()
+    message, command = _make_message(user_id=uid)
+    command.args = "42"
+    session = _make_session()
+
+    monkeypatch.setattr(
+        handler.FeatureFlagRepo, "get", AsyncMock(return_value=True)
+    )
+    member = _make_user(uid, is_member=True)
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=member))
+
+    mock_butler = MagicMock()
+    mock_butler.execute_undo = AsyncMock(
+        side_effect=ButlerActionError("ttl expired", error_kind="ttl_expired", action_id=42)
+    )
+    monkeypatch.setattr(handler, "_build_undo_service", lambda s: mock_butler)
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    session.rollback.assert_awaited()
+    message.reply.assert_awaited_once()
+
+
+def test_butler_undo_cascade_in_flight(app_env, monkeypatch) -> None:
+    """/butler_undo when cascade running → system-busy message."""
+    handler = import_module("bot.handlers.butler")
+
+    from bot.services.butler import CascadeInFlightError
+
+    uid = _random_tg_id()
+    message, command = _make_message(user_id=uid)
+    command.args = "42"
+    session = _make_session()
+
+    monkeypatch.setattr(
+        handler.FeatureFlagRepo, "get", AsyncMock(return_value=True)
+    )
+    member = _make_user(uid, is_member=True)
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=member))
+
+    mock_butler = MagicMock()
+    mock_butler.execute_undo = AsyncMock(
+        side_effect=CascadeInFlightError("locked", error_kind="cascade_in_flight", action_id=42)
+    )
+    monkeypatch.setattr(handler, "_build_undo_service", lambda s: mock_butler)
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    session.rollback.assert_awaited()
+    message.reply.assert_awaited_once()
+    reply_text = message.reply.call_args[0][0]
+    assert "занята" in reply_text.lower() or "секунд" in reply_text.lower()
 
 
 # ---------------------------------------------------------------------------
