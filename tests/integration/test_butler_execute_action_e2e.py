@@ -11,9 +11,7 @@ to the tool; we exercise only the argument-passing path using minimal fakes.
 from __future__ import annotations
 
 import pytest
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
 from bot.services.butler_tools import (

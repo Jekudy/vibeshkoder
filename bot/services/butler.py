@@ -988,7 +988,6 @@ class ButlerService:
                         error_kind="tool_not_allowed",
                     )
                 try:
-                    from pydantic import ValidationError as _PydanticValidationError
                     validated_args = args_model_cls.model_validate(step_args)
                 except Exception as _ve:
                     raise ButlerPlanError(
