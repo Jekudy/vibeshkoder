@@ -239,7 +239,7 @@ def test_feature_flag_off_no_service_call(app_env, monkeypatch) -> None:
 
 
 def test_non_member_rejection(app_env, monkeypatch) -> None:
-    """Non-member → polite refusal message, no ButlerService interaction."""
+    """Non-member → SILENT rejection (H3: no confirmation bot exists)."""
     handler = import_module("bot.handlers.butler")
 
     uid = _random_tg_id()
@@ -258,9 +258,8 @@ def test_non_member_rejection(app_env, monkeypatch) -> None:
     asyncio.run(handler.handle_butler(message, command, session))
 
     mock_build.assert_not_called()
-    message.reply.assert_awaited_once()
-    call_args = message.reply.call_args
-    assert "участникам" in call_args[0][0] or "участник" in call_args[0][0].lower()
+    # H3: non-members are silently rejected — no reply
+    message.reply.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +268,7 @@ def test_non_member_rejection(app_env, monkeypatch) -> None:
 
 
 def test_non_member_rejection_user_none(app_env, monkeypatch) -> None:
-    """UserRepo.get returns None → polite refusal."""
+    """UserRepo.get returns None → SILENT rejection (H3: no confirmation bot exists)."""
     handler = import_module("bot.handlers.butler")
 
     message, command = _make_message()
@@ -282,9 +281,8 @@ def test_non_member_rejection_user_none(app_env, monkeypatch) -> None:
 
     asyncio.run(handler.handle_butler(message, command, session))
 
-    message.reply.assert_awaited_once()
-    reply_text = message.reply.call_args[0][0]
-    assert "участник" in reply_text.lower() or "доступ" in reply_text.lower()
+    # H3: non-members are silently rejected — no reply
+    message.reply.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +512,7 @@ def test_cross_user_consent_flow_approve(app_env, monkeypatch) -> None:
 
 
 def test_cross_user_consent_flow_reject(app_env, monkeypatch) -> None:
-    """Affected user rejects → cancel_action called."""
+    """Affected user rejects → revoke_affected_user_consent called (C1 fix)."""
     handler = import_module("bot.handlers.butler")
 
     uid = _random_tg_id()
@@ -542,7 +540,10 @@ def test_cross_user_consent_flow_reject(app_env, monkeypatch) -> None:
     )
 
     mock_butler = MagicMock()
-    mock_butler.cancel_action = AsyncMock(return_value=MagicMock(status="cancelled"))
+    # C1 fix: handler now calls revoke_affected_user_consent (not cancel_action)
+    mock_butler.revoke_affected_user_consent = AsyncMock(
+        return_value=MagicMock(status="cancelled")
+    )
     monkeypatch.setattr(handler, "_build_butler_service", lambda s: mock_butler)
 
     token = "affected-token-xyz"
@@ -554,10 +555,10 @@ def test_cross_user_consent_flow_reject(app_env, monkeypatch) -> None:
 
     asyncio.run(handler.handle_butler_affected_reject(callback, session))
 
-    mock_butler.cancel_action.assert_awaited_once()
-    call_kwargs = mock_butler.cancel_action.call_args.kwargs
+    mock_butler.revoke_affected_user_consent.assert_awaited_once()
+    call_kwargs = mock_butler.revoke_affected_user_consent.call_args.kwargs
     assert call_kwargs["action_id"] == action_id
-    assert call_kwargs["cancelling_user_id"] == affected_uid
+    assert call_kwargs["affected_user_id"] == affected_uid
 
     session.commit.assert_awaited_once()
 
@@ -899,6 +900,360 @@ def test_all_commands_no_op_when_flag_off(app_env, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 # Test 19: Affected user not found in confirmations → forbidden
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Test 20: Distinct error messages — cancel callback H1 fix
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_callback_forbidden_error_distinct(app_env, monkeypatch) -> None:
+    """Cancel callback: ButlerActionRejectedError(forbidden) → forbidden message (not system-busy)."""
+    handler = import_module("bot.handlers.butler")
+
+    from bot.services.butler import ButlerActionRejectedError
+
+    uid = _random_tg_id()
+    action_id = 55
+
+    fake_action = FakeButlerAction(id=action_id, requester_tg_id=uid)
+    monkeypatch.setattr(
+        handler.ButlerActionRepo, "get", AsyncMock(return_value=fake_action)
+    )
+
+    mock_butler = MagicMock()
+    mock_butler.cancel_action = AsyncMock(
+        side_effect=ButlerActionRejectedError(
+            "forbidden", error_kind="forbidden", action_id=action_id
+        )
+    )
+    monkeypatch.setattr(handler, "_build_butler_service", lambda s: mock_butler)
+
+    callback = _make_callback(
+        user_id=uid, data=f"butler_cancel_cb:{action_id}"
+    )
+    session = _make_session()
+
+    asyncio.run(handler.handle_butler_cancel_callback(callback, session))
+
+    alert_calls = [c for c in callback.answer.call_args_list if c.kwargs.get("show_alert")]
+    assert len(alert_calls) >= 1
+    msg = alert_calls[-1].args[0]
+    # Must NOT be "system busy" — must be "forbidden" message
+    assert "занята" not in msg.lower()
+    assert "прав" in msg.lower() or "запрещ" in msg.lower()
+
+
+def test_cancel_callback_wrong_status_distinct(app_env, monkeypatch) -> None:
+    """Cancel callback: ButlerActionError(wrong_status) → 'cannot cancel' (not system-busy)."""
+    handler = import_module("bot.handlers.butler")
+
+    from bot.services.butler import ButlerActionError
+
+    uid = _random_tg_id()
+    action_id = 56
+
+    fake_action = FakeButlerAction(id=action_id, requester_tg_id=uid)
+    monkeypatch.setattr(
+        handler.ButlerActionRepo, "get", AsyncMock(return_value=fake_action)
+    )
+
+    mock_butler = MagicMock()
+    mock_butler.cancel_action = AsyncMock(
+        side_effect=ButlerActionError(
+            "wrong_status", error_kind="wrong_status", action_id=action_id
+        )
+    )
+    monkeypatch.setattr(handler, "_build_butler_service", lambda s: mock_butler)
+
+    callback = _make_callback(
+        user_id=uid, data=f"butler_cancel_cb:{action_id}"
+    )
+    session = _make_session()
+
+    asyncio.run(handler.handle_butler_cancel_callback(callback, session))
+
+    alert_calls = [c for c in callback.answer.call_args_list if c.kwargs.get("show_alert")]
+    assert len(alert_calls) >= 1
+    msg = alert_calls[-1].args[0]
+    assert "занята" not in msg.lower()
+    assert "нельзя отмен" in msg.lower() or "already" in msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# Test 21: H2 — AffectedUserUnreachableError on DM send failure
+# ---------------------------------------------------------------------------
+
+
+def test_affected_user_dm_failure_raises_unreachable(app_env, monkeypatch) -> None:
+    """DM send to affected user fails → handler replies with unreachable message, no commit."""
+    handler = import_module("bot.handlers.butler")
+
+    uid = _random_tg_id()
+    affected_uid = _random_tg_id()
+    action_id = 77
+
+    fake_action = FakeButlerAction(id=action_id, requester_tg_id=uid)
+
+    requester_conf = FakeConfirmation(
+        id=1, action_id=action_id, confirmer_tg_id=uid,
+        confirmation_role="requester", status="pending",
+        preview_payload_hash="h1",
+        expires_at=_now() + timedelta(minutes=5),
+        confirmation_token="requester-tok",
+    )
+    affected_conf = FakeConfirmation(
+        id=2, action_id=action_id, confirmer_tg_id=affected_uid,
+        confirmation_role="affected_user", status="pending",
+        preview_payload_hash="h2",
+        expires_at=_now() + timedelta(minutes=5),
+        confirmation_token="affected-tok",
+    )
+
+    monkeypatch.setattr(
+        handler.FeatureFlagRepo, "get", AsyncMock(return_value=True)
+    )
+    member = _make_user(uid, is_member=True)
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=member))
+
+    mock_butler = MagicMock()
+    mock_butler.plan_action = AsyncMock(return_value=fake_action)
+    monkeypatch.setattr(handler, "_build_butler_service", lambda s: mock_butler)
+
+    monkeypatch.setattr(
+        handler.ButlerActionConfirmationRepo,
+        "list_for_action",
+        AsyncMock(return_value=[requester_conf, affected_conf]),
+    )
+
+    # Bot that fails to send to the affected user
+    failing_bot = AsyncMock()
+    failing_bot.send_message = AsyncMock(side_effect=Exception("User blocked bot"))
+
+    msg, cmd = _make_message(user_id=uid, bot=failing_bot)
+    session = _make_session()
+
+    asyncio.run(handler.handle_butler(msg, cmd, session))
+
+    # Handler should have replied with unreachable message
+    msg.reply.assert_awaited()
+    all_replies = msg.reply.call_args_list
+    texts = [c[0][0] for c in all_replies if c[0]]
+    assert any("участник" in t.lower() or "отправ" in t.lower() or "действие" in t.lower() for t in texts)
+
+    # Commit must NOT have been called (action rolled back logically)
+    session.commit.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Test 22: M2 — per-tool flag enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_per_tool_flag_disabled_rejects_action(app_env, monkeypatch) -> None:
+    """Tool-specific flag OFF → polite message, no preview sent."""
+    handler = import_module("bot.handlers.butler")
+
+    uid = _random_tg_id()
+    action_id = 88
+
+    # Plan returns a tool that has a per-tool flag
+    fake_action = FakeButlerAction(
+        id=action_id, requester_tg_id=uid, tool_name="schedule_meeting"
+    )
+    requester_conf = FakeConfirmation(
+        id=1, action_id=action_id, confirmer_tg_id=uid,
+        confirmation_role="requester", status="pending",
+        preview_payload_hash="h",
+        expires_at=_now() + timedelta(minutes=5),
+        confirmation_token="tok",
+    )
+
+    # Feature flag: master=ON, tool flag=OFF
+    async def _flag_get(session, key):
+        if key == "memory.butler.enabled":
+            return True
+        if key == "memory.butler.schedule_meeting.enabled":
+            return False
+        return True
+
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get)
+    member = _make_user(uid, is_member=True)
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=member))
+
+    mock_butler = MagicMock()
+    mock_butler.plan_action = AsyncMock(return_value=fake_action)
+    monkeypatch.setattr(handler, "_build_butler_service", lambda s: mock_butler)
+
+    monkeypatch.setattr(
+        handler.ButlerActionConfirmationRepo,
+        "list_for_action",
+        AsyncMock(return_value=[requester_conf]),
+    )
+
+    msg, cmd = _make_message(user_id=uid)
+    session = _make_session()
+
+    asyncio.run(handler.handle_butler(msg, cmd, session))
+
+    msg.reply.assert_awaited()
+    texts = [c[0][0] for c in msg.reply.call_args_list if c[0]]
+    # Should have replied with tool-disabled message
+    assert any("недоступ" in t.lower() or "инструмент" in t.lower() for t in texts)
+    # Commit must NOT have been called
+    session.commit.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Test 23: M7 — html.escape in _render_preview
+# ---------------------------------------------------------------------------
+
+
+def test_render_preview_html_escapes_fields(app_env) -> None:
+    """_render_preview escapes HTML special chars in LLM-generated fields."""
+    handler = import_module("bot.handlers.butler")
+
+    # Action with HTML-dangerous characters in LLM-generated summary
+    action = FakeButlerAction(
+        id=1,
+        requester_tg_id=42,
+        plan_summary="<script>alert('xss')</script> & some text",
+        tool_name="recall_evidence",
+        risk_level="low",
+        visibility_scope="member",
+    )
+
+    result = handler._render_preview(action)
+
+    # Dangerous chars must be escaped
+    assert "<script>" not in result
+    assert "&lt;script&gt;" in result
+    assert "&amp;" in result
+
+
+# ---------------------------------------------------------------------------
+# Test 24: M3 / C1 — real service path for affected-user reject (non-admin)
+# ---------------------------------------------------------------------------
+
+
+def test_affected_user_reject_real_service_path(app_env, monkeypatch) -> None:
+    """C1/M3: Affected user (non-admin) reject succeeds via revoke_affected_user_consent.
+
+    Uses a real ButlerService with patched user_repo so that the non-admin
+    affected user does NOT trigger forbidden in cancel_action.
+    This verifies the production wiring is correct — not masked by mock.
+    """
+    from bot.services.butler import (
+        ButlerService,
+        AffectedUserUnreachableError,
+        ButlerActionError,
+    )
+    from dataclasses import dataclass, field as dc_field
+    from datetime import datetime, timedelta, timezone
+    from typing import Any
+    import uuid
+
+    uid = _random_tg_id()
+    affected_uid = _random_tg_id()
+    action_id = 200
+
+    # --- Minimal fake repos that support revoke_affected_user_consent ---
+
+    @dataclass
+    class _FakeAction:
+        id: int
+        requester_tg_id: int
+        status: str = "pending_confirmation"
+        rejection_reason: str | None = None
+        expires_at: datetime = dc_field(
+            default_factory=lambda: datetime.now(timezone.utc) + timedelta(minutes=5)
+        )
+        plan_payload: dict = dc_field(default_factory=dict)
+        query: str = "test"
+        visibility_scope: str = "member"
+        tool_name: str = "recall_evidence"
+
+    @dataclass
+    class _FakeConf:
+        id: int
+        action_id: int
+        confirmer_tg_id: int
+        confirmation_role: str
+        status: str = "pending"
+        confirmation_token: str = "tok"
+
+    _action_row = _FakeAction(id=action_id, requester_tg_id=uid)
+    _conf_affected = _FakeConf(
+        id=2, action_id=action_id,
+        confirmer_tg_id=affected_uid,
+        confirmation_role="affected_user",
+    )
+
+    class _FakeActionRepo:
+        async def get(self, session: Any, action_id: int) -> Any:
+            return _action_row if _action_row.id == action_id else None
+
+        async def get_for_update(self, session: Any, action_id: int) -> Any:
+            return _action_row if _action_row.id == action_id else None
+
+        async def update_status(self, session: Any, action_id: int, *, status: str,
+                                rejection_reason: str | None = None, **kwargs: Any) -> int:
+            _action_row.status = status
+            if rejection_reason is not None:
+                _action_row.rejection_reason = rejection_reason
+            return 1
+
+    class _FakeConfRepo:
+        async def list_for_action(self, session: Any, action_id: int) -> list:
+            return [_conf_affected] if _conf_affected.action_id == action_id else []
+
+        async def mark_resolved(self, session: Any, conf_id: int, *, status: str,
+                                resolved_at: Any = None) -> int:
+            if _conf_affected.id == conf_id:
+                _conf_affected.status = status
+            return 1
+
+    class _FakeUserRepo:
+        async def get(self, session: Any, user_id: int) -> Any:
+            # affected user is NOT admin
+            u = MagicMock()
+            u.is_admin = False
+            u.is_member = True
+            return u
+
+    class _StubSettings:
+        butler_plan_ttl_seconds = 900
+        butler_confirmation_ttl_seconds = 300
+        user_plans_day_ceiling = 10
+        user_execs_day_ceiling = 5
+        chat_actions_day_ceiling = 50
+        tool_hour_ceiling = 20
+
+    class _NoopRepo:
+        async def try_increment(self, *a, **kw): return True
+        async def decrement(self, *a, **kw): pass
+
+    svc = ButlerService(
+        session=AsyncMock(),
+        ledger_repo=None,
+        butler_action_repo=_FakeActionRepo(),
+        butler_action_confirmation_repo=_FakeConfRepo(),
+        butler_tool_invocation_repo=AsyncMock(),
+        butler_rate_bucket_repo=_NoopRepo(),
+        user_repo=_FakeUserRepo(),
+        llm_gateway=AsyncMock(),
+        evidence_builder=AsyncMock(),
+        settings=_StubSettings(),
+    )
+
+    # Affected user (non-admin) calls revoke_affected_user_consent — must NOT raise forbidden
+    result = asyncio.run(svc.revoke_affected_user_consent(
+        action_id=action_id,
+        affected_user_id=affected_uid,
+    ))
+
+    assert result.status == "cancelled"
+    assert _conf_affected.status == "revoked"
 
 
 def test_affected_user_not_in_confirmations_forbidden(app_env, monkeypatch) -> None:

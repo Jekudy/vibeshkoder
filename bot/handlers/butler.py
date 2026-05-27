@@ -43,6 +43,7 @@ Design decisions (binding per PHASE12_PLAN_REFRESH.md)
 - Module-level imports for all ButlerActionError subclasses (prevents class
   identity issues in combined-mode test runs — see commit db33b1c).
 - Privacy: log entries never contain raw user content or query text.
+- Non-members: silently rejected — no confirmation bot exists (§3.3).
 
 Stub wiring (T12-05 scope)
 --------------------------
@@ -55,6 +56,7 @@ can replace stubs with real implementations without touching handler logic.
 
 from __future__ import annotations
 
+import html
 import logging
 from typing import Any
 
@@ -80,6 +82,7 @@ from bot.db.repos.user import UserRepo
 # identity issues in combined-mode CI (see commit db33b1c, memory file
 # feedback-codex-defaults.md for context on _clear_modules test isolation).
 from bot.services.butler import (
+    AffectedUserUnreachableError,
     ButlerActionError,
     ButlerActionExpiredError,
     ButlerActionRejectedError,
@@ -88,6 +91,7 @@ from bot.services.butler import (
     EvidenceStaleError,
     MembershipRevokedError,
 )
+from bot.services.butler_evidence import build_butler_evidence
 from bot.filters.chat_type import PrivateChatFilter
 
 logger = logging.getLogger(__name__)
@@ -102,7 +106,7 @@ BUTLER_INTRO_FLAG = "memory.butler.send_intro.enabled"
 BUTLER_UPDATE_INTRO_FLAG = "memory.butler.update_intro.enabled"
 BUTLER_CARD_FLAG = "memory.butler.suggest_card_creation.enabled"
 
-# Per-tool flag map for gate checks
+# Per-tool flag map for gate checks (M2 — enforced after plan_action returns tool name)
 _TOOL_FLAGS: dict[str, str] = {
     "recall_evidence": BUTLER_RECALL_FLAG,
     "schedule_meeting": BUTLER_MEETING_FLAG,
@@ -117,7 +121,6 @@ _TOOL_FLAGS: dict[str, str] = {
 
 _MSG_FLAG_OFF = "Butler ещё не включён. Следите за обновлениями."
 _MSG_NOT_DM = "Команда /butler работает только в личных сообщениях с ботом."
-_MSG_NOT_MEMBER = "Доступ только участникам сообщества."
 _MSG_EMPTY_QUERY = "Использование: /butler <запрос>"
 _MSG_RATE_LIMIT = "Вы достигли лимита запросов. Попробуйте позже."
 _MSG_EVIDENCE_STALE = (
@@ -131,18 +134,26 @@ _MSG_BAD_TOKEN = "Ссылка на подтверждение недейств�
 _MSG_ALREADY_CONFIRMED = "Вы уже подтвердили это действие."
 _MSG_PLAN_ERROR = "Не удалось спланировать действие. Попробуйте другой запрос."
 _MSG_UNDO_STUB = "Отмена действий появится в следующем обновлении."
-
-# Confirmation expiry message
-_MSG_CONFIRMATION_EXPIRED = (
-    "Срок действия кнопки истёк. Повторите /butler."
+_MSG_TOOL_DISABLED = "Этот инструмент сейчас недоступен."
+_MSG_AFFECTED_UNREACHABLE = (
+    "Не удалось отправить запрос участнику(ам) — действие не будет выполнено."
 )
+
+# §5.B — all 8 error_kind strings mapped to user messages (M1)
+_MSG_GOVERNANCE_REJECT = "Действие не прошло проверку допустимости."
+_MSG_HALLUCINATED_ARGS = "Butler не смог правильно понять запрос. Попробуйте переформулировать."
+_MSG_CROSS_USER_CONSENT_MISSING = "Для этого действия требуется согласие других участников."
+_MSG_DRY_RUN_FAILURE = "Тестовый запуск действия не удался. Попробуйте позже."
+_MSG_BUDGET_EXCEEDED = "Достигнут бюджетный лимит. Попробуйте позже."
+_MSG_TTL_EXPIRED = "Время ожидания истекло. Повторите /butler."
+_MSG_PLAN_FAILED = "Планирование действия завершилось ошибкой. Попробуйте другой запрос."
 
 # Cross-user consent messages
 _MSG_CONSENT_REQUEST_PREFIX = "🔔 Запрос на действие от участника сообщества:\n\n"
 _MSG_CONSENT_APPROVED = "Вы одобрили запрос. Ожидайте выполнения."
 _MSG_CONSENT_REJECTED = "Вы отклонили запрос."
 _MSG_CONSENT_REVOKED_EFFECT = (
-    "Действие отменено: согласие было отозвано."
+    "❌ Согласие отозвано участником. Действие отменено."
 )
 
 
@@ -196,12 +207,13 @@ def _render_preview(action: Any) -> str:
 
     Reads action.plan_summary (NOT NULL post-migration-074).
     Never reads raw evidence content — only structural metadata from the ORM row.
+    HTML-escapes all LLM-generated fields to prevent parse errors (M7).
     """
-    plan_summary = action.plan_summary
+    plan_summary = html.escape(action.plan_summary)
     action_id = action.id
-    tool_name = action.tool_name
+    tool_name = html.escape(action.tool_name)
     risk_level = action.risk_level
-    visibility = action.visibility_scope
+    visibility = html.escape(action.visibility_scope)
 
     # Map risk_level to a user-facing label
     risk_label = {"low": "низкий", "medium": "средний", "high": "высокий"}.get(
@@ -219,6 +231,94 @@ def _render_preview(action: Any) -> str:
     return "\n".join(lines)
 
 
+def _dispatch_butler_error(exc: ButlerActionError) -> str:
+    """Return the correct user-facing message for a ButlerActionError subclass.
+
+    Maps all 8 §5.B error_kind strings to distinct messages (H1 + M1).
+    Unknown error_kind → raise invariant_broken (consistent with line ~358 pattern).
+    """
+    kind = exc.error_kind or ""
+
+    # Named subclasses first
+    if isinstance(exc, ButlerActionExpiredError):
+        return _MSG_EXPIRED
+    if isinstance(exc, EvidenceStaleError):
+        return _MSG_EVIDENCE_STALE
+    if isinstance(exc, CascadeInFlightError):
+        return _MSG_CASCADE_IN_FLIGHT
+    if isinstance(exc, ButlerActionRejectedError):
+        if kind == "forbidden":
+            return _MSG_FORBIDDEN
+        if kind == "wrong_status":
+            return "Это действие уже нельзя отменить."
+        if kind == "affected_user_consent_revoked":
+            return _MSG_CONSENT_REVOKED_EFFECT
+
+    # error_kind dispatch — §5.B all 8 paths (M1)
+    _kind_map: dict[str, str] = {
+        "rate_limit_exceeded": _MSG_RATE_LIMIT,
+        "evidence_stale": _MSG_EVIDENCE_STALE,
+        "governance_reject": _MSG_GOVERNANCE_REJECT,
+        "hallucinated_args": _MSG_HALLUCINATED_ARGS,
+        "cross_user_consent_missing": _MSG_CROSS_USER_CONSENT_MISSING,
+        "dry_run_failure": _MSG_DRY_RUN_FAILURE,
+        "budget_exceeded": _MSG_BUDGET_EXCEEDED,
+        "ttl_expired": _MSG_TTL_EXPIRED,
+        "plan_failed": _MSG_PLAN_FAILED,
+        "not_found": _MSG_NOT_FOUND,
+        "bad_token": _MSG_BAD_TOKEN,
+        "already_confirmed_by_user": _MSG_ALREADY_CONFIRMED,
+        "wrong_status": "Это действие уже нельзя отменить.",
+        "forbidden": _MSG_FORBIDDEN,
+        "cascade_in_flight": _MSG_CASCADE_IN_FLIGHT,
+        "expired": _MSG_EXPIRED,
+        "affected_user_consent_revoked": _MSG_CONSENT_REVOKED_EFFECT,
+        # invariant_broken is not user-facing — raise to trigger unexpected error handler
+    }
+
+    if kind in _kind_map:
+        return _kind_map[kind]
+
+    # Completely unknown error_kind — raise invariant_broken
+    raise ButlerActionError(
+        f"handler: unknown ButlerActionError error_kind={kind!r}",
+        error_kind="invariant_broken",
+    )
+
+
+# Module-level cached service builder components (L1 — avoid re-creating stubs on every call)
+class _EvidenceBuilderAdapter:
+    """Adapter wrapping build_butler_evidence free function as an object."""
+
+    async def build_butler_evidence(self, **kwargs: Any) -> Any:
+        return await build_butler_evidence(**kwargs)
+
+
+class _StubGateway:
+    """Stub LLM gateway — will be replaced in T12-03 wiring."""
+
+    async def plan_butler_action(self, **kwargs: Any) -> Any:
+        # This path is never reached while memory.butler.enabled=False.
+        raise NotImplementedError(
+            "LLM gateway for Butler not yet wired (T12-03 scope)"
+        )
+
+
+class _StubSettings:
+    butler_plan_ttl_seconds: int = 900
+    butler_confirmation_ttl_seconds: int = 300
+    user_plans_day_ceiling: int = 10
+    user_execs_day_ceiling: int = 5
+    chat_actions_day_ceiling: int = 50
+    tool_hour_ceiling: int = 20
+
+
+# Cached singleton instances (L1)
+_EVIDENCE_BUILDER = _EvidenceBuilderAdapter()
+_STUB_GATEWAY = _StubGateway()
+_STUB_SETTINGS = _StubSettings()
+
+
 def _build_butler_service(session: AsyncSession) -> ButlerService:
     """Construct a ButlerService with concrete repos + stub LLM collaborators.
 
@@ -227,31 +327,6 @@ def _build_butler_service(session: AsyncSession) -> ButlerService:
     handler can reach plan_action only when the feature flag is ON, which
     is OFF by default, so the stubs are safe.
     """
-    from bot.services.butler_evidence import build_butler_evidence
-
-    class _EvidenceBuilderAdapter:
-        """Adapter wrapping build_butler_evidence free function as an object."""
-
-        async def build_butler_evidence(self, **kwargs: Any) -> Any:
-            return await build_butler_evidence(**kwargs)
-
-    class _StubGateway:
-        """Stub LLM gateway — will be replaced in T12-03 wiring."""
-
-        async def plan_butler_action(self, **kwargs: Any) -> Any:
-            # This path is never reached while memory.butler.enabled=False.
-            raise NotImplementedError(
-                "LLM gateway for Butler not yet wired (T12-03 scope)"
-            )
-
-    class _StubSettings:
-        butler_plan_ttl_seconds: int = 900
-        butler_confirmation_ttl_seconds: int = 300
-        user_plans_day_ceiling: int = 10
-        user_execs_day_ceiling: int = 5
-        chat_actions_day_ceiling: int = 50
-        tool_hour_ceiling: int = 20
-
     return ButlerService(
         session=session,
         ledger_repo=None,  # type: ignore[arg-type]
@@ -260,9 +335,9 @@ def _build_butler_service(session: AsyncSession) -> ButlerService:
         butler_tool_invocation_repo=ButlerToolInvocationRepo,
         butler_rate_bucket_repo=ButlerRateBucketRepo,
         user_repo=UserRepo,
-        llm_gateway=_StubGateway(),
-        evidence_builder=_EvidenceBuilderAdapter(),
-        settings=_StubSettings(),
+        llm_gateway=_STUB_GATEWAY,
+        evidence_builder=_EVIDENCE_BUILDER,
+        settings=_STUB_SETTINGS,
     )
 
 
@@ -288,11 +363,12 @@ async def handle_butler(
         return
 
     # Auth check: membership gate
+    # H3: non-members are silently rejected — no confirmation bot exists
     user = await UserRepo.get(session, message.from_user.id)
     if user is None or not (
         getattr(user, "is_member", False) or getattr(user, "is_admin", False)
     ):
-        await message.reply(_MSG_NOT_MEMBER)
+        # Silent return — no reply (H3: non-members get no confirmation bot exists)
         return
 
     query = (command.args or "").strip()
@@ -310,12 +386,28 @@ async def handle_butler(
             visibility_scope="member",
         )
     except MembershipRevokedError:
-        await message.reply(_MSG_NOT_MEMBER)
+        # Silent return — membership was revoked between check and plan
         return
     except ButlerActionError as exc:
         kind = exc.error_kind or ""
         if kind == "rate_limit_exceeded":
             await message.reply(_MSG_RATE_LIMIT)
+        elif kind == "evidence_stale":
+            await message.reply(_MSG_EVIDENCE_STALE)
+        elif kind == "governance_reject":
+            await message.reply(_MSG_GOVERNANCE_REJECT)
+        elif kind == "hallucinated_args":
+            await message.reply(_MSG_HALLUCINATED_ARGS)
+        elif kind == "cross_user_consent_missing":
+            await message.reply(_MSG_CROSS_USER_CONSENT_MISSING)
+        elif kind == "dry_run_failure":
+            await message.reply(_MSG_DRY_RUN_FAILURE)
+        elif kind == "budget_exceeded":
+            await message.reply(_MSG_BUDGET_EXCEEDED)
+        elif kind == "ttl_expired":
+            await message.reply(_MSG_TTL_EXPIRED)
+        elif kind == "plan_failed":
+            await message.reply(_MSG_PLAN_FAILED)
         else:
             logger.info(
                 "butler: plan_action rejected",
@@ -330,6 +422,18 @@ async def handle_butler(
         )
         await message.reply(_MSG_PLAN_ERROR)
         return
+
+    # M2: per-tool flag gate — check after plan_action returns the tool name
+    tool_flag_key = _TOOL_FLAGS.get(action.tool_name)
+    if tool_flag_key is not None:
+        tool_enabled = await FeatureFlagRepo.get(session, tool_flag_key)
+        if not tool_enabled:
+            logger.info(
+                "butler: tool disabled by per-tool flag, action rejected",
+                extra={"tool_name": action.tool_name, "user_id": message.from_user.id},
+            )
+            await message.reply(_MSG_TOOL_DISABLED)
+            return
 
     # Render preview and send with confirmation keyboard
     preview_text = _render_preview(action)
@@ -367,17 +471,22 @@ async def handle_butler(
         reply_markup=_confirm_keyboard(action.id, token),
     )
 
-    # Send DMs to affected users for cross-user consent
+    # Send DMs to affected users for cross-user consent (H2: raise on failure)
     affected_confs = [
         c for c in confirmations if c.confirmation_role == "affected_user"
     ]
     if affected_confs and message.bot is not None:
-        await _send_consent_requests(
-            bot=message.bot,
-            action=action,
-            affected_confirmations=affected_confs,
-            preview_text=preview_text,
-        )
+        try:
+            await _send_consent_requests(
+                bot=message.bot,
+                action=action,
+                affected_confirmations=affected_confs,
+                preview_text=preview_text,
+            )
+        except AffectedUserUnreachableError:
+            # Roll back — requester gets a clear error
+            await message.reply(_MSG_AFFECTED_UNREACHABLE)
+            return
 
     await session.commit()
 
@@ -393,6 +502,9 @@ async def _send_consent_requests(
 
     §3.5: NO admin override — each affected user must consent independently.
     §10 decision 5: unbypassable.
+
+    H2: if ANY required DM fails → raises AffectedUserUnreachableError BEFORE
+    handler commits, preventing silent phantom confirmations.
     """
     for conf in affected_confirmations:
         affected_user_id = conf.confirmer_tg_id
@@ -423,6 +535,12 @@ async def _send_consent_requests(
                 "butler: failed to send consent DM to affected user",
                 extra={"action_id": action.id, "affected_user_id": affected_user_id},
             )
+            raise AffectedUserUnreachableError(
+                f"failed to send consent DM to affected_user_id={affected_user_id} "
+                f"for action_id={action.id}",
+                error_kind="affected_user_unreachable",
+                action_id=action.id,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +565,7 @@ async def handle_butler_status(
     if user is None or not (
         getattr(user, "is_member", False) or getattr(user, "is_admin", False)
     ):
-        await message.reply(_MSG_NOT_MEMBER)
+        # H3: silent rejection for non-members
         return
 
     args = (command.args or "").strip()
@@ -511,7 +629,7 @@ async def handle_butler_cancel(
     if user is None or not (
         getattr(user, "is_member", False) or getattr(user, "is_admin", False)
     ):
-        await message.reply(_MSG_NOT_MEMBER)
+        # H3: silent rejection for non-members
         return
 
     args = (command.args or "").strip()
@@ -533,23 +651,8 @@ async def handle_butler_cancel(
             cancelling_user_id=message.from_user.id,
             is_admin=_is_admin(message.from_user.id),
         )
-    except CascadeInFlightError:
-        await message.reply(_MSG_CASCADE_IN_FLIGHT)
-        return
-    except ButlerActionRejectedError as exc:
-        if exc.error_kind == "forbidden":
-            await message.reply(_MSG_FORBIDDEN)
-        else:
-            await message.reply(_MSG_PLAN_ERROR)
-        return
     except ButlerActionError as exc:
-        kind = exc.error_kind or ""
-        if kind == "wrong_status":
-            await message.reply("Это действие уже нельзя отменить.")
-        elif kind == "not_found" or kind == "cascade_in_flight":
-            await message.reply(_MSG_NOT_FOUND)
-        else:
-            await message.reply(_MSG_PLAN_ERROR)
+        await message.reply(_dispatch_butler_error(exc))
         return
 
     await message.reply("✅ Действие отменено.")
@@ -578,7 +681,7 @@ async def handle_butler_undo(
     if user is None or not (
         getattr(user, "is_member", False) or getattr(user, "is_admin", False)
     ):
-        await message.reply(_MSG_NOT_MEMBER)
+        # H3: silent rejection for non-members
         return
 
     await message.reply(_MSG_UNDO_STUB)
@@ -602,7 +705,8 @@ async def handle_butler_confirm_callback(
 
     parts = callback.data.split(":", 2)
     if len(parts) != 3:
-        await callback.message.reply(_MSG_BAD_TOKEN) if callback.message else None
+        if callback.message:
+            await callback.message.reply(_MSG_BAD_TOKEN)
         return
 
     try:
@@ -647,23 +751,13 @@ async def handle_butler_confirm_callback(
         await callback.answer(_MSG_CASCADE_IN_FLIGHT, show_alert=True)
         return
     except ButlerActionError as exc:
-        kind = exc.error_kind or ""
-        if kind == "bad_token":
-            await callback.answer(_MSG_BAD_TOKEN, show_alert=True)
-        elif kind == "already_confirmed_by_user":
-            await callback.answer(_MSG_ALREADY_CONFIRMED, show_alert=True)
-        else:
-            logger.info(
-                "butler: confirm_callback rejected",
-                extra={"error_kind": kind, "action_id": action_id},
-            )
-            await callback.answer(_MSG_PLAN_ERROR, show_alert=True)
+        await callback.answer(_dispatch_butler_error(exc), show_alert=True)
         return
 
     # Update the keyboard to remove buttons after confirmation
     if callback.message:
         await callback.message.edit_text(
-            callback.message.text + "\n\n✅ <i>Подтверждено</i>",
+            (callback.message.text or "") + "\n\n✅ <i>Подтверждено</i>",
             parse_mode="HTML",
             reply_markup=None,
         )
@@ -717,13 +811,13 @@ async def handle_butler_cancel_callback(
             cancelling_user_id=callback.from_user.id,
             is_admin=_is_admin(callback.from_user.id),
         )
-    except (CascadeInFlightError, ButlerActionError):
-        await callback.answer(_MSG_CASCADE_IN_FLIGHT, show_alert=True)
+    except ButlerActionError as exc:
+        await callback.answer(_dispatch_butler_error(exc), show_alert=True)
         return
 
     if callback.message:
         await callback.message.edit_text(
-            callback.message.text + "\n\n❌ <i>Отменено</i>",
+            (callback.message.text or "") + "\n\n❌ <i>Отменено</i>",
             parse_mode="HTML",
             reply_markup=None,
         )
@@ -783,13 +877,7 @@ async def handle_butler_affected_approve(
         await callback.answer(_MSG_CASCADE_IN_FLIGHT, show_alert=True)
         return
     except ButlerActionError as exc:
-        kind = exc.error_kind or ""
-        if kind == "bad_token":
-            await callback.answer(_MSG_BAD_TOKEN, show_alert=True)
-        elif kind == "already_confirmed_by_user":
-            await callback.answer(_MSG_ALREADY_CONFIRMED, show_alert=True)
-        else:
-            await callback.answer(_MSG_PLAN_ERROR, show_alert=True)
+        await callback.answer(_dispatch_butler_error(exc), show_alert=True)
         return
 
     if callback.message:
@@ -816,6 +904,8 @@ async def handle_butler_affected_reject(
     """Handle affected user's rejection of cross-user consent.
 
     Rejection cancels the entire action (§3.5 — no admin override).
+    C1 fix: uses revoke_affected_user_consent instead of cancel_action with is_admin=True.
+    M6: notifies requester that consent was revoked.
     """
     await callback.answer()
 
@@ -829,7 +919,7 @@ async def handle_butler_affected_reject(
     try:
         action_id = int(parts[1])
         # token is in parts[2] but rejection does not need it —
-        # we cancel the whole action by actor identity + action_id.
+        # revoke_affected_user_consent identifies via actor identity + action_id.
     except (ValueError, IndexError):
         if callback.message:
             await callback.message.edit_reply_markup()
@@ -857,29 +947,41 @@ async def handle_butler_affected_reject(
         await callback.answer(_MSG_FORBIDDEN, show_alert=True)
         return
 
-    # Cancel the whole action (consent revoked by affected user)
+    # C1 fix: call revoke_affected_user_consent (no is_admin bypass)
     butler = _build_butler_service(session)
 
     try:
-        await butler.cancel_action(
+        await butler.revoke_affected_user_consent(
             action_id=action_id,
-            cancelling_user_id=callback.from_user.id,
-            # Affected users can cancel the action via rejection;
-            # butler.cancel_action handles the requester OR admin check,
-            # so we pass is_admin=True here ONLY for affected-user rejection
-            # path — the semantic is "this user has authority to cancel
-            # because they are an affected party, not because they are admin".
-            # T12-07 will add a dedicated affected_user cancellation path.
-            is_admin=True,
+            affected_user_id=callback.from_user.id,
         )
-    except (CascadeInFlightError, ButlerActionError):
-        await callback.answer(_MSG_CASCADE_IN_FLIGHT, show_alert=True)
+    except ButlerActionError as exc:
+        await callback.answer(_dispatch_butler_error(exc), show_alert=True)
         return
 
+    # Update affected user's own message
     if callback.message:
         await callback.message.edit_text(
             _MSG_CONSENT_REJECTED,
             reply_markup=None,
         )
+
+    # M6: notify requester that consent was revoked
+    # originating_message_id stores the requester preview message_id (if available)
+    requester_chat_id = action.requester_tg_id
+    requester_msg_id = getattr(action, "originating_message_id", None)
+    if requester_msg_id is not None and callback.bot is not None:
+        try:
+            await callback.bot.edit_message_text(
+                chat_id=requester_chat_id,
+                message_id=requester_msg_id,
+                text=_MSG_CONSENT_REVOKED_EFFECT,
+                reply_markup=None,
+            )
+        except Exception:
+            logger.warning(
+                "butler: failed to notify requester of consent revocation",
+                extra={"action_id": action_id, "requester_tg_id": requester_chat_id},
+            )
 
     await session.commit()
