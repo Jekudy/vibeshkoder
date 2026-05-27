@@ -138,6 +138,15 @@ class MembershipRevokedError(ButlerActionError):
     """Raised when the requester is no longer a member at plan time."""
 
 
+class AffectedUserUnreachableError(ButlerActionError):
+    """Raised when a DM to an affected user fails before the action is committed.
+
+    Callers (T12-05 handler) should roll back the planned action and report the
+    error to the requester so they are not left waiting for a consent that will
+    never arrive.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -1107,6 +1116,102 @@ class ButlerService:
             action_id,
             status="cancelled",
             rejection_reason="cancelled_by_user",
+        )
+
+        updated = await self._action_repo.get(self._session, action_id)
+        return updated or action
+
+    # -----------------------------------------------------------------------
+    # revoke_affected_user_consent (T12-05-fix C1)
+    # -----------------------------------------------------------------------
+
+    async def revoke_affected_user_consent(
+        self,
+        *,
+        action_id: int,
+        affected_user_id: int,
+    ) -> Any:
+        """Affected user revokes their consent row.
+
+        Looks up butler_action_confirmations by (action_id, confirmer_tg_id=affected_user_id,
+        role='affected_user') using get_for_update on the parent action (NOWAIT lock pattern
+        from cancel_action/confirm_action). If found and status='pending', updates to
+        status='revoked' and transitions action to 'cancelled'.
+
+        Consent invariant: any single revoked affected-user consent → action cancelled.
+        This is an ADDITIVE method that does NOT modify existing T12-04 method signatures.
+
+        Raises:
+          ButlerActionError(not_found) — no matching confirmation row for this user.
+          ButlerActionError(wrong_status) — confirmation already in terminal state.
+          CascadeInFlightError — forget_cascade holds the parent row lock (NOWAIT path).
+        """
+        # Acquire FOR UPDATE NOWAIT on butler_actions row to coordinate with cascade.
+        # Same lock pattern as cancel_action / confirm_action.
+        try:
+            action = await self._action_repo.get_for_update(self._session, action_id)
+        except _SAOperationalError as exc:
+            raise CascadeInFlightError(
+                f"butler_actions(id={action_id}) locked by cascade (NOWAIT) — try again",
+                error_kind="cascade_in_flight",
+                action_id=action_id,
+            ) from exc
+        if action is None:
+            raise CascadeInFlightError(
+                f"butler_actions(id={action_id}) locked by cascade",
+                error_kind="cascade_in_flight",
+                action_id=action_id,
+            )
+
+        # Look up the affected_user's confirmation row.
+        # get_for_action_user returns first matching (action_id, confirmer_tg_id);
+        # filter to role='affected_user' via list_for_action to avoid requester match.
+        all_confs = await self._confirmation_repo.list_for_action(
+            self._session, action_id
+        )
+        confirmation = next(
+            (
+                c
+                for c in all_confs
+                if c.confirmer_tg_id == affected_user_id
+                and c.confirmation_role == "affected_user"
+            ),
+            None,
+        )
+        if confirmation is None:
+            raise ButlerActionError(
+                f"no affected_user confirmation row for action_id={action_id} "
+                f"user={affected_user_id}",
+                error_kind="not_found",
+                action_id=action_id,
+            )
+
+        if confirmation.status != "pending":
+            raise ButlerActionError(
+                f"affected_user confirmation status={confirmation.status!r} is not 'pending' "
+                f"for action_id={action_id} user={affected_user_id}",
+                error_kind="wrong_status",
+                action_id=action_id,
+            )
+
+        # Atomically: update confirmation → 'revoked', action → 'cancelled'.
+        # 'revoked' is added by migration 075 to the CHECK constraint.
+        await self._confirmation_repo.mark_resolved(
+            self._session,
+            confirmation.id,
+            status="revoked",
+        )
+
+        await self._action_repo.update_status(
+            self._session,
+            action_id,
+            status="cancelled",
+            rejection_reason="affected_user_consent_revoked",
+        )
+
+        logger.info(
+            "butler: affected_user consent revoked",
+            extra={"action_id": action_id},
         )
 
         updated = await self._action_repo.get(self._session, action_id)
