@@ -191,8 +191,10 @@ async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str
     # + 10.5-S3 (068 graph_provenance.triple_hash TEXT → BIGINT).
     # + T12-01 (070-073 Phase 12 Butler schema foundation: audit triple,
     #   ledger call_type CHECK, rate buckets, card suggestions).
+    # + T12-04 (074 butler_actions query/visibility_scope/plan_payload + confirmation_token).
+    # + T12-05-fix (075 butler_action_confirmations.status adds 'revoked' value).
     # Assert the current head explicitly; revisit when future migrations land.
-    assert current == "074"
+    assert current == "075"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(

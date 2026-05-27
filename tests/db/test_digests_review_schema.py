@@ -145,9 +145,11 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     Migration 068: graph_provenance.triple_hash TEXT → BIGINT (10.5-S3).
     Migrations 070-073: Phase 12 Butler schema foundation (T12-01) —
     070 audit triple, 071 ledger call_type CHECK, 072 rate buckets, 073 card suggestions.
+    Migration 074: butler_actions query/visibility_scope/plan_payload + confirmation_token (T12-04).
+    Migration 075: butler_action_confirmations.status adds 'revoked' (T12-05-fix C1).
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "074"
+    assert current == "075"
 
 
 # ─── Test: upgrade adds 4 review columns with correct types/nullability ──────
