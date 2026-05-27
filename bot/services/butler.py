@@ -1356,8 +1356,14 @@ class ButlerService:
         Idempotent: already-expired actions are returned unchanged.
         Not-yet-expired actions are also returned unchanged (caller's problem
         to schedule correctly — TTL reaper calls this).
+
+        Uses ``get_for_update`` (FOR UPDATE NOWAIT) to coordinate with
+        ``_cascade_butler_actions`` which holds the same row lock inside the
+        cascade transaction — same pattern as confirm/cancel/execute (M2).
+        On contention the ``OperationalError`` propagates to the worker tick
+        which logs and continues to the next row.
         """
-        action = await self._action_repo.get(self._session, action_id)
+        action = await self._action_repo.get_for_update(self._session, action_id)
         if action is None:
             raise ButlerActionError(
                 f"action_id={action_id} not found",

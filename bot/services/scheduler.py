@@ -890,6 +890,47 @@ async def _query_pending_past_ttl(session: Any, *, now: datetime, limit: int) ->
     return await ButlerActionRepo.get_pending_past_ttl(session, now=now, limit=limit)
 
 
+async def _expire_action_inline(session: Any, action_id: int, *, action_repo: Any) -> Any:
+    """Free-function equivalent of ButlerService.expire_action for the worker tick.
+
+    Uses only ``action_repo`` — no other ButlerService collaborators needed.
+    Avoids constructing ButlerService with ``None`` collaborators (M1) so if
+    expire_action ever extends to use other repos, AttributeError is explicit
+    rather than silent in the apscheduler tick.
+
+    Logic mirrors ButlerService.expire_action exactly:
+    - Row not found → raise ButlerActionError(not_found)
+    - Already expired / not pending_confirmation → idempotent no-op
+    - Past TTL → update_status('expired', 'ttl_expired'), return refreshed row
+    """
+    from bot.services.butler import ButlerActionError
+
+    action = await action_repo.get_for_update(session, action_id)
+    if action is None:
+        raise ButlerActionError(
+            f"action_id={action_id} not found",
+            error_kind="not_found",
+            action_id=action_id,
+        )
+    if action.status == "expired":
+        return action
+    if action.status != "pending_confirmation":
+        return action
+
+    now = datetime.now(timezone.utc)
+    if action.expires_at is None or action.expires_at > now:
+        return action
+
+    await action_repo.update_status(
+        session,
+        action_id,
+        status="expired",
+        rejection_reason="ttl_expired",
+    )
+    updated = await action_repo.get(session, action_id)
+    return updated or action
+
+
 async def butler_expire_tick(*, bot: Bot, session: Any) -> int:
     """Inner tick: expire all pending_confirmation actions past their TTL.
 
@@ -897,8 +938,12 @@ async def butler_expire_tick(*, bot: Bot, session: Any) -> int:
 
     The session parameter is accepted for injection in tests (callers pass
     the active session so the tick participates in the same transaction).
+
+    Uses ``_expire_action_inline`` (free function, M1) rather than constructing
+    a ``ButlerService`` with most collaborators set to None.
     """
     from bot.db.repos.butler_action import BUTLER_EXPIRE_BATCH_SIZE
+    from bot.db.repos.butler_action import ButlerActionRepo as _ActionRepo
 
     now = datetime.now(timezone.utc)
     stale_actions = await _query_pending_past_ttl(session, now=now, limit=BUTLER_EXPIRE_BATCH_SIZE)
@@ -906,27 +951,10 @@ async def butler_expire_tick(*, bot: Bot, session: Any) -> int:
         await session.commit()
         return 0
 
-    from bot.services.butler import ButlerService
-    from bot.db.repos.butler_action import ButlerActionRepo as _ActionRepo
-    from bot.db.repos.butler_rate_bucket import ButlerRateBucketRepo
-
     expired_count = 0
     for action in stale_actions:
-        # ButlerService.expire_action is idempotent — safe to call on already-expired rows.
-        svc = ButlerService(
-            session=session,
-            ledger_repo=None,  # type: ignore[arg-type]  # not needed for expire_action
-            butler_action_repo=_ActionRepo,
-            butler_action_confirmation_repo=None,  # type: ignore[arg-type]
-            butler_tool_invocation_repo=None,  # type: ignore[arg-type]
-            butler_rate_bucket_repo=ButlerRateBucketRepo,
-            user_repo=None,
-            llm_gateway=None,  # type: ignore[arg-type]
-            evidence_builder=None,  # type: ignore[arg-type]
-            settings=None,  # type: ignore[arg-type]
-        )
         try:
-            updated = await svc.expire_action(action_id=action.id)
+            updated = await _expire_action_inline(session, action.id, action_repo=_ActionRepo)
             if getattr(updated, "status", None) == "expired":
                 expired_count += 1
         except Exception:
