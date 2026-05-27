@@ -2066,6 +2066,11 @@ class ButlerToolInvocation(Base):
         JSON().with_variant(JSONB(), "postgresql"),
         nullable=True,
     )
+    # posted_message_id — migration 075 (T12-06-fix C2).
+    # Written by send_intro / schedule_meeting after bot.send_message() succeeds.
+    # NULL for tools that produce no Telegram output (recall_evidence, suggest_card_creation).
+    # Used by update_intro for Butler ownership verification.
+    posted_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 class ButlerActionConfirmation(Base):

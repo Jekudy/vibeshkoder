@@ -54,20 +54,22 @@ class SendIntroTool:
         context: "ButlerEvidenceContext",
         args: BaseModel,
     ) -> None:
-        """Validate that intro_text is non-blank and target_user_id is set."""
-        if isinstance(args, SendIntroArgs):
-            intro_text = args.intro_text
-            target_user_id = args.target_user_id
-        else:
-            intro_text = getattr(args, "intro_text", "") or ""
-            target_user_id = getattr(args, "target_user_id", 0)
+        """Validate that intro_text is non-blank and target_user_id is set.
 
-        if not intro_text.strip():
+        Raises ButlerPlanError(invariant_broken) if args is not SendIntroArgs.
+        """
+        if not isinstance(args, SendIntroArgs):
+            raise ButlerPlanError(
+                "send_intro: args must be SendIntroArgs",
+                error_kind="invariant_broken",
+            )
+
+        if not args.intro_text.strip():
             raise ButlerPlanError(
                 "send_intro: intro_text is blank",
                 error_kind="invalid_args",
             )
-        if not target_user_id:
+        if not args.target_user_id:
             raise ButlerPlanError(
                 "send_intro: target_user_id must be non-zero",
                 error_kind="invalid_args",
@@ -80,6 +82,8 @@ class SendIntroTool:
         *,
         session: "AsyncSession",
         bot: Any = None,
+        action_repo: Any = None,
+        action_id: int,
     ) -> ToolResult:
         """Send the confirmed intro text to the target user.
 
@@ -92,12 +96,13 @@ class SendIntroTool:
         Privacy: intro_text is NOT included in logs or the returned payload.
         Result payload carries only IDs (target_user_id, message_id).
         """
-        if isinstance(args, SendIntroArgs):
-            intro_text = args.intro_text
-            target_user_id = args.target_user_id
-        else:
-            intro_text = getattr(args, "intro_text", "")
-            target_user_id = getattr(args, "target_user_id", 0)
+        if not isinstance(args, SendIntroArgs):
+            raise ButlerPlanError(
+                "send_intro: args must be SendIntroArgs",
+                error_kind="invariant_broken",
+            )
+        intro_text = args.intro_text
+        target_user_id = args.target_user_id
 
         if bot is None:
             logger.error(
@@ -110,8 +115,9 @@ class SendIntroTool:
             )
 
         # Send to target_user_id as a DM, using the confirmed text
-        # (not re-fetched — this is the binding invariant)
-        msg = await bot.send_message(chat_id=target_user_id, text=intro_text)
+        # (not re-fetched — this is the binding invariant).
+        # parse_mode=None: intro_text is user-supplied; never parse as HTML/Markdown (M1).
+        msg = await bot.send_message(chat_id=target_user_id, text=intro_text, parse_mode=None)
         sent_message_id: int = msg.message_id
 
         # Privacy: never log intro_text or its hash

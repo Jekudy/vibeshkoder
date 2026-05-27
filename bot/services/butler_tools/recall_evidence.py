@@ -14,7 +14,7 @@ to Telegram, so there is nothing to undo.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -51,18 +51,17 @@ class RecallEvidenceTool:
         """Validate governance policy for recall_evidence.
 
         Raises ButlerPlanError if the query is blank (nothing to recall).
+        Raises ButlerActionError(invariant_broken) if args is not a RecallEvidenceArgs.
         Context is pre-filtered by build_butler_evidence — no additional
         DB access needed.
         """
-        # args is already a RecallEvidenceArgs (pydantic model) at this point,
-        # passed validated from execute_action via TOOL_ARGS_SCHEMA.
-        if isinstance(args, RecallEvidenceArgs):
-            query = args.query
-        else:
-            # Fallback: accept raw dict or BaseModel with .query attr
-            query = getattr(args, "query", "") or ""
+        if not isinstance(args, RecallEvidenceArgs):
+            raise ButlerPlanError(
+                "recall_evidence: args must be RecallEvidenceArgs",
+                error_kind="invariant_broken",
+            )
 
-        if not query.strip():
+        if not args.query.strip():
             raise ButlerPlanError(
                 "recall_evidence: query is blank — nothing to recall",
                 error_kind="invalid_args",
@@ -74,6 +73,9 @@ class RecallEvidenceTool:
         args: BaseModel,
         *,
         session: "AsyncSession",
+        bot: Any = None,
+        action_repo: Any = None,
+        action_id: int,
     ) -> ToolResult:
         """Return the sealed evidence set from the context.
 
@@ -86,6 +88,11 @@ class RecallEvidenceTool:
           item_count    — number of items in the bundle
           abstained     — bool: True if no evidence was found
         """
+        if not isinstance(args, RecallEvidenceArgs):
+            raise ButlerPlanError(
+                "recall_evidence: args must be RecallEvidenceArgs",
+                error_kind="invariant_broken",
+            )
         # Hard Constraint #2: we only touch the sealed ctx — no session.execute calls.
         evidence_ids = ctx.evidence_ids
         context_hash = ctx.context_hash

@@ -80,7 +80,7 @@ from sqlalchemy.exc import OperationalError as _SAOperationalError
 # isinstance(exc, ButlerPlanError) uses the same class object as the exc
 # was instantiated with — lazy re-import after _clear_modules() in tests
 # would create a different class object and isinstance would return False.
-from bot.services.butler_tools import ButlerPlanError  # noqa: E402
+from bot.services.butler_tools import ButlerPlanError, TOOL_ARGS_SCHEMA  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -829,6 +829,7 @@ class ButlerService:
         *,
         action_id: int,
         tool_registry: dict[str, Any] | None = None,
+        bot: Any = None,
     ) -> Any:
         """Execute a confirmed butler action.
 
@@ -843,11 +844,28 @@ class ButlerService:
         4. For each action step in plan_payload['actions'] (C3):
            a. INSERT invocation row (status='running').
            b. Resolve tool from tool_registry.
-           c. await tool.validate_policy(context, args).
-           d. await tool.execute(plan, ctx, session=session).
-           e. Update invocation status='succeeded'|'failed'.
-           f. On failure → mark action status='execution_failed' (C5) + return.
+           c. Build ButlerEvidenceContext via evidence_builder (for ctx arg).
+           d. Validate step_args via TOOL_ARGS_SCHEMA[tool_name] (for args arg).
+           e. await tool.validate_policy(ctx, validated_args).
+           f. await tool.execute(ctx, validated_args, session=session, bot=bot,
+              action_repo=self._action_repo, action_id=action_id).
+           g. Call build_inverse(result) + persist inverse on action row.
+           h. Update invocation status='succeeded'|'failed'.
+           i. On failure → mark action status='execution_failed' (C5) + return.
         5. On all success → action status='succeeded'.
+
+        Parameters
+        ----------
+        action_id:
+            PK of the butler_actions row (must be 'confirmed').
+        tool_registry:
+            Optional override of TOOL_DISPATCH for tests or feature-flag gating.
+            If None, no tools are dispatched (stub success path, T12-04 mode).
+        bot:
+            Telegram Bot instance, threaded to tool.execute (Phase 7 FHR pattern).
+            Required for tools that send Telegram messages (schedule_meeting,
+            send_intro, update_intro). None is safe for recall_evidence and
+            suggest_card_creation which produce no Telegram output.
         """
         try:
             action = await self._action_repo.get_for_update(self._session, action_id)
@@ -953,10 +971,43 @@ class ButlerService:
 
             result = None
             if tool is not None:
+                # C1: build typed ctx + validated_args before calling tool.
+                # Build ButlerEvidenceContext via evidence_builder (replay path).
+                tool_ctx = await self._evidence_builder.build_butler_evidence(
+                    session=self._session,
+                    requester_user_id=action.requester_tg_id,
+                    query=action.query,
+                    chat_id=action.chat_id,
+                    visibility_scope=action.visibility_scope,
+                )
+                # Validate step_args dict → typed pydantic model.
+                args_model_cls = TOOL_ARGS_SCHEMA.get(tool_name)
+                if args_model_cls is None:
+                    raise ButlerPlanError(
+                        f"execute_action: unknown tool_name={tool_name!r}",
+                        error_kind="tool_not_allowed",
+                    )
                 try:
-                    # validate_policy may raise — treat as failure
-                    await tool.validate_policy(None, step_args)
-                    result = await tool.execute(None, None, session=self._session)
+                    from pydantic import ValidationError as _PydanticValidationError
+                    validated_args = args_model_cls.model_validate(step_args)
+                except Exception as _ve:
+                    raise ButlerPlanError(
+                        f"execute_action: args validation failed for tool={tool_name}: {_ve}",
+                        error_kind="invalid_args",
+                    ) from _ve
+
+                try:
+                    # validate_policy takes (ctx, typed_args) — C1 fix
+                    await tool.validate_policy(tool_ctx, validated_args)
+                    # execute takes (ctx, typed_args, *, session, bot, action_repo, action_id) — C1 fix
+                    result = await tool.execute(
+                        tool_ctx,
+                        validated_args,
+                        session=self._session,
+                        bot=bot,
+                        action_repo=self._action_repo,
+                        action_id=action_id,
+                    )
                 except Exception as exc:
                     await self._invocation_repo.update_invocation(
                         self._session,
@@ -1011,6 +1062,28 @@ class ButlerService:
                 response_payload_hash=_payload_hash(resp_payload),
                 finished_at=_now_utc(),
             )
+
+            # Build inverse_op_payload via tool.build_inverse(result) if tool was wired.
+            # Required by ck_butler_actions_executed_has_inverse CHECK constraint:
+            # executed/succeeded rows must have inverse_op_payload OR rollback_kind='not_reversible'.
+            if tool is not None and hasattr(tool, "build_inverse"):
+                try:
+                    inverse_payload = await tool.build_inverse(result)
+                    await self._action_repo.update_status(
+                        self._session,
+                        action_id,
+                        # Status stays as 'executing' during multi-step; final 'succeeded' below.
+                        # We update inverse_op_payload only here — status is set once after loop.
+                        status="executing",
+                        inverse_op_payload=inverse_payload,
+                    )
+                except Exception:
+                    # build_inverse failure is non-fatal — log and continue.
+                    logger.warning(
+                        "butler:execute_action: build_inverse failed for tool=%s action=%s",
+                        tool_name,
+                        action_id,
+                    )
 
         # All steps succeeded
         await self._action_repo.update_status(

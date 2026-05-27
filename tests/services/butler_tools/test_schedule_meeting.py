@@ -117,7 +117,7 @@ async def test_execute_posts_telegram_message():
     args = ScheduleMeetingArgs(topic="Rust architecture", proposed_time_text="Friday 15:00")
     bot = _make_mock_bot(message_id=888)
 
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     assert result.success is True
     bot.send_message.assert_called_once()
@@ -133,7 +133,7 @@ async def test_execute_returns_message_id_in_payload():
     args = ScheduleMeetingArgs(topic="Rust architecture")
     bot = _make_mock_bot(message_id=999)
 
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     assert result.payload["message_id"] == 999
     assert result.payload["chat_id"] == CHAT_ID
@@ -146,7 +146,7 @@ async def test_execute_no_calendar_api_calls():
     args = ScheduleMeetingArgs(topic="Meeting test")
     bot = _make_mock_bot(message_id=111)
 
-    await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     # Only send_message should be called on the bot
     assert bot.send_message.call_count == 1
@@ -167,7 +167,7 @@ async def test_build_inverse_has_delete_message_kind():
     ctx = _make_ctx()
     args = ScheduleMeetingArgs(topic="test")
     bot = _make_mock_bot(message_id=555)
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     inverse = await _TOOL.build_inverse(result)
     assert inverse["rollback_kind"] == "delete_message"
@@ -179,7 +179,7 @@ async def test_build_inverse_contains_message_id_and_chat_id():
     ctx = _make_ctx()
     args = ScheduleMeetingArgs(topic="test")
     bot = _make_mock_bot(message_id=444)
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     inverse = await _TOOL.build_inverse(result)
     assert inverse["message_id"] == 444
@@ -192,7 +192,7 @@ async def test_build_inverse_is_deterministic():
     ctx = _make_ctx()
     args = ScheduleMeetingArgs(topic="test")
     bot = _make_mock_bot(message_id=222)
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     inv1 = await _TOOL.build_inverse(result)
     inv2 = await _TOOL.build_inverse(result)

@@ -126,7 +126,7 @@ async def test_execute_sends_confirmed_intro_text():
     args = SendIntroArgs(target_user_id=TARGET_UID, intro_text=intro_text)
     bot = _make_mock_bot(message_id=202)
 
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     assert result.success is True
     bot.send_message.assert_called_once()
@@ -142,7 +142,7 @@ async def test_execute_returns_message_id_in_payload():
     args = SendIntroArgs(target_user_id=TARGET_UID, intro_text="Hello!")
     bot = _make_mock_bot(message_id=303)
 
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     assert result.payload["message_id"] == 303
     assert result.payload["target_user_id"] == TARGET_UID
@@ -161,7 +161,7 @@ async def test_execute_no_db_reads():
     ctx = _make_ctx()
     args = SendIntroArgs(target_user_id=TARGET_UID, intro_text="Hello")
     bot = _make_mock_bot()
-    await _TOOL.execute(ctx, args, session=spy, bot=bot)
+    await _TOOL.execute(ctx, args, session=spy, bot=bot, action_id=1)
     assert spy.calls == 0, "send_intro must NOT re-fetch intro_text from DB"
 
 
@@ -175,7 +175,7 @@ async def test_build_inverse_has_delete_message_kind():
     ctx = _make_ctx()
     args = SendIntroArgs(target_user_id=TARGET_UID, intro_text="Hello")
     bot = _make_mock_bot(message_id=404)
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     inverse = await _TOOL.build_inverse(result)
     assert inverse["rollback_kind"] == "delete_message"
@@ -186,7 +186,7 @@ async def test_build_inverse_contains_message_id():
     ctx = _make_ctx()
     args = SendIntroArgs(target_user_id=TARGET_UID, intro_text="Hello")
     bot = _make_mock_bot(message_id=505)
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     inverse = await _TOOL.build_inverse(result)
     assert inverse["message_id"] == 505
@@ -198,7 +198,7 @@ async def test_build_inverse_deterministic():
     ctx = _make_ctx()
     args = SendIntroArgs(target_user_id=TARGET_UID, intro_text="Hello")
     bot = _make_mock_bot(message_id=606)
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     inv1 = await _TOOL.build_inverse(result)
     inv2 = await _TOOL.build_inverse(result)
@@ -218,7 +218,7 @@ async def test_execute_payload_no_intro_text():
     args = SendIntroArgs(target_user_id=TARGET_UID, intro_text=intro_text)
     bot = _make_mock_bot(message_id=707)
 
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_id=1)
 
     payload_str = json.dumps(result.payload)
     assert intro_text not in payload_str
