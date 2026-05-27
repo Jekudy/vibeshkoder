@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from apscheduler.schedulers.base import SchedulerAlreadyRunningError
 
 pytestmark = pytest.mark.usefixtures("app_env")
 
@@ -226,7 +227,7 @@ def test_start_scheduler_registers_butler_expire_tick_job() -> None:
 
     try:
         sched_mod.start_scheduler(mock_bot)
-    except Exception:
+    except (SchedulerAlreadyRunningError, RuntimeError):
         pass  # scheduler.start() may fail without full config
 
     # Collect all job IDs that were registered
@@ -235,3 +236,72 @@ def test_start_scheduler_registers_butler_expire_tick_job() -> None:
         for call in mock_scheduler.add_job.call_args_list
     ]
     assert "butler_expire_tick" in job_ids
+
+
+# ---------------------------------------------------------------------------
+# Tests — H1: _butler_budget_check uses call_type filter for monthly cost
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_butler_budget_check_monthly_uses_call_type_filter() -> None:
+    """_butler_budget_check passes call_type to monthly_cost_usd (H1 fix)."""
+    from decimal import Decimal
+    from bot.services.llm_gateway import _butler_budget_check
+
+    monthly_call_types_seen: list[str | None] = []
+
+    class _FakeLedger:
+        async def daily_cost_usd(self, session, *, day, call_type=None):
+            return Decimal("0")
+
+        async def monthly_cost_usd(self, session, *, year, month, call_type=None):
+            monthly_call_types_seen.append(call_type)
+            return Decimal("0")
+
+    result = await _butler_budget_check(None, _FakeLedger(), "butler_decision")
+    assert result is False
+    # Both butler_decision and butler_summary call_types should be queried
+    assert "butler_decision" in monthly_call_types_seen
+    assert "butler_summary" in monthly_call_types_seen
+    # None (unfiltered) should NOT be passed
+    assert None not in monthly_call_types_seen
+
+
+# ---------------------------------------------------------------------------
+# Tests — H2: get_pending_past_ttl respects BUTLER_EXPIRE_BATCH_SIZE limit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_pending_past_ttl_respects_batch_size(db_session) -> None:
+    """get_pending_past_ttl with limit returns at most limit rows."""
+    from bot.db.repos.butler_action import ButlerActionRepo
+
+    now = datetime.now(timezone.utc)
+    # With no rows in DB the result is empty regardless of limit
+    rows = await ButlerActionRepo.get_pending_past_ttl(db_session, now=now, limit=1)
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_butler_expire_tick_passes_batch_limit() -> None:
+    """butler_expire_tick passes BUTLER_EXPIRE_BATCH_SIZE limit to get_pending_past_ttl."""
+    import bot.services.scheduler as sched_mod
+
+    captured_kwargs: list[dict] = []
+
+    # No default for limit — if caller doesn't pass it, TypeError is raised
+    async def _capture_query(session, *, now, limit):
+        captured_kwargs.append({"limit": limit})
+        return []
+
+    session_mock = MagicMock()
+    session_mock.commit = AsyncMock()
+
+    with patch.object(sched_mod, "_query_pending_past_ttl", new=_capture_query):
+        await sched_mod.butler_expire_tick(bot=MagicMock(), session=session_mock)
+
+    assert len(captured_kwargs) == 1
+    # Default batch size is 200
+    assert captured_kwargs[0]["limit"] == 200

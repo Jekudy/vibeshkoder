@@ -7,12 +7,17 @@ The caller (handler / service) owns the transaction lifecycle.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update
 
 from bot.db.models import ButlerAction
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# Maximum rows returned per tick — prevents pickup-storm when bot was down.
+# Configurable via env var; backlogs drain across ticks (60s interval).
+BUTLER_EXPIRE_BATCH_SIZE: int = int(os.environ.get("BUTLER_EXPIRE_BATCH_SIZE", "200"))
 
 _log = logging.getLogger(__name__)
 
@@ -209,15 +214,17 @@ class ButlerActionRepo:
         session: AsyncSession,
         *,
         now: datetime | None = None,
+        limit: int = BUTLER_EXPIRE_BATCH_SIZE,
     ) -> list[ButlerAction]:
-        """Return all ``pending_confirmation`` rows where ``expires_at <= now``.
+        """Return at most ``limit`` ``pending_confirmation`` rows where ``expires_at <= now``.
 
         Used by the TTL expiry worker tick (T12-08) to identify stale actions
         that should be transitioned to ``expired`` status via
         ``ButlerService.expire_action``.
 
         Ordered by ``expires_at`` ascending so the oldest stale actions are
-        processed first.
+        processed first. The ``limit`` cap prevents a pickup-storm when the bot
+        was offline for an extended period — backlogs drain across ticks.
         """
         cutoff = now if now is not None else datetime.now(timezone.utc)
         stmt = (
@@ -227,6 +234,7 @@ class ButlerActionRepo:
                 ButlerAction.expires_at <= cutoff,
             )
             .order_by(ButlerAction.expires_at.asc())
+            .limit(limit)
         )
         result = await session.execute(stmt)
         return list(result.scalars().all())
