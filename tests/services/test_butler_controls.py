@@ -30,19 +30,6 @@ from bot.services.butler_tools import (
 # themselves (and restoring it in finally).
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(autouse=True)
-def _zero_budget_spend(monkeypatch):
-    """Patch _query_butler_daily_spend to return $0 for all tests in this module.
-
-    Tests that specifically exercise the budget ceiling override this themselves
-    by directly assigning and restoring butler_budget._query_butler_daily_spend.
-    """
-    import bot.services.butler_budget as bb_mod
-
-    async def _zero(session: Any, user_id: int) -> Decimal:
-        return Decimal("0")
-
-    monkeypatch.setattr(bb_mod, "_query_butler_daily_spend", _zero)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +265,39 @@ class _FakeGateway:
         return p, 1, Decimal("0.01")
 
 
+class _FakeResult:
+    """Fake SQLAlchemy result — scalar_one_or_none returns a configurable value.
+
+    Default is None (SUM returns NULL on empty table → Decimal("0") spend).
+    Pass scalar=Decimal("0.25") to simulate a non-zero spend.
+    """
+
+    def __init__(self, scalar: Any = None) -> None:
+        self._scalar = scalar
+
+    def scalar_one_or_none(self) -> Any:
+        return self._scalar
+
+
+class _FakeSession:
+    """Minimal fake AsyncSession for unit tests.
+
+    Provides execute() that returns a configurable scalar so SQL-based functions
+    (like compute_user_daily_budget_spent) return a controlled value without
+    hitting a real DB.  Robust against _clear_modules() — no module-level
+    patching needed.
+
+    scalar_result=None → spend = Decimal("0")  (budget OK)
+    scalar_result=Decimal("0.25") → spend = Decimal("0.25")  (budget exceeded)
+    """
+
+    def __init__(self, *, scalar_result: Any = None) -> None:
+        self._scalar_result = scalar_result
+
+    async def execute(self, stmt: Any, params: Any = None) -> _FakeResult:
+        return _FakeResult(scalar=self._scalar_result)
+
+
 class _FakeEvidenceBuilder:
     async def build_butler_evidence(self, **kwargs: Any) -> Any:
         from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
@@ -312,10 +332,11 @@ def _make_service(
     user_repo: _FakeUserRepo | None = None,
     action_repo: _FakeActionRepo | None = None,
     settings: _FakeSettings | None = None,
+    session: _FakeSession | None = None,
 ) -> tuple[ButlerService, _FakeActionRepo]:
     ar = action_repo or _FakeActionRepo()
     svc = ButlerService(
-        session=None,
+        session=session or _FakeSession(),
         ledger_repo=ledger_repo or _FakeLedgerRepo(),
         butler_action_repo=ar,
         butler_action_confirmation_repo=_FakeConfirmationRepo(),
@@ -466,15 +487,19 @@ async def test_budget_cap_at_exact_ceiling_is_exceeded() -> None:
 @pytest.mark.asyncio
 async def test_compute_user_daily_budget_spent() -> None:
     """compute_user_daily_budget_spent delegates to _query_butler_daily_spend."""
-    from bot.services import butler_budget as bb_mod
-    from bot.services.butler_budget import compute_user_daily_budget_spent
+    import bot.services.butler_budget as bb_mod
 
     async def _fake_query(session: Any, user_id: int) -> Decimal:
         return Decimal("0.15")
 
+    # Patch _query_butler_daily_spend on the butler_budget module to verify delegation.
+    # This is a direct unit test of butler_budget internals — not subject to the
+    # butler-namespace stale-module issue because we're testing the function directly.
     original = bb_mod._query_butler_daily_spend
     bb_mod._query_butler_daily_spend = _fake_query
     try:
+        # Re-import compute_user_daily_budget_spent from the same module object we patched
+        from bot.services.butler_budget import compute_user_daily_budget_spent
         spent = await compute_user_daily_budget_spent(session=None, user_id=USER_ID)
     finally:
         bb_mod._query_butler_daily_spend = original
@@ -489,29 +514,24 @@ async def test_compute_user_daily_budget_spent() -> None:
 
 @pytest.mark.asyncio
 async def test_plan_action_rejects_when_user_daily_budget_exceeded() -> None:
-    """When user daily spend >= ceiling, plan_action raises budget_exceeded."""
-    from bot.services import butler_budget as bb_mod
+    """When user daily spend >= ceiling, plan_action raises budget_exceeded.
 
-    # Patch _query_butler_daily_spend to simulate the user having exceeded the ceiling
-    async def _over_spend(session: Any, user_id: int) -> Decimal:
-        return Decimal("0.25")  # > 0.20 ceiling
-
+    Uses _FakeSession(scalar_result=Decimal("0.25")) so _query_butler_daily_spend
+    returns 0.25 >= 0.20 ceiling without any module-level patching.
+    This approach is robust against _clear_modules() from app_env fixture.
+    """
     rate_repo = _FakeRateBucketRepo()
-    svc, ar = _make_service(rate_bucket_repo=rate_repo)
+    # Session returns 0.25 from scalar_one_or_none → budget query returns Decimal("0.25")
+    over_budget_session = _FakeSession(scalar_result=Decimal("0.25"))
+    svc, ar = _make_service(rate_bucket_repo=rate_repo, session=over_budget_session)
 
-    # monkeypatch _query_butler_daily_spend at module level
-    original = bb_mod._query_butler_daily_spend
-    bb_mod._query_butler_daily_spend = _over_spend
-    try:
-        with pytest.raises(ButlerActionError) as exc_info:
-            await svc.plan_action(
-                requester_user_id=USER_ID,
-                chat_id=CHAT_ID,
-                query="test",
-                visibility_scope="member",
-            )
-    finally:
-        bb_mod._query_butler_daily_spend = original
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.plan_action(
+            requester_user_id=USER_ID,
+            chat_id=CHAT_ID,
+            query="test",
+            visibility_scope="member",
+        )
 
     assert exc_info.value.error_kind == "budget_exceeded"
     # Rate buckets (user_plans_day, chat_actions_day) should be rolled back
@@ -522,24 +542,17 @@ async def test_plan_action_rejects_when_user_daily_budget_exceeded() -> None:
 
 @pytest.mark.asyncio
 async def test_plan_action_proceeds_when_budget_within_ceiling() -> None:
-    """When user spend < ceiling, plan_action succeeds past budget check."""
-    from bot.services import butler_budget as bb_mod
+    """When user spend < ceiling, plan_action succeeds past budget check.
 
-    async def _under_spend(session: Any, user_id: int) -> Decimal:
-        return Decimal("0.10")  # < 0.20 ceiling
-
-    original = bb_mod._query_butler_daily_spend
-    bb_mod._query_butler_daily_spend = _under_spend
-    try:
-        svc, ar = _make_service()
-        action = await svc.plan_action(
-            requester_user_id=USER_ID,
-            chat_id=CHAT_ID,
-            query="test",
-            visibility_scope="member",
-        )
-    finally:
-        bb_mod._query_butler_daily_spend = original
+    _FakeSession default (scalar_result=None) → Decimal("0") spend → budget OK.
+    """
+    svc, ar = _make_service()
+    action = await svc.plan_action(
+        requester_user_id=USER_ID,
+        chat_id=CHAT_ID,
+        query="test",
+        visibility_scope="member",
+    )
 
     assert action.status == "pending_confirmation"
 
