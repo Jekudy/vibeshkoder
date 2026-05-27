@@ -885,9 +885,9 @@ async def graph_purge_worker_job() -> None:
 # ─── T12-08: Butler TTL expiry worker ───────────────────────────────────────
 
 
-async def _query_pending_past_ttl(session: Any, *, now: datetime) -> list:
+async def _query_pending_past_ttl(session: Any, *, now: datetime, limit: int) -> list:
     """Thin helper so tests can patch without reaching into the repo directly."""
-    return await ButlerActionRepo.get_pending_past_ttl(session, now=now)
+    return await ButlerActionRepo.get_pending_past_ttl(session, now=now, limit=limit)
 
 
 async def butler_expire_tick(*, bot: Bot, session: Any) -> int:
@@ -898,8 +898,10 @@ async def butler_expire_tick(*, bot: Bot, session: Any) -> int:
     The session parameter is accepted for injection in tests (callers pass
     the active session so the tick participates in the same transaction).
     """
+    from bot.db.repos.butler_action import BUTLER_EXPIRE_BATCH_SIZE
+
     now = datetime.now(timezone.utc)
-    stale_actions = await _query_pending_past_ttl(session, now=now)
+    stale_actions = await _query_pending_past_ttl(session, now=now, limit=BUTLER_EXPIRE_BATCH_SIZE)
     if not stale_actions:
         await session.commit()
         return 0

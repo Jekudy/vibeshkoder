@@ -158,7 +158,7 @@ class LedgerRepoProtocol(Protocol):
         ...
 
     async def monthly_cost_usd(
-        self, session: Any, *, year: int, month: int
+        self, session: Any, *, year: int, month: int, call_type: str | None = None
     ) -> Decimal:
         ...
 
@@ -2204,10 +2204,8 @@ async def _butler_budget_check(
     Sums daily cost for both butler_decision + butler_summary call_types and
     compares against ``BUTLER_DAILY_USD_CEILING`` ($1 default).
 
-    Monthly check: uses global monthly_cost_usd (no call_type filter) as a
-    shared-bucket proxy until T12-08 lands the per-call_type monthly filter.
-    TODO(T12-08): replace with ``monthly_cost_usd(call_type='butler_decision')``
-    + ``monthly_cost_usd(call_type='butler_summary')`` when that method lands.
+    Monthly check: sums butler_decision + butler_summary monthly costs using
+    per-call_type filter (T12-08 — isolates butler costs from QA/digest/graph costs).
     """
     today = datetime.now(timezone.utc).date()
     # Daily: filter to butler call types only (decision + summary share $1/day budget)
@@ -2220,11 +2218,16 @@ async def _butler_budget_check(
     butler_daily_total = daily_decision + daily_summary
     if butler_daily_total >= _BUTLER_DAILY_USD_CEILING:
         return True
-    # Monthly: shared monthly proxy (T12-08 TODO for butler-specific filter)
-    monthly_total = await ledger_repo.monthly_cost_usd(
-        session, year=today.year, month=today.month
+    # Monthly: butler-specific filter (decision + summary combined)
+    butler_monthly = (
+        await ledger_repo.monthly_cost_usd(
+            session, year=today.year, month=today.month, call_type="butler_decision"
+        )
+        + await ledger_repo.monthly_cost_usd(
+            session, year=today.year, month=today.month, call_type="butler_summary"
+        )
     )
-    if monthly_total >= _BUTLER_MONTHLY_USD_CEILING:
+    if butler_monthly >= _BUTLER_MONTHLY_USD_CEILING:
         return True
     return False
 
