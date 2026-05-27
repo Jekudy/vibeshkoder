@@ -284,6 +284,28 @@ commit). Commits `d7045ca`..`4c09fe5`. Alembic head 074 → 075. 86 tests green 
 Phase 11 binding **86 → 86** (delta 0; L12/C10/I9/R8/G3 family lands in T12-09).
 FHR required at T12-10 (cycle-end). Rollout: `docs/rollout-fragments/phase12/T12-05.md`.
 
+**Phase 12 (Butler) — T12-07 (`/butler_undo` + undo audit) PR #351 pending merge, 2026-05-27.**
+`/butler_undo <action_id>` — DM-only, member auth, dual flag gate (`memory.butler.enabled` +
+`memory.butler.undo.enabled`, both default OFF). 5 rollback kinds: `not_reversible`,
+`delete_message`, `edit_message`, `followup_correction`, `cancel_pending`. LIFO ordering over
+`butler_tool_invocations`. Migration 077: `butler_undo_invocations` audit table (UNIQUE
+`(action_id, invocation_id)` — DB-level idempotency) + widens `butler_actions.status` to
+include `'undone'`. Migration 078: `butler_tool_invocations.inverse_op_payload` JSONB —
+populated by `execute_action` after `tool.build_inverse(result)`. Key invariants:
+FOR UPDATE NOWAIT cascade lock; idempotency check BEFORE TTL; coded error messages (no raw
+exc text); `dismiss_by_undo` sets `reviewed_by`+`reviewed_at` (CHECK constraint compliance).
+`_resolve_prior_text` cascade-aware: relies on `forget_cascade._cascade_message_versions`
+nullifying `MessageVersion.text` on redaction; narrow `except (SQLAlchemyError, OperationalError)`.
+Forget cascade widened: `butler_undo_invocations` layer between `butler_tool_invocations` and
+`butler_actions`; `_cascade_butler_undo_invocations` redacts `error_message`. 3-round PAR:
+round-1 NEEDS_FIXES (4C+3H+5M: field-mismatches, missing column, CHECK violation, broad except);
+round-2 NEEDS_FIXES (all round-1 closed + 1 CRITICAL REGRESSION — `_resolve_prior_text` SQL used
+non-existent ORM columns, masked by mock-only tests — class of bug: mock tests don't catch
+column-name mismatches); round-3 APPROVE (JOIN through `chat_messages`, narrow except, 3 new
+tests). 115 tests green (+13: 10 e2e + 3 resolve_prior_text). Alembic head 076 → 077 → 078.
+Phase 11 binding delta = 0 (L12/C10/I9/R8/G3 lands in T12-09). FHR required at T12-10.
+Rollout: `docs/rollout-fragments/phase12/T12-07.md`.
+
 **Phase 12 (Butler) — T12-06 (5 tool implementations) PR #349 pending merge, 2026-05-27.**
 Wave 2 sprint F: 5 butler tool implementations under `bot/services/butler_tools/`.
 Tool semantic invariants: `recall_evidence` = sealed `ButlerEvidenceContext` only

@@ -1,24 +1,26 @@
 {
-  "sprint": "T12-08",
+  "sprint": "T12-07",
   "claude_product": "ACCEPTED",
   "technical_review": "APPROVE",
   "docs_update": "UPDATED",
   "docs_review": "PASS",
   "provider": "split-focus",
-  "ts": "2026-05-27T13:56:59Z",
-  "pr": 350,
-  "rounds": 2,
-  "round_1_findings": "1C + 2H + 3M + 2L (Claude product + Claude tech split-focus)",
-  "round_2_findings": "all 9 round-1 items closed, no new regressions",
+  "ts": "2026-05-27T14:13:53Z",
+  "pr": 351,
+  "rounds": 3,
+  "round_1_findings": "3 CRITICAL + 2 HIGH product + 4 CRITICAL + 3 HIGH + 5 MEDIUM tech (significant rework: field-mismatches, missing column, CHECK violation, broad except)",
+  "round_2_findings": "all round-1 closed EXCEPT 1 CRITICAL REGRESSION introduced by _resolve_prior_text SQL using non-existent columns (column-name bug only surfaces in real DB or schema-grep)",
+  "round_3_findings": "C3-NEW + H-NEW closed (JOIN through chat_messages, narrow except, 3 new tests)",
   "phase11_binding_delta": 0,
-  "alembic_head": "076 (T12-08 added no migrations — used existing tables)",
-  "tests": "80 passed (was 74 round-1, +6 from C1 budget integration + Protocol assertions)",
+  "alembic_head": "076 -> 077 -> 078",
+  "tests": "115 passed (+13 across rounds — 10 e2e + 3 resolve_prior_text)",
   "fhr_required": "T12-10 (cycle-end)",
   "secondary_provider_fallback_reason": "codex companion broker stalled; fell back to second Claude reviewer per Rule 7",
+  "round_2_regression_pattern": "mock-only tests don't catch ORM column-name mismatches; recommendation: add real-DB integration tests for SQL helpers when feasible",
   "docs_files_updated": [
     "docs/memory-system/IMPLEMENTATION_STATUS.md",
     "CLAUDE.md",
-    "docs/rollout-fragments/phase12/T12-08.md"
+    "docs/rollout-fragments/phase12/T12-07.md"
   ],
   "llms_txt": "UNCHANGED — file does not exist in this repo"
 }
