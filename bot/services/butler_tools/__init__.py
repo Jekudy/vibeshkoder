@@ -354,16 +354,39 @@ class ButlerTool(Protocol):
 
     async def execute(
         self,
-        plan: ButlerPlan,
         ctx: "ButlerEvidenceContext",
+        args: BaseModel,
         *,
         session: "AsyncSession",
+        bot: Any = None,
+        action_repo: Any = None,
+        action_id: int,
     ) -> ToolResult:
         """Execute the tool action.
 
         Called ONLY after user confirmation gate passes (T12-04 / T12-05).
-        Must write a ``butler_tool_invocations`` row (T12-06 responsibility).
+        The ``butler_tool_invocations`` row is written by the service caller
+        (ButlerService.execute_action) — NOT by the tool implementation.
         Must fail-closed on any governance violation (Hard Constraint #3).
+
+        Parameters
+        ----------
+        ctx:
+            Sealed ButlerEvidenceContext built by build_butler_evidence.
+        args:
+            Validated pydantic args model (e.g. RecallEvidenceArgs). Caller
+            MUST pass a typed pydantic instance — never a raw dict.
+        session:
+            Async SQLAlchemy session. Caller owns commit/rollback.
+        bot:
+            Telegram Bot instance (threaded from handler, per Phase 7 FHR
+            pattern). None for tools that produce no Telegram output.
+        action_repo:
+            ButlerActionRepo instance. Passed to tools that need ownership
+            lookup (update_intro). None for tools that do not need it.
+        action_id:
+            The butler_actions.id for this execution. NO default — caller
+            MUST pass the real PK to prevent FK violation on DB writes.
         """
         ...
 

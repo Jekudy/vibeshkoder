@@ -53,20 +53,22 @@ class UpdateIntroTool:
         context: "ButlerEvidenceContext",
         args: BaseModel,
     ) -> None:
-        """Validate message_id > 0 and new_intro_text is non-blank."""
-        if isinstance(args, UpdateIntroArgs):
-            message_id = args.message_id
-            new_intro_text = args.new_intro_text
-        else:
-            message_id = getattr(args, "message_id", 0)
-            new_intro_text = getattr(args, "new_intro_text", "") or ""
+        """Validate message_id > 0 and new_intro_text is non-blank.
 
-        if not message_id:
+        Raises ButlerPlanError(invariant_broken) if args is not UpdateIntroArgs.
+        """
+        if not isinstance(args, UpdateIntroArgs):
+            raise ButlerPlanError(
+                "update_intro: args must be UpdateIntroArgs",
+                error_kind="invariant_broken",
+            )
+
+        if not args.message_id:
             raise ButlerPlanError(
                 "update_intro: message_id must be non-zero",
                 error_kind="invalid_args",
             )
-        if not new_intro_text.strip():
+        if not args.new_intro_text.strip():
             raise ButlerPlanError(
                 "update_intro: new_intro_text is blank",
                 error_kind="invalid_args",
@@ -80,15 +82,18 @@ class UpdateIntroTool:
         session: "AsyncSession",
         bot: Any = None,
         action_repo: Any = None,
+        action_id: int,
     ) -> ToolResult:
         """Edit a Butler-owned intro message, or fall back to a follow-up reply.
 
         Strategy:
-        1. Check ownership via action_repo.find_by_message_id (None → not Butler's).
-        2. If owned, attempt bot.edit_message_text.
+        1. Check ownership via action_repo.find_by_posted_message_id
+           (None → not Butler's, or action_repo not wired).
+        2. If owned, attempt bot.edit_message_text with parse_mode=None.
            On success → outcome='edited', message_id from result.
            On exception (edit timeout, etc.) → fall through to step 3.
-        3. If not owned or edit failed → post a follow-up reply via bot.send_message.
+        3. If not owned or edit failed → post a follow-up reply via bot.send_message
+           with parse_mode=None (M1: user-supplied text must not be parsed).
            outcome='followup_reply', followup_message_id from result.
 
         This tool NEVER raises an unhandled exception — the spec requires a
@@ -96,21 +101,24 @@ class UpdateIntroTool:
 
         Privacy: new_intro_text NOT in logs or payload.
         """
-        if isinstance(args, UpdateIntroArgs):
-            message_id = args.message_id
-            new_intro_text = args.new_intro_text
-        else:
-            message_id = getattr(args, "message_id", 0)
-            new_intro_text = getattr(args, "new_intro_text", "")
+        if not isinstance(args, UpdateIntroArgs):
+            raise ButlerPlanError(
+                "update_intro: args must be UpdateIntroArgs",
+                error_kind="invariant_broken",
+            )
+        message_id = args.message_id
+        new_intro_text = args.new_intro_text
 
         chat_id = ctx.chat_id
 
-        # Step 1 — ownership check via action_repo
+        # Step 1 — ownership check via action_repo.find_by_posted_message_id
+        # (C2 fix: uses posted_message_id column added in migration 075, not
+        # the non-existent find_by_message_id on butler_actions).
         is_butler_owned = False
         if action_repo is not None:
             try:
-                action_row = await action_repo.find_by_message_id(session, message_id)
-                is_butler_owned = action_row is not None
+                invocation_row = await action_repo.find_by_posted_message_id(session, message_id)
+                is_butler_owned = invocation_row is not None
             except Exception as exc:
                 # Ownership check failed — treat as not owned (fail-closed)
                 logger.warning(
@@ -121,10 +129,12 @@ class UpdateIntroTool:
         # Step 2 — attempt edit if Butler owns the message
         if is_butler_owned and bot is not None:
             try:
+                # parse_mode=None: new_intro_text is user-supplied; never parse as HTML/Markdown (M1).
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
                     text=new_intro_text,
+                    parse_mode=None,
                 )
                 logger.info(
                     "butler:update_intro: edit succeeded",
@@ -163,9 +173,11 @@ class UpdateIntroTool:
         followup_text = (
             f"Уточнение: {new_intro_text}"
         )
+        # parse_mode=None: followup_text contains user-supplied content; never parse (M1).
         followup_msg = await bot.send_message(
             chat_id=chat_id,
             text=followup_text,
+            parse_mode=None,
         )
         followup_message_id: int = followup_msg.message_id
 

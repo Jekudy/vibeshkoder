@@ -62,6 +62,26 @@ class ButlerToolInvocationRepo:
         return list(result.scalars().all())
 
     @staticmethod
+    async def find_by_posted_message_id(
+        session: AsyncSession,
+        posted_message_id: int,
+    ) -> "ButlerToolInvocation | None":
+        """Return the invocation row that posted this Telegram message_id.
+
+        Used by update_intro to verify Butler ownership before attempting an edit.
+        Returns None if no invocation has posted this message_id (not Butler's).
+
+        The partial index on (posted_message_id) WHERE posted_message_id IS NOT NULL
+        (migration 075) ensures this lookup is fast even on large invocation tables.
+        """
+        result = await session.execute(
+            select(ButlerToolInvocation).where(
+                ButlerToolInvocation.posted_message_id == posted_message_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
     async def update_invocation(
         session: AsyncSession,
         invocation_id: int,

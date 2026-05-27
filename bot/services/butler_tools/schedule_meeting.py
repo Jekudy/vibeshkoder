@@ -47,13 +47,17 @@ class ScheduleMeetingTool:
         context: "ButlerEvidenceContext",
         args: BaseModel,
     ) -> None:
-        """Validate that a non-blank topic is provided."""
-        if isinstance(args, ScheduleMeetingArgs):
-            topic = args.topic
-        else:
-            topic = getattr(args, "topic", "") or ""
+        """Validate that a non-blank topic is provided.
 
-        if not topic.strip():
+        Raises ButlerPlanError(invariant_broken) if args is not ScheduleMeetingArgs.
+        """
+        if not isinstance(args, ScheduleMeetingArgs):
+            raise ButlerPlanError(
+                "schedule_meeting: args must be ScheduleMeetingArgs",
+                error_kind="invariant_broken",
+            )
+
+        if not args.topic.strip():
             raise ButlerPlanError(
                 "schedule_meeting: topic is blank",
                 error_kind="invalid_args",
@@ -66,6 +70,8 @@ class ScheduleMeetingTool:
         *,
         session: "AsyncSession",
         bot: Any = None,
+        action_repo: Any = None,
+        action_id: int,
     ) -> ToolResult:
         """Post a Telegram meeting proposal message.
 
@@ -77,14 +83,14 @@ class ScheduleMeetingTool:
           chat_id    — the target chat where the proposal was posted
           message_id — Telegram message_id of the posted proposal
         """
-        if isinstance(args, ScheduleMeetingArgs):
-            topic = args.topic
-            proposed_time_text = args.proposed_time_text
-            participant_user_ids = list(args.participant_user_ids)
-        else:
-            topic = getattr(args, "topic", "")
-            proposed_time_text = getattr(args, "proposed_time_text", None)
-            participant_user_ids = list(getattr(args, "participant_user_ids", []))
+        if not isinstance(args, ScheduleMeetingArgs):
+            raise ButlerPlanError(
+                "schedule_meeting: args must be ScheduleMeetingArgs",
+                error_kind="invariant_broken",
+            )
+        topic = args.topic
+        proposed_time_text = args.proposed_time_text
+        participant_user_ids = list(args.participant_user_ids)
 
         chat_id = ctx.chat_id
 
@@ -102,7 +108,9 @@ class ScheduleMeetingTool:
         sent_message_id: int
         if bot is not None:
             # Production path: send via real Bot instance
-            msg = await bot.send_message(chat_id=chat_id, text=proposal_text)
+            # parse_mode=None: proposal_text may contain user-supplied content;
+            # never parse as HTML/Markdown to prevent injection (M1).
+            msg = await bot.send_message(chat_id=chat_id, text=proposal_text, parse_mode=None)
             sent_message_id = msg.message_id
         else:
             # Fallback: no bot available — log and mark as failed

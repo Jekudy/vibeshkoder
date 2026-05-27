@@ -193,8 +193,9 @@ async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str
     #   ledger call_type CHECK, rate buckets, card suggestions).
     # + T12-04 (074 butler_actions query/visibility_scope/plan_payload + confirmation_token).
     # + T12-05-fix (075 butler_action_confirmations.status adds 'revoked' value).
+    # + T12-06-fix C2 (076 butler_tool_invocations.posted_message_id).
     # Assert the current head explicitly; revisit when future migrations land.
-    assert current == "075"
+    assert current == "076"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(

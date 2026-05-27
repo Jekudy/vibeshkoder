@@ -58,13 +58,17 @@ class SuggestCardCreationTool:
         context: "ButlerEvidenceContext",
         args: BaseModel,
     ) -> None:
-        """Validate that title is non-blank."""
-        if isinstance(args, SuggestCardCreationArgs):
-            title = args.title
-        else:
-            title = getattr(args, "title", "") or ""
+        """Validate that title is non-blank.
 
-        if not title.strip():
+        Raises ButlerPlanError(invariant_broken) if args is not SuggestCardCreationArgs.
+        """
+        if not isinstance(args, SuggestCardCreationArgs):
+            raise ButlerPlanError(
+                "suggest_card_creation: args must be SuggestCardCreationArgs",
+                error_kind="invariant_broken",
+            )
+
+        if not args.title.strip():
             raise ButlerPlanError(
                 "suggest_card_creation: title is blank",
                 error_kind="invalid_args",
@@ -76,8 +80,9 @@ class SuggestCardCreationTool:
         args: BaseModel,
         *,
         session: "AsyncSession",
-        action_id: int = 0,
         bot: Any = None,
+        action_repo: Any = None,
+        action_id: int,
     ) -> ToolResult:
         """Write extraction_candidates + butler_card_suggestions rows.
 
@@ -96,20 +101,32 @@ class SuggestCardCreationTool:
             Validated SuggestCardCreationArgs.
         session
             Async SQLAlchemy session. Caller owns commit/rollback.
-        action_id
-            The butler_actions.id for the mapping row. Defaults to 0 (test path).
         bot
-            Not used by this tool (no Telegram output). Accepted for protocol
+            Not used by this tool (no Telegram output). Accepted for Protocol
             compatibility with the ButlerTool Protocol.
+        action_repo
+            Not used by this tool. Accepted for Protocol compatibility.
+        action_id
+            The butler_actions.id for the mapping row. Required — no default.
+            FK constraint on butler_card_suggestions.butler_action_id is NOT NULL
+            REFERENCES butler_actions(id) ON DELETE RESTRICT; id=0 would FK-violate.
+            Raises ButlerPlanError(invariant_broken) if 0 or absent (defense in depth).
         """
-        if isinstance(args, SuggestCardCreationArgs):
-            title = args.title
-            summary = args.summary or ""
-            tags = list(args.tags)
-        else:
-            title = getattr(args, "title", "")
-            summary = getattr(args, "summary", "") or ""
-            tags = list(getattr(args, "tags", []))
+        if not isinstance(args, SuggestCardCreationArgs):
+            raise ButlerPlanError(
+                "suggest_card_creation: args must be SuggestCardCreationArgs",
+                error_kind="invariant_broken",
+            )
+        # C3: action_id=0 default removed — caller MUST pass real PK.
+        # Defense in depth: if 0 slips through, fail before FK violation.
+        if not action_id:
+            raise ButlerPlanError(
+                "suggest_card_creation: action_id is required and must be non-zero",
+                error_kind="invariant_broken",
+            )
+        title = args.title
+        summary = args.summary or ""
+        tags = list(args.tags)
 
         # Build the candidate JSON payload (audit-safe, no raw user content beyond title)
         candidate_json = {

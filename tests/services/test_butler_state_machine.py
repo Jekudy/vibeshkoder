@@ -1251,7 +1251,16 @@ class FakeButlerTool:
     async def validate_policy(self, context: Any, args: Any) -> None:
         pass  # Always passes in happy path
 
-    async def execute(self, plan: Any, ctx: Any, *, session: Any) -> FakeToolResult:
+    async def execute(
+        self,
+        ctx: Any,
+        args: Any,
+        *,
+        session: Any,
+        bot: Any = None,
+        action_repo: Any = None,
+        action_id: int,
+    ) -> FakeToolResult:
         if self.should_fail:
             return FakeToolResult(success=False, error=self.fail_error)
         return FakeToolResult(success=True, payload={"result": "recalled"})

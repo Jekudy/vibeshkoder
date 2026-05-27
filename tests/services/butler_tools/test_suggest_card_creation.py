@@ -165,7 +165,7 @@ async def test_execute_creates_candidate_with_pending_status():
     args = SuggestCardCreationArgs(title="Rust practices", summary="Summary", tags=["rust"])
     session = _FakeSession()
 
-    result = await _TOOL.execute(ctx, args, session=session)
+    result = await _TOOL.execute(ctx, args, session=session, action_id=1)
 
     assert result.success is True
     # Find the ExtractionCandidate in session.added
@@ -181,7 +181,7 @@ async def test_execute_never_creates_approved_card():
     args = SuggestCardCreationArgs(title="Rust practices")
     session = _FakeSession()
 
-    await _TOOL.execute(ctx, args, session=session)
+    await _TOOL.execute(ctx, args, session=session, action_id=1)
 
     # No object in session.added should have status='approved' or 'active'
     for obj in session.added:
@@ -198,7 +198,7 @@ async def test_execute_creates_butler_card_suggestion_row():
     args = SuggestCardCreationArgs(title="Rust practices")
     session = _FakeSession()
 
-    await _TOOL.execute(ctx, args, session=session)
+    await _TOOL.execute(ctx, args, session=session, action_id=1)
 
     suggestions = [obj for obj in session.added if isinstance(obj, ButlerCardSuggestion)]
     assert len(suggestions) == 1
@@ -211,7 +211,7 @@ async def test_execute_payload_has_suggestion_id():
     args = SuggestCardCreationArgs(title="Rust practices")
     session = _FakeSession()
 
-    result = await _TOOL.execute(ctx, args, session=session)
+    result = await _TOOL.execute(ctx, args, session=session, action_id=1)
 
     assert result.success is True
     assert "butler_card_suggestion_id" in result.payload
@@ -240,7 +240,7 @@ async def test_execute_no_direct_db_execute():
             self.added = self._added
 
     session = _StrictSession()
-    result = await _TOOL.execute(ctx, args, session=session)
+    result = await _TOOL.execute(ctx, args, session=session, action_id=1)
     assert result.success is True
 
 
@@ -255,7 +255,7 @@ async def test_build_inverse_has_cancel_pending_kind():
     ctx = _make_ctx()
     args = SuggestCardCreationArgs(title="Test")
     session = _FakeSession()
-    result = await _TOOL.execute(ctx, args, session=session)
+    result = await _TOOL.execute(ctx, args, session=session, action_id=1)
 
     inverse = await _TOOL.build_inverse(result)
     assert inverse["rollback_kind"] == "cancel_pending"
@@ -267,7 +267,7 @@ async def test_build_inverse_has_suggestion_id():
     ctx = _make_ctx()
     args = SuggestCardCreationArgs(title="Test")
     session = _FakeSession()
-    result = await _TOOL.execute(ctx, args, session=session)
+    result = await _TOOL.execute(ctx, args, session=session, action_id=1)
 
     inverse = await _TOOL.build_inverse(result)
     assert "butler_card_suggestion_id" in inverse
@@ -278,8 +278,34 @@ async def test_build_inverse_deterministic():
     ctx = _make_ctx()
     args = SuggestCardCreationArgs(title="Test")
     session = _FakeSession()
-    result = await _TOOL.execute(ctx, args, session=session)
+    result = await _TOOL.execute(ctx, args, session=session, action_id=1)
 
     inv1 = await _TOOL.build_inverse(result)
     inv2 = await _TOOL.build_inverse(result)
     assert json.dumps(inv1, sort_keys=True) == json.dumps(inv2, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# C3: action_id=0 raises invariant_broken
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_action_id_zero_raises_invariant_broken():
+    """C3: action_id=0 must raise ButlerPlanError(invariant_broken) before FK violation.
+
+    butler_card_suggestions.butler_action_id is NOT NULL FK; id=0 would fail at
+    DB layer with IntegrityError. The defense-in-depth guard must catch this first.
+
+    Note: catches Exception (not ButlerPlanError) to avoid combined-mode _clear_modules
+    class-identity mismatch — the same issue documented in commit bd935c8. The
+    error_kind assertion is the meaningful check.
+    """
+    ctx = _make_ctx()
+    args = SuggestCardCreationArgs(title="Test Card")
+    session = _FakeSession()
+
+    with pytest.raises(Exception) as exc_info:
+        await _TOOL.execute(ctx, args, session=session, action_id=0)
+
+    assert getattr(exc_info.value, "error_kind", None) == "invariant_broken"

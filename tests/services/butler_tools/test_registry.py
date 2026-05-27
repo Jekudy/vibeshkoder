@@ -94,3 +94,26 @@ def test_dispatch_values_are_callable_tools():
         assert hasattr(tool, "validate_policy"), f"Tool {tool_name!r} missing validate_policy()"
         assert hasattr(tool, "build_inverse"), f"Tool {tool_name!r} missing build_inverse()"
         assert inspect.iscoroutinefunction(tool.execute), f"Tool {tool_name!r}.execute is not async"
+
+
+def test_each_tool_execute_signature_compliant():
+    """M5: each tool.execute has the required parameters matching the Protocol.
+
+    @runtime_checkable only checks attribute names — this test checks actual
+    parameter names to catch signature drift before production callsite breaks.
+    """
+    from bot.services.butler_tools import TOOL_DISPATCH
+    import inspect
+
+    # Required parameters from the updated Protocol (C1 fix).
+    # inspect.signature on a bound method omits 'self', so we check the non-self params.
+    required_params = {"ctx", "args", "session", "bot", "action_repo", "action_id"}
+
+    for tool_name, tool in TOOL_DISPATCH.items():
+        sig = inspect.signature(tool.execute)
+        actual_params = set(sig.parameters.keys())
+        missing = required_params - actual_params
+        assert not missing, (
+            f"Tool {tool_name!r}.execute missing parameters: {missing!r}. "
+            f"Got: {sorted(actual_params)!r}"
+        )

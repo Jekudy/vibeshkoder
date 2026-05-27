@@ -127,7 +127,7 @@ async def test_execute_returns_success_with_evidence_ids():
     """execute returns ToolResult with success=True and evidence_ids in payload."""
     ctx = _make_ctx((10, 20))
     args = RecallEvidenceArgs(query="who knows Python?")
-    result = await _TOOL.execute(ctx, args, session=_FakeSession())
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), action_id=1)
 
     assert isinstance(result, ToolResult)
     assert result.success is True
@@ -140,7 +140,7 @@ async def test_execute_payload_has_context_hash():
     """execute payload includes context_hash from the sealed ctx."""
     ctx = _make_ctx((5,))
     args = RecallEvidenceArgs(query="something")
-    result = await _TOOL.execute(ctx, args, session=_FakeSession())
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), action_id=1)
 
     assert result.payload["context_hash"] == ctx.context_hash
 
@@ -158,7 +158,7 @@ async def test_execute_no_direct_db_calls():
     spy = _SpySession()
     ctx = _make_ctx()
     args = RecallEvidenceArgs(query="test")
-    await _TOOL.execute(ctx, args, session=spy)
+    await _TOOL.execute(ctx, args, session=spy, action_id=1)
     assert spy.calls == 0, "recall_evidence must not issue direct DB queries"
 
 
@@ -172,7 +172,7 @@ async def test_build_inverse_is_not_reversible():
     """build_inverse returns rollback_kind='not_reversible' (no Telegram effect)."""
     ctx = _make_ctx()
     args = RecallEvidenceArgs(query="test")
-    result = await _TOOL.execute(ctx, args, session=_FakeSession())
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), action_id=1)
     inverse = await _TOOL.build_inverse(result)
 
     assert inverse["rollback_kind"] == "not_reversible"
@@ -183,7 +183,7 @@ async def test_build_inverse_is_deterministic():
     """Same ToolResult always produces identical inverse_op_payload bytes."""
     ctx = _make_ctx((7, 8))
     args = RecallEvidenceArgs(query="test")
-    result = await _TOOL.execute(ctx, args, session=_FakeSession())
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), action_id=1)
 
     inv1 = await _TOOL.build_inverse(result)
     inv2 = await _TOOL.build_inverse(result)
@@ -201,7 +201,7 @@ async def test_execute_payload_no_snippet_text():
     """execute payload does NOT include raw snippet text (privacy rule)."""
     ctx = _make_ctx((3,))
     args = RecallEvidenceArgs(query="who knows Python?")
-    result = await _TOOL.execute(ctx, args, session=_FakeSession())
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), action_id=1)
 
     payload_str = json.dumps(result.payload)
     assert "snippet content" not in payload_str
