@@ -2251,3 +2251,71 @@ class ButlerCardSuggestion(Base):
         ),
         nullable=False,
     )
+
+
+# ─── Phase 12: Butler undo audit (T12-07 / alembic 077) ──────────────────────
+
+
+class ButlerUndoInvocation(Base):
+    """Per-step undo audit row — one row per tool invocation rolled back during /butler_undo.
+
+    The UNIQUE constraint on (butler_action_id, butler_tool_invocation_id) provides
+    idempotency: re-running /butler_undo on an already-undone action returns the
+    existing rows, no double-side-effect.
+
+    FK to butler_actions ON DELETE RESTRICT — undo audit rows cannot outlive
+    the parent action (immutable audit chain). Cascade integration: forget_cascade
+    _cascade_butler_actions must run AFTER this layer so undo audit rows are
+    processed before the parent action row is masked.
+    """
+
+    __tablename__ = "butler_undo_invocations"
+    __table_args__ = (
+        CheckConstraint(
+            "rollback_kind IN ("
+            "'not_reversible','delete_message','edit_message',"
+            "'followup_correction','cancel_pending'"
+            ")",
+            name="ck_butler_undo_invocations_rollback_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending','succeeded','failed','skipped_not_reversible')",
+            name="ck_butler_undo_invocations_status",
+        ),
+        UniqueConstraint(
+            "butler_action_id",
+            "butler_tool_invocation_id",
+            name="uq_butler_undo_invocations_action_invocation",
+        ),
+        Index("ix_butler_undo_invocations_butler_action_id", "butler_action_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    butler_action_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "butler_actions.id",
+            name="fk_butler_undo_action_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    butler_tool_invocation_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "butler_tool_invocations.id",
+            name="fk_butler_undo_invocation_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    requester_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    rollback_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'pending'")
+    )
+    error_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
