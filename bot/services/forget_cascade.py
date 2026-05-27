@@ -185,6 +185,10 @@ CASCADE_LAYER_ORDER: tuple[str, ...] = (
     # with ON DELETE RESTRICT, so children MUST be processed before parent.
     "butler_action_confirmations",
     "butler_tool_invocations",
+    # T12-07: butler_undo_invocations MUST run AFTER butler_tool_invocations
+    # (FK constraint: undo rows reference tool invocation ids) and BEFORE
+    # butler_actions (parent audit row must survive until child undo rows are redacted).
+    "butler_undo_invocations",
     "butler_actions",
 )
 
@@ -1630,6 +1634,78 @@ async def _cascade_butler_actions(session: AsyncSession, event) -> int:
     return count
 
 
+async def _cascade_butler_undo_invocations(session: AsyncSession, event) -> int:
+    """Redact butler_undo_invocations rows tied to a forget event (T12-07).
+
+    For all undo invocations belonging to affected butler_actions:
+        SET error_message = '[CONTENT_REDACTED: forget_event_id=<n>]'
+        WHERE error_message IS NOT NULL
+        AND (error_message LIKE '[CONTENT_REDACTED%') IS FALSE  -- idempotency guard.
+
+    Preserves the undo audit row itself (status, rollback_kind) so the audit chain
+    remains intact; only user-visible error text is masked.
+
+    Convention note (write-side): affected rows resolved via event.target_id +
+        _resolve_affected_mvids — write-side cascade convention; read-side filters
+        use fe.tombstone_key prefix.
+
+    Returns count of rows modified.
+    """
+    from sqlalchemy import bindparam
+    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+    from sqlalchemy.types import BigInteger
+
+    mvids = await _resolve_affected_mvids(session, event)
+    action_ids: list[int] = []
+
+    if mvids:
+        rows = await session.execute(
+            text(
+                "SELECT id FROM butler_actions "
+                "WHERE evidence_ids @> ANY("
+                "  SELECT jsonb_build_array(v::bigint) "
+                "  FROM unnest(CAST(:mvids AS bigint[])) AS v"
+                ")"
+            ).bindparams(bindparam("mvids", type_=PG_ARRAY(BigInteger))),
+            {"mvids": list(mvids)},
+        )
+        action_ids = [r[0] for r in rows]
+
+    if event.target_type == "user" and event.target_id is not None:
+        try:
+            tg_id = int(event.target_id)
+        except (TypeError, ValueError):
+            pass
+        else:
+            rows = await session.execute(
+                text("SELECT id FROM butler_actions WHERE requester_tg_id = :tg_id"),
+                {"tg_id": tg_id},
+            )
+            for r in rows:
+                if r[0] not in action_ids:
+                    action_ids.append(r[0])
+
+    if not action_ids:
+        return 0
+
+    redact_text = f"[CONTENT_REDACTED: forget_event_id={event.id}]"
+    result = await session.execute(
+        text(
+            "UPDATE butler_undo_invocations "
+            "SET error_message = :redact_text "
+            "WHERE butler_action_id = ANY(CAST(:action_ids AS bigint[])) "
+            "  AND error_message IS NOT NULL "
+            "  AND error_message NOT LIKE '[CONTENT_REDACTED%' "
+            "RETURNING id"
+        ).bindparams(bindparam("action_ids", type_=PG_ARRAY(BigInteger))),
+        {"action_ids": action_ids, "redact_text": redact_text},
+    )
+    count = len(result.fetchall())
+    if count:
+        await session.flush()
+    return count
+
+
 # Map layer name → cascade function. Layers absent from this map are recorded as
 # skipped. When a future phase adds a layer's table, add its function here.
 _LAYER_FUNCS: dict[str, Any] = {
@@ -1652,6 +1728,8 @@ _LAYER_FUNCS: dict[str, Any] = {
     # T12-01 Phase 12 layers — PHASE12_PLAN_REFRESH.md §4.4. Runs AFTER graph_nodes.
     "butler_action_confirmations": _cascade_butler_action_confirmations,
     "butler_tool_invocations": _cascade_butler_tool_invocations,
+    # T12-07: undo audit runs AFTER tool invocations, BEFORE parent action row.
+    "butler_undo_invocations": _cascade_butler_undo_invocations,
     "butler_actions": _cascade_butler_actions,
 }
 
