@@ -73,8 +73,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import settings
 from bot.db.repos.butler_action import ButlerActionRepo
 from bot.db.repos.butler_action_confirmation import ButlerActionConfirmationRepo
+from bot.db.repos.butler_card_suggestion import ButlerCardSuggestionRepo
 from bot.db.repos.butler_rate_bucket import ButlerRateBucketRepo
 from bot.db.repos.butler_tool_invocation import ButlerToolInvocationRepo
+from bot.db.repos.butler_undo_invocation import ButlerUndoInvocationRepo
 from bot.db.repos.feature_flag import FeatureFlagRepo
 from bot.db.repos.user import UserRepo
 
@@ -100,6 +102,7 @@ router = Router(name="butler")
 
 # Feature flag keys
 BUTLER_MASTER_FLAG = "memory.butler.enabled"
+BUTLER_UNDO_FLAG = "memory.butler.undo.enabled"
 BUTLER_RECALL_FLAG = "memory.butler.recall_evidence.enabled"
 BUTLER_MEETING_FLAG = "memory.butler.schedule_meeting.enabled"
 BUTLER_INTRO_FLAG = "memory.butler.send_intro.enabled"
@@ -134,6 +137,20 @@ _MSG_BAD_TOKEN = "Ссылка на подтверждение недейств�
 _MSG_ALREADY_CONFIRMED = "Вы уже подтвердили это действие."
 _MSG_PLAN_ERROR = "Не удалось спланировать действие. Попробуйте другой запрос."
 _MSG_UNDO_STUB = "Отмена действий появится в следующем обновлении."
+_MSG_UNDO_FLAG_OFF = "Функция отмены ещё не включена."
+_MSG_UNDO_USAGE = "Использование: /butler_undo <action_id>"
+_MSG_UNDO_BAD_ID = "Неверный формат action_id."
+_MSG_UNDO_TTL_EXPIRED = "Действие уже нельзя отменить — прошло слишком много времени."
+_MSG_UNDO_WRONG_STATUS = "Это действие нельзя откатить в текущем состоянии."
+_MSG_UNDO_COMPLETE = "Откат выполнен."
+
+# Per-step result icons for undo summary rendering
+_UNDO_STEP_ICONS: dict[str, str] = {
+    "succeeded": "✅",
+    "failed": "❌",
+    "skipped_not_reversible": "⏭️",
+    "pending": "⏳",
+}
 _MSG_TOOL_DISABLED = "Этот инструмент сейчас недоступен."
 _MSG_AFFECTED_UNREACHABLE = (
     "Не удалось отправить запрос участнику(ам) — действие не будет выполнено."
@@ -339,6 +356,18 @@ def _build_butler_service(session: AsyncSession) -> ButlerService:
         evidence_builder=_EVIDENCE_BUILDER,
         settings=_STUB_SETTINGS,
     )
+
+
+def _build_undo_service(session: AsyncSession) -> ButlerService:
+    """Construct a ButlerService wired with undo-specific repos (T12-07).
+
+    Extends _build_butler_service with undo invocation + card suggestion repos
+    so that execute_undo can write audit rows and dismiss pending card suggestions.
+    """
+    svc = _build_butler_service(session)
+    svc._undo_invocation_repo = ButlerUndoInvocationRepo  # type: ignore[attr-defined]
+    svc._card_suggestion_repo = ButlerCardSuggestionRepo  # type: ignore[attr-defined]
+    return svc
 
 
 # ---------------------------------------------------------------------------
@@ -671,8 +700,24 @@ async def handle_butler_cancel(
 
 
 # ---------------------------------------------------------------------------
-# /butler_undo command (stub — T12-07 scope)
+# /butler_undo command (T12-07 — full rollback implementation)
 # ---------------------------------------------------------------------------
+
+
+def _render_undo_summary(summary: Any) -> str:
+    """Render a human-readable undo summary with per-step result icons."""
+    steps = summary.get("steps", []) if isinstance(summary, dict) else []
+    lines = ["🔄 <b>Откат Butler действия</b>"]
+    for step in steps:
+        if step is None:
+            continue
+        status = getattr(step, "status", "unknown")
+        rollback_kind = getattr(step, "rollback_kind", "?")
+        icon = _UNDO_STEP_ICONS.get(status, "❓")
+        lines.append(f"{icon} {rollback_kind}: {status}")
+    lines.append("")
+    lines.append(_MSG_UNDO_COMPLETE)
+    return "\n".join(lines)
 
 
 @router.message(Command("butler_undo"), PrivateChatFilter())
@@ -681,8 +726,23 @@ async def handle_butler_undo(
     command: CommandObject,
     session: AsyncSession,
 ) -> None:
-    """Stub handler — full rollback arrives in T12-07."""
+    """Handle /butler_undo <action_id> — rolls back a succeeded butler action.
+
+    Auth: member or admin only, DM-only (PrivateChatFilter).
+    Feature flags: memory.butler.enabled AND memory.butler.undo.enabled (both default OFF).
+    """
+    # Master flag gate
     if not await FeatureFlagRepo.get(session, BUTLER_MASTER_FLAG):
+        return
+
+    # Undo sub-flag gate (default OFF — returns stub message when undo not yet enabled)
+    if not await FeatureFlagRepo.get(session, BUTLER_UNDO_FLAG):
+        if message.from_user is not None:
+            user = await UserRepo.get(session, message.from_user.id)
+            if user is not None and (
+                getattr(user, "is_member", False) or getattr(user, "is_admin", False)
+            ):
+                await message.reply(_MSG_UNDO_STUB)
         return
 
     if message.from_user is None:
@@ -695,7 +755,68 @@ async def handle_butler_undo(
         # H3: silent rejection for non-members
         return
 
-    await message.reply(_MSG_UNDO_STUB)
+    args = (command.args or "").strip()
+    if not args:
+        await session.rollback()
+        await message.reply(_MSG_UNDO_USAGE)
+        return
+
+    try:
+        action_id = int(args)
+    except ValueError:
+        await session.rollback()
+        await message.reply(_MSG_UNDO_BAD_ID)
+        return
+
+    butler = _build_undo_service(session)
+
+    try:
+        summary = await butler.execute_undo(
+            action_id=action_id,
+            requester_user_id=message.from_user.id,
+            is_admin=_is_admin(message.from_user.id),
+            bot=message.bot,
+        )
+    except CascadeInFlightError:
+        await session.rollback()
+        await message.reply(_MSG_CASCADE_IN_FLIGHT)
+        return
+    except ButlerActionRejectedError as exc:
+        await session.rollback()
+        await message.reply(_dispatch_butler_error(exc))
+        return
+    except ButlerActionError as exc:
+        await session.rollback()
+        kind = exc.error_kind or ""
+        if kind == "ttl_expired":
+            await message.reply(_MSG_UNDO_TTL_EXPIRED)
+        elif kind == "wrong_status":
+            await message.reply(_MSG_UNDO_WRONG_STATUS)
+        elif kind == "not_found":
+            await message.reply(_MSG_NOT_FOUND)
+        elif kind == "forbidden":
+            await message.reply(_MSG_FORBIDDEN)
+        else:
+            logger.info(
+                "butler_undo: error kind=%s action_id=%s",
+                kind,
+                action_id,
+                extra={"user_id": message.from_user.id},
+            )
+            await message.reply(_MSG_UNDO_WRONG_STATUS)
+        return
+    except Exception:
+        logger.exception(
+            "butler_undo: unexpected error for action_id=%s",
+            action_id,
+            extra={"user_id": message.from_user.id},
+        )
+        await session.rollback()
+        await message.reply(_MSG_UNDO_WRONG_STATUS)
+        return
+
+    summary_text = _render_undo_summary(summary)
+    await message.reply(summary_text, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
