@@ -111,8 +111,6 @@ class FakeButlerAction:
     visibility_scope: str = "member"
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
-    # succeeded_at is used for TTL check — using executed_at as proxy
-    succeeded_at: datetime | None = field(default_factory=_now)
 
 
 @dataclass
@@ -279,8 +277,8 @@ class FakeButlerCardSuggestionRepo:
     async def get_for_action(self, session: Any, butler_action_id: int) -> FakeButlerCardSuggestion | None:
         return self._suggestion
 
-    async def dismiss_by_undo(self, session: Any, butler_action_id: int) -> int:
-        self.updates.append({"butler_action_id": butler_action_id, "action": "dismiss_by_undo"})
+    async def dismiss_by_undo(self, session: Any, butler_action_id: int, *, reviewer_user_id: int) -> int:
+        self.updates.append({"butler_action_id": butler_action_id, "action": "dismiss_by_undo", "reviewer_user_id": reviewer_user_id})
         return 1
 
 
@@ -293,16 +291,15 @@ def _make_action(
     *,
     requester_tg_id: int = REQUESTER_ID,
     status: str = "succeeded",
-    succeeded_at: datetime | None = None,
+    executed_at: datetime | None = None,
     inverse_op_payload: dict | None = None,
 ) -> FakeButlerAction:
     action = FakeButlerAction(
         id=ACTION_ID,
         requester_tg_id=requester_tg_id,
         status=status,
-        executed_at=succeeded_at or _now(),
+        executed_at=executed_at or _now(),
     )
-    action.succeeded_at = succeeded_at or _now()
     action.inverse_op_payload = inverse_op_payload
     return action
 
@@ -345,10 +342,12 @@ def _make_service(
     ledger_repo = MagicMock()
     confirmation_repo = MagicMock()
     rate_bucket_repo = MagicMock()
-    user_repo = MagicMock()
+    # user_repo.get must be awaitable since M3 admin verify uses await user_repo.get(...)
+    user_repo = AsyncMock()
+    user_repo.get = AsyncMock(return_value=None)
     llm_gateway = MagicMock()
     evidence_builder = MagicMock()
-    settings = MagicMock()
+    settings = MagicMock(butler_undo_ttl_minutes=60)
 
     svc = ButlerService(
         session=session,
@@ -361,10 +360,9 @@ def _make_service(
         llm_gateway=llm_gateway,
         evidence_builder=evidence_builder,
         settings=settings,
+        undo_invocation_repo=undo_inv_repo,
+        card_suggestion_repo=card_sugg_repo,
     )
-    # Inject undo-specific repos
-    svc._undo_invocation_repo = undo_inv_repo  # type: ignore[attr-defined]
-    svc._card_suggestion_repo = card_sugg_repo  # type: ignore[attr-defined]
     return svc
 
 
@@ -469,13 +467,18 @@ def test_edit_message_happy() -> None:
 
 
 def test_followup_correction_happy() -> None:
-    """rollback_kind=followup_correction → bot.send_message called with correction_text."""
+    """rollback_kind=followup_correction → bot.delete_message called with followup_message_id.
+
+    C4 fix: update_intro.build_inverse emits {followup_message_id, chat_id}.
+    Undo = delete the follow-up message (cleaner than posting another message).
+    """
+    followup_msg_id = 7788
     inv = _make_invocation(
         rollback_kind="followup_correction",
         inverse_op_payload={
             "rollback_kind": "followup_correction",
             "chat_id": CHAT_ID,
-            "correction_text": "This was a correction.",
+            "followup_message_id": followup_msg_id,
         },
     )
     action = _make_action()
@@ -486,7 +489,9 @@ def test_followup_correction_happy() -> None:
 
     asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
 
-    bot.send_message.assert_awaited_once_with(chat_id=CHAT_ID, text="This was a correction.")
+    # C4: delete the follow-up message instead of sending a correction
+    bot.delete_message.assert_awaited_once_with(chat_id=CHAT_ID, message_id=followup_msg_id)
+    bot.send_message.assert_not_awaited()
     assert any(u["status"] == "succeeded" for u in undo_repo.updates)
 
 
@@ -595,7 +600,7 @@ def test_wrong_status_pending() -> None:
 
 def test_ttl_expired() -> None:
     """Undo after TTL window → ButlerActionError(ttl_expired)."""
-    action = _make_action(succeeded_at=_past(BUTLER_UNDO_TTL_MINUTES + 1))
+    action = _make_action(executed_at=_past(BUTLER_UNDO_TTL_MINUTES + 1))
     svc = _make_service(action=action)
 
     with pytest.raises(ButlerActionError) as exc_info:

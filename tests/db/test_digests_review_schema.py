@@ -148,9 +148,11 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     Migration 074: butler_actions query/visibility_scope/plan_payload + confirmation_token (T12-04).
     Migration 075: butler_action_confirmations.status adds 'revoked' (T12-05-fix C1).
     Migration 076: T12-06-fix C2 — butler_tool_invocations.posted_message_id.
+    Migration 077: T12-07 — butler_undo_invocations table + status widened with 'undone'.
+    Migration 078: T12-07-fix C1 — butler_tool_invocations.inverse_op_payload column.
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "076"
+    assert current == "078"
 
 
 # ─── Test: upgrade adds 4 review columns with correct types/nullability ──────
