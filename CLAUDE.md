@@ -317,6 +317,26 @@ Operator steps: none. 2-round dual-model review: Claude product ACCEPTED +
 Claude tech APPROVE (Codex companion stalled; fell back to second Claude
 reviewer per Rule 7).
 
+**Phase 12 (Butler) — T12-08 (TTL expiry worker + per-user budget + monthly cap filter) PR #350 pending merge, 2026-05-27.**
+Wave 3 sprint: abuse controls + scheduler reaper. Key invariants: (1) TTL worker
+(`butler_expire_tick_job`) only fires when master flag `memory.butler.enabled`=ON —
+gated by flag check at tick start, not at job registration. (2) Budget check
+(`ButlerBudgetChecker.is_user_daily_exceeded`) wired into `ButlerService.plan_action`
+between rate-bucket increments and evidence build: on ceiling hit → rate buckets
+rolled back + audit ledger row + raises `ButlerActionError(error_kind='budget_exceeded')`.
+(3) Monthly butler LLM cap sums both `call_type='butler_decision'` and
+`call_type='butler_summary'` (H1 fix — TODO removed). Round-2 fix cycle
+(4 commits `b1ca1cf`..`92326c3`): C1 budget wiring, H1 monthly call_type filter,
+H2 `get_pending_past_ttl` LIMIT (default 200), H3 `LedgerRepoProtocol` signature,
+M1 `_expire_action_inline` free function (avoids `ButlerService(None,...)` antipattern),
+M2 `expire_action` FOR UPDATE NOWAIT, M3 `.env.example` new vars documented,
+M4 configurable fake session in tests. No migration (uses existing
+`butler_actions.expires_at` from T12-04 + `llm_usage_ledger`). 80 tests green.
+Phase 11 binding **86 → 86** (delta 0; L12/C10/I9/R8/G3 family lands in T12-09).
+Commits `e8dc08f`..`92326c3`. No flag flipped. Rollout: `docs/rollout-fragments/phase12/T12-08.md`.
+2-round dual-model review: Claude product ACCEPTED + Claude tech APPROVE (Codex companion
+stalled; fell back to second Claude reviewer per Rule 7). FHR required at T12-10 (cycle-end).
+
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
 
