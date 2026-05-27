@@ -446,3 +446,36 @@ def validate_butler_plan(
         validated_actions.append(canonical_step)
 
     return plan.model_copy(update={"actions": tuple(validated_actions)})
+
+
+# ---------------------------------------------------------------------------
+# TOOL_DISPATCH — maps tool_name → ButlerTool instance (T12-06)
+# ---------------------------------------------------------------------------
+# Lazy imports to avoid circular imports between butler.py and tool modules.
+# Import the concrete implementations at module load time (they are safe to import
+# without DB connection — all state is in the Protocol instance, not module-level).
+
+def _build_tool_dispatch() -> "dict[str, ButlerTool]":
+    """Build the TOOL_DISPATCH registry from the 5 tool implementations."""
+    from bot.services.butler_tools.recall_evidence import RecallEvidenceTool
+    from bot.services.butler_tools.schedule_meeting import ScheduleMeetingTool
+    from bot.services.butler_tools.send_intro import SendIntroTool
+    from bot.services.butler_tools.suggest_card_creation import SuggestCardCreationTool
+    from bot.services.butler_tools.update_intro import UpdateIntroTool
+
+    tools: list[ButlerTool] = [
+        RecallEvidenceTool(),
+        ScheduleMeetingTool(),
+        SendIntroTool(),
+        UpdateIntroTool(),
+        SuggestCardCreationTool(),
+    ]
+    dispatch = {t.name: t for t in tools}
+    # Invariant: TOOL_DISPATCH keys must exactly match ALLOWED_BUTLER_TOOLS.
+    assert set(dispatch.keys()) == set(ALLOWED_BUTLER_TOOLS), (
+        f"TOOL_DISPATCH keys {set(dispatch.keys())} != ALLOWED_BUTLER_TOOLS {set(ALLOWED_BUTLER_TOOLS)}"
+    )
+    return dispatch
+
+
+TOOL_DISPATCH: "dict[str, ButlerTool]" = _build_tool_dispatch()
