@@ -1347,6 +1347,295 @@ class ButlerService:
         return updated or action
 
     # -----------------------------------------------------------------------
+    # execute_undo
+    # -----------------------------------------------------------------------
+
+    async def execute_undo(
+        self,
+        *,
+        action_id: int,
+        requester_user_id: int,
+        is_admin: bool = False,
+        bot: Any = None,
+        undo_ttl_minutes: int = 60,
+    ) -> Any:
+        """Execute undo for a succeeded butler action — rolls back tool invocations LIFO.
+
+        Steps
+        -----
+        1. SELECT FOR UPDATE NOWAIT on butler_actions row (cascade coordination).
+        2. Auth check: requester_user_id == action.requester_tg_id OR is_admin.
+        3. Status check: action.status MUST be 'succeeded' or 'undone' (idempotent re-run).
+        4. TTL check: now - action.succeeded_at <= undo_ttl_minutes.
+        5. Idempotency: if all undo_invocations rows already exist with succeeded/skipped
+           status → return existing summary without re-executing.
+        6. Load all tool invocations for action; process LIFO (reverse invocation_seq order).
+        7. Per rollback_kind:
+           - not_reversible → write skipped_not_reversible audit row, continue.
+           - delete_message → bot.delete_message; write succeeded/failed audit row.
+           - edit_message → bot.edit_message_text; write succeeded/failed audit row.
+           - followup_correction → bot.send_message; write succeeded/failed audit row.
+           - cancel_pending → update card suggestion; write succeeded/failed audit row.
+        8. Transition action.status → 'undone'.
+        9. Return undo summary (list of per-step audit rows).
+
+        Raises:
+          CascadeInFlightError — forget_cascade holds the parent row lock.
+          ButlerActionError(forbidden) — requester is neither owner nor admin.
+          ButlerActionError(wrong_status) — action not in succeeded/undone state.
+          ButlerActionError(ttl_expired) — outside the undo TTL window.
+          ButlerActionError(not_found) — action_id does not exist.
+        """
+        import os as _os
+
+        _undo_ttl_min = int(_os.environ.get("BUTLER_UNDO_TTL_MINUTES", str(undo_ttl_minutes)))
+
+        # Step 1 — FOR UPDATE NOWAIT (cascade coordination)
+        try:
+            action = await self._action_repo.get_for_update(self._session, action_id)
+        except _SAOperationalError as exc:
+            raise CascadeInFlightError(
+                f"butler_actions(id={action_id}) locked by cascade (NOWAIT) — try again",
+                error_kind="cascade_in_flight",
+                action_id=action_id,
+            ) from exc
+        if action is None:
+            raise CascadeInFlightError(
+                f"butler_actions(id={action_id}) locked by cascade",
+                error_kind="cascade_in_flight",
+                action_id=action_id,
+            )
+
+        # Step 2 — auth check
+        if action.requester_tg_id != requester_user_id and not is_admin:
+            raise ButlerActionRejectedError(
+                f"user {requester_user_id} not authorized to undo action {action_id}",
+                error_kind="forbidden",
+                action_id=action_id,
+            )
+
+        # Step 3 — status check: only 'succeeded' can be undone; 'undone' is idempotent
+        if action.status not in ("succeeded", "undone"):
+            raise ButlerActionError(
+                f"action_id={action_id} cannot be undone (status={action.status!r})",
+                error_kind="wrong_status",
+                action_id=action_id,
+            )
+
+        # Step 4 — TTL check (using executed_at as proxy for succeeded_at)
+        # If the model has succeeded_at use it; fall back to executed_at.
+        _succeeded_at = getattr(action, "succeeded_at", None) or action.executed_at
+        if _succeeded_at is not None:
+            age_minutes = (_now_utc() - _succeeded_at).total_seconds() / 60
+            if age_minutes > _undo_ttl_min:
+                raise ButlerActionError(
+                    f"action_id={action_id} undo TTL expired ({age_minutes:.1f} min > {_undo_ttl_min} min)",
+                    error_kind="ttl_expired",
+                    action_id=action_id,
+                )
+
+        # Step 5 — idempotency: load existing undo rows
+        undo_repo = getattr(self, "_undo_invocation_repo", None)
+        card_suggestion_repo = getattr(self, "_card_suggestion_repo", None)
+
+        # Load all tool invocations BEFORE idempotency check
+        invocations = await self._invocation_repo.list_for_action(self._session, action_id)
+
+        if undo_repo is not None and invocations:
+            # Check if all invocations already have undo rows in a terminal state
+            existing_undo_rows = []
+            all_have_terminal = True
+            for inv in invocations:
+                existing = await undo_repo.find_by_action_and_invocation(
+                    self._session, action_id, inv.id
+                )
+                if existing is not None and existing.status in (
+                    "succeeded", "failed", "skipped_not_reversible"
+                ):
+                    existing_undo_rows.append(existing)
+                else:
+                    all_have_terminal = False
+
+            if all_have_terminal and len(existing_undo_rows) == len(invocations):
+                # Already fully undone — return existing summary
+                logger.info(
+                    "butler:execute_undo: idempotent re-run, returning existing summary action_id=%s",
+                    action_id,
+                )
+                return {"action_id": action_id, "status": "undone", "steps": existing_undo_rows}
+
+        # Step 6 — process LIFO (reverse invocation_seq order)
+        sorted_invocations = sorted(
+            invocations,
+            key=lambda inv: getattr(inv, "invocation_seq", 0),
+            reverse=True,  # LIFO
+        )
+
+        undo_step_rows = []
+
+        for inv in sorted_invocations:
+            inv_payload = inv.inverse_op_payload or {}
+            rollback_kind = inv_payload.get("rollback_kind", "not_reversible")
+
+            # Create audit row (pending → will be updated to final status)
+            undo_row = None
+            if undo_repo is not None:
+                # Check for existing row first (partial idempotency)
+                undo_row = await undo_repo.find_by_action_and_invocation(
+                    self._session, action_id, inv.id
+                )
+                if undo_row is None:
+                    undo_row = await undo_repo.create(
+                        self._session,
+                        butler_action_id=action_id,
+                        butler_tool_invocation_id=inv.id,
+                        requester_user_id=requester_user_id,
+                        rollback_kind=rollback_kind,
+                        status="pending",
+                    )
+
+            # Step 7 — dispatch by rollback_kind
+            if rollback_kind == "not_reversible":
+                final_status = "skipped_not_reversible"
+                err_kind = None
+                err_msg = None
+            elif rollback_kind == "delete_message":
+                final_status, err_kind, err_msg = await self._undo_delete_message(
+                    inv_payload, bot
+                )
+            elif rollback_kind == "edit_message":
+                final_status, err_kind, err_msg = await self._undo_edit_message(
+                    inv_payload, bot
+                )
+            elif rollback_kind == "followup_correction":
+                final_status, err_kind, err_msg = await self._undo_followup_correction(
+                    inv_payload, bot
+                )
+            elif rollback_kind == "cancel_pending":
+                final_status, err_kind, err_msg = await self._undo_cancel_pending(
+                    inv_payload, action_id, card_suggestion_repo
+                )
+            else:
+                # Unknown rollback_kind — treat as not_reversible
+                logger.warning(
+                    "butler:execute_undo: unknown rollback_kind=%r for invocation %s",
+                    rollback_kind,
+                    inv.id,
+                )
+                final_status = "skipped_not_reversible"
+                err_kind = "unknown_rollback_kind"
+                err_msg = f"unknown rollback_kind={rollback_kind!r}"
+
+            # Update audit row to final status
+            if undo_repo is not None and undo_row is not None:
+                if undo_row.status == "pending":
+                    await undo_repo.update_status(
+                        self._session,
+                        undo_row.id,
+                        status=final_status,
+                        error_kind=err_kind,
+                        error_message=err_msg,
+                    )
+            elif undo_row is not None:
+                undo_row.status = final_status  # type: ignore[attr-defined]
+
+            undo_step_rows.append(undo_row)
+
+        # Step 8 — transition action to 'undone'
+        await self._action_repo.update_status(
+            self._session,
+            action_id,
+            status="undone",
+            undone_at=_now_utc(),
+        )
+
+        return {"action_id": action_id, "status": "undone", "steps": undo_step_rows}
+
+    # -----------------------------------------------------------------------
+    # execute_undo helpers
+    # -----------------------------------------------------------------------
+
+    async def _undo_delete_message(
+        self,
+        payload: dict,
+        bot: Any,
+    ) -> tuple[str, str | None, str | None]:
+        """Execute delete_message rollback. Returns (status, error_kind, error_message)."""
+        chat_id = payload.get("chat_id")
+        message_id = payload.get("message_id")
+        if chat_id is None or message_id is None:
+            return "failed", "missing_payload_fields", "chat_id or message_id missing from inverse_op_payload"
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            return "succeeded", None, None
+        except Exception as exc:
+            logger.warning(
+                "butler:execute_undo: delete_message failed chat_id=%s message_id=%s: %s",
+                chat_id, message_id, exc,
+            )
+            return "failed", "telegram_error", str(exc)[:200]
+
+    async def _undo_edit_message(
+        self,
+        payload: dict,
+        bot: Any,
+    ) -> tuple[str, str | None, str | None]:
+        """Execute edit_message rollback. Returns (status, error_kind, error_message)."""
+        chat_id = payload.get("chat_id")
+        message_id = payload.get("message_id")
+        prior_text = payload.get("prior_text")
+        if chat_id is None or message_id is None or prior_text is None:
+            return "failed", "missing_payload_fields", "chat_id, message_id, or prior_text missing"
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=prior_text)
+            return "succeeded", None, None
+        except Exception as exc:
+            logger.warning(
+                "butler:execute_undo: edit_message_text failed chat_id=%s message_id=%s: %s",
+                chat_id, message_id, exc,
+            )
+            return "failed", "telegram_error", str(exc)[:200]
+
+    async def _undo_followup_correction(
+        self,
+        payload: dict,
+        bot: Any,
+    ) -> tuple[str, str | None, str | None]:
+        """Execute followup_correction rollback. Returns (status, error_kind, error_message)."""
+        chat_id = payload.get("chat_id")
+        correction_text = payload.get("correction_text")
+        if chat_id is None or correction_text is None:
+            return "failed", "missing_payload_fields", "chat_id or correction_text missing"
+        try:
+            await bot.send_message(chat_id=chat_id, text=correction_text)
+            return "succeeded", None, None
+        except Exception as exc:
+            logger.warning(
+                "butler:execute_undo: send_message failed chat_id=%s: %s",
+                chat_id, exc,
+            )
+            return "failed", "telegram_error", str(exc)[:200]
+
+    async def _undo_cancel_pending(
+        self,
+        payload: dict,
+        action_id: int,
+        card_suggestion_repo: Any,
+    ) -> tuple[str, str | None, str | None]:
+        """Execute cancel_pending rollback. Returns (status, error_kind, error_message)."""
+        if card_suggestion_repo is None:
+            return "skipped_not_reversible", "no_card_suggestion_repo", "card_suggestion_repo not wired"
+        try:
+            await card_suggestion_repo.dismiss_by_undo(self._session, action_id)
+            return "succeeded", None, None
+        except Exception as exc:
+            logger.warning(
+                "butler:execute_undo: cancel_pending failed for action_id=%s: %s",
+                action_id, exc,
+            )
+            return "failed", "repo_error", str(exc)[:200]
+
+    # -----------------------------------------------------------------------
     # expire_action
     # -----------------------------------------------------------------------
 
