@@ -443,15 +443,81 @@ async def test_budget_cap_at_exact_ceiling_is_exceeded() -> None:
 
 @pytest.mark.asyncio
 async def test_compute_user_daily_budget_spent() -> None:
-    """compute_user_daily_budget_spent returns SUM of butler ledger entries for MSK day."""
+    """compute_user_daily_budget_spent delegates to _query_butler_daily_spend."""
+    from bot.services import butler_budget as bb_mod
     from bot.services.butler_budget import compute_user_daily_budget_spent
 
-    # Mock the join query with a simple async function
-    spent = await compute_user_daily_budget_spent(
-        session=None,
-        user_id=USER_ID,
-        _override_result=Decimal("0.15"),
-    )
+    async def _fake_query(session: Any, user_id: int) -> Decimal:
+        return Decimal("0.15")
+
+    original = bb_mod._query_butler_daily_spend
+    bb_mod._query_butler_daily_spend = _fake_query
+    try:
+        spent = await compute_user_daily_budget_spent(session=None, user_id=USER_ID)
+    finally:
+        bb_mod._query_butler_daily_spend = original
+
     assert spent == Decimal("0.15")
 
+
+# ---------------------------------------------------------------------------
+# Tests — C1: ButlerBudgetChecker wired into plan_action
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_action_rejects_when_user_daily_budget_exceeded() -> None:
+    """When user daily spend >= ceiling, plan_action raises budget_exceeded."""
+    from bot.services import butler_budget as bb_mod
+
+    # Patch _query_butler_daily_spend to simulate the user having exceeded the ceiling
+    async def _over_spend(session: Any, user_id: int) -> Decimal:
+        return Decimal("0.25")  # > 0.20 ceiling
+
+    rate_repo = _FakeRateBucketRepo()
+    svc, ar = _make_service(rate_bucket_repo=rate_repo)
+
+    # monkeypatch _query_butler_daily_spend at module level
+    original = bb_mod._query_butler_daily_spend
+    bb_mod._query_butler_daily_spend = _over_spend
+    try:
+        with pytest.raises(ButlerActionError) as exc_info:
+            await svc.plan_action(
+                requester_user_id=USER_ID,
+                chat_id=CHAT_ID,
+                query="test",
+                visibility_scope="member",
+            )
+    finally:
+        bb_mod._query_butler_daily_spend = original
+
+    assert exc_info.value.error_kind == "budget_exceeded"
+    # Rate buckets (user_plans_day, chat_actions_day) should be rolled back
+    decremented_kinds = {d["bucket_kind"] for d in rate_repo._decremented}
+    assert "user_plans_day" in decremented_kinds
+    assert "chat_actions_day" in decremented_kinds
+
+
+@pytest.mark.asyncio
+async def test_plan_action_proceeds_when_budget_within_ceiling() -> None:
+    """When user spend < ceiling, plan_action succeeds past budget check."""
+    from bot.services import butler_budget as bb_mod
+
+    async def _under_spend(session: Any, user_id: int) -> Decimal:
+        return Decimal("0.10")  # < 0.20 ceiling
+
+    original = bb_mod._query_butler_daily_spend
+    bb_mod._query_butler_daily_spend = _under_spend
+    try:
+        svc, ar = _make_service()
+        action = await svc.plan_action(
+            requester_user_id=USER_ID,
+            chat_id=CHAT_ID,
+            query="test",
+            visibility_scope="member",
+        )
+    finally:
+        bb_mod._query_butler_daily_spend = original
+
+    assert action.status == "pending_confirmation"
 
