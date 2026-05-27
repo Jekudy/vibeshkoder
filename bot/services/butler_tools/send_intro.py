@@ -144,13 +144,16 @@ class SendIntroTool:
     async def build_inverse(self, result: ToolResult) -> dict[str, object]:
         """Return a delete_message inverse payload.
 
-        T12-07 will attempt bot.delete_message(chat_id=target_user_id, message_id).
-        If deletion is no longer available (>48h), T12-07 falls back to
-        followup_correction.
+        C2 fix: emit chat_id (not target_user_id) to match _undo_delete_message
+        which reads payload.get("chat_id"). For DMs, Telegram user_id == chat_id
+        so chat_id=target_user_id is semantically correct.
+        T12-07 will attempt bot.delete_message(chat_id=chat_id, message_id).
         """
         payload = result.payload or {}
+        # target_user_id == chat_id for private chats (Telegram DM convention).
+        target_user_id = payload.get("target_user_id")
         return {
             "rollback_kind": "delete_message",
-            "target_user_id": payload.get("target_user_id"),
+            "chat_id": target_user_id,
             "message_id": payload.get("message_id"),
         }
