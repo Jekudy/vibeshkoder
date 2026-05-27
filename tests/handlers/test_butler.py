@@ -691,7 +691,6 @@ def test_butler_undo_stub(app_env, monkeypatch) -> None:
     # Master flag ON, undo sub-flag OFF — returns stub message
     def _flag_side_effect(session, flag_name: str):
         if flag_name == handler.BUTLER_UNDO_FLAG:
-            import asyncio as _asyncio
             async def _false():
                 return False
             return _false()

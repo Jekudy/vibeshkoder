@@ -36,12 +36,8 @@ import pytest
 # in combined-mode CI (see commit db33b1c, T12-04 fix cycle).
 from bot.services.butler import (
     ButlerActionError,
-    ButlerActionExpiredError,
-    ButlerActionRejectedError,
     ButlerService,
     CascadeInFlightError,
-    EvidenceStaleError,
-    MembershipRevokedError,
 )
 
 
