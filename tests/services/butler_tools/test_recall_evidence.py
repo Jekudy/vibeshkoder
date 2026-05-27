@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
-from bot.services.butler_tools import RecallEvidenceArgs, ToolResult
+from bot.services.butler_tools import ButlerPlanError, RecallEvidenceArgs, ToolResult
 from bot.services.butler_tools.recall_evidence import RecallEvidenceTool
 from bot.services.evidence import EvidenceBundle, EvidenceItem
 
@@ -113,8 +113,6 @@ async def test_validate_policy_passes_with_valid_args():
 @pytest.mark.asyncio
 async def test_validate_policy_rejects_empty_query():
     """validate_policy raises ButlerPlanError for empty query."""
-    from bot.services.butler_tools import ButlerPlanError
-
     ctx = _make_ctx()
     args = RecallEvidenceArgs(query="   ")
     with pytest.raises(ButlerPlanError):
