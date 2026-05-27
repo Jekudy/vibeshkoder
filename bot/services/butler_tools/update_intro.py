@@ -20,6 +20,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
+from sqlalchemy.exc import SQLAlchemyError, OperationalError
 
 from bot.services.butler_tools import ButlerPlanError, UpdateIntroArgs, ToolResult
 
@@ -82,6 +83,7 @@ class UpdateIntroTool:
         session: "AsyncSession",
         bot: Any = None,
         action_repo: Any = None,
+        invocation_repo: Any = None,
         action_id: int,
     ) -> ToolResult:
         """Edit a Butler-owned intro message, or fall back to a follow-up reply.
@@ -111,20 +113,24 @@ class UpdateIntroTool:
 
         chat_id = ctx.chat_id
 
-        # Step 1 — ownership check via action_repo.find_by_posted_message_id
-        # (C2 fix: uses posted_message_id column added in migration 075, not
-        # the non-existent find_by_message_id on butler_actions).
+        # Step 1 — ownership check via invocation_repo.find_by_posted_message_id
+        # (C2 fix: uses ButlerToolInvocationRepo which has find_by_posted_message_id,
+        # NOT ButlerActionRepo which does not).
         is_butler_owned = False
-        if action_repo is not None:
-            try:
-                invocation_row = await action_repo.find_by_posted_message_id(session, message_id)
-                is_butler_owned = invocation_row is not None
-            except Exception as exc:
-                # Ownership check failed — treat as not owned (fail-closed)
-                logger.warning(
-                    "butler:update_intro: ownership check failed — treating as not Butler's",
-                    extra={"message_id": message_id, "error": str(exc)},
-                )
+        if invocation_repo is None:
+            raise ButlerPlanError(
+                "update_intro: invocation_repo is required but was not provided",
+                error_kind="invariant_broken",
+            )
+        try:
+            invocation_row = await invocation_repo.find_by_posted_message_id(session, message_id)
+            is_butler_owned = invocation_row is not None
+        except (SQLAlchemyError, OperationalError) as exc:
+            # DB-level ownership check failed — treat as not owned (fail-closed)
+            logger.warning(
+                "butler:update_intro: ownership check failed — treating as not Butler's",
+                extra={"message_id": message_id, "error": str(exc)},
+            )
 
         # Step 2 — attempt edit if Butler owns the message
         if is_butler_owned and bot is not None:

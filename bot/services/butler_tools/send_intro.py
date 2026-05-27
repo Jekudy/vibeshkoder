@@ -83,6 +83,7 @@ class SendIntroTool:
         session: "AsyncSession",
         bot: Any = None,
         action_repo: Any = None,
+        invocation_repo: Any = None,
         action_id: int,
     ) -> ToolResult:
         """Send the confirmed intro text to the target user.

@@ -92,6 +92,7 @@ class ButlerToolInvocationRepo:
         finished_at: datetime | None = None,
         error_code: str | None = None,
         error_context: dict | None = None,
+        posted_message_id: int | None = None,
     ) -> int:
         """Update an invocation row mid/post-execute.
 
@@ -114,6 +115,8 @@ class ButlerToolInvocationRepo:
             values["error_code"] = error_code
         if error_context is not None:
             values["error_context"] = error_context
+        if posted_message_id is not None:
+            values["posted_message_id"] = posted_message_id
 
         stmt = (
             update(ButlerToolInvocation)

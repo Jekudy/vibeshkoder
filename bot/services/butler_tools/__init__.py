@@ -360,6 +360,7 @@ class ButlerTool(Protocol):
         session: "AsyncSession",
         bot: Any = None,
         action_repo: Any = None,
+        invocation_repo: Any = None,
         action_id: int,
     ) -> ToolResult:
         """Execute the tool action.
@@ -382,8 +383,11 @@ class ButlerTool(Protocol):
             Telegram Bot instance (threaded from handler, per Phase 7 FHR
             pattern). None for tools that produce no Telegram output.
         action_repo:
-            ButlerActionRepo instance. Passed to tools that need ownership
-            lookup (update_intro). None for tools that do not need it.
+            ButlerActionRepo instance. None for tools that do not need it.
+        invocation_repo:
+            ButlerToolInvocationRepo instance. Passed to tools that need
+            invocation lookup by posted_message_id (update_intro). None for
+            tools that do not need it.
         action_id:
             The butler_actions.id for this execution. NO default — caller
             MUST pass the real PK to prevent FK violation on DB writes.

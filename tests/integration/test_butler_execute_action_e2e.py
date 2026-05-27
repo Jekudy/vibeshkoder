@@ -1,4 +1,4 @@
-"""Integration test: execute_action signature alignment (T12-06-fix C1).
+"""Integration test: execute_action signature alignment (T12-06-fix C1/C2).
 
 Verifies that ButlerService.execute_action threads real (ctx, args, session,
 bot, action_repo, action_id) to real tool implementations — not FakeButlerTool.
@@ -12,13 +12,18 @@ from __future__ import annotations
 
 import pytest
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
 from bot.services.butler_tools import (
     RecallEvidenceArgs,
     ToolResult,
+    UpdateIntroArgs,
 )
 from bot.services.butler_tools.recall_evidence import RecallEvidenceTool
+from bot.services.butler_tools.update_intro import UpdateIntroTool
+from bot.db.repos.butler_tool_invocation import ButlerToolInvocationRepo
+from bot.db.models import ButlerToolInvocation
 from bot.services.evidence import EvidenceBundle, EvidenceItem
 
 CHAT_ID = -100_999_911
@@ -156,3 +161,84 @@ async def test_recall_evidence_build_inverse_deterministic() -> None:
     inv2 = await tool.build_inverse(result)
 
     assert json.dumps(inv1, sort_keys=True) == json.dumps(inv2, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_update_intro_finds_owned_message_e2e() -> None:
+    """C2 regression guard: update_intro.execute must use invocation_repo for ownership check.
+
+    This test would FAIL on the pre-fix state in two ways:
+    - Stage 1: if action_repo (ButlerActionRepo) is passed instead of invocation_repo
+      → AttributeError on find_by_posted_message_id (method doesn't exist on ButlerActionRepo)
+      → silently swallowed, is_butler_owned=False, falls through to followup path
+    - Stage 2: if posted_message_id was never written to the row → find returns None
+      → is_butler_owned=False, edit path never taken
+
+    The test uses a real ButlerToolInvocationRepo against a minimal fake session that
+    returns a ButlerToolInvocation row with posted_message_id=12345.
+    """
+    POSTED_MSG_ID = 12345
+
+    # Build a fake invocation row with posted_message_id set
+    fake_invocation = ButlerToolInvocation(
+        id=1,
+        action_id=10,
+        tool_name="send_intro",
+        invocation_seq=1,
+        idempotency_key="test-key",
+        request_payload={},
+        request_payload_hash="abc",
+        status="succeeded",
+        posted_message_id=POSTED_MSG_ID,
+    )
+
+    # Build a fake session that returns the row for find_by_posted_message_id
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return fake_invocation
+
+    class _OwnershipSession:
+        async def execute(self, stmt, *a, **kw):
+            # Real ButlerToolInvocationRepo.find_by_posted_message_id calls session.execute(select(...))
+            return _FakeResult()
+
+    invocation_repo = ButlerToolInvocationRepo()
+
+    # Fake bot that records edit_message_text calls
+    fake_bot = MagicMock()
+    edit_called_with: list = []
+
+    async def _fake_edit(chat_id, message_id, text, parse_mode):
+        edit_called_with.append({"chat_id": chat_id, "message_id": message_id})
+
+    fake_bot.edit_message_text = _fake_edit
+
+    tool = UpdateIntroTool()
+    ctx = _make_ctx()  # chat_id = CHAT_ID = -100_999_911
+
+    args = UpdateIntroArgs(message_id=POSTED_MSG_ID, new_intro_text="Updated intro text")
+
+    result = await tool.execute(
+        ctx,
+        args,
+        session=_OwnershipSession(),
+        bot=fake_bot,
+        invocation_repo=invocation_repo,  # C2 fix: pass invocation_repo, not action_repo
+        action_repo=None,
+        action_id=10,
+    )
+
+    # The edit path MUST be taken (not followup_reply)
+    assert result.success is True, f"Expected success, got error={result.error}"
+    assert result.payload is not None
+    assert result.payload.get("outcome") == "edited", (
+        f"Expected outcome='edited' (edit path), got outcome={result.payload.get('outcome')!r}. "
+        f"If 'followup_reply': invocation_repo was not wired correctly (C2 stage 1 or stage 2 bug)."
+    )
+    assert result.payload.get("message_id") == POSTED_MSG_ID
+    # Confirm the bot.edit_message_text was actually called (not send_message)
+    assert len(edit_called_with) == 1, (
+        f"edit_message_text should be called once; got {len(edit_called_with)} calls. "
+        "Followup path was taken instead of edit path."
+    )
+    assert edit_called_with[0]["message_id"] == POSTED_MSG_ID

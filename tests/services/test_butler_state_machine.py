@@ -208,6 +208,7 @@ class FakeButlerToolInvocation:
     finished_at: datetime | None = None
     error_code: str | None = None
     error_context: dict | None = None
+    posted_message_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +461,7 @@ class FakeButlerToolInvocationRepo:
         finished_at: datetime | None = None,
         error_code: str | None = None,
         error_context: dict | None = None,
+        posted_message_id: int | None = None,
     ) -> int:
         row = self._rows.get(invocation_id)
         if row is None:
@@ -475,6 +477,8 @@ class FakeButlerToolInvocationRepo:
             row.error_code = error_code
         if error_context is not None:
             row.error_context = error_context
+        if posted_message_id is not None:
+            row.posted_message_id = posted_message_id
         return 1
 
     def list_for_action(self, action_id: int) -> list[FakeButlerToolInvocation]:
@@ -1259,6 +1263,7 @@ class FakeButlerTool:
         session: Any,
         bot: Any = None,
         action_repo: Any = None,
+        invocation_repo: Any = None,
         action_id: int,
     ) -> FakeToolResult:
         if self.should_fail:
