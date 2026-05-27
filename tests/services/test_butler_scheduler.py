@@ -40,7 +40,7 @@ async def test_butler_expire_tick_no_stale_actions_commits() -> None:
 
 @pytest.mark.asyncio
 async def test_butler_expire_tick_expires_stale_action() -> None:
-    """butler_expire_tick calls expire_action on a stale action and returns count."""
+    """butler_expire_tick calls _expire_action_inline on a stale action and returns count."""
     import bot.services.scheduler as sched_mod
 
     now = datetime.now(timezone.utc)
@@ -57,18 +57,15 @@ async def test_butler_expire_tick_expires_stale_action() -> None:
 
     session_mock = MagicMock()
     session_mock.commit = AsyncMock()
-    session_mock.execute = AsyncMock()
 
     expire_action_calls: list[int] = []
 
-    # Patch the ButlerService constructor inside the tick
-    class _FakeService:
-        async def expire_action(self, *, action_id: int) -> _FakeExpiredAction:
-            expire_action_calls.append(action_id)
-            return _FakeExpiredAction()
+    async def _fake_expire_inline(session, action_id, *, action_repo):
+        expire_action_calls.append(action_id)
+        return _FakeExpiredAction()
 
     with patch.object(sched_mod, "_query_pending_past_ttl", new=AsyncMock(return_value=[_FakeAction()])):
-        with patch("bot.services.butler.ButlerService", return_value=_FakeService()):
+        with patch.object(sched_mod, "_expire_action_inline", new=_fake_expire_inline):
             result = await sched_mod.butler_expire_tick(bot=MagicMock(), session=session_mock)
 
     assert result == 1
@@ -305,3 +302,47 @@ async def test_butler_expire_tick_passes_batch_limit() -> None:
     assert len(captured_kwargs) == 1
     # Default batch size is 200
     assert captured_kwargs[0]["limit"] == 200
+
+
+# ---------------------------------------------------------------------------
+# Tests — M1: butler_expire_tick uses _expire_action_inline free function
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_butler_expire_tick_uses_expire_action_inline() -> None:
+    """butler_expire_tick calls _expire_action_inline, not ButlerService (M1)."""
+    import bot.services.scheduler as sched_mod
+
+    # Verify _expire_action_inline exists as a free function in the scheduler module
+    assert hasattr(sched_mod, "_expire_action_inline"), (
+        "_expire_action_inline free function must exist in scheduler module"
+    )
+
+    now = datetime.now(timezone.utc)
+    past = now - timedelta(minutes=10)
+
+    class _FakeAction:
+        id = 77
+        status = "pending_confirmation"
+        expires_at = past
+
+    class _FakeExpiredAction:
+        id = 77
+        status = "expired"
+
+    session_mock = MagicMock()
+    session_mock.commit = AsyncMock()
+
+    inline_calls: list[int] = []
+
+    async def _fake_expire_inline(session, action_id, *, action_repo):
+        inline_calls.append(action_id)
+        return _FakeExpiredAction()
+
+    with patch.object(sched_mod, "_query_pending_past_ttl", new=AsyncMock(return_value=[_FakeAction()])):
+        with patch.object(sched_mod, "_expire_action_inline", new=_fake_expire_inline):
+            result = await sched_mod.butler_expire_tick(bot=MagicMock(), session=session_mock)
+
+    assert result == 1
+    assert 77 in inline_calls

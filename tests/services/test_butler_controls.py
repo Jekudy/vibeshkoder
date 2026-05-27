@@ -24,6 +24,28 @@ from bot.services.butler_tools import (
 
 
 # ---------------------------------------------------------------------------
+# Module-level fixture: patch _query_butler_daily_spend to return zero (budget OK)
+# so that unit tests that don't exercise the budget path pass through unblocked.
+# Tests that DO exercise budget paths override this by setting _query_butler_daily_spend
+# themselves (and restoring it in finally).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _zero_budget_spend(monkeypatch):
+    """Patch _query_butler_daily_spend to return $0 for all tests in this module.
+
+    Tests that specifically exercise the budget ceiling override this themselves
+    by directly assigning and restoring butler_budget._query_butler_daily_spend.
+    """
+    import bot.services.butler_budget as bb_mod
+
+    async def _zero(session: Any, user_id: int) -> Decimal:
+        return Decimal("0")
+
+    monkeypatch.setattr(bb_mod, "_query_butler_daily_spend", _zero)
+
+
+# ---------------------------------------------------------------------------
 # Minimal shared fakes (kept small — no duplication of the large
 # test_butler_state_machine.py double set)
 # ---------------------------------------------------------------------------
@@ -520,4 +542,61 @@ async def test_plan_action_proceeds_when_budget_within_ceiling() -> None:
         bb_mod._query_butler_daily_spend = original
 
     assert action.status == "pending_confirmation"
+
+
+# ---------------------------------------------------------------------------
+# Tests — M2: expire_action uses get_for_update (FOR UPDATE NOWAIT)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_expire_action_uses_get_for_update() -> None:
+    """expire_action calls get_for_update, not get, for cascade coordination (M2)."""
+    from datetime import timedelta
+
+    get_calls: list[str] = []
+
+    class _TrackingActionRepo(_FakeActionRepo):
+        async def get(self, session, action_id):
+            get_calls.append("get")
+            return await super().get(session, action_id)
+
+        async def get_for_update(self, session, action_id):
+            get_calls.append("get_for_update")
+            return await super().get_for_update(session, action_id)
+
+    ar = _TrackingActionRepo()
+    # Create a stale pending_confirmation row
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    row = await ar.create(
+        None,
+        requester_tg_id=USER_ID,
+        chat_id=CHAT_ID,
+        action_type="recall",
+        status="pending_confirmation",
+        tool_name="recall_evidence",
+        tool_manifest_version="v1.0.0",
+        governance_filter_version="",
+        evidence_context_hash="",
+        plan_summary="",
+        action_args={},
+        action_args_hash="",
+        rollback_kind="not_reversible",
+        risk_level="low",
+        rejection_reason=None,
+        llm_usage_ledger_id=None,
+        query="test",
+        visibility_scope="member",
+        plan_payload={},
+        expires_at=past,
+    )
+
+    svc, _ = _make_service(action_repo=ar)
+    updated = await svc.expire_action(action_id=row.id)
+
+    assert updated.status == "expired"
+    # get_for_update must be called (not bare get) for cascade coordination
+    assert "get_for_update" in get_calls
+    # bare get should NOT be the first call
+    assert get_calls[0] == "get_for_update"
 
