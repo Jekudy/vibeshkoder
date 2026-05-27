@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from bot.db.models import ButlerCardSuggestion, ExtractionCandidate
 from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
 from bot.services.butler_tools import ButlerPlanError, SuggestCardCreationArgs, ToolResult
 from bot.services.butler_tools.suggest_card_creation import SuggestCardCreationTool
@@ -170,7 +171,6 @@ async def test_execute_creates_candidate_with_pending_status():
 
     assert result.success is True
     # Find the ExtractionCandidate in session.added
-    from bot.db.models import ExtractionCandidate
     candidates = [obj for obj in session.added if isinstance(obj, ExtractionCandidate)]
     assert len(candidates) == 1
     assert candidates[0].status == "pending"
@@ -202,7 +202,6 @@ async def test_execute_creates_butler_card_suggestion_row():
 
     result = await _TOOL.execute(ctx, args, session=session)
 
-    from bot.db.models import ButlerCardSuggestion
     suggestions = [obj for obj in session.added if isinstance(obj, ButlerCardSuggestion)]
     assert len(suggestions) == 1
 
