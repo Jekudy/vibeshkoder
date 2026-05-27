@@ -17,9 +17,8 @@ Design rationale
   (Phase 7/8 precedent).
 * No new migration: the join via ``butler_actions.llm_usage_ledger_id`` links
   each ledger row to its requester without a DB column change.
-* ``compute_user_daily_budget_spent`` accepts an ``_override_result`` kwarg
-  (test-only injection point) so callers can skip the real DB query in unit
-  tests without patching SQLAlchemy.
+* ``compute_user_daily_budget_spent`` delegates to ``_query_butler_daily_spend``
+  which can be monkeypatched in tests to skip the real DB query.
 """
 
 from __future__ import annotations
@@ -69,13 +68,11 @@ class ButlerBudgetChecker:
         return exceeded
 
 
-async def compute_user_daily_budget_spent(
-    session: Any,
-    *,
-    user_id: int,
-    _override_result: Decimal | None = None,
-) -> Decimal:
-    """Return SUM of butler LLM spend for ``user_id`` on the current MSK calendar day.
+async def _query_butler_daily_spend(session: Any, user_id: int) -> Decimal:  # positional to match spend_fn protocol
+    """Execute the DB query for today's butler LLM spend for ``user_id``.
+
+    Testable via ``monkeypatch.setattr(butler_budget, "_query_butler_daily_spend", ...)``
+    without patching SQLAlchemy internals.
 
     Queries:
       SELECT SUM(l.cost_usd)
@@ -85,13 +82,7 @@ async def compute_user_daily_budget_spent(
         AND l.call_type IN ('butler_decision', 'butler_summary')
         AND l.created_at >= :day_start_utc
         AND l.created_at < :day_end_utc
-
-    ``_override_result`` is a test-only injection point: when set, the DB
-    query is skipped and the value is returned directly.
     """
-    if _override_result is not None:
-        return _override_result
-
     from sqlalchemy import func, select
 
     from bot.db.models import LlmUsageLedger, ButlerAction
@@ -117,3 +108,15 @@ async def compute_user_daily_budget_spent(
     result = await session.execute(stmt)
     total = result.scalar_one_or_none()
     return Decimal(str(total)) if total is not None else Decimal("0")
+
+
+async def compute_user_daily_budget_spent(session: Any, user_id: int) -> Decimal:
+    """Return SUM of butler LLM spend for ``user_id`` on the current MSK calendar day.
+
+    Signature matches the ``spend_fn: Callable[[Any, int], Awaitable[Decimal]]``
+    protocol expected by ``ButlerBudgetChecker.is_user_daily_exceeded``.
+
+    Delegates to ``_query_butler_daily_spend`` which can be patched in tests via
+    ``monkeypatch.setattr(butler_budget, "_query_butler_daily_spend", ...)``.
+    """
+    return await _query_butler_daily_spend(session, user_id)

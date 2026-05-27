@@ -81,6 +81,11 @@ from sqlalchemy.exc import OperationalError as _SAOperationalError
 # was instantiated with — lazy re-import after _clear_modules() in tests
 # would create a different class object and isinstance would return False.
 from bot.services.butler_tools import ButlerPlanError, TOOL_ARGS_SCHEMA  # noqa: E402
+from bot.services.butler_budget import (  # noqa: E402
+    ButlerBudgetChecker,
+    compute_user_daily_budget_spent,
+    _PER_USER_DAILY_USD_CEILING,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +425,51 @@ class ButlerService:
         _incremented_buckets.append(
             {"bucket_kind": "chat_actions_day", "scope_id": effective_chat_id, "bucket_key": bucket_key}
         )
+
+        # Per-user daily budget check (T12-08 — separate from /recall global budget).
+        # Placement: after rate bucket increments so audit cohort placement is consistent,
+        # before tool_hour check so we fail fast before the LLM call when user is over budget.
+        _budget_checker = ButlerBudgetChecker(
+            per_user_daily_ceiling=getattr(
+                self._settings, "butler_per_user_daily_usd_ceiling", _PER_USER_DAILY_USD_CEILING
+            ),
+        )
+        _budget_exceeded = await _budget_checker.is_user_daily_exceeded(
+            self._session,
+            user_id=requester_user_id,
+            spend_fn=compute_user_daily_budget_spent,
+        )
+        if _budget_exceeded:
+            # Roll back already-incremented rate buckets
+            for _bucket in _incremented_buckets:
+                await self._rate_bucket_repo.decrement(self._session, **_bucket)
+
+            action_row = await self._action_repo.create(
+                self._session,
+                requester_tg_id=requester_user_id,
+                chat_id=effective_chat_id,
+                action_type="recall",
+                status="rejected",
+                tool_name="recall_evidence",
+                tool_manifest_version="v1.0.0",
+                governance_filter_version="",
+                evidence_context_hash="",
+                plan_summary="",
+                action_args={},
+                action_args_hash="",
+                rollback_kind="not_reversible",
+                risk_level="low",
+                rejection_reason="budget_exceeded",
+                llm_usage_ledger_id=None,
+                query=query,
+                visibility_scope=visibility_scope,
+                plan_payload={},
+            )
+            raise ButlerActionError(
+                f"per-user daily budget exceeded for user {requester_user_id}",
+                error_kind="budget_exceeded",
+                action_id=action_row.id,
+            )
 
         # Step 2 — build evidence context
         evidence_context = await self._evidence_builder.build_butler_evidence(
