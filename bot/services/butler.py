@@ -998,13 +998,14 @@ class ButlerService:
                 try:
                     # validate_policy takes (ctx, typed_args) — C1 fix
                     await tool.validate_policy(tool_ctx, validated_args)
-                    # execute takes (ctx, typed_args, *, session, bot, action_repo, action_id) — C1 fix
+                    # execute takes (ctx, typed_args, *, session, bot, action_repo, invocation_repo, action_id) — C2 fix
                     result = await tool.execute(
                         tool_ctx,
                         validated_args,
                         session=self._session,
                         bot=bot,
                         action_repo=self._action_repo,
+                        invocation_repo=self._invocation_repo,
                         action_id=action_id,
                     )
                 except Exception as exc:
@@ -1053,6 +1054,11 @@ class ButlerService:
 
             # Success for this step
             resp_payload = getattr(result, "payload", {}) or {}
+            # C2 fix: persist posted_message_id for send_intro + schedule_meeting
+            # so update_intro.find_by_posted_message_id can verify Butler ownership.
+            _posted_message_id: int | None = None
+            if tool_name in {"send_intro", "schedule_meeting"}:
+                _posted_message_id = resp_payload.get("message_id")
             await self._invocation_repo.update_invocation(
                 self._session,
                 invocation.id,
@@ -1060,6 +1066,7 @@ class ButlerService:
                 response_payload=resp_payload,
                 response_payload_hash=_payload_hash(resp_payload),
                 finished_at=_now_utc(),
+                posted_message_id=_posted_message_id,
             )
 
             # Build inverse_op_payload via tool.build_inverse(result) if tool was wired.

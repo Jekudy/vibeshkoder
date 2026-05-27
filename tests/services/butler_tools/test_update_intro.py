@@ -147,7 +147,7 @@ async def test_execute_edit_success():
     args = UpdateIntroArgs(message_id=100, new_intro_text="Updated intro")
     bot, repo = _make_bot_edit_ok()
 
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_repo=repo, action_id=1)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, invocation_repo=repo, action_id=1)
 
     assert result.success is True
     assert result.payload["outcome"] == "edited"
@@ -162,7 +162,7 @@ async def test_execute_edit_success_does_not_raise():
     bot, repo = _make_bot_edit_fail()
 
     # Should NOT raise — falls back to followup reply
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_repo=repo, action_id=1)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, invocation_repo=repo, action_id=1)
     assert result.success is True
     assert result.payload["outcome"] == "followup_reply"
 
@@ -174,7 +174,7 @@ async def test_execute_followup_reply_posts_to_chat():
     args = UpdateIntroArgs(message_id=999, new_intro_text="Updated intro")
     bot, repo = _make_bot_edit_fail()
 
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_repo=repo, action_id=1)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, invocation_repo=repo, action_id=1)
 
     bot.send_message.assert_called_once()
     assert result.payload["outcome"] == "followup_reply"
@@ -192,7 +192,7 @@ async def test_build_inverse_edit_outcome_is_edit_message():
     ctx = _make_ctx()
     args = UpdateIntroArgs(message_id=100, new_intro_text="Updated intro")
     bot, repo = _make_bot_edit_ok()
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_repo=repo, action_id=1)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, invocation_repo=repo, action_id=1)
 
     inverse = await _TOOL.build_inverse(result)
     assert inverse["rollback_kind"] == "edit_message"
@@ -205,7 +205,7 @@ async def test_build_inverse_followup_outcome_is_followup_correction():
     ctx = _make_ctx()
     args = UpdateIntroArgs(message_id=999, new_intro_text="Updated intro")
     bot, repo = _make_bot_edit_fail()
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_repo=repo, action_id=1)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, invocation_repo=repo, action_id=1)
 
     inverse = await _TOOL.build_inverse(result)
     assert inverse["rollback_kind"] == "followup_correction"
@@ -216,7 +216,7 @@ async def test_build_inverse_deterministic():
     ctx = _make_ctx()
     args = UpdateIntroArgs(message_id=100, new_intro_text="New text")
     bot, repo = _make_bot_edit_ok()
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_repo=repo, action_id=1)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, invocation_repo=repo, action_id=1)
 
     inv1 = await _TOOL.build_inverse(result)
     inv2 = await _TOOL.build_inverse(result)
@@ -235,7 +235,7 @@ async def test_execute_payload_no_intro_text():
     args = UpdateIntroArgs(message_id=100, new_intro_text=intro_text)
     bot, repo = _make_bot_edit_ok()
 
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, action_repo=repo, action_id=1)
+    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot, invocation_repo=repo, action_id=1)
 
     payload_str = json.dumps(result.payload)
     assert intro_text not in payload_str

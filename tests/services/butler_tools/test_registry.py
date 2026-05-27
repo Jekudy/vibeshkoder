@@ -105,9 +105,9 @@ def test_each_tool_execute_signature_compliant():
     from bot.services.butler_tools import TOOL_DISPATCH
     import inspect
 
-    # Required parameters from the updated Protocol (C1 fix).
+    # Required parameters from the updated Protocol (C1 fix + C2 fix).
     # inspect.signature on a bound method omits 'self', so we check the non-self params.
-    required_params = {"ctx", "args", "session", "bot", "action_repo", "action_id"}
+    required_params = {"ctx", "args", "session", "bot", "action_repo", "invocation_repo", "action_id"}
 
     for tool_name, tool in TOOL_DISPATCH.items():
         sig = inspect.signature(tool.execute)

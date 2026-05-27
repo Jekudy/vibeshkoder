@@ -71,6 +71,7 @@ class ScheduleMeetingTool:
         session: "AsyncSession",
         bot: Any = None,
         action_repo: Any = None,
+        invocation_repo: Any = None,
         action_id: int,
     ) -> ToolResult:
         """Post a Telegram meeting proposal message.
