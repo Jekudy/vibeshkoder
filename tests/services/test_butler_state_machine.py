@@ -2431,6 +2431,105 @@ async def test_execute_action_operational_error_maps_to_cascade_in_flight() -> N
     assert exc_info.value.error_kind == "cascade_in_flight"
 
 
+# ===========================================================================
+# Tests — revoke_affected_user_consent (C1 T12-05-fix)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_revoke_affected_user_consent_happy_path() -> None:
+    """Affected user revokes consent → confirmation row 'revoked', action 'cancelled'."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx, tool_name="send_intro", affected_user_ids=(99,))
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="send intro to @alice",
+        visibility_scope="member",
+    )
+
+    # Invoke the new method as the affected user (user 99)
+    result = await svc.revoke_affected_user_consent(
+        action_id=action.id,
+        affected_user_id=99,
+    )
+
+    # Action should be cancelled
+    assert result.status == "cancelled"
+
+    # Confirmation row should be 'revoked'
+    confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    affected_conf = next(c for c in confs if c.confirmer_tg_id == 99)
+    assert affected_conf.status == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_revoke_affected_user_consent_wrong_user_raises_not_found() -> None:
+    """revoke_affected_user_consent by non-affected user → ButlerActionNotFoundError
+    (or ButlerActionRejectedError with not_found kind)."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx, tool_name="send_intro", affected_user_ids=(99,))
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="send intro",
+        visibility_scope="member",
+    )
+
+    # User 777 is NOT an affected user on this action
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.revoke_affected_user_consent(
+            action_id=action.id,
+            affected_user_id=777,
+        )
+
+    assert exc_info.value.error_kind in ("not_found", "forbidden")
+
+
+@pytest.mark.asyncio
+async def test_revoke_affected_user_consent_already_terminal_raises_wrong_status() -> None:
+    """revoke_affected_user_consent when confirmation already confirmed → wrong_status."""
+    ctx = _make_context()
+    plan = _valid_plan(ctx, tool_name="send_intro", affected_user_ids=(99,))
+    harness = _ButlerServiceTestHarness(
+        gateway=FakeLLMGateway(plan=plan),
+        evidence_builder=FakeEvidenceBuilder(context=ctx),
+    )
+    svc = harness.make_service()
+
+    action = await svc.plan_action(
+        requester_user_id=42,
+        chat_id=CHAT_ID,
+        query="send intro",
+        visibility_scope="member",
+    )
+
+    # Manually confirm the affected user's row
+    confs = await harness.confirmation_repo.list_for_action(harness.session, action.id)
+    affected_conf = next(c for c in confs if c.confirmer_tg_id == 99)
+    affected_conf.status = "confirmed"
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        await svc.revoke_affected_user_consent(
+            action_id=action.id,
+            affected_user_id=99,
+        )
+
+    assert exc_info.value.error_kind == "wrong_status"
+
+
 @pytest.mark.asyncio
 async def test_plan_action_chat_rate_limit_rolls_back_user_plans_day() -> None:
     """When chat_actions_day is exceeded, user_plans_day increment is rolled back (Fix 1).

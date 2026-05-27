@@ -265,6 +265,25 @@ sources/run. Scheduler: `graph_projection_nightly` (03:30 MSK) +
 `graph_purge_worker` (5-min interval). Phase 11 binding **77/77** green.
 Rollout playbook: `docs/memory-system/PHASE10_ROLLOUT.md`.
 
+**Phase 12 (Butler / action execution) — IN PROGRESS, authorized 2026-05-23.**
+T12-01 (schema + migrations 073, merged), T12-02 (evidence context, PR pending),
+T12-03 (tools registry + gateway entry points, PR pending), T12-04 (`ButlerService`
+state machine + 6 exceptions + rate buckets + cross-user consent + cascade guard,
+migration 074, PR pending) completed across Waves 1–2. **T12-05 (Telegram handlers)
+— PR #348 pending merge.** Lands `bot/handlers/butler.py`: `/butler`,
+`/butler_status`, `/butler_cancel`, `/butler_undo` (stub) + 4 inline keyboard
+callbacks (confirm/cancel/affected_approve/affected_reject). DM-only baseline
+(PrivateChatFilter). Cross-user consent E2E: affected user receives separate DM; on
+reject → `revoke_affected_user_consent` → action cancelled; requester preview edited
+to "consent revoked" notice. `AffectedUserUnreachableError` new exception class
+(additive). Migration 075 widens `ck_butler_action_confirmations_status` CHECK to
+include `'revoked'`. Round-2 fix: all early-return paths call `await
+session.rollback()` before return (defeats `DbSessionMiddleware` unconditional
+commit). Commits `d7045ca`..`4c09fe5`. Alembic head 074 → 075. 86 tests green (+9).
+`memory.butler.enabled` master flag default OFF + 5 per-tool flags default OFF.
+Phase 11 binding **86 → 86** (delta 0; L12/C10/I9/R8/G3 family lands in T12-09).
+FHR required at T12-10 (cycle-end). Rollout: `docs/rollout-fragments/phase12/T12-05.md`.
+
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
 
@@ -351,4 +370,4 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 Issue tracker for memory cycle: **GitHub Issues** (label `phase:0`, `phase:1`, etc.). The
 `nt` (Notion) plugin remains the tracker for non-memory work in this repo if any.
 
-<!-- updated-by-superflow:2026-05-15 -->
+<!-- updated-by-superflow:2026-05-27 -->
