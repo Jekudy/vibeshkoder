@@ -270,7 +270,7 @@ T12-01 (schema + migrations 073, merged), T12-02 (evidence context, PR pending),
 T12-03 (tools registry + gateway entry points, PR pending), T12-04 (`ButlerService`
 state machine + 6 exceptions + rate buckets + cross-user consent + cascade guard,
 migration 074, PR pending) completed across Waves 1–2. **T12-05 (Telegram handlers)
-— PR #348 pending merge.** Lands `bot/handlers/butler.py`: `/butler`,
+— PR #348 MERGED 2026-05-27.** Lands `bot/handlers/butler.py`: `/butler`,
 `/butler_status`, `/butler_cancel`, `/butler_undo` (stub) + 4 inline keyboard
 callbacks (confirm/cancel/affected_approve/affected_reject). DM-only baseline
 (PrivateChatFilter). Cross-user consent E2E: affected user receives separate DM; on
@@ -283,6 +283,39 @@ commit). Commits `d7045ca`..`4c09fe5`. Alembic head 074 → 075. 86 tests green 
 `memory.butler.enabled` master flag default OFF + 5 per-tool flags default OFF.
 Phase 11 binding **86 → 86** (delta 0; L12/C10/I9/R8/G3 family lands in T12-09).
 FHR required at T12-10 (cycle-end). Rollout: `docs/rollout-fragments/phase12/T12-05.md`.
+
+**Phase 12 (Butler) — T12-06 (5 tool implementations) PR #349 pending merge, 2026-05-27.**
+Wave 2 sprint F: 5 butler tool implementations under `bot/services/butler_tools/`.
+Tool semantic invariants: `recall_evidence` = sealed `ButlerEvidenceContext` only
+(no direct DB access, rollback_kind=`not_reversible`); `schedule_meeting` =
+Telegram-native text proposal only, no calendar API (Hard Constraint #6,
+rollback_kind=`delete_message`); `send_intro` = confirmed text from args, never
+re-fetched from DB (privacy), rollback_kind=`delete_message`; `update_intro` =
+ownership verified via `invocation_repo.find_by_posted_message_id` + edit-or-followup
+fallback, no exception raised on 48h timeout (rollback_kind=`edit_message` or
+`followup_correction`); `suggest_card_creation` = writes pending-only
+`extraction_candidates` + `butler_card_suggestions` mapping, NEVER approved
+(rollback_kind=`cancel_pending`). `TOOL_DISPATCH` registry dict added to
+`bot/services/butler_tools/__init__.py` with module-load assertion
+`set(TOOL_DISPATCH.keys()) == ALLOWED_BUTLER_TOOLS`.
+Round-2 wiring discipline: `ButlerTool` Protocol contract extended with
+`invocation_repo` kwarg — full signature `execute(ctx, args, *, session, bot,
+action_repo, invocation_repo, action_id)`. Migration **076** adds
+`butler_tool_invocations.posted_message_id BIGINTEGER NULLABLE` + partial index;
+`ButlerToolInvocationRepo` gains `find_by_posted_message_id` +
+`update_invocation(posted_message_id=...)`. `ButlerService.execute_action` extracts
+message_id from result.payload for `send_intro`/`schedule_meeting` and persists it,
+making `update_intro` ownership lookup non-dead-code. 15 `getattr(args, X, default)`
+calls removed across all 5 tools — each raises `ButlerPlanError(invariant_broken)`
+on wrong arg type. `action_id` required (no default, defense guard) in
+`suggest_card_creation`. `parse_mode=None` pinned on all 3 send/edit paths.
+`except` in `update_intro` narrowed to `(SQLAlchemyError, OperationalError)`.
+136 tests green (71 unit + 58 state-machine + 5 integration + 2 top-level
+registry). Phase 11 binding **86 → 86** (L12/C10/I9/R8/G3 lands in T12-09).
+Commits `a411e9e`..`3122431`. Alembic head 075 → 076. No flag flipped.
+Operator steps: none. 2-round dual-model review: Claude product ACCEPTED +
+Claude tech APPROVE (Codex companion stalled; fell back to second Claude
+reviewer per Rule 7).
 
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:

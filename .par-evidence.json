@@ -1,0 +1,28 @@
+{
+  "sprint": "T12-06",
+  "claude_product": "ACCEPTED",
+  "technical_review": "APPROVE",
+  "docs_update": "UPDATED",
+  "docs_review": "PASS",
+  "provider": "split-focus",
+  "ts": "2026-05-27T12:00:00Z",
+  "pr": 349,
+  "rounds": 2,
+  "round_1_findings": "3C + 2H + 3M resolved (Claude tech)",
+  "round_2_findings": "C2 dual-stage + HIGH-NEW-1 resolved (Claude tech)",
+  "phase11_binding_delta": 0,
+  "alembic_head": "074 -> 075 (subject to rebase rename to 076 if T12-05 merges first)",
+  "tests": "136 passed (was 129 round-1)",
+  "fhr_required": "T12-10 (cycle-end)",
+  "rebase_note": "Migration 075 collides with T12-05's 075. Will renumber to 076 during pre-merge rebase. Tests asserting alembic head will need bump 075 -> 076 at that time.",
+  "secondary_provider_fallback_reason": "codex companion broker stalled at 2026-05-27T09:17Z; fell back to second Claude reviewer per Rule 7",
+  "docs_files_updated": [
+    "docs/memory-system/IMPLEMENTATION_STATUS.md",
+    "CLAUDE.md",
+    "docs/rollout-fragments/phase12/T12-06.md"
+  ],
+  "docs_files_removed": [
+    "_FINDINGS.md"
+  ],
+  "llms_txt": "UNCHANGED — file does not exist in this repo; T12-06 adds no public API surface requiring one"
+}
