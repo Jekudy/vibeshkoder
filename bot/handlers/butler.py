@@ -432,6 +432,12 @@ async def handle_butler(
                 "butler: tool disabled by per-tool flag, action rejected",
                 extra={"tool_name": action.tool_name, "user_id": message.from_user.id},
             )
+            # Explicit rollback required: DbSessionMiddleware commits unconditionally on
+            # normal handler return. Without this, the pending butler_actions row created
+            # by plan_action (flushed but not yet committed) would survive and linger
+            # until TTL expiry — a silent failure. Rollback here before return so the
+            # middleware sees a clean session with no work to commit.
+            await session.rollback()
             await message.reply(_MSG_TOOL_DISABLED)
             return
 
@@ -484,7 +490,12 @@ async def handle_butler(
                 preview_text=preview_text,
             )
         except AffectedUserUnreachableError:
-            # Roll back — requester gets a clear error
+            # Explicit rollback required: DbSessionMiddleware commits unconditionally on
+            # normal handler return. Without this, the pending butler_actions row created
+            # by plan_action (flushed but not yet committed) would survive and linger
+            # until TTL expiry — a silent failure. Rollback here before return so the
+            # middleware sees a clean session with no work to commit.
+            await session.rollback()
             await message.reply(_MSG_AFFECTED_UNREACHABLE)
             return
 

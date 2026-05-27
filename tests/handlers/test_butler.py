@@ -1042,6 +1042,9 @@ def test_affected_user_dm_failure_raises_unreachable(app_env, monkeypatch) -> No
 
     # Commit must NOT have been called (action rolled back logically)
     session.commit.assert_not_awaited()
+    # Handler must have called rollback explicitly before return to defeat
+    # DbSessionMiddleware's unconditional commit on normal return.
+    session.rollback.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1104,9 @@ def test_per_tool_flag_disabled_rejects_action(app_env, monkeypatch) -> None:
     assert any("недоступ" in t.lower() or "инструмент" in t.lower() for t in texts)
     # Commit must NOT have been called
     session.commit.assert_not_awaited()
+    # Handler must have called rollback explicitly before return to defeat
+    # DbSessionMiddleware's unconditional commit on normal return.
+    session.rollback.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
