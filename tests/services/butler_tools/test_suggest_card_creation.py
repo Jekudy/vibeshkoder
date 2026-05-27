@@ -12,16 +12,15 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from bot.db.models import ButlerCardSuggestion, ExtractionCandidate
 from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
-from bot.services.butler_tools import ButlerPlanError, SuggestCardCreationArgs, ToolResult
+from bot.services.butler_tools import ButlerPlanError, SuggestCardCreationArgs
 from bot.services.butler_tools.suggest_card_creation import SuggestCardCreationTool
 from bot.services.evidence import EvidenceBundle
 
@@ -105,7 +104,6 @@ class _FakeSession:
     def add(self, obj: Any) -> None:
         # Assign fake ID on add
         if hasattr(obj, "id") and obj.id is None:
-            import uuid as _uuid
             obj.id = 1
         self.added.append(obj)
 
@@ -200,7 +198,7 @@ async def test_execute_creates_butler_card_suggestion_row():
     args = SuggestCardCreationArgs(title="Rust practices")
     session = _FakeSession()
 
-    result = await _TOOL.execute(ctx, args, session=session)
+    await _TOOL.execute(ctx, args, session=session)
 
     suggestions = [obj for obj in session.added if isinstance(obj, ButlerCardSuggestion)]
     assert len(suggestions) == 1
