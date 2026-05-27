@@ -190,7 +190,9 @@ async def test_build_inverse_contains_message_id():
 
     inverse = await _TOOL.build_inverse(result)
     assert inverse["message_id"] == 505
-    assert inverse["target_user_id"] == TARGET_UID
+    # C2 fix: build_inverse now emits chat_id (= target_user_id for DMs) instead of
+    # target_user_id. _undo_delete_message reads chat_id; target_user_id was ignored.
+    assert inverse["chat_id"] == TARGET_UID
 
 
 @pytest.mark.asyncio
