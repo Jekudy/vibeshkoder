@@ -15,6 +15,7 @@ from bot.handlers import (
     admin_cards,
     admin_extract,
     admin_graph,
+    butler,
     chat_events,
     chat_messages,
     digest,
@@ -179,6 +180,7 @@ async def main() -> None:
         admin_graph.router,    # T10-07: /graph_project_now /graph_stats /graph_query /graph_purge_now
         digest.router,         # T7-06: /digest_now /digest_preview /digest_history
         wiki.router,           # T9-06: /wiki_publish /wiki_unpublish /wiki_robots (admin-only)
+        butler.router,         # T12-05: /butler /butler_status /butler_cancel /butler_undo (DM-only, flag OFF)
         chat_events.router,
         edited_message.router,  # T1-14: edited_message handler (before chat_messages catch-all)
         forget_me.router,  # T3-03: /forget_me command (DM or in-chat)
