@@ -136,7 +136,7 @@ _MSG_NOT_FOUND = "Действие не найдено."
 _MSG_BAD_TOKEN = "Ссылка на подтверждение недействительна."
 _MSG_ALREADY_CONFIRMED = "Вы уже подтвердили это действие."
 _MSG_PLAN_ERROR = "Не удалось спланировать действие. Попробуйте другой запрос."
-_MSG_UNDO_STUB = "Отмена действий появится в следующем обновлении."
+_MSG_UNDO_STUB = "Функция отмены временно отключена."
 _MSG_UNDO_FLAG_OFF = "Функция отмены ещё не включена."
 _MSG_UNDO_USAGE = "Использование: /butler_undo <action_id>"
 _MSG_UNDO_BAD_ID = "Неверный формат action_id."
@@ -328,6 +328,8 @@ class _StubSettings:
     user_execs_day_ceiling: int = 5
     chat_actions_day_ceiling: int = 50
     tool_hour_ceiling: int = 20
+    # M5: undo TTL from env, defaulting to 60 minutes.
+    butler_undo_ttl_minutes: int = int(__import__("os").environ.get("BUTLER_UNDO_TTL_MINUTES", "60"))
 
 
 # Cached singleton instances (L1)
@@ -361,13 +363,23 @@ def _build_butler_service(session: AsyncSession) -> ButlerService:
 def _build_undo_service(session: AsyncSession) -> ButlerService:
     """Construct a ButlerService wired with undo-specific repos (T12-07).
 
-    Extends _build_butler_service with undo invocation + card suggestion repos
-    so that execute_undo can write audit rows and dismiss pending card suggestions.
+    H3 fix: pass undo repos via constructor (not monkey-patch) so they are
+    always wired — no getattr fallbacks that could silently be None.
     """
-    svc = _build_butler_service(session)
-    svc._undo_invocation_repo = ButlerUndoInvocationRepo  # type: ignore[attr-defined]
-    svc._card_suggestion_repo = ButlerCardSuggestionRepo  # type: ignore[attr-defined]
-    return svc
+    return ButlerService(
+        session=session,
+        ledger_repo=None,  # type: ignore[arg-type]
+        butler_action_repo=ButlerActionRepo,
+        butler_action_confirmation_repo=ButlerActionConfirmationRepo,
+        butler_tool_invocation_repo=ButlerToolInvocationRepo,
+        butler_rate_bucket_repo=ButlerRateBucketRepo,
+        user_repo=UserRepo,
+        llm_gateway=_STUB_GATEWAY,
+        evidence_builder=_EVIDENCE_BUILDER,
+        settings=_STUB_SETTINGS,
+        undo_invocation_repo=ButlerUndoInvocationRepo,
+        card_suggestion_repo=ButlerCardSuggestionRepo,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +829,7 @@ async def handle_butler_undo(
 
     summary_text = _render_undo_summary(summary)
     await message.reply(summary_text, parse_mode="HTML")
+    await session.commit()
 
 
 # ---------------------------------------------------------------------------
