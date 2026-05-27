@@ -82,3 +82,60 @@ class ButlerCardSuggestionRepo:
             )
         )
         return result.scalar_one_or_none()
+
+    @staticmethod
+    async def dismiss_by_undo(
+        session: AsyncSession,
+        butler_action_id: int,
+    ) -> int:
+        """Dismiss a pending card suggestion by /butler_undo (T12-07).
+
+        Rejects the associated extraction_candidate (transitions from 'pending' to
+        'rejected') for the suggestion linked to butler_action_id, marking it as
+        withdrawn by the undo flow. This is the 'cancel_pending' rollback_kind path.
+
+        Looks up the butler_card_suggestions row, then rejects the linked
+        extraction_candidate if one exists and is still pending.
+
+        Returns count of extraction_candidates updated (0 if none found or already terminal).
+        Flushes; caller commits.
+        """
+        from sqlalchemy import update as sa_update
+
+        from bot.db.models import ExtractionCandidate
+
+        # Find the suggestion
+        result = await session.execute(
+            select(ButlerCardSuggestion).where(
+                ButlerCardSuggestion.butler_action_id == butler_action_id
+            )
+        )
+        suggestion = result.scalar_one_or_none()
+        if suggestion is None or suggestion.extraction_candidate_id is None:
+            _log.debug(
+                "butler_card_suggestions: dismiss_by_undo — no suggestion or no candidate "
+                "for action_id=%s",
+                butler_action_id,
+            )
+            return 0
+
+        # Reject the linked extraction_candidate if still pending
+        stmt = (
+            sa_update(ExtractionCandidate)
+            .where(
+                ExtractionCandidate.id == suggestion.extraction_candidate_id,
+                ExtractionCandidate.status == "pending",
+            )
+            .values(status="rejected")
+        )
+        update_result = await session.execute(stmt)
+        rowcount: int = update_result.rowcount
+        if rowcount > 0:
+            await session.flush()
+            _log.debug(
+                "butler_card_suggestions: dismiss_by_undo — rejected candidate %s "
+                "for action_id=%s",
+                suggestion.extraction_candidate_id,
+                butler_action_id,
+            )
+        return rowcount
