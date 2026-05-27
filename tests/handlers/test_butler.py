@@ -74,7 +74,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -481,7 +481,6 @@ def test_cross_user_consent_flow_approve(app_env, monkeypatch) -> None:
     """Affected user approves → confirm_action called with affected user's token."""
     handler = import_module("bot.handlers.butler")
 
-    uid = _random_tg_id()
     affected_uid = _random_tg_id()
     action_id = 55
 
@@ -1143,15 +1142,9 @@ def test_affected_user_reject_real_service_path(app_env, monkeypatch) -> None:
     affected user does NOT trigger forbidden in cancel_action.
     This verifies the production wiring is correct — not masked by mock.
     """
-    from bot.services.butler import (
-        ButlerService,
-        AffectedUserUnreachableError,
-        ButlerActionError,
-    )
+    from bot.services.butler import ButlerService
     from dataclasses import dataclass, field as dc_field
     from datetime import datetime, timedelta, timezone
-    from typing import Any
-    import uuid
 
     uid = _random_tg_id()
     affected_uid = _random_tg_id()
@@ -1190,31 +1183,29 @@ def test_affected_user_reject_real_service_path(app_env, monkeypatch) -> None:
     )
 
     class _FakeActionRepo:
-        async def get(self, session: Any, action_id: int) -> Any:
+        async def get(self, session, action_id):
             return _action_row if _action_row.id == action_id else None
 
-        async def get_for_update(self, session: Any, action_id: int) -> Any:
+        async def get_for_update(self, session, action_id):
             return _action_row if _action_row.id == action_id else None
 
-        async def update_status(self, session: Any, action_id: int, *, status: str,
-                                rejection_reason: str | None = None, **kwargs: Any) -> int:
+        async def update_status(self, session, action_id, *, status, rejection_reason=None, **kwargs):
             _action_row.status = status
             if rejection_reason is not None:
                 _action_row.rejection_reason = rejection_reason
             return 1
 
     class _FakeConfRepo:
-        async def list_for_action(self, session: Any, action_id: int) -> list:
+        async def list_for_action(self, session, action_id):
             return [_conf_affected] if _conf_affected.action_id == action_id else []
 
-        async def mark_resolved(self, session: Any, conf_id: int, *, status: str,
-                                resolved_at: Any = None) -> int:
+        async def mark_resolved(self, session, conf_id, *, status, resolved_at=None):
             if _conf_affected.id == conf_id:
                 _conf_affected.status = status
             return 1
 
     class _FakeUserRepo:
-        async def get(self, session: Any, user_id: int) -> Any:
+        async def get(self, session, user_id):
             # affected user is NOT admin
             u = MagicMock()
             u.is_admin = False
