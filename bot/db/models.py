@@ -1822,7 +1822,7 @@ class ButlerAction(Base):
         CheckConstraint(
             "status IN ("
             "'requested','evidence_loaded','planned','pending_confirmation',"
-            "'confirmed','executing','succeeded',"
+            "'confirmed','executing','succeeded','undone',"
             "'undo_pending','undo_succeeded','undo_failed',"
             "'rejected','expired','execution_failed','cancelled'"
             ")",
@@ -2066,11 +2066,20 @@ class ButlerToolInvocation(Base):
         JSON().with_variant(JSONB(), "postgresql"),
         nullable=True,
     )
-    # posted_message_id — migration 075 (T12-06-fix C2).
+    # posted_message_id — migration 076 (T12-06-fix C2).
     # Written by send_intro / schedule_meeting after bot.send_message() succeeds.
     # NULL for tools that produce no Telegram output (recall_evidence, suggest_card_creation).
     # Used by update_intro for Butler ownership verification.
     posted_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # inverse_op_payload — migration 078 (T12-07-fix C1).
+    # Written by execute_action after tool.build_inverse(result) succeeds.
+    # Contains rollback_kind + tool-specific params for /butler_undo dispatch.
+    # NULL for in-flight or pre-078 invocations.
+    inverse_op_payload: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
 
 
 class ButlerActionConfirmation(Base):
