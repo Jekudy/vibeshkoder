@@ -706,3 +706,68 @@ def test_lifo_order() -> None:
 
     # LIFO: inv2 (message_id=1002) undone BEFORE inv1 (message_id=1001)
     assert call_order == [1002, 1001], f"Expected LIFO [1002, 1001], got {call_order}"
+
+
+# ---------------------------------------------------------------------------
+# Test 13: _resolve_prior_text returns the pre-edit version text (C3-NEW)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_prior_text_returns_pre_edit_version() -> None:
+    """_resolve_prior_text returns the second-latest version_seq text (pre-edit body).
+
+    C3-NEW fix: the old implementation used non-existent column names
+    (MessageVersion.message_text, MessageVersion.chat_id, MessageVersion.message_id)
+    causing AttributeError swallowed by broad except → None always returned.
+
+    This test wires a mock session whose execute() returns a mock scalar_one_or_none()
+    of "v2" (the second-latest version), verifying the corrected JOIN query shape.
+    """
+    # Build a mock session that returns "v2" from scalar_one_or_none()
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = "v2"
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_result)
+
+    svc = _make_service()
+    # Inject the mock session directly
+    svc._session = mock_session
+
+    result = asyncio.run(svc._resolve_prior_text(chat_id=CHAT_ID, message_id=12345))
+
+    assert result == "v2", f"Expected 'v2' (pre-edit text), got {result!r}"
+    # Verify execute was actually called (not silently returning None from except)
+    mock_session.execute.assert_awaited_once()
+
+
+def test_resolve_prior_text_returns_none_when_no_prior_version() -> None:
+    """_resolve_prior_text returns None when no prior version exists (first edit)."""
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = None
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_result)
+
+    svc = _make_service()
+    svc._session = mock_session
+
+    result = asyncio.run(svc._resolve_prior_text(chat_id=CHAT_ID, message_id=12345))
+
+    assert result is None
+    mock_session.execute.assert_awaited_once()
+
+
+def test_resolve_prior_text_returns_none_on_sqlalchemy_error() -> None:
+    """_resolve_prior_text swallows SQLAlchemyError and returns None (graceful fallback)."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(side_effect=SQLAlchemyError("connection error"))
+
+    svc = _make_service()
+    svc._session = mock_session
+
+    result = asyncio.run(svc._resolve_prior_text(chat_id=CHAT_ID, message_id=12345))
+
+    assert result is None

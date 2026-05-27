@@ -74,6 +74,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from sqlalchemy.exc import OperationalError as _SAOperationalError
+from sqlalchemy.exc import SQLAlchemyError as _SQLAlchemyError
 
 # butler_tools does NOT import from butler — no circular import risk.
 # Must be module-level (not lazy-imported inside except blocks) so that
@@ -1624,31 +1625,33 @@ class ButlerService:
         pair — that version was the content before Butler edited the message.
 
         Returns None if the version row is absent or has been redacted by a forget event.
-        The cascade redaction mechanism handles privacy transparently — callers receive
-        None and write a fallback_prior_text_unavailable audit entry.
+        The cascade redaction mechanism nulls MessageVersion.text on redaction (is_redacted=True),
+        so scalar_one_or_none() returns None transparently — callers write a
+        fallback_prior_text_unavailable audit entry.
         """
         try:
             from sqlalchemy import select
-            from bot.db.models import MessageVersion
+            from bot.db.models import ChatMessage, MessageVersion
 
-            # Select the second-latest version by version_seq descending.
-            # version_seq=1 is oldest (original), higher = newer edits.
-            # After Butler's edit, the latest version IS the edited text.
-            # The prior text is the second-latest version.
+            # JOIN through chat_messages to resolve (chat_id, message_id) → chat_message.id.
+            # MessageVersion has no chat_id or message_id columns directly — only chat_message_id FK.
+            # Select the second-latest version by version_seq descending (OFFSET 1 skips Butler's edit).
+            # is_redacted=True rows still have version_seq entries but text=None (cascade nulled);
+            # returning None for those is correct — callers fall back to unavailable audit.
             stmt = (
-                select(MessageVersion.message_text)
+                select(MessageVersion.text)
+                .join(ChatMessage, MessageVersion.chat_message_id == ChatMessage.id)
                 .where(
-                    MessageVersion.chat_id == chat_id,
-                    MessageVersion.message_id == message_id,
+                    ChatMessage.chat_id == chat_id,
+                    ChatMessage.message_id == message_id,
                 )
                 .order_by(MessageVersion.version_seq.desc())
                 .offset(1)  # skip the most-recent (Butler's edit)
                 .limit(1)
             )
             result = await self._session.execute(stmt)
-            row = result.scalar_one_or_none()
-            return row
-        except Exception:
+            return result.scalar_one_or_none()
+        except (_SQLAlchemyError, _SAOperationalError):
             logger.warning(
                 "butler:execute_undo: _resolve_prior_text failed chat_id=%s message_id=%s",
                 chat_id, message_id,
