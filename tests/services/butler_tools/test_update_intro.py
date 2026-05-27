@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
-from bot.services.butler_tools import ButlerPlanError, UpdateIntroArgs, ToolResult
+from bot.services.butler_tools import ButlerPlanError, UpdateIntroArgs
 from bot.services.butler_tools.update_intro import UpdateIntroTool
 from bot.services.evidence import EvidenceBundle
 

@@ -9,7 +9,6 @@ Tests that:
 
 from __future__ import annotations
 
-import pytest
 
 from bot.services.butler_tools import ALLOWED_BUTLER_TOOLS, ButlerTool
 

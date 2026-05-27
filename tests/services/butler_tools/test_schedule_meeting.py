@@ -11,17 +11,15 @@ Spec: PHASE12_PLAN_REFRESH.md §10 T12-06
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
-from bot.services.butler_tools import ButlerPlanError, ScheduleMeetingArgs, ToolResult
+from bot.services.butler_tools import ButlerPlanError, ScheduleMeetingArgs
 from bot.services.butler_tools.schedule_meeting import ScheduleMeetingTool
-from bot.services.evidence import EvidenceBundle, EvidenceItem
+from bot.services.evidence import EvidenceBundle
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -148,7 +146,7 @@ async def test_execute_no_calendar_api_calls():
     args = ScheduleMeetingArgs(topic="Meeting test")
     bot = _make_mock_bot(message_id=111)
 
-    result = await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
+    await _TOOL.execute(ctx, args, session=_FakeSession(), bot=bot)
 
     # Only send_message should be called on the bot
     assert bot.send_message.call_count == 1
