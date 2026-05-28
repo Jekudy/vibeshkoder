@@ -56,6 +56,10 @@ class ButlerActionRepo:
         visibility_scope: str = "member",
         plan_payload: dict | None = None,
         rejection_reason: str | None = None,
+        # T12-07: undo linkage + inverse op carried on the child row
+        parent_action_id: int | None = None,
+        inverse_op_payload: dict | None = None,
+        undone_at: datetime | None = None,
     ) -> ButlerAction:
         """Insert a new butler_actions row. Flushes; caller commits."""
         row = ButlerAction(
@@ -84,6 +88,9 @@ class ButlerActionRepo:
             visibility_scope=visibility_scope,
             plan_payload=plan_payload if plan_payload is not None else {},
             rejection_reason=rejection_reason,
+            parent_action_id=parent_action_id,
+            inverse_op_payload=inverse_op_payload,
+            undone_at=undone_at,
         )
         session.add(row)
         await session.flush()
@@ -97,6 +104,24 @@ class ButlerActionRepo:
             select(ButlerAction).where(ButlerAction.id == action_id)
         )
         return result.scalar_one_or_none()
+
+    @staticmethod
+    async def list_children(
+        session: AsyncSession,
+        parent_action_id: int,
+    ) -> list[ButlerAction]:
+        """Return all rows whose ``parent_action_id`` points at ``parent_action_id``.
+
+        Used by the undo flow (T12-07) as the double-undo guard: if an undo
+        child already exists in a non-failed state, a second ``/butler_undo`` is
+        refused. Ordered oldest-first.
+        """
+        result = await session.execute(
+            select(ButlerAction)
+            .where(ButlerAction.parent_action_id == parent_action_id)
+            .order_by(ButlerAction.created_at.asc())
+        )
+        return list(result.scalars().all())
 
     @staticmethod
     async def get_for_update(session: AsyncSession, action_id: int) -> ButlerAction | None:

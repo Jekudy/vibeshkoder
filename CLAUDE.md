@@ -337,6 +337,37 @@ Commits `e8dc08f`..`92326c3`. No flag flipped. Rollout: `docs/rollout-fragments/
 2-round dual-model review: Claude product ACCEPTED + Claude tech APPROVE (Codex companion
 stalled; fell back to second Claude reviewer per Rule 7). FHR required at T12-10 (cycle-end).
 
+**Phase 12 (Butler) — T12-07 (rollback + `/butler_undo`) PR pending, 2026-05-28.**
+Wave 3 sprint G: undo flow + inverse-op execution. `ButlerService.undo_action`
+acquires `get_for_update` (NOWAIT → `CascadeInFlightError`), authorizes
+(requester / admin-via-`user_repo` / affected_user) BEFORE revealing state, then
+writes a NEW child `butler_actions` row (`parent_action_id`→original,
+`undo_pending`→`undo_succeeded`|`undo_failed`). **The original audit row is never
+mutated** (immutability invariant). Child inherits `evidence_context_hash` +
+`evidence_ids` + `llm_usage_ledger_id` from the parent (C10.b citation
+preservation; also satisfies `ck_butler_actions_ledger_required_post_plan` since
+undo spends NO new LLM budget) and sets its own `rollback_kind='not_reversible'`
+(satisfies `ck_butler_actions_executed_has_inverse`). `_execute_inverse` dispatches
+on the ORIGINAL's `inverse_op_payload['rollback_kind']`: `delete_message`→
+`bot.delete_message` (chat=`chat_id`|`target_user_id`), `edit_message`→
+`bot.edit_message_text` to a neutral retraction notice (`parse_mode=None`; **prior
+text is never stored — privacy**), `followup_correction`→`bot.send_message`,
+`cancel_pending`→`ExtractionCandidateRepo.mark_status('rejected')` **only if still
+`pending`** (FOR UPDATE; never clobbers an admin's approve/reject), `not_reversible`
+→no-op audit. Failure→`undo_failed` + content-free `error_context` →
+`ButlerUndoError` (new additive exception). Double-undo guard via new
+`ButlerActionRepo.list_children`; `create()` gains
+`parent_action_id`/`inverse_op_payload`/`undone_at`. Handler `/butler_undo` real
+(was stub): master-flag + membership gates, `session.rollback()` on guard
+early-returns (T12-05 middleware-commit discipline). **No migration** (schema
+forward-provisioned in 070/074; alembic head unchanged at **076**). 22 new tests
+(15 service + 7 handler); 327 butler-keyed pass. Privacy lint exit 0, ruff clean,
+no new mypy errors. Phase 11 binding **86 → 86** (delta 0; L12/C10/I9/R8/G3 lands
+in T12-09). No flag flipped. Adversarial review (1H+2M) addressed inline. Rollout:
+`docs/rollout-fragments/phase12/T12-07.md`. Scope note: the optional separate
+undo-confirmation gate (PHASE12_DESIGN) is deferred to Phase 12.5 — PLAN §T12-07
+acceptance criteria do not require it. FHR required at T12-10 (cycle-end).
+
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
 

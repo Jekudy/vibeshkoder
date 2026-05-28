@@ -99,6 +99,13 @@ _USER_EXECS_DAY_CEILING = 5
 _CHAT_ACTIONS_DAY_CEILING = 50
 _TOOL_HOUR_CEILING = 20  # per-tool per-hour default
 
+# T12-07 — undo / rollback.
+# Retraction text used when an undo cannot restore the prior message body
+# (edit_message / followup_correction inverse kinds). The original text is
+# deliberately NEVER stored (privacy), so the inverse op replaces/annotates the
+# message with a neutral, content-free notice rather than the prior wording.
+_UNDO_RETRACTION_NOTICE = "[Это сообщение было отозвано.]"
+
 # ---------------------------------------------------------------------------
 # Exception hierarchy
 # ---------------------------------------------------------------------------
@@ -149,6 +156,16 @@ class AffectedUserUnreachableError(ButlerActionError):
     Callers (T12-05 handler) should roll back the planned action and report the
     error to the requester so they are not left waiting for a consent that will
     never arrive.
+    """
+
+
+class ButlerUndoError(ButlerActionError):
+    """Raised when an inverse (rollback) operation fails during ``undo_action``.
+
+    The undo child row is persisted with ``status='undo_failed'`` and a
+    structured ``error_context`` BEFORE this is raised, so the failure is
+    auditable even though the side effect did not complete. ``error_kind`` is
+    ``'undo_failed'``.
     """
 
 
@@ -248,6 +265,7 @@ class ButlerService:
         llm_gateway: Any,
         evidence_builder: Any,
         settings: Any,
+        extraction_candidate_repo: Any = None,
     ) -> None:
         self._session = session
         self._ledger_repo = ledger_repo
@@ -261,6 +279,11 @@ class ButlerService:
         self._gateway = llm_gateway
         self._evidence_builder = evidence_builder
         self._settings = settings
+        # T12-07: repo used by the cancel_pending undo branch to mark a
+        # Butler-suggested extraction_candidate as rejected. Optional — when
+        # None, the cancel_pending branch lazy-imports the real repo so existing
+        # call sites/tests need no constructor change.
+        self._extraction_candidate_repo = extraction_candidate_repo
 
     # -----------------------------------------------------------------------
     # plan_action
@@ -1345,6 +1368,368 @@ class ButlerService:
 
         updated = await self._action_repo.get(self._session, action_id)
         return updated or action
+
+    # -----------------------------------------------------------------------
+    # undo_action (T12-07)
+    # -----------------------------------------------------------------------
+
+    async def undo_action(
+        self,
+        *,
+        action_id: int,
+        requester_user_id: int,
+        is_admin: bool = False,
+        bot: Any = None,
+    ) -> Any:
+        """Undo a previously-succeeded butler action via its inverse operation.
+
+        Transition (on the NEW child row): undo_pending → undo_succeeded | undo_failed.
+
+        Design (PHASE12_PLAN §T12-07, PHASE12_DESIGN §"/butler_undo"):
+        * The original action row is **immutable** — it is NEVER mutated here.
+          The undo is recorded entirely on a NEW ``butler_actions`` child row whose
+          ``parent_action_id`` points back at the original (audit linkage).
+        * The child inherits ``evidence_context_hash`` + ``evidence_ids`` +
+          ``llm_usage_ledger_id`` from the parent (C10.b — citations preserved
+          across undo; and satisfies ``ck_butler_actions_ledger_required_post_plan``
+          since undo spends NO new LLM budget).
+        * The child's own ``rollback_kind='not_reversible'`` (an undo cannot itself
+          be undone) — this also satisfies ``ck_butler_actions_executed_has_inverse``.
+
+        Authorization (criterion 6): the actor must be the requester, an admin
+        (verified via ``user_repo`` when wired), or an ``affected_user`` of the
+        original action.
+
+        Inverse execution is keyed on the ORIGINAL action's stored
+        ``inverse_op_payload['rollback_kind']``:
+          - ``delete_message``        → ``bot.delete_message``
+          - ``edit_message``          → ``bot.edit_message_text`` to a neutral
+                                        retraction notice (prior text never stored)
+          - ``followup_correction``   → ``bot.send_message`` retraction notice
+          - ``cancel_pending``        → mark the extraction_candidate ``rejected``
+          - ``not_reversible``        → no side effect; child recorded as
+                                        ``undo_succeeded`` (criterion 4)
+
+        Failure (criterion 5): any exception during inverse execution marks the
+        child ``undo_failed`` with a structured ``error_context`` (ids + rollback
+        kind + exception class only — never user content) and raises
+        ``ButlerUndoError``.
+
+        Raises
+        ------
+        CascadeInFlightError       — cascade holds the original row lock (NOWAIT).
+        ButlerActionError          — not_found / wrong_status / already_undone.
+        ButlerActionRejectedError  — actor not authorized (error_kind='forbidden').
+        ButlerUndoError            — inverse op raised (child persisted undo_failed).
+        """
+        # Acquire FOR UPDATE NOWAIT on the original row to coordinate with cascade
+        # (same lock pattern as cancel_action / confirm_action).
+        try:
+            original = await self._action_repo.get_for_update(self._session, action_id)
+        except _SAOperationalError as exc:
+            raise CascadeInFlightError(
+                f"butler_actions(id={action_id}) locked by cascade (NOWAIT) — try again",
+                error_kind="cascade_in_flight",
+                action_id=action_id,
+            ) from exc
+        if original is None:
+            raise CascadeInFlightError(
+                f"butler_actions(id={action_id}) locked by cascade",
+                error_kind="cascade_in_flight",
+                action_id=action_id,
+            )
+
+        # Authorization FIRST (before any state is revealed) — requester OR admin
+        # OR affected_user (criterion 6). Same ordering as cancel_action so an
+        # unauthorized actor cannot probe an action's status / undo history.
+        await self._authorize_undo(
+            original=original,
+            actor_user_id=requester_user_id,
+            is_admin=is_admin,
+        )
+
+        # Only a successfully-executed action can be undone.
+        if original.status != "succeeded":
+            raise ButlerActionError(
+                f"action_id={action_id} is not undoable from status={original.status!r}",
+                error_kind="wrong_status",
+                action_id=action_id,
+            )
+
+        # Double-undo guard: refuse if a non-failed undo child already exists.
+        children = await self._action_repo.list_children(self._session, action_id)
+        if any(
+            getattr(c, "status", None) in ("undo_pending", "undo_succeeded")
+            for c in children
+        ):
+            raise ButlerActionError(
+                f"action_id={action_id} already has an undo in flight or completed",
+                error_kind="wrong_status",
+                action_id=action_id,
+            )
+
+        inverse = original.inverse_op_payload or {}
+        rollback_kind = inverse.get("rollback_kind") or original.rollback_kind
+
+        # Build the child audit row (status='undo_pending').
+        # Inherits parent citations + ledger (C10.b + ledger CHECK). The child's
+        # own rollback_kind is 'not_reversible' (an undo is not itself undoable).
+        now = _now_utc()
+        child = await self._action_repo.create(
+            self._session,
+            requester_tg_id=requester_user_id,
+            chat_id=original.chat_id,
+            action_type=original.action_type,
+            status="undo_pending",
+            tool_name=original.tool_name,
+            tool_manifest_version=original.tool_manifest_version,
+            governance_filter_version=original.governance_filter_version,
+            evidence_context_hash=original.evidence_context_hash,
+            evidence_ids=list(original.evidence_ids or []),
+            plan_summary=f"Undo of action #{action_id} (rollback_kind={rollback_kind})",
+            action_args={},
+            action_args_hash="",
+            rollback_kind="not_reversible",
+            risk_level=original.risk_level,
+            requires_confirmation=False,
+            llm_usage_ledger_id=original.llm_usage_ledger_id,
+            query=original.query,
+            visibility_scope=original.visibility_scope,
+            plan_payload={},
+            parent_action_id=action_id,
+            inverse_op_payload=inverse or None,
+        )
+
+        # not_reversible (or no stored inverse): nothing to execute — record audit
+        # and finish (criterion 4).
+        if rollback_kind == "not_reversible" or not inverse:
+            await self._action_repo.update_status(
+                self._session,
+                child.id,
+                status="undo_succeeded",
+                undone_at=now,
+                result_payload={"rollback_kind": "not_reversible", "undone": False},
+            )
+            logger.info(
+                "butler: undo recorded (not_reversible) parent=%s child=%s",
+                action_id,
+                child.id,
+            )
+            return await self._action_repo.get(self._session, child.id) or child
+
+        # Execute the inverse operation (criterion 3).
+        try:
+            result_payload = await self._execute_inverse(
+                rollback_kind=rollback_kind,
+                inverse=inverse,
+                actor_user_id=requester_user_id,
+                bot=bot,
+            )
+        except Exception as exc:
+            # criterion 5 — record undo_failed with structured, content-free context.
+            error_context = {
+                "rollback_kind": rollback_kind,
+                "exception_type": type(exc).__name__,
+                "message_id": inverse.get("message_id")
+                or inverse.get("followup_message_id"),
+                # chat_id for group posts; target_user_id is the DM chat for intros.
+                "chat_id": inverse.get("chat_id") or inverse.get("target_user_id"),
+            }
+            await self._action_repo.update_status(
+                self._session,
+                child.id,
+                status="undo_failed",
+                error_code=str(exc)[:200],
+                error_context=error_context,
+            )
+            logger.warning(
+                "butler: undo failed parent=%s child=%s rollback_kind=%s",
+                action_id,
+                child.id,
+                rollback_kind,
+            )
+            raise ButlerUndoError(
+                f"undo of action_id={action_id} failed during {rollback_kind}",
+                error_kind="undo_failed",
+                action_id=child.id,
+            ) from exc
+
+        await self._action_repo.update_status(
+            self._session,
+            child.id,
+            status="undo_succeeded",
+            undone_at=now,
+            result_payload=result_payload,
+        )
+        logger.info(
+            "butler: undo succeeded parent=%s child=%s rollback_kind=%s",
+            action_id,
+            child.id,
+            rollback_kind,
+        )
+        return await self._action_repo.get(self._session, child.id) or child
+
+    async def _authorize_undo(
+        self,
+        *,
+        original: Any,
+        actor_user_id: int,
+        is_admin: bool,
+    ) -> None:
+        """Authorize an undo actor: requester OR admin OR affected_user.
+
+        Admin status is verified via ``user_repo`` when wired (M2 pattern from
+        cancel_action); otherwise the caller-supplied ``is_admin`` flag is trusted
+        (test doubles). Affected-user membership is established by an
+        ``affected_user`` confirmation row for this action.
+        """
+        if actor_user_id == original.requester_tg_id:
+            return
+
+        effective_is_admin = is_admin
+        if self._user_repo is not None:
+            actor = await self._user_repo.get(self._session, actor_user_id)
+            effective_is_admin = actor is not None and getattr(actor, "is_admin", False)
+        if effective_is_admin:
+            return
+
+        confirmations = await self._confirmation_repo.list_for_action(
+            self._session, original.id
+        )
+        is_affected = any(
+            c.confirmer_tg_id == actor_user_id
+            and c.confirmation_role == "affected_user"
+            for c in confirmations
+        )
+        if is_affected:
+            return
+
+        raise ButlerActionRejectedError(
+            f"user {actor_user_id} is not authorized to undo action_id={original.id}",
+            error_kind="forbidden",
+            action_id=original.id,
+        )
+
+    async def _execute_inverse(
+        self,
+        *,
+        rollback_kind: str,
+        inverse: dict,
+        actor_user_id: int,
+        bot: Any,
+    ) -> dict:
+        """Perform the inverse side effect for a given rollback_kind.
+
+        Returns a structured, content-free result_payload. Raises on failure
+        (caller records undo_failed).
+        """
+        message_id = inverse.get("message_id")
+
+        if rollback_kind == "delete_message":
+            # DM intros store target_user_id (the DM chat); group posts store chat_id.
+            chat_id = inverse.get("chat_id")
+            if chat_id is None:
+                chat_id = inverse.get("target_user_id")
+            if bot is None or chat_id is None or message_id is None:
+                raise ButlerActionError(
+                    "delete_message inverse missing bot/chat_id/message_id",
+                    error_kind="invariant_broken",
+                )
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            return {
+                "rollback_kind": rollback_kind,
+                "deleted_message_id": message_id,
+                "chat_id": chat_id,
+            }
+
+        if rollback_kind == "edit_message":
+            chat_id = inverse.get("chat_id")
+            if bot is None or chat_id is None or message_id is None:
+                raise ButlerActionError(
+                    "edit_message inverse missing bot/chat_id/message_id",
+                    error_kind="invariant_broken",
+                )
+            # Prior text was never stored (privacy) — replace with a neutral notice.
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=_UNDO_RETRACTION_NOTICE,
+                parse_mode=None,
+            )
+            return {
+                "rollback_kind": rollback_kind,
+                "edited_message_id": message_id,
+                "chat_id": chat_id,
+            }
+
+        if rollback_kind == "followup_correction":
+            chat_id = inverse.get("chat_id")
+            if bot is None or chat_id is None:
+                raise ButlerActionError(
+                    "followup_correction inverse missing bot/chat_id",
+                    error_kind="invariant_broken",
+                )
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=_UNDO_RETRACTION_NOTICE,
+                parse_mode=None,
+            )
+            return {
+                "rollback_kind": rollback_kind,
+                "correction_message_id": getattr(sent, "message_id", None),
+                "chat_id": chat_id,
+            }
+
+        if rollback_kind == "cancel_pending":
+            candidate_id_raw = inverse.get("candidate_id")
+            if candidate_id_raw is None:
+                raise ButlerActionError(
+                    "cancel_pending inverse missing candidate_id",
+                    error_kind="invariant_broken",
+                )
+            import uuid as _uuid
+
+            candidate_id = (
+                candidate_id_raw
+                if isinstance(candidate_id_raw, _uuid.UUID)
+                else _uuid.UUID(str(candidate_id_raw))
+            )
+            repo = self._extraction_candidate_repo
+            if repo is None:
+                from bot.db.repos.extraction_candidate import ExtractionCandidateRepo
+
+                repo = ExtractionCandidateRepo
+            # Only reject a candidate that is STILL pending. If an admin already
+            # acted on it (approved/rejected/superseded) between the suggestion
+            # and this undo, do NOT clobber that decision — the suggestion has
+            # already left the Butler's pending queue. FOR UPDATE serializes
+            # against a concurrent admin /approve.
+            candidate = await repo.get_by_id_for_update(self._session, candidate_id)
+            if candidate is None or candidate.status != "pending":
+                return {
+                    "rollback_kind": rollback_kind,
+                    "candidate_id": str(candidate_id),
+                    "cancelled": False,
+                    "reason": "candidate_not_pending"
+                    if candidate is not None
+                    else "candidate_not_found",
+                }
+            await repo.mark_status(
+                self._session,
+                candidate_id=candidate_id,
+                status="rejected",
+                reviewed_by=actor_user_id,
+            )
+            return {
+                "rollback_kind": rollback_kind,
+                "cancelled_candidate_id": str(candidate_id),
+                "cancelled": True,
+            }
+
+        raise ButlerActionError(
+            f"unknown rollback_kind={rollback_kind!r}",
+            error_kind="invariant_broken",
+        )
 
     # -----------------------------------------------------------------------
     # expire_action

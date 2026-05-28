@@ -47,8 +47,8 @@ Test inventory
 13. butler_status_happy
     /butler_status <id> → status reply.
 
-14. butler_undo_stub
-    /butler_undo → stub message.
+14. butler_undo (T12-07)
+    /butler_undo → flag/member gates, usage, success/not-reversible/failed/forbidden.
 
 15. rate_limit_exceeded_path (§5.B path 2)
     plan_action raises rate_limit_exceeded → polite user message.
@@ -675,30 +675,159 @@ def test_butler_status_happy(app_env, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 13: /butler_undo → stub message
+# Test 13: /butler_undo (T12-07)
 # ---------------------------------------------------------------------------
 
 
-def test_butler_undo_stub(app_env, monkeypatch) -> None:
-    """/butler_undo → stub message (T12-07 scope)."""
+def test_butler_undo_flag_off_silent(app_env, monkeypatch) -> None:
+    """/butler_undo with master flag OFF → silent no-op, no reply."""
+    handler = import_module("bot.handlers.butler")
+
+    message, command = _make_message()
+    command.args = "1"
+    session = _make_session()
+
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=False))
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    message.reply.assert_not_called()
+
+
+def test_butler_undo_non_member_silent(app_env, monkeypatch) -> None:
+    """/butler_undo from a non-member → silent rejection."""
+    handler = import_module("bot.handlers.butler")
+
+    message, command = _make_message()
+    command.args = "1"
+    session = _make_session()
+
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=None))
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    message.reply.assert_not_called()
+
+
+def test_butler_undo_usage_on_empty_args(app_env, monkeypatch) -> None:
+    """/butler_undo with no action_id → usage hint."""
     handler = import_module("bot.handlers.butler")
 
     uid = _random_tg_id()
     message, command = _make_message(user_id=uid)
-    command.args = "1"
+    command.args = ""
     session = _make_session()
 
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", AsyncMock(return_value=True)
-    )
-    member = _make_user(uid, is_member=True)
-    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=member))
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=_make_user(uid)))
 
     asyncio.run(handler.handle_butler_undo(message, command, session))
 
     message.reply.assert_awaited_once()
-    reply_text = message.reply.call_args[0][0]
-    assert "обновлен" in reply_text.lower() or "undo" in reply_text.lower() or "отмен" in reply_text.lower()
+    assert "action_id" in message.reply.call_args[0][0]
+
+
+def test_butler_undo_success_reports_rollback(app_env, monkeypatch) -> None:
+    """A real rollback (delete_message) → success message + commit."""
+    handler = import_module("bot.handlers.butler")
+
+    uid = _random_tg_id()
+    message, command = _make_message(user_id=uid)
+    command.args = "42"
+    session = _make_session()
+
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=_make_user(uid)))
+
+    child = FakeButlerAction(id=43, requester_tg_id=uid, status="undo_succeeded")
+    child.result_payload = {"rollback_kind": "delete_message", "deleted_message_id": 1}
+    mock_butler = MagicMock()
+    mock_butler.undo_action = AsyncMock(return_value=child)
+    monkeypatch.setattr(handler, "_build_butler_service", lambda s: mock_butler)
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    message.reply.assert_awaited_once()
+    assert "откат" in message.reply.call_args[0][0].lower()
+    session.commit.assert_awaited_once()
+
+
+def test_butler_undo_not_reversible_message(app_env, monkeypatch) -> None:
+    """A not_reversible undo → 'logged, not reversible' message."""
+    handler = import_module("bot.handlers.butler")
+
+    uid = _random_tg_id()
+    message, command = _make_message(user_id=uid)
+    command.args = "42"
+    session = _make_session()
+
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=_make_user(uid)))
+
+    child = FakeButlerAction(id=43, requester_tg_id=uid, status="undo_succeeded")
+    child.result_payload = {"rollback_kind": "not_reversible", "undone": False}
+    mock_butler = MagicMock()
+    mock_butler.undo_action = AsyncMock(return_value=child)
+    monkeypatch.setattr(handler, "_build_butler_service", lambda s: mock_butler)
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    message.reply.assert_awaited_once()
+    assert "нельзя откатить" in message.reply.call_args[0][0].lower()
+
+
+def test_butler_undo_failed_path(app_env, monkeypatch) -> None:
+    """ButlerUndoError → failure message; audit row still committed."""
+    handler = import_module("bot.handlers.butler")
+
+    from bot.services.butler import ButlerUndoError
+
+    uid = _random_tg_id()
+    message, command = _make_message(user_id=uid)
+    command.args = "42"
+    session = _make_session()
+
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=_make_user(uid)))
+
+    mock_butler = MagicMock()
+    mock_butler.undo_action = AsyncMock(
+        side_effect=ButlerUndoError("boom", error_kind="undo_failed", action_id=43)
+    )
+    monkeypatch.setattr(handler, "_build_butler_service", lambda s: mock_butler)
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    message.reply.assert_awaited_once()
+    assert handler._MSG_UNDO_FAILED == message.reply.call_args[0][0]
+    session.commit.assert_awaited_once()
+
+
+def test_butler_undo_forbidden_path(app_env, monkeypatch) -> None:
+    """Unauthorized actor → forbidden message, no commit."""
+    handler = import_module("bot.handlers.butler")
+
+    from bot.services.butler import ButlerActionRejectedError
+
+    uid = _random_tg_id()
+    message, command = _make_message(user_id=uid)
+    command.args = "42"
+    session = _make_session()
+
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=_make_user(uid)))
+
+    mock_butler = MagicMock()
+    mock_butler.undo_action = AsyncMock(
+        side_effect=ButlerActionRejectedError("no", error_kind="forbidden", action_id=42)
+    )
+    monkeypatch.setattr(handler, "_build_butler_service", lambda s: mock_butler)
+
+    asyncio.run(handler.handle_butler_undo(message, command, session))
+
+    message.reply.assert_awaited_once()
+    assert handler._MSG_FORBIDDEN == message.reply.call_args[0][0]
 
 
 # ---------------------------------------------------------------------------

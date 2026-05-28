@@ -14,7 +14,8 @@ Commands
     Cancels a pending/confirmed action (requester or admin only).
 
 /butler_undo <action_id>
-    Handler stub — full rollback lands in T12-07.
+    Undo a previously-succeeded action via its inverse op (T12-07). Writes a
+    linked child butler_actions row; the original audit row is immutable.
 
 Inline keyboard callbacks
 -------------------------
@@ -87,10 +88,12 @@ from bot.services.butler import (
     ButlerActionExpiredError,
     ButlerActionRejectedError,
     ButlerService,
+    ButlerUndoError,
     CascadeInFlightError,
     EvidenceStaleError,
     MembershipRevokedError,
 )
+from bot.db.repos.extraction_candidate import ExtractionCandidateRepo
 from bot.services.butler_evidence import build_butler_evidence
 from bot.filters.chat_type import PrivateChatFilter
 
@@ -133,8 +136,14 @@ _MSG_NOT_FOUND = "Действие не найдено."
 _MSG_BAD_TOKEN = "Ссылка на подтверждение недействительна."
 _MSG_ALREADY_CONFIRMED = "Вы уже подтвердили это действие."
 _MSG_PLAN_ERROR = "Не удалось спланировать действие. Попробуйте другой запрос."
-_MSG_UNDO_STUB = "Отмена действий появится в следующем обновлении."
 _MSG_TOOL_DISABLED = "Этот инструмент сейчас недоступен."
+_MSG_UNDO_USAGE = "Использование: /butler_undo <action_id>"
+_MSG_UNDO_DONE = "✅ Действие отменено (откат выполнен)."
+_MSG_UNDO_NOT_REVERSIBLE = (
+    "Это действие нельзя откатить автоматически — отмена записана в журнал."
+)
+_MSG_UNDO_WRONG_STATUS = "Это действие нельзя откатить (уже отменено или не выполнялось)."
+_MSG_UNDO_FAILED = "Не удалось выполнить откат. Попробуйте позже."
 _MSG_AFFECTED_UNREACHABLE = (
     "Не удалось отправить запрос участнику(ам) — действие не будет выполнено."
 )
@@ -273,6 +282,7 @@ def _dispatch_butler_error(exc: ButlerActionError) -> str:
         "cascade_in_flight": _MSG_CASCADE_IN_FLIGHT,
         "expired": _MSG_EXPIRED,
         "affected_user_consent_revoked": _MSG_CONSENT_REVOKED_EFFECT,
+        "undo_failed": _MSG_UNDO_FAILED,
         # invariant_broken is not user-facing — raise to trigger unexpected error handler
     }
 
@@ -338,6 +348,7 @@ def _build_butler_service(session: AsyncSession) -> ButlerService:
         llm_gateway=_STUB_GATEWAY,
         evidence_builder=_EVIDENCE_BUILDER,
         settings=_STUB_SETTINGS,
+        extraction_candidate_repo=ExtractionCandidateRepo,
     )
 
 
@@ -671,7 +682,7 @@ async def handle_butler_cancel(
 
 
 # ---------------------------------------------------------------------------
-# /butler_undo command (stub — T12-07 scope)
+# /butler_undo command (T12-07)
 # ---------------------------------------------------------------------------
 
 
@@ -681,7 +692,12 @@ async def handle_butler_undo(
     command: CommandObject,
     session: AsyncSession,
 ) -> None:
-    """Stub handler — full rollback arrives in T12-07."""
+    """Undo a previously-succeeded butler action via its inverse operation.
+
+    Auth = membership gate (handler) + requester/admin/affected_user (service).
+    The original action row is immutable; the undo is recorded on a linked child
+    row. Irreversible actions report a "logged, not reversible" notice.
+    """
     if not await FeatureFlagRepo.get(session, BUTLER_MASTER_FLAG):
         return
 
@@ -695,7 +711,63 @@ async def handle_butler_undo(
         # H3: silent rejection for non-members
         return
 
-    await message.reply(_MSG_UNDO_STUB)
+    args = (command.args or "").strip()
+    if not args:
+        await message.reply(_MSG_UNDO_USAGE)
+        return
+
+    try:
+        action_id = int(args)
+    except ValueError:
+        await message.reply("Неверный формат action_id.")
+        return
+
+    butler = _build_butler_service(session)
+
+    try:
+        child = await butler.undo_action(
+            action_id=action_id,
+            requester_user_id=message.from_user.id,
+            is_admin=_is_admin(message.from_user.id),
+            bot=message.bot,
+        )
+    except ButlerUndoError:
+        # Child row already persisted as undo_failed by the service — commit the
+        # audit row (not rollback), then report failure.
+        await session.commit()
+        await message.reply(_MSG_UNDO_FAILED)
+        return
+    except ButlerActionRejectedError as exc:
+        # Guards raise before any child row is written; roll back the read-only
+        # transaction (incl. the FOR UPDATE lock) so DbSessionMiddleware does not
+        # commit it — same discipline as the T12-05 early-return paths.
+        await session.rollback()
+        if (exc.error_kind or "") == "wrong_status":
+            await message.reply(_MSG_UNDO_WRONG_STATUS)
+        else:
+            await message.reply(_MSG_FORBIDDEN)
+        return
+    except ButlerActionError as exc:
+        await session.rollback()
+        kind = exc.error_kind or ""
+        if kind == "wrong_status":
+            await message.reply(_MSG_UNDO_WRONG_STATUS)
+        elif kind == "cascade_in_flight":
+            await message.reply(_MSG_CASCADE_IN_FLIGHT)
+        else:
+            await message.reply(_dispatch_butler_error(exc))
+        return
+
+    # Distinguish a real rollback from a not_reversible audit-only undo. Key off
+    # the child's OWN recorded result_payload (set by the service) rather than the
+    # inherited inverse_op_payload, so the message reflects what actually happened.
+    result = getattr(child, "result_payload", None) or {}
+    if result.get("rollback_kind") == "not_reversible":
+        await message.reply(_MSG_UNDO_NOT_REVERSIBLE)
+    else:
+        await message.reply(_MSG_UNDO_DONE)
+
+    await session.commit()
 
 
 # ---------------------------------------------------------------------------
