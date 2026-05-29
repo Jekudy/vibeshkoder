@@ -107,6 +107,17 @@ is_allowed_path() {
   # test_wiki_leakage.py / test_graph_leakage.py allowlist entries above.
   [[ "$path" == "tests/evals/test_butler_leakage.py" ]] && return 0
 
+  # T12-09 Butler Phase 11 binding suites (I9 forget-cascade / C10 citations /
+  # R8 refusal / G3 drift families). These eval files name the canonical privacy
+  # policy literals in docstrings, comments, and assertion messages because they
+  # ENFORCE those invariants by name. Same rationale as test_butler_leakage.py /
+  # test_digest_leakage.py / test_wiki_leakage.py /
+  # test_forget_cascade_butler.py entries above.
+  [[ "$path" == "tests/evals/test_butler_forget_cascade.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_butler_citations.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_butler_refusal.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_butler_drift.py" ]] && return 0
+
   # T12-02 butler_evidence.py — the canonical governance pre-filter for the
   # Butler evidence-build path. Docstrings and inline comments name the
   # privacy policy literals because the file IS the policy enforcer — it
