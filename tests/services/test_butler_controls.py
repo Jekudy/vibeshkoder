@@ -301,13 +301,30 @@ class _FakeSession:
 class _FakeEvidenceBuilder:
     async def build_butler_evidence(self, **kwargs: Any) -> Any:
         from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
-        from bot.services.evidence import EvidenceBundle
+        from bot.services.evidence import EvidenceBundle, EvidenceItem
 
+        # Non-abstained bundle (≥1 item) so plan_action proceeds past the R8.b
+        # empty-evidence guard — these tests exercise rate-limit / budget paths
+        # downstream of evidence build, not the abstain refusal.
+        item = EvidenceItem(
+            message_version_id=10,
+            chat_message_id=1010,
+            chat_id=CHAT_ID,
+            message_id=2010,
+            user_id=USER_ID,
+            snippet="snippet",
+            ts_rank=0.5,
+            captured_at=datetime.now(timezone.utc),
+            message_date=datetime.now(timezone.utc),
+            source_type="message",
+            card_id=None,
+            card_source_message_version_ids=(),
+        )
         bundle = EvidenceBundle(
             query="test",
             chat_id=CHAT_ID,
-            items=(),
-            abstained=True,
+            items=(item,),
+            abstained=False,
             created_at=datetime.now(timezone.utc),
         )
         ctx_hash = butler_context_hash(bundle, "member", "test-v1")
