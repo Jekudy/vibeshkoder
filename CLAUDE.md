@@ -368,6 +368,30 @@ in T12-09). No flag flipped. Adversarial review (1H+2M) addressed inline. Rollou
 undo-confirmation gate (PHASE12_DESIGN) is deferred to Phase 12.5 — PLAN §T12-07
 acceptance criteria do not require it. FHR required at T12-10 (cycle-end).
 
+**Phase 12 (Butler) — T12-09 (Phase 11 binding suite 86→102) PR #352, 2026-05-29.**
+Wave 4 sprint I: 25 new butler binding tests across 5 families + 1 fail-closed
+guard, all verified against live Postgres 16 (alembic head 076, no migration).
+**G3** (`tests/evals/test_butler_drift.py` + `test_no_llm_imports.py`): G3.a adds
+`assert_no_forbidden_imports_per_path(forbidden_map)` AST scanner extending the
+global `LLM_PROVIDER_PREFIXES` scan — forbids anthropic/openai/`bot.services.graph_query`
+in butler paths (empty-glob = harness misconfig + planted-violation meta-test);
+G3.b hash stability; G3.c/d CHECK enforcement. **R8** (`test_butler_refusal.py`):
+R8.b lands a NEW guard — `plan_action` refuses an abstained/empty-evidence bundle
+before the LLM call (rate-bucket rollback + `rejected`/`empty_evidence` audit row,
+NULL ledger; handler shows a "nothing found" message); R8.a/c/d/e/f/g cover
+membership/consent/graph/TTL/whitelist/args. **C10** (`test_butler_citations.py`):
+evidence resolution + undo hash inheritance (DB-backed `undo_action`) + token
+resolution vs redacted/archived. **I9** (`test_butler_forget_cascade.py`): binds
+the shipped T12-01 cascade layers. **L11.c-e** (`test_butler_leakage.py`):
+forgotten/redacted exclusion + affected-user preview surface.
+`scripts/lint_privacy_check.sh` allowlists the 4 new binding files. Reconciliation:
+I9.a/d assert the shipped `{"redacted":true,...}` whole-payload mask (not the
+spec's per-field `[CONTENT_REDACTED]` string — identical privacy outcome); spec's
+distinct `source_card_forgotten` + auto followup_correction (I9.b) deferred to
+Phase 12.5. 199 eval tests pass; privacy lint exit 0; ruff clean. Phase 11 binding
+**86 → 102**. No flag flipped. Rollout: `docs/rollout-fragments/phase12/T12-09.md`.
+**Only T12-10 (FHR + closure) remains in Phase 12.**
+
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
 
