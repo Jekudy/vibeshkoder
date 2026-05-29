@@ -503,6 +503,42 @@ class ButlerService:
             visibility_scope=visibility_scope,
         )
 
+        # Step 2b — abstain on empty evidence (R8.b). The Butler must NEVER plan an
+        # action with no governed evidence backing it (Invariants #3/#4 — every
+        # action cites ≥1 source). Refuse BEFORE spending any LLM budget: roll back
+        # the rate buckets already consumed, write a rejected audit row (NULL ledger,
+        # per constraint #9), and raise. This is the Phase 5 Abstention pattern applied
+        # to the action layer — never a hallucinated empty-citation plan.
+        if getattr(evidence_context.bundle, "abstained", False):
+            for _bucket in _incremented_buckets:
+                await self._rate_bucket_repo.decrement(self._session, **_bucket)
+            action_row = await self._action_repo.create(
+                self._session,
+                requester_tg_id=requester_user_id,
+                chat_id=effective_chat_id,
+                action_type="recall",
+                status="rejected",
+                tool_name="recall_evidence",
+                tool_manifest_version="v1.0.0",
+                governance_filter_version=evidence_context.governance_filter_version,
+                evidence_context_hash=evidence_context.context_hash,
+                plan_summary="",
+                action_args={},
+                action_args_hash="",
+                rollback_kind="not_reversible",
+                risk_level="low",
+                rejection_reason="empty_evidence",
+                llm_usage_ledger_id=None,
+                query=query,
+                visibility_scope=visibility_scope,
+                plan_payload={},
+            )
+            raise ButlerActionError(
+                f"butler refuses to plan on empty evidence for user {requester_user_id}",
+                error_kind="empty_evidence",
+                action_id=action_row.id,
+            )
+
         # Step 3 — call LLM gateway
         plan = None
         ledger_id = None

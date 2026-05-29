@@ -156,6 +156,7 @@ _MSG_DRY_RUN_FAILURE = "Тестовый запуск действия не уд
 _MSG_BUDGET_EXCEEDED = "Достигнут бюджетный лимит. Попробуйте позже."
 _MSG_TTL_EXPIRED = "Время ожидания истекло. Повторите /butler."
 _MSG_PLAN_FAILED = "Планирование действия завершилось ошибкой. Попробуйте другой запрос."
+_MSG_EMPTY_EVIDENCE = "Не нашёл подходящих данных для этого запроса."
 
 # Cross-user consent messages
 _MSG_CONSENT_REQUEST_PREFIX = "🔔 Запрос на действие от участника сообщества:\n\n"
@@ -283,6 +284,7 @@ def _dispatch_butler_error(exc: ButlerActionError) -> str:
         "expired": _MSG_EXPIRED,
         "affected_user_consent_revoked": _MSG_CONSENT_REVOKED_EFFECT,
         "undo_failed": _MSG_UNDO_FAILED,
+        "empty_evidence": _MSG_EMPTY_EVIDENCE,
         # invariant_broken is not user-facing — raise to trigger unexpected error handler
     }
 
@@ -419,6 +421,8 @@ async def handle_butler(
             await message.reply(_MSG_TTL_EXPIRED)
         elif kind == "plan_failed":
             await message.reply(_MSG_PLAN_FAILED)
+        elif kind == "empty_evidence":
+            await message.reply(_MSG_EMPTY_EVIDENCE)
         else:
             logger.info(
                 "butler: plan_action rejected",
