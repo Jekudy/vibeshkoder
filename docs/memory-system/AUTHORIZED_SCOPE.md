@@ -468,7 +468,14 @@ NOT in Phase 8 scope (defer to Phase 8.5+ or Phase 9+):
 
 ---
 
-## Authorized: Phase 12 — Future Butler / Action Layer (2026-05-25)
+## Authorized: Phase 12 — Future Butler / Action Layer (2026-05-25) — **CLOSED 2026-05-30**
+
+**Status: CLOSED 2026-05-30.** All 10 sprints (T12-01..T12-10) merged. FHR APPROVE (Claude
+product + Claude technical per Rule 7, Codex companion stalled). 1 HIGH fixed (scheduler
+savepoint in TTL worker) + 1 MEDIUM fixed (ORM CHECK drift in `ButlerActionConfirmation`).
+Phase 11 binding **102/102** green. All `memory.butler.*` flags default OFF — production
+rollout playbook in `docs/memory-system/PHASE12_ROLLOUT.md`. Phase 12 is the FINAL phase
+of the memory system cycle. Phase 12.5 carryovers tracked in `IMPLEMENTATION_STATUS.md`.
 
 Phase 12 authorized for implementation 2026-05-25. Predecessor gates (Phases 0–11) all CLOSED on `main` as of 2026-05-21. Owned by Orchestrator B per `ORCHESTRATOR_REGISTRY.md`. Canonical specs:
 - `docs/memory-system/PHASE12_PLAN.md` (ratified 2026-05-02, design contract)

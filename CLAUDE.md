@@ -339,6 +339,25 @@ Operator steps: none. 2-round dual-model review: Claude product ACCEPTED +
 Claude tech APPROVE (Codex companion stalled; fell back to second Claude
 reviewer per Rule 7).
 
+**Phase 12 (Butler) — CLOSED 2026-05-30.** All 10 sprints merged (T12-01..T12-10).
+Phase 11 binding **102/102** green (+25 Butler ACs: L11.a-e, C10.a-c, I9.a-f, R8.a-g,
+G3.a-d). FHR APPROVE (Claude `deep-product-reviewer` + Claude `standard-code-reviewer`
+per Rule 7; Codex companion stalled through all FHR rounds). 1 HIGH fixed: scheduler
+TTL tick now uses a savepoint per action so a single expiry failure does not roll back
+the entire batch (mirrors `digest_daily_job` pattern). 1 MEDIUM fixed: ORM
+`ButlerActionConfirmation.status` CheckConstraint now includes `'revoked'` (migration
+075 had added it to the DB but models.py was not updated). FHR CRITICAL findings were
+false positives — verified against real code. All `memory.butler.*` flags default OFF.
+Rollout playbook: `docs/memory-system/PHASE12_ROLLOUT.md`. **Phase 12 is the FINAL
+phase of the memory system cycle — 12-phase cycle COMPLETE.**
+
+Phase 12.5 carryovers (tracked in `IMPLEMENTATION_STATUS.md`):
+- Redact-at-rest for `extraction_candidates.candidate_json` + `butler_card_suggestions.suggested_card_payload` (pre-existing Phase-6 condition; read-side tombstone gates prevent promotion; deferred hardening).
+- Downgrade-guard hardening for migrations 075/077 (widen CHECK constraints; safe downgrade requires no `'revoked'`/`'undone'` rows).
+- Per-tool-flag service-layer defense-in-depth (handler-layer flags enforced; service-layer redundant check deferred).
+- Callback master-flag re-check at callback time for long-running confirmations.
+- `_resolve_prior_text` live-PG integration test (mock-only in T12-07).
+
 **Phase 12 (Butler) — T12-08 (TTL expiry worker + per-user budget + monthly cap filter) PR #350 pending merge, 2026-05-27.**
 Wave 3 sprint: abuse controls + scheduler reaper. Key invariants: (1) TTL worker
 (`butler_expire_tick_job`) only fires when master flag `memory.butler.enabled`=ON —
