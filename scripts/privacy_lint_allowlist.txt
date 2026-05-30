@@ -1,0 +1,2 @@
+bot/services/butler.py	The forget cascade NULLs MessageVersion.text for redacted content, so a forgotten
+bot/services/butler.py	# C3: MessageVersion.text is the pre-edit content; if a forget cascade nulled it,
