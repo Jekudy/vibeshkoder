@@ -42,6 +42,10 @@ is_allowed_path() {
   # historically but rebase fragility makes that unreliable.
   [[ "$path" == "CLAUDE.md" ]] && return 0
   [[ "$path" == "docs/memory-system/IMPLEMENTATION_STATUS.md" ]] && return 0
+  # .par-evidence.json — superflow PAR/FHR audit record; closure entries quote
+  # the canonical privacy literals when recording review findings (same rationale
+  # as CLAUDE.md / IMPLEMENTATION_STATUS.md above).
+  [[ "$path" == ".par-evidence.json" ]] && return 0
 
   # Phase 7 digest modules + tests reference the canonical
   # privacy literals in docstrings and test inputs because their job
