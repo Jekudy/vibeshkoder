@@ -106,6 +106,10 @@ is_allowed_path() {
   # Same rationale as test_digest_leakage.py /
   # test_wiki_leakage.py / test_graph_leakage.py allowlist entries above.
   [[ "$path" == "tests/evals/test_butler_leakage.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_butler_forget_cascade.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_butler_citations.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_butler_refusal.py" ]] && return 0
+  [[ "$path" == "tests/evals/test_butler_drift.py" ]] && return 0
 
   # T12-02 butler_evidence.py — the canonical governance pre-filter for the
   # Butler evidence-build path. Docstrings and inline comments name the
