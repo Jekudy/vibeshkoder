@@ -346,3 +346,92 @@ async def test_butler_expire_tick_uses_expire_action_inline() -> None:
 
     assert result == 1
     assert 77 in inline_calls
+
+
+# ---------------------------------------------------------------------------
+# Tests — FHR HIGH: per-row savepoint isolation in butler_expire_tick
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_butler_expire_tick_lock_contention_does_not_discard_batch() -> None:
+    """Lock contention on one row must not discard expiry of other rows.
+
+    Regression for FHR HIGH defect: without per-row savepoint, an OperationalError
+    (e.g. FOR UPDATE NOWAIT lock contention, SQLSTATE 55P03) is caught by the bare
+    ``except Exception`` but the session is left in aborted-transaction state.
+    Every subsequent row's work and the final commit then also fail or raise, so
+    the outer job handler rolls back — rows already expired earlier in the batch
+    are discarded.
+
+    With the per-row savepoint (``session.begin_nested()``), only the contended
+    row's savepoint is rolled back; the outer transaction stays usable and the
+    other rows are committed.
+
+    Test approach: mock-based (fake session where begin_nested is an async context
+    manager that isolates exceptions).  _expire_action_inline raises OperationalError
+    for action_id=2 only; rows 1 and 3 must still be expired and tick must return 2.
+
+    The test verifies the PRODUCTION CODE uses begin_nested: if the loop wraps each
+    row in ``async with session.begin_nested()``, begin_nested will be called 3 times
+    (once per row).  If the code does NOT use begin_nested, the call count is 0 and
+    the assertion fails — proving the fix is present.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    import bot.services.scheduler as sched_mod
+
+    class _FakeAction:
+        def __init__(self, action_id: int) -> None:
+            self.id = action_id
+
+    class _FakeExpiredAction:
+        def __init__(self, action_id: int) -> None:
+            self.id = action_id
+            self.status = "expired"
+
+    # Track which action_ids were successfully expired
+    expired_ids: list[int] = []
+
+    async def _fake_expire_inline(session, action_id, *, action_repo):
+        if action_id == 2:
+            raise OperationalError("lock not available", None, None)
+        expired_ids.append(action_id)
+        return _FakeExpiredAction(action_id)
+
+    # Build a session mock that supports begin_nested() as an async context manager.
+    # The mock records how many times begin_nested was entered so we can assert the
+    # production code wraps each row in a savepoint.
+    from contextlib import asynccontextmanager
+
+    begin_nested_enter_count = [0]
+
+    @asynccontextmanager
+    async def _fake_begin_nested():
+        begin_nested_enter_count[0] += 1
+        try:
+            yield MagicMock()
+        except Exception:
+            # Savepoint rolled back — outer transaction NOT poisoned
+            pass
+
+    session_mock = MagicMock()
+    session_mock.commit = AsyncMock()
+    session_mock.begin_nested = _fake_begin_nested
+
+    stale = [_FakeAction(1), _FakeAction(2), _FakeAction(3)]
+
+    with patch.object(sched_mod, "_query_pending_past_ttl", new=AsyncMock(return_value=stale)):
+        with patch.object(sched_mod, "_expire_action_inline", new=_fake_expire_inline):
+            result = await sched_mod.butler_expire_tick(bot=MagicMock(), session=session_mock)
+
+    # The loop MUST enter begin_nested once per row (3 rows → 3 savepoints)
+    assert begin_nested_enter_count[0] == 3, (
+        f"expected begin_nested entered 3 times (one savepoint per row), "
+        f"got {begin_nested_enter_count[0]} — the per-row savepoint fix is missing"
+    )
+    # Rows 1 and 3 must be expired; row 2 (lock contention) is skipped
+    assert result == 2, f"expected 2 expired rows, got {result}"
+    assert expired_ids == [1, 3], f"expected [1, 3] expired, got {expired_ids}"
+    # Final commit must still be called (outer transaction not poisoned)
+    session_mock.commit.assert_called_once()
