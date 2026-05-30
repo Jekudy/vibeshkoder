@@ -37,7 +37,6 @@ from bot.services.butler import (
 )
 from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
 from bot.services.butler_tools import (
-    ALLOWED_BUTLER_TOOLS,
     ButlerActionStep,
     ButlerPlan,
     InvalidToolArgsError,

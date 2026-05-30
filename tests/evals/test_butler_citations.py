@@ -29,7 +29,6 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import select
 
-from bot.services.butler_evidence import butler_context_hash
 from bot.services.wiki_renderer import _CARD_TOKEN_RE, _MV_TOKEN_RE
 
 pytestmark = pytest.mark.usefixtures("app_env")
@@ -221,7 +220,7 @@ async def test_c10b_execute_undo_transitions_parent_and_writes_audit_rows(
       (ii) parent evidence_context_hash is unchanged (immutable audit trail)
       (iii) butler_undo_invocations has ≥1 row with butler_action_id == parent_id
     """
-    from bot.db.models import ButlerAction, ButlerToolInvocation, ButlerUndoInvocation
+    from bot.db.models import ButlerToolInvocation, ButlerUndoInvocation
     import datetime as _dt
 
     from bot.db.repos.butler_action import ButlerActionRepo
