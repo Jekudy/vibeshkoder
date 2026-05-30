@@ -1,26 +1,52 @@
 {
-  "sprint": "T12-09",
+  "sprint": "T12-10",
   "claude_product": "ACCEPTED",
   "technical_review": "APPROVE",
   "docs_update": "UPDATED",
   "docs_review": "PASS",
   "provider": "split-focus",
-  "ts": "2026-05-30T15:20:00Z",
+  "ts": "2026-05-30T19:08:00Z",
   "pr": null,
-  "scope": "Phase 11 binding suite extension butler families L11/C10/I9/R8/G3 (77 -> 102) + one authorized runtime change: empty-evidence abstention guard in plan_action",
-  "binding_count": "77 -> 102 (25 new ACs: L11.a-e + C10.a-c + I9.a-f + R8.a-g + G3.a-d)",
-  "runtime_change": "plan_action Step 2b: if evidence_context.bundle.abstained -> rejected butler_actions row (rejection_reason=empty_evidence, ledger NULL) + raise ButlerActionError(error_kind=empty_evidence) before LLM gateway. Closes the hallucinated-empty-citation spec gap (R8.b). Mirrors budget_exceeded sibling reject path. Handler routes empty_evidence -> _MSG_EMPTY_EVIDENCE.",
-  "scope_expansion_authorization": "User-approved 2026-05-30: R8.b spec AC required an abstention refusal absent on main (QA path had it, Butler never replicated). User chose patch-the-guard over drop-to-101, closing the privacy gap before any flag-flip.",
-  "review_rounds": 2,
-  "round_1": "Product ACCEPTED (guard correct + privacy-load-bearing, CHECK-valid, no gateway bypass, controls-ripple sound, binding asserts non-vacuous; 1 disclosed: I9.b binds weaker-than-spec source_forgotten + whole-payload JSONB sentinel, core no-leak invariant intact, FHR/12.5 to confirm). Codex companion DOWN (ChatGPT-account 'Unknown feature flag: hooks') -> Rule 7 fallback to 2nd Claude technical reviewer. Technical APPROVE (ran G3.a honeypot + empty-glob guard live; counterfactual-verified controls ripple; 1 LOW: handler empty_evidence routing gap).",
-  "round_2": "LOW fixed: _butler_command except-chain now has 'elif kind == empty_evidence -> _MSG_EMPTY_EVIDENCE' + handler regression test test_plan_empty_evidence_path. Re-verified 30 handler tests pass.",
-  "carryovers": "I9.b auto-followup_correction on already-executed cited action deferred to Phase 12.5 (FHR to confirm); spec mask format [CONTENT_REDACTED: forget_event_id={n}] vs shipped JSONB {redacted:true,forget_event_id:n} documented divergence (privacy invariant holds).",
-  "tests": "local Postgres (head 078): refusal 7 passed, butler eval family 20 passed/31 skipped, butler service 73 passed, undo 31 passed/7 skipped, handler 30 passed; full Phase-11 regression 176 passed. CI authoritative.",
-  "lint_privacy": "exit 0 (4 butler-eval allowlist entries added)",
-  "migration": "none",
-  "alembic_head": "078 (unchanged)",
-  "phase11_binding_delta": 25,
-  "fhr_required": "T12-10 (cycle-end)",
-  "docs_files_updated": ["docs/rollout-fragments/phase12/t12-09.md", "docs/memory-system/IMPLEMENTATION_STATUS.md", "CLAUDE.md"],
-  "commits": "3285039 d8e3c7a 1f1d42c 1eb34f6 2f66a82 04a7b1f 19ca423 6ec0801 + handler-fix + docs"
+  "scope": "Phase 12 (Butler) closure: mandatory Final Holistic Review over the complete butler subsystem (T12-01..T12-09 as a unified system) + 1 HIGH fix + 1 MEDIUM fix + PHASE12_ROLLOUT.md operator runbook + closure-doc flips to CLOSED. Phase 12 is the FINAL phase — closes the 12-phase memory-system cycle.",
+  "fhr": {
+    "required_by": "superflow Rule 9 (governance_mode=critical + 11 sprints + parallel waves + privacy invariants) — mandatory at cycle end",
+    "method": "6-dimension scoped fan-out workflow (undo-vs-forget, cross-user-consent, forget-cascade-completeness, state-machine-txn, db-constraints, tools-flags-budget) + adversarial verification of every CRITICAL/HIGH against real code, then synthesis. Re-run after initial 2 monolithic FHR agents stalled on watchdog (env flakiness).",
+    "reviewers": "Claude deep-product-reviewer + Claude deep-code-reviewer (Rule 7 fallback — Codex companion DOWN all session: ChatGPT-account 'Unknown feature flag: hooks')",
+    "verdict": "APPROVE",
+    "real_findings": {
+      "HIGH_fixed": "scheduler.py butler_expire_tick — batched TTL reaper shared one txn with no per-row savepoint; a single FOR-UPDATE-NOWAIT lock-contention (55P03) from forget_cascade poisoned the txn and discarded the whole tick's expirations. FIX: per-row `async with session.begin_nested()` savepoint (commit 8dec11c) + red-green test test_butler_expire_tick_lock_contention_does_not_discard_batch. Bounded blast radius (flag default OFF, idempotent retry) but real state-machine/txn defect.",
+      "MEDIUM_fixed": "models.py:2102 ButlerActionConfirmation.status CheckConstraint missing 'revoked' (migration 075 added it to DB but ORM metadata drifted — create_all-from-metadata would reject revoked rows). FIX: added 'revoked' (commit e7f5188)."
+    },
+    "false_positives_disproven_against_real_code": [
+      "undo-vs-forget CRITICAL 'repo is a stub' — agent ran in wrong cwd; real repo verified (butler.py 1881 lines); clean re-review = PASS (edit-undo sources only cascade-redacted message_versions, fails closed; no rollback kind re-publishes forgotten content).",
+      "forget-cascade CRITICAL 'butler_card_suggestions.rationale unredacted' — no 'rationale' column exists; cited path bot/db/models/butler.py is fictional (real: bot/db/models.py single file).",
+      "tools-flags CRITICAL 'cross-user consent not enforced' — cited fictional _check_cross_user_consent/confirm_and_execute; real execute_action re-checks affected_user consent fail-closed at butler.py:981-1001 before any side effect.",
+      "tools-flags HIGH 'per-tool flags unenforced' — enforced at handlers/butler.py:467-475 (T12-06 M2 gate).",
+      "tools-flags HIGH 'callback master-flag guard missing' — downgraded to LOW (2 of 3 claims fabricated; worst case = DB status flip + cosmetic edit, no Telegram side effect, flag default OFF)."
+    ],
+    "deferred_carryovers_phase_12_5": [
+      "Redact-at-rest for extraction_candidates.candidate_json + mirror butler_card_suggestions.suggested_card_payload — PRE-EXISTING Phase-6 condition; spec (PHASE12_PLAN_REFRESH §4.6:532, charter:48) explicitly defers card-suggestion governance to Phase 6 and mandates only 3 butler cascade layers (which shipped, +1 undo). Read-side tombstone gates (extractor NOT EXISTS + /approve R3 block) prevent any promotion/citation/surfacing of forgotten content. NOT a Phase 12 blocker.",
+      "Downgrade-guard hardening for migrations 075/077 CHECK-widening (refuse downgrade while live revoked/undone rows exist).",
+      "Per-tool-flag service-layer defense-in-depth (handler-layer enforced; service-layer redundant check).",
+      "Callback master-flag re-check at callback time for long-running confirmations.",
+      "_resolve_prior_text live-Postgres integration test (mock-only in T12-07)."
+    ]
+  },
+  "phase_12_summary": "All 10 sprints T12-01..T12-10 merged. Phase 11 binding 102/102. memory.butler.* flags (master + 5 per-tool + undo) all default OFF. Migrations 070-078, single linear head 078. Rollout playbook docs/memory-system/PHASE12_ROLLOUT.md.",
+  "tests": "local Postgres (head 078): butler+scheduler+confirmation+forget_cascade suite 377 passed / 208 skipped. scheduler savepoint regression test green. CI authoritative.",
+  "lint_privacy": "exit 0",
+  "ruff": "All checks passed (bot/db/models.py, bot/services/scheduler.py)",
+  "migration": "none (alembic head stays 078)",
+  "alembic_head": "078",
+  "docs_files_updated": [
+    "docs/memory-system/PHASE12_ROLLOUT.md (NEW)",
+    "docs/rollout-fragments/phase12/t12-10.md (NEW)",
+    "docs/memory-system/AUTHORIZED_SCOPE.md (Phase 12 CLOSED)",
+    "docs/memory-system/ROADMAP.md (Phase 12 CLOSED, cycle COMPLETE)",
+    "CLAUDE.md (Phase 12 CLOSED block + 12.5 carryovers)",
+    "docs/memory-system/IMPLEMENTATION_STATUS.md (Phase 12 CLOSED, T12-09/T12-10 done)",
+    ".env.example + .env.dev.example + .env.production.example (3 butler cost-ceiling env vars; memory.butler.* documented as DB flags)"
+  ],
+  "llms_txt": "not present in repo (checked, no action)",
+  "commits": "8dec11c (scheduler HIGH) e7f5188 (models CHECK MEDIUM) 5b96782 (closure docs)"
 }
