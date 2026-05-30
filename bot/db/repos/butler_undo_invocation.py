@@ -99,11 +99,13 @@ class ButlerUndoInvocationRepo:
         Returns rowcount (should be 1). Raises LookupError if row absent.
         Flushes; caller commits.
         """
-        values: dict = {"status": status}
-        if error_kind is not None:
-            values["error_kind"] = error_kind
-        if error_message is not None:
-            values["error_message"] = error_message
+        # Always set status. Always set error_kind/error_message — passing None
+        # explicitly nulls them, which clears stale error info on a successful retry.
+        values: dict = {
+            "status": status,
+            "error_kind": error_kind,
+            "error_message": error_message,
+        }
 
         stmt = (
             update(ButlerUndoInvocation)

@@ -1446,6 +1446,7 @@ class ButlerService:
             is_affected_user = any(
                 c.confirmer_tg_id == requester_user_id
                 and c.confirmation_role == "affected_user"
+                and c.status == "confirmed"
                 for c in all_confs
             )
             if not is_affected_user:
@@ -1580,9 +1581,12 @@ class ButlerService:
                 err_kind = "unknown_rollback_kind"
                 err_msg = f"unknown rollback_kind={rollback_kind!r}"
 
-            # Update audit row to final status
+            # Update audit row to final status.
+            # Guard includes 'failed' so a retried failed row gets its status updated
+            # (and stale error fields cleared on success). Without this, a failed row
+            # re-executes its side-effect on every subsequent /butler_undo.
             if undo_repo is not None and undo_row is not None:
-                if undo_row.status == "pending":
+                if undo_row.status in ("pending", "failed"):
                     await undo_repo.update_status(
                         self._session,
                         undo_row.id,
@@ -1682,18 +1686,20 @@ class ButlerService:
     ) -> tuple[str, str | None, str | None]:
         """Execute edit_message rollback. Returns (status, error_kind, error_message).
 
-        C3: update_intro.build_inverse omits prior_text (privacy). If payload lacks
-        prior_text, query message_versions for the second-latest version (pre-edit text).
-        If lookup fails → audit fallback_prior_text_unavailable.
+        Prior text is resolved exclusively via _resolve_prior_text (message_versions JOIN
+        chat_messages). This is the only forget-safe source — inverse_op_payload does NOT
+        store prior_text by design (update_intro.build_inverse omits it for privacy).
+        The forget cascade NULLs MessageVersion.text for redacted content, so a forgotten
+        prior text correctly returns None → fallback_prior_text_unavailable.
         """
         chat_id = payload.get("chat_id")
         message_id = payload.get("message_id")
         if chat_id is None or message_id is None:
             return "failed", "missing_payload_fields", "chat_id or message_id missing"
-        prior_text = payload.get("prior_text")
-        if prior_text is None:
-            # C3: look up prior text from message_versions (second-latest version).
-            prior_text = await self._resolve_prior_text(chat_id, message_id)
+        # C3 / R3: always resolve from message_versions (forget-safe). Never read from
+        # inverse_op_payload — that column is not redacted by the forget cascade, so any
+        # content stored there would be a latent privacy leak.
+        prior_text = await self._resolve_prior_text(chat_id, message_id)
         if prior_text is None:
             logger.warning(
                 "butler:execute_undo: edit_message — prior_text unavailable for "

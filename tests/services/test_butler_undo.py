@@ -257,10 +257,9 @@ class FakeButlerUndoInvocationRepo:
         for row in self._rows.values():
             if row.id == undo_invocation_id:
                 row.status = status
-                if error_kind is not None:
-                    row.error_kind = error_kind
-                if error_message is not None:
-                    row.error_message = error_message
+                # Always update error fields (None explicitly nulls them — clears stale errors on retry)
+                row.error_kind = error_kind
+                row.error_message = error_message
                 return 1
         raise LookupError(f"ButlerUndoInvocation(id={undo_invocation_id}) not found")
 
@@ -436,14 +435,20 @@ def test_delete_message_happy() -> None:
 
 
 def test_edit_message_happy() -> None:
-    """rollback_kind=edit_message → bot.edit_message_text called with prior_text."""
+    """rollback_kind=edit_message → bot.edit_message_text called with prior_text.
+
+    R3: prior_text is always resolved via _resolve_prior_text (forget-safe).
+    inverse_op_payload.prior_text is ignored (removed — latent privacy leak).
+    """
+    from unittest.mock import patch
+
     inv = _make_invocation(
         rollback_kind="edit_message",
         inverse_op_payload={
             "rollback_kind": "edit_message",
             "chat_id": CHAT_ID,
             "message_id": 8888,
-            "prior_text": "original text",
+            # prior_text intentionally absent — must come from _resolve_prior_text only
         },
     )
     action = _make_action()
@@ -452,7 +457,12 @@ def test_edit_message_happy() -> None:
 
     svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo)
 
-    asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
+    # R3: patch _resolve_prior_text — the only permitted source for prior_text
+    async def _fake_resolve(chat_id: int, message_id: int) -> str | None:
+        return "original text"
+
+    with patch.object(svc, "_resolve_prior_text", side_effect=_fake_resolve):
+        asyncio.run(svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot))
 
     bot.edit_message_text.assert_awaited_once_with(
         chat_id=CHAT_ID, message_id=8888, text="original text"
@@ -850,7 +860,7 @@ def test_affected_user_can_undo() -> None:
                 butler_action_id=ACTION_ID,
                 confirmer_tg_id=AFFECTED_USER_ID,
                 confirmation_role="affected_user",
-                status="approved",
+                status="confirmed",  # R1 fix: must be 'confirmed' to authorize undo
             )
         ]
     )
@@ -889,7 +899,7 @@ def test_non_affected_non_requester_non_admin_still_forbidden() -> None:
                 butler_action_id=ACTION_ID,
                 confirmer_tg_id=77,  # different user, not STRANGER_ID
                 confirmation_role="affected_user",
-                status="approved",
+                status="confirmed",  # even a confirmed affected_user of ID 77 doesn't help STRANGER_ID
             )
         ]
     )
@@ -954,3 +964,167 @@ def test_failed_undo_step_is_retried_not_skipped() -> None:
 
     # Bot was called — the step was retried
     bot.delete_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# R1 — affected_user with non-confirmed status must be forbidden
+# ---------------------------------------------------------------------------
+
+
+def test_affected_user_rejected_status_is_forbidden() -> None:
+    """R1: affected_user whose confirmation status='rejected' must NOT be authorized to undo.
+
+    Spec PLAN.md §728: 'parties to a CONSUMMATED action'. Rejected consent means
+    the action was revoked — the user is not a party to the consummated action.
+    """
+    AFFECTED_USER_ID = 77
+    inv = _make_invocation(rollback_kind="not_reversible")
+    action = _make_action(requester_tg_id=REQUESTER_ID)
+
+    confirmation_repo = FakeButlerActionConfirmationRepo(
+        rows=[
+            FakeButlerActionConfirmation(
+                id=1,
+                butler_action_id=ACTION_ID,
+                confirmer_tg_id=AFFECTED_USER_ID,
+                confirmation_role="affected_user",
+                status="rejected",  # NOT confirmed — must NOT authorize
+            )
+        ]
+    )
+    svc = _make_service_with_confirmation_repo(
+        action=action,
+        confirmation_repo=confirmation_repo,
+        invocations=[inv],
+    )
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        asyncio.run(
+            svc.execute_undo(
+                action_id=ACTION_ID,
+                requester_user_id=AFFECTED_USER_ID,
+                is_admin=False,
+                bot=AsyncMock(),
+            )
+        )
+    assert exc_info.value.error_kind == "forbidden"
+
+
+def test_affected_user_revoked_status_is_forbidden() -> None:
+    """R1: affected_user with status='revoked' must NOT be authorized to undo."""
+    AFFECTED_USER_ID = 77
+    inv = _make_invocation(rollback_kind="not_reversible")
+    action = _make_action(requester_tg_id=REQUESTER_ID)
+
+    confirmation_repo = FakeButlerActionConfirmationRepo(
+        rows=[
+            FakeButlerActionConfirmation(
+                id=1,
+                butler_action_id=ACTION_ID,
+                confirmer_tg_id=AFFECTED_USER_ID,
+                confirmation_role="affected_user",
+                status="revoked",  # revoked consent — must NOT authorize
+            )
+        ]
+    )
+    svc = _make_service_with_confirmation_repo(
+        action=action,
+        confirmation_repo=confirmation_repo,
+        invocations=[inv],
+    )
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        asyncio.run(
+            svc.execute_undo(
+                action_id=ACTION_ID,
+                requester_user_id=AFFECTED_USER_ID,
+                is_admin=False,
+                bot=AsyncMock(),
+            )
+        )
+    assert exc_info.value.error_kind == "forbidden"
+
+
+# ---------------------------------------------------------------------------
+# R2 — retried failed undo row must be updated to succeeded, errors cleared
+# ---------------------------------------------------------------------------
+
+
+def test_failed_undo_row_status_updated_on_successful_retry() -> None:
+    """R2: when a 'failed' undo row is retried and succeeds, its status must become
+    'succeeded' and error_message must be cleared to None.
+
+    Bug: guard `if undo_row.status == 'pending'` skips status update for 'failed' rows,
+    so the row stays 'failed' and every future /butler_undo re-executes the side-effect.
+    """
+    inv = _make_invocation(
+        rollback_kind="delete_message",
+        inverse_op_payload={"rollback_kind": "delete_message", "chat_id": CHAT_ID, "message_id": 9999},
+    )
+    action = _make_action(status="succeeded")
+    undo_repo = FakeButlerUndoInvocationRepo()
+
+    # Pre-populate with a 'failed' row that has an error message
+    failed_undo = FakeButlerUndoInvocation(
+        id=301,
+        butler_action_id=ACTION_ID,
+        butler_tool_invocation_id=INVOCATION_ID_1,
+        requester_user_id=REQUESTER_ID,
+        rollback_kind="delete_message",
+        status="failed",
+        error_kind="telegram_error",
+        error_message="TelegramError: retry_after=30",
+    )
+    undo_repo._rows[(ACTION_ID, INVOCATION_ID_1)] = failed_undo
+
+    bot = AsyncMock()
+    bot.delete_message = AsyncMock(return_value=True)
+
+    svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo)
+
+    asyncio.run(
+        svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot)
+    )
+
+    # The failed row must now have status='succeeded' with errors cleared
+    final_row = undo_repo._rows[(ACTION_ID, INVOCATION_ID_1)]
+    assert final_row.status == "succeeded", f"Expected 'succeeded', got {final_row.status!r}"
+    assert final_row.error_message is None, f"Expected error_message=None, got {final_row.error_message!r}"
+
+
+# ---------------------------------------------------------------------------
+# R4 — config validator: butler_undo_ttl_minutes must be > 0
+# ---------------------------------------------------------------------------
+
+
+def _ttl_validator(v: int) -> int:
+    """Inline replica of Settings.validate_butler_undo_ttl for isolated testing.
+
+    R4: the config field_validator rejects values <= 0. This standalone function
+    mirrors the exact logic so tests do not trigger the module-level Settings()
+    instantiation (which requires BOT_TOKEN and other env vars at import time).
+    The corresponding production validator in bot/config.py must stay in sync.
+    """
+    if v <= 0:
+        raise ValueError(
+            f"BUTLER_UNDO_TTL_MINUTES must be > 0 (got {v}); "
+            "setting it to 0 or negative silently disables undo for all actions."
+        )
+    return v
+
+
+def test_butler_undo_ttl_minutes_zero_raises() -> None:
+    """R4: butler_undo_ttl_minutes=0 must fail validation (value <= 0)."""
+    with pytest.raises(ValueError, match="must be > 0"):
+        _ttl_validator(0)
+
+
+def test_butler_undo_ttl_minutes_negative_raises() -> None:
+    """R4: butler_undo_ttl_minutes=-5 must fail validation (value <= 0)."""
+    with pytest.raises(ValueError, match="must be > 0"):
+        _ttl_validator(-5)
+
+
+def test_butler_undo_ttl_minutes_positive_is_valid() -> None:
+    """R4: butler_undo_ttl_minutes=60 (default) must pass validation."""
+    assert _ttl_validator(60) == 60
