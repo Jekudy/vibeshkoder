@@ -328,8 +328,6 @@ class _StubSettings:
     user_execs_day_ceiling: int = 5
     chat_actions_day_ceiling: int = 50
     tool_hour_ceiling: int = 20
-    # M5: undo TTL from env, defaulting to 60 minutes.
-    butler_undo_ttl_minutes: int = int(__import__("os").environ.get("BUTLER_UNDO_TTL_MINUTES", "60"))
 
 
 # Cached singleton instances (L1)
@@ -376,7 +374,7 @@ def _build_undo_service(session: AsyncSession) -> ButlerService:
         user_repo=UserRepo,
         llm_gateway=_STUB_GATEWAY,
         evidence_builder=_EVIDENCE_BUILDER,
-        settings=_STUB_SETTINGS,
+        settings=settings,
         undo_invocation_repo=ButlerUndoInvocationRepo,
         card_suggestion_repo=ButlerCardSuggestionRepo,
     )

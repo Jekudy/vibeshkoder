@@ -1403,8 +1403,9 @@ class ButlerService:
           ButlerActionError(ttl_expired) — outside the undo TTL window.
           ButlerActionError(not_found) — action_id does not exist.
         """
-        # M5: read TTL from settings injection (not os.environ per call).
-        # settings.butler_undo_ttl_minutes is set from env at settings-class definition time.
+        # Read TTL from injected settings (env var BUTLER_UNDO_TTL_MINUTES → field
+        # butler_undo_ttl_minutes on bot.config.Settings). Falls back to the function
+        # default so unit tests that pass a stub without this field still work.
         _undo_ttl_min = int(
             getattr(self._settings, "butler_undo_ttl_minutes", undo_ttl_minutes)
         )
@@ -1434,11 +1435,25 @@ class ButlerService:
             )
 
         if action.requester_tg_id != requester_user_id and not effective_is_admin:
-            raise ButlerActionRejectedError(
-                f"user {requester_user_id} not authorized to undo action {action_id}",
-                error_kind="forbidden",
-                action_id=action_id,
+            # Spec PLAN.md §728 / DESIGN §470 / charter §91: affected_user of a
+            # cross-user action (e.g. send_intro) is also authorized to undo.
+            # Affected-user rows only exist for cross-user tools, so the role check
+            # is inherently per-action-type (no migration needed).
+            is_affected_user = False
+            all_confs = await self._confirmation_repo.list_for_action(
+                self._session, action_id
             )
+            is_affected_user = any(
+                c.confirmer_tg_id == requester_user_id
+                and c.confirmation_role == "affected_user"
+                for c in all_confs
+            )
+            if not is_affected_user:
+                raise ButlerActionRejectedError(
+                    f"user {requester_user_id} not authorized to undo action {action_id}",
+                    error_kind="forbidden",
+                    action_id=action_id,
+                )
 
         # Step 3 — status check: only 'succeeded' can be undone; 'undone' is idempotent
         if action.status not in ("succeeded", "undone"):
@@ -1466,8 +1481,10 @@ class ButlerService:
                 existing = await undo_repo.find_by_action_and_invocation(
                     self._session, action_id, inv.id
                 )
+                # V2 fix: only SUCCESS-terminal states short-circuit; 'failed' must
+                # be retried on a subsequent /butler_undo (spec PLAN.md §724 retry-safe).
                 if existing is not None and existing.status in (
-                    "succeeded", "failed", "skipped_not_reversible"
+                    "succeeded", "skipped_not_reversible"
                 ):
                     existing_undo_rows.append(existing)
                 else:
