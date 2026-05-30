@@ -303,11 +303,27 @@ class _FakeEvidenceBuilder:
         from bot.services.butler_evidence import ButlerEvidenceContext, butler_context_hash
         from bot.services.evidence import EvidenceBundle
 
+        from bot.services.evidence import EvidenceItem
+
+        _item = EvidenceItem(
+            message_version_id=1,
+            chat_message_id=2,
+            chat_id=CHAT_ID,
+            message_id=3,
+            user_id=55,
+            snippet="test snippet",
+            ts_rank=0.9,
+            captured_at=datetime.now(timezone.utc),
+            message_date=datetime.now(timezone.utc),
+            source_type="message",
+            card_id=None,
+            card_source_message_version_ids=(),
+        )
         bundle = EvidenceBundle(
             query="test",
             chat_id=CHAT_ID,
-            items=(),
-            abstained=True,
+            items=(_item,),
+            abstained=False,
             created_at=datetime.now(timezone.utc),
         )
         ctx_hash = butler_context_hash(bundle, "member", "test-v1")
