@@ -359,6 +359,29 @@ Commits `e8dc08f`..`92326c3`. No flag flipped. Rollout: `docs/rollout-fragments/
 2-round dual-model review: Claude product ACCEPTED + Claude tech APPROVE (Codex companion
 stalled; fell back to second Claude reviewer per Rule 7). FHR required at T12-10 (cycle-end).
 
+**Phase 12 (Butler) — T12-09 (Phase 11 binding suite 77 → 102 + empty-evidence abstention guard) 2026-05-30.**
+Wave 3 sprint: 25 new binding ACs across `tests/evals/test_butler_{leakage,citations,
+forget_cascade,refusal,drift}.py` (5 new files) + G3.a appended to `test_no_llm_imports.py`
+AST per-path scanner (Butler tool files). AC families: L11.a-e (leakage, 5), C10.a-c
+(citations, 3 — C10.b grounded to PR #351 TABLE-based `butler_undo_invocations`, NOT #352
+child-row), I9.a-f (forget cascade, 6), R8.a-g (refusal, 7), G3.a-d (drift/AST, 4).
+Runtime guard added: `ButlerService.plan_action` Step 2b rejects when
+`evidence_context.bundle.abstained` is True → writes `butler_actions` row with
+`status='rejected'`, `rejection_reason='empty_evidence'`, `llm_usage_ledger_id=NULL`
+(no gateway call) + raises `ButlerActionError(error_kind='empty_evidence')`. Closes
+privacy gap: hallucinated plans on empty-citation context. Mirrors `budget_exceeded`
+sibling path (T12-08). Handler maps `'empty_evidence'` → `_MSG_EMPTY_EVIDENCE` in
+`bot/handlers/butler.py`. No migration (alembic head stays 078; `rejection_reason`
+column from T12-04). No flag flipped (`memory.butler.*` all default OFF). Commits
+`3285039`..`2a598f8` (9 commits). Phase 11 binding **77 → 102** (+25 ACs). 2-round
+dual-model review: Claude product ACCEPTED + Claude tech APPROVE (Codex companion
+stalled; Rule 7 Claude fallback; 1 LOW handler routing finding fixed + regression test).
+Phase 12 remains IN PROGRESS — FHR + T12-10 required for closure. Phase 12.5 carryovers:
+I9.b auto-followup_correction edge case deferred; spec mask-format divergence
+(`[CONTENT_REDACTED: forget_event_id={n}]` spec vs shipped JSONB `{"redacted":true,
+"forget_event_id":n}`) documented (privacy invariant holds either way).
+Rollout: `docs/rollout-fragments/phase12/t12-09.md`.
+
 Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 `bot/handlers/chat_messages.py`, or adding `alembic/versions/`:
 
