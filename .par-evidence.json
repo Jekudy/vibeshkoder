@@ -5,22 +5,31 @@
   "docs_update": "UPDATED",
   "docs_review": "PASS",
   "provider": "split-focus",
-  "ts": "2026-05-27T14:13:53Z",
+  "ts": "2026-05-30T13:10:00Z",
   "pr": 351,
-  "rounds": 3,
+  "rounds": 5,
   "round_1_findings": "3 CRITICAL + 2 HIGH product + 4 CRITICAL + 3 HIGH + 5 MEDIUM tech (significant rework: field-mismatches, missing column, CHECK violation, broad except)",
   "round_2_findings": "all round-1 closed EXCEPT 1 CRITICAL REGRESSION introduced by _resolve_prior_text SQL using non-existent columns (column-name bug only surfaces in real DB or schema-grep)",
   "round_3_findings": "C3-NEW + H-NEW closed (JOIN through chat_messages, narrow except, 3 new tests)",
+  "fix_sprint_2026_05_30": {
+    "trigger": "spec-conformance audit (ground-truth workflow wf_1ebb2cbb) + dual-model review before merge-to-main",
+    "merge_readiness_fixes": "F1 (No-Fallbacks: BUTLER_UNDO_TTL_MINUTES moved to canonical Settings, __import__('os') stub removed), F3 (env examples), F7 (spec conformance: affected_user undo auth per PLAN.md:728/DESIGN:470/charter:91), V1 (verified inverse_op_payload persist->read already correct at head), V2 (failed undo step now retry-able)",
+    "round_4_findings": "Product NEEDS_FIXES 1 HIGH (affected_user auth ignored confirmation status) + Codex REQUEST_CHANGES 2 HIGH (R2 failed-retry status-update guard double-execution; R3 latent inverse_op_payload prior_text leak) + 2 MEDIUM (R1 status gate; R4 TTL validation)",
+    "round_5_findings": "R1 (c.status=='confirmed' gate), R2 (status-update guard widened to pending|failed + update_status always clears error fields), R3 (removed dead payload.get('prior_text') branch; only forget-safe _resolve_prior_text), R4 (field_validator butler_undo_ttl_minutes>0) — Product ACCEPTED + Codex APPROVE, no new defects",
+    "review_threads_resolved": "2 codex P1/P2 threads on #351 resolved with replies",
+    "commits": "76f6c8f, 43454f7, 74c1fa3, a489cd8, e779d37, 66449f8"
+  },
   "phase11_binding_delta": 0,
   "alembic_head": "076 -> 077 -> 078",
-  "tests": "115 passed (+13 across rounds — 10 e2e + 3 resolve_prior_text)",
+  "tests": "375 passed, 157 skipped (DB-only) at head 66449f8; CI test job green (10m2s)",
+  "ci_status": "all green on 66449f8: test, lint-privacy, gitleaks, semgrep, trivy",
   "fhr_required": "T12-10 (cycle-end)",
-  "secondary_provider_fallback_reason": "codex companion broker stalled; fell back to second Claude reviewer per Rule 7",
+  "secondary_provider_fallback_reason": "fix-sprint dual review used Claude product + Codex technical (both completed; no fallback needed this round)",
   "round_2_regression_pattern": "mock-only tests don't catch ORM column-name mismatches; recommendation: add real-DB integration tests for SQL helpers when feasible",
   "docs_files_updated": [
-    "docs/memory-system/IMPLEMENTATION_STATUS.md",
     "CLAUDE.md",
-    "docs/rollout-fragments/phase12/T12-07.md"
+    "docs/memory-system/IMPLEMENTATION_STATUS.md",
+    "docs/rollout-fragments/phase12/t12-07.md"
   ],
-  "llms_txt": "UNCHANGED — file does not exist in this repo"
+  "llms_txt": "not present in repo (no update needed)"
 }
