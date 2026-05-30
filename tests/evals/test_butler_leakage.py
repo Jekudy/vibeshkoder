@@ -460,3 +460,189 @@ async def test_l11b_secondline_nomem_field_excluded(
         f"(second-line detect_policy fired), got {ctx.governance_excluded_count}. "
         "This confirms detect_policy re-check is active for text/caption fields."
     )
+
+
+# ---------------------------------------------------------------------------
+# L11.c — forgotten source excluded from Butler evidence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_l11c_forgotten_source_excluded_from_butler_evidence(
+    db_session: AsyncSession,
+) -> None:
+    """L11.c — a forget_events-active message_version MUST NOT reach the Butler.
+
+    (The pending-action mid-flight expiry + callback fail-closed half of L11.c is
+    bound by I9.e in tests/evals/test_butler_forget_cascade.py.)
+    """
+    butler_evidence = __import__(
+        "bot.services.butler_evidence", fromlist=["build_butler_evidence"]
+    )
+    forget_repo = __import__("bot.db.repos.forget_event", fromlist=["ForgetEventRepo"])
+    models = __import__("bot.db.models", fromlist=["ChatMessage"])
+
+    user_id = next(_user_counter)
+    await _make_user(db_session, user_id)
+    msg_id = next(_msg_counter)
+    text_val = "забываемое тестовое содержание одиннадцать-це"
+    query_word = text_val.split()[-1]
+
+    mvid = await _create_message_with_policy(
+        db_session,
+        message_id=msg_id,
+        user_id=user_id,
+        text_value=text_val,
+        caption_value=None,
+        memory_policy="normal",  # searchable + not redacted
+    )
+
+    # Sanity: before forgetting, the row IS retrievable as evidence.
+    ctx_before = await butler_evidence.build_butler_evidence(
+        db_session,
+        requester_user_id=user_id,
+        query=query_word,
+        chat_id=_BUTLER_LEAKAGE_CHAT_ID,
+        visibility_scope="member",
+    )
+    assert mvid in ctx_before.bundle.evidence_ids
+
+    # Fire a forget event (status='pending') with the matching tombstone_key.
+    from sqlalchemy import select as _select
+
+    chat_msg = (
+        await db_session.execute(
+            _select(models.ChatMessage).where(models.ChatMessage.message_id == msg_id)
+        )
+    ).scalar_one()
+    await forget_repo.ForgetEventRepo.create(
+        db_session,
+        target_type="message",
+        target_id=str(chat_msg.id),
+        actor_user_id=user_id,
+        authorized_by="admin",
+        tombstone_key=f"message:{chat_msg.chat_id}:{chat_msg.message_id}",
+        reason="l11c",
+        policy="forgotten",
+    )
+
+    ctx_after = await butler_evidence.build_butler_evidence(
+        db_session,
+        requester_user_id=user_id,
+        query=query_word,
+        chat_id=_BUTLER_LEAKAGE_CHAT_ID,
+        visibility_scope="member",
+    )
+    assert mvid not in ctx_after.bundle.evidence_ids, (
+        f"L11.c: forgotten message_version_id {mvid} leaked into ButlerEvidenceContext"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L11.d — redacted message_versions excluded from Butler evidence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_l11d_redacted_source_excluded_from_butler_evidence(
+    db_session: AsyncSession,
+) -> None:
+    """L11.d — a redacted message_versions row MUST NOT appear in Butler evidence.
+
+    Builds a row with searchable normalized_text but is_redacted=TRUE; the
+    evidence builder's governance predicate (mv.is_redacted=FALSE) must drop it.
+    """
+    butler_evidence = __import__(
+        "bot.services.butler_evidence", fromlist=["build_butler_evidence"]
+    )
+    models = __import__("bot.db.models", fromlist=["ChatMessage", "MessageVersion"])
+    content_hash_service = __import__(
+        "bot.services.content_hash", fromlist=["compute_content_hash"]
+    )
+
+    user_id = next(_user_counter)
+    await _make_user(db_session, user_id)
+    msg_id = next(_msg_counter)
+    text_val = "редактированное тестовое содержание одиннадцать-де"
+    query_word = text_val.split()[-1]
+    ts = datetime.now(timezone.utc)
+
+    chat_msg = models.ChatMessage(
+        message_id=msg_id,
+        chat_id=_BUTLER_LEAKAGE_CHAT_ID,
+        user_id=user_id,
+        text=text_val,
+        caption=None,
+        date=ts,
+        raw_json={"message_id": msg_id},
+        memory_policy="normal",
+        is_redacted=True,  # message-level redaction
+    )
+    db_session.add(chat_msg)
+    await db_session.flush()
+    version = models.MessageVersion(
+        chat_message_id=chat_msg.id,
+        content_hash=content_hash_service.compute_content_hash(text_val, None, "text", None),
+        version_seq=1,
+        text=text_val,
+        caption=None,
+        normalized_text=text_val,  # searchable so FTS would find it
+        is_redacted=True,  # version-level redaction → governance predicate drops it
+        entities_json=None,
+        imported_final=False,
+        captured_at=ts,
+    )
+    db_session.add(version)
+    await db_session.flush()
+    chat_msg.current_version_id = version.id
+    await db_session.flush()
+    mvid = int(version.id)
+
+    ctx = await butler_evidence.build_butler_evidence(
+        db_session,
+        requester_user_id=user_id,
+        query=query_word,
+        chat_id=_BUTLER_LEAKAGE_CHAT_ID,
+        visibility_scope="member",
+    )
+    assert mvid not in ctx.bundle.evidence_ids, (
+        f"L11.d: redacted message_version_id {mvid} leaked into ButlerEvidenceContext"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L11.e — affected-user consent preview excludes evidence content
+# ---------------------------------------------------------------------------
+
+
+def test_l11e_affected_user_preview_excludes_evidence_content() -> None:
+    """L11.e — the preview shown to an affected user surfaces only the plan summary
+    and structural metadata, never raw evidence (in- or out-of-scope) content.
+
+    The cross-user consent DM (bot/handlers/butler.py::_send_consent_requests)
+    sends ``_render_preview(action)``, which is derived solely from
+    ``plan_summary`` + tool/risk/visibility metadata — it never reads
+    ``evidence_ids`` content. A planted evidence snippet must not appear.
+    """
+    from types import SimpleNamespace
+
+    handler = __import__("bot.handlers.butler", fromlist=["_render_preview"])
+
+    evidence_secret = "ADMIN_ONLY_SECRET_EVIDENCE_SNIPPET"
+    action = SimpleNamespace(
+        id=4242,
+        plan_summary="Предложить встречу участнику по теме X",
+        tool_name="schedule_meeting",
+        risk_level="low",
+        visibility_scope="member",
+        # Even if evidence content were attached to the row, the renderer must
+        # not surface it:
+        evidence_ids=[1, 2, 3],
+        result_payload={"text": evidence_secret},
+    )
+
+    preview = handler._render_preview(action)
+
+    assert "Предложить встречу" in preview  # plan summary IS shown
+    assert evidence_secret not in preview  # evidence content is NOT shown
+    assert "schedule_meeting" in preview  # structural metadata only
