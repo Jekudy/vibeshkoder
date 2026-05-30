@@ -214,6 +214,24 @@ class _Settings:
     butler_per_user_daily_usd_ceiling = 10_000
 
 
+class _FakeResult:
+    """Minimal result proxy for _FakeSession.execute()."""
+
+    def scalar_one_or_none(self) -> None:
+        return None  # SUM → NULL → Decimal("0") spend → budget always OK
+
+
+class _FakeSession:
+    """Minimal async session that satisfies the budget query path.
+
+    Returns None from execute() scalar so the budget check sees zero spend
+    and never triggers budget_exceeded — budget is not the subject of R8.b.
+    """
+
+    async def execute(self, stmt: Any, params: Any = None) -> "_FakeResult":
+        return _FakeResult()
+
+
 # ---------------------------------------------------------------------------
 # R8.f / R8.g — plan validation (pure, no DB, no LLM)
 # ---------------------------------------------------------------------------
@@ -288,12 +306,44 @@ async def test_r8a_non_member_refused_before_evidence_and_llm() -> None:
 
 
 # ---------------------------------------------------------------------------
-# R8.b — BLOCKED (empty_evidence behavior pending orchestrator decision)
+# R8.b — empty/abstained evidence bundle stops plan_action before the LLM call
 # ---------------------------------------------------------------------------
-# R8.b is intentionally omitted from this pass.
-# The #352 version asserts error_kind='empty_evidence' which does NOT exist on
-# main (plan_action on abstained bundle does not raise this kind).
-# Build after orchestrator resolves: re-ground to real behavior or drop AC.
+
+
+async def test_r8b_abstained_bundle_raises_empty_evidence_before_llm() -> None:
+    """R8.b: plan_action with an abstained evidence bundle raises ButlerActionRejectedError
+    (error_kind='empty_evidence') and never calls the LLM gateway."""
+    action_repo = _FakeActionRepo()
+
+    svc = ButlerService(
+        session=_FakeSession(),
+        ledger_repo=None,
+        butler_action_repo=action_repo,
+        butler_action_confirmation_repo=_FakeConfirmationRepo(),
+        butler_tool_invocation_repo=None,
+        butler_rate_bucket_repo=_FakeRateBucketRepo(),
+        user_repo=_FakeUserRepo(SimpleNamespace(is_member=True, is_admin=False)),
+        llm_gateway=_ExplodingGateway(),
+        evidence_builder=_FakeEvidenceBuilder(_context(abstained=True)),
+        settings=_Settings(),
+    )
+
+    with pytest.raises(ButlerActionError) as ei:
+        await svc.plan_action(
+            requester_user_id=_next_id(),
+            chat_id=None,
+            query="who knows Rust?",
+            visibility_scope="member",
+        )
+
+    exc = ei.value
+    assert exc.error_kind == "empty_evidence"
+
+    # A rejected butler_actions row must have been written
+    assert len(action_repo.rows) == 1
+    row = next(iter(action_repo.rows.values()))
+    assert row.status == "rejected"
+    assert row.rejection_reason == "empty_evidence"
 
 
 # ---------------------------------------------------------------------------

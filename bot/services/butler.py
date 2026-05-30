@@ -487,6 +487,37 @@ class ButlerService:
             visibility_scope=visibility_scope,
         )
 
+        # Step 2b — abstention guard: empty/zero-item evidence bundle → reject before LLM.
+        # Prevents the gateway from producing a hallucinated empty-citation plan when there
+        # is no usable memory to act on (privacy invariant: never synthesise from nothing).
+        if evidence_context.bundle.abstained:
+            action_row = await self._action_repo.create(
+                self._session,
+                requester_tg_id=requester_user_id,
+                chat_id=effective_chat_id,
+                action_type="recall",
+                status="rejected",
+                tool_name="recall_evidence",
+                tool_manifest_version="v1.0.0",
+                governance_filter_version=evidence_context.governance_filter_version,
+                evidence_context_hash=evidence_context.context_hash,
+                plan_summary="",
+                action_args={},
+                action_args_hash="",
+                rollback_kind="not_reversible",
+                risk_level="low",
+                rejection_reason="empty_evidence",
+                llm_usage_ledger_id=None,
+                query=query,
+                visibility_scope=visibility_scope,
+                plan_payload={},
+            )
+            raise ButlerActionError(
+                f"no usable evidence for user {requester_user_id} — abstained",
+                error_kind="empty_evidence",
+                action_id=action_row.id,
+            )
+
         # Step 3 — call LLM gateway
         plan = None
         ledger_id = None

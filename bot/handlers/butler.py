@@ -162,6 +162,7 @@ _MSG_HALLUCINATED_ARGS = "Butler не смог правильно понять �
 _MSG_CROSS_USER_CONSENT_MISSING = "Для этого действия требуется согласие других участников."
 _MSG_DRY_RUN_FAILURE = "Тестовый запуск действия не удался. Попробуйте позже."
 _MSG_BUDGET_EXCEEDED = "Достигнут бюджетный лимит. Попробуйте позже."
+_MSG_EMPTY_EVIDENCE = "У меня нет подходящих воспоминаний для этого запроса."
 _MSG_TTL_EXPIRED = "Время ожидания истекло. Повторите /butler."
 _MSG_PLAN_FAILED = "Планирование действия завершилось ошибкой. Попробуйте другой запрос."
 
@@ -280,6 +281,7 @@ def _dispatch_butler_error(exc: ButlerActionError) -> str:
         "cross_user_consent_missing": _MSG_CROSS_USER_CONSENT_MISSING,
         "dry_run_failure": _MSG_DRY_RUN_FAILURE,
         "budget_exceeded": _MSG_BUDGET_EXCEEDED,
+        "empty_evidence": _MSG_EMPTY_EVIDENCE,
         "ttl_expired": _MSG_TTL_EXPIRED,
         "plan_failed": _MSG_PLAN_FAILED,
         "not_found": _MSG_NOT_FOUND,
