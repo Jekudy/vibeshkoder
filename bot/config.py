@@ -4,7 +4,7 @@ import logging
 import secrets
 import warnings
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 _MIN_WEB_PASSWORD_LENGTH = 12
@@ -73,6 +73,16 @@ class Settings(BaseSettings):
     # How long after execution an action can be undone (minutes).
     # Env var: BUTLER_UNDO_TTL_MINUTES (pydantic maps case-insensitively).
     butler_undo_ttl_minutes: int = 60
+
+    @field_validator("butler_undo_ttl_minutes")
+    @classmethod
+    def validate_butler_undo_ttl(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(
+                f"BUTLER_UNDO_TTL_MINUTES must be > 0 (got {v}); "
+                "setting it to 0 or negative silently disables undo for all actions."
+            )
+        return v
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
