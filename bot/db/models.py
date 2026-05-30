@@ -2099,7 +2099,7 @@ class ButlerActionConfirmation(Base):
             name="ck_butler_action_confirmations_role",
         ),
         CheckConstraint(
-            "status IN ('pending','confirmed','rejected','expired','cancelled')",
+            "status IN ('pending','confirmed','rejected','expired','cancelled','revoked')",
             name="ck_butler_action_confirmations_status",
         ),
         Index("ix_butler_action_confirmations_action", "action_id"),
