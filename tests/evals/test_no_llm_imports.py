@@ -306,3 +306,121 @@ def test_i3_allow_list_contract_documented() -> None:
         "bot/services/llm_providers/{anthropic,openai}.py. If a new provider "
         "is added, extend the allow-list AND re-confirm gateway invariant #2."
     )
+
+
+# ---------------------------------------------------------------------------
+# G3.a (T12-09) — per-path forbidden-import scan.
+#
+# Extends — does NOT replace — the global LLM_PROVIDER_PREFIXES scan above with
+# a path-keyed map so a specific subsystem can forbid additional modules. The
+# Butler boundary (Phase 12) forbids anthropic / openai (Hard Constraint #1) AND
+# bot.services.graph_query (preserves Phase 10 admin-only graph stance, §5.7).
+# ---------------------------------------------------------------------------
+
+
+def _module_matches_forbidden(module: str | None, forbidden: frozenset[str]) -> str | None:
+    """Return the forbidden entry a module matches, else None.
+
+    A module matches a forbidden name F if module == F or module starts with
+    ``F + "."`` (sub-module import). This catches both ``import F`` /
+    ``from F import x`` and ``from F.sub import y``.
+    """
+    if module is None:
+        return None
+    for f in forbidden:
+        if module == f or module.startswith(f + "."):
+            return f
+    return None
+
+
+def _forbidden_import_sites(path: Path, forbidden: frozenset[str]) -> list[tuple[int, str]]:
+    sites: list[tuple[int, str]] = []
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except SyntaxError as exc:
+        pytest.fail(f"unable to parse {_relative_to_repo(path)}: {exc!s}")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                hit = _module_matches_forbidden(alias.name, forbidden)
+                if hit is not None:
+                    sites.append((node.lineno, f"import {alias.name}"))
+        elif isinstance(node, ast.ImportFrom):
+            # node.module is None for relative imports like `from . import x`.
+            hit = _module_matches_forbidden(node.module, forbidden)
+            if hit is not None:
+                names = ", ".join(alias.name for alias in node.names)
+                sites.append((node.lineno, f"from {node.module} import {names}"))
+    return sites
+
+
+def assert_no_forbidden_imports_per_path(
+    forbidden_map: dict[str, frozenset[str]],
+) -> None:
+    """Assert that every file matching each glob key imports none of its forbidden modules.
+
+    ``forbidden_map`` keys are repo-relative glob patterns under ``bot/``; values
+    are frozensets of forbidden module names. A glob that matches NO file is a
+    harness misconfiguration (coverage must not silently drop) and fails the
+    assertion. Extends — does not replace — the global LLM_PROVIDER_PREFIXES scan.
+    """
+    violations: list[str] = []
+    empty_globs: list[str] = []
+    for glob_pattern, forbidden in forbidden_map.items():
+        matched = sorted(
+            p for p in REPO_ROOT.glob(glob_pattern) if "__pycache__" not in p.parts
+        )
+        if not matched:
+            empty_globs.append(glob_pattern)
+            continue
+        for path in matched:
+            rel = _relative_to_repo(path)
+            for line_no, statement in _forbidden_import_sites(path, forbidden):
+                violations.append(f"{rel}:{line_no}: {statement}")
+
+    assert not empty_globs, (
+        "G3.a harness misconfiguration — these glob patterns matched no files "
+        "(coverage would silently drop):\n" + "\n".join(empty_globs)
+    )
+    assert not violations, (
+        "G3.a violation — forbidden import detected in a path-scoped file:\n"
+        + "\n".join(violations)
+    )
+
+
+# Verbatim map from PHASE12_PLAN_REFRESH.md §12.5 G3.a.
+_BUTLER_FORBIDDEN_IMPORTS: dict[str, frozenset[str]] = {
+    "bot/services/butler*.py": frozenset({"anthropic", "openai", "bot.services.graph_query"}),
+    "bot/handlers/butler.py": frozenset({"anthropic", "openai", "bot.services.graph_query"}),
+    "bot/services/butler_tools/*.py": frozenset({"anthropic", "openai", "bot.services.graph_query"}),
+}
+
+
+def test_g3a_butler_paths_have_no_forbidden_imports() -> None:
+    """G3.a: Butler service/handler/tool files import no anthropic/openai/graph_query."""
+    assert_no_forbidden_imports_per_path(_BUTLER_FORBIDDEN_IMPORTS)
+
+
+def test_g3a_helper_detects_a_planted_violation(tmp_path) -> None:
+    """G3.a meta-test: the helper actually flags a forbidden import (no silent pass).
+
+    Guards against a broken scanner that would let real violations through —
+    same honeypot rationale as the I4b URL scan.
+    """
+    bad = tmp_path / "bot" / "services" / "butler_planted.py"
+    bad.parent.mkdir(parents=True)
+    bad.write_text("from bot.services.graph_query import run_query\n", encoding="utf-8")
+
+    # Point the scan at tmp_path by temporarily swapping REPO_ROOT semantics:
+    # build the absolute glob ourselves and feed the helper a map it can resolve.
+    import tests.evals.test_no_llm_imports as mod
+
+    original_root = mod.REPO_ROOT
+    mod.REPO_ROOT = tmp_path
+    try:
+        with pytest.raises(AssertionError, match="graph_query"):
+            mod.assert_no_forbidden_imports_per_path(
+                {"bot/services/butler_*.py": frozenset({"bot.services.graph_query"})}
+            )
+    finally:
+        mod.REPO_ROOT = original_root
