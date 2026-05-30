@@ -1689,8 +1689,8 @@ class ButlerService:
         Prior text is resolved exclusively via _resolve_prior_text (message_versions JOIN
         chat_messages). This is the only forget-safe source — inverse_op_payload does NOT
         store prior_text by design (update_intro.build_inverse omits it for privacy).
-        The forget cascade NULLs MessageVersion.text for redacted content, so a forgotten
-        prior text correctly returns None → fallback_prior_text_unavailable.
+        The forget cascade NULLs MessageVersion.text for redacted content, so a prior
+        version that was redacted correctly returns None → fallback_prior_text_unavailable.
         """
         chat_id = payload.get("chat_id")
         message_id = payload.get("message_id")
