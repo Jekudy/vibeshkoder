@@ -953,14 +953,16 @@ async def butler_expire_tick(*, bot: Bot, session: Any) -> int:
 
     expired_count = 0
     for action in stale_actions:
+        updated = None
         try:
-            updated = await _expire_action_inline(session, action.id, action_repo=_ActionRepo)
-            if getattr(updated, "status", None) == "expired":
-                expired_count += 1
+            async with session.begin_nested():
+                updated = await _expire_action_inline(session, action.id, action_repo=_ActionRepo)
         except Exception:
             logger.exception(
                 "butler_expire_tick: expire_action failed for action_id=%s", action.id
             )
+        if getattr(updated, "status", None) == "expired":
+            expired_count += 1
 
     await session.commit()
     if expired_count:
