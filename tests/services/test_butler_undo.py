@@ -336,7 +336,10 @@ def _make_service(
     # Stub the unused collaborators
     session = AsyncMock()
     ledger_repo = MagicMock()
-    confirmation_repo = MagicMock()
+    # AsyncMock so list_for_action is awaitable; returns [] so auth branch
+    # finds no affected_user rows for non-requester non-admin calls.
+    confirmation_repo = AsyncMock()
+    confirmation_repo.list_for_action = AsyncMock(return_value=[])
     rate_bucket_repo = MagicMock()
     # user_repo.get must be awaitable since M3 admin verify uses await user_repo.get(...)
     user_repo = AsyncMock()
@@ -716,12 +719,8 @@ def test_lifo_order() -> None:
 def test_resolve_prior_text_returns_pre_edit_version() -> None:
     """_resolve_prior_text returns the second-latest version_seq text (pre-edit body).
 
-    C3-NEW fix: the old implementation used non-existent column names
-    (MessageVersion.message_text, MessageVersion.chat_id, MessageVersion.message_id)
-    causing AttributeError swallowed by broad except → None always returned.
-
-    This test wires a mock session whose execute() returns a mock scalar_one_or_none()
-    of "v2" (the second-latest version), verifying the corrected JOIN query shape.
+    Wires a mock session whose execute() returns "v2" from scalar_one_or_none(),
+    verifying the JOIN query shape through ChatMessage → MessageVersion.
     """
     # Build a mock session that returns "v2" from scalar_one_or_none()
     mock_result = MagicMock()
@@ -771,3 +770,187 @@ def test_resolve_prior_text_returns_none_on_sqlalchemy_error() -> None:
     result = asyncio.run(svc._resolve_prior_text(chat_id=CHAT_ID, message_id=12345))
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Test 16: F7 — affected_user is allowed to undo (spec PLAN.md §§728/470)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeButlerActionConfirmation:
+    id: int
+    butler_action_id: int
+    confirmer_tg_id: int
+    confirmation_role: str  # 'requester' | 'affected_user'
+    status: str = "approved"
+
+
+class FakeButlerActionConfirmationRepo:
+    """Minimal fake that supports list_for_action."""
+
+    def __init__(self, rows: list[FakeButlerActionConfirmation] | None = None) -> None:
+        self._rows = rows or []
+
+    async def list_for_action(
+        self, session: Any, action_id: int
+    ) -> list[FakeButlerActionConfirmation]:
+        return [r for r in self._rows if r.butler_action_id == action_id]
+
+
+def _make_service_with_confirmation_repo(
+    action: FakeButlerAction,
+    confirmation_repo: Any,
+    invocations: list | None = None,
+) -> ButlerService:
+    """Build a ButlerService with a real confirmation repo for F7 tests."""
+    action_repo = FakeButlerActionRepo(action)
+    invocation_repo = FakeButlerToolInvocationRepo(invocations or [])
+    undo_inv_repo = FakeButlerUndoInvocationRepo()
+    card_sugg_repo = FakeButlerCardSuggestionRepo()
+
+    session = AsyncMock()
+    ledger_repo = MagicMock()
+    rate_bucket_repo = MagicMock()
+    user_repo = AsyncMock()
+    user_repo.get = AsyncMock(return_value=None)
+    llm_gateway = MagicMock()
+    evidence_builder = MagicMock()
+    settings = MagicMock(butler_undo_ttl_minutes=60)
+
+    return ButlerService(
+        session=session,
+        ledger_repo=ledger_repo,
+        butler_action_repo=action_repo,
+        butler_action_confirmation_repo=confirmation_repo,
+        butler_tool_invocation_repo=invocation_repo,
+        butler_rate_bucket_repo=rate_bucket_repo,
+        user_repo=user_repo,
+        llm_gateway=llm_gateway,
+        evidence_builder=evidence_builder,
+        settings=settings,
+        undo_invocation_repo=undo_inv_repo,
+        card_suggestion_repo=card_sugg_repo,
+    )
+
+
+def test_affected_user_can_undo() -> None:
+    """An affected_user of a cross-user action (e.g. send_intro) must be able to undo.
+
+    Spec: PLAN.md §728, DESIGN §470, charter §91 — requester|affected_user|admin allowed.
+    """
+    AFFECTED_USER_ID = 77
+    inv = _make_invocation(rollback_kind="not_reversible")
+    action = _make_action(requester_tg_id=REQUESTER_ID)  # requester != affected user
+
+    confirmation_repo = FakeButlerActionConfirmationRepo(
+        rows=[
+            FakeButlerActionConfirmation(
+                id=1,
+                butler_action_id=ACTION_ID,
+                confirmer_tg_id=AFFECTED_USER_ID,
+                confirmation_role="affected_user",
+                status="approved",
+            )
+        ]
+    )
+    svc = _make_service_with_confirmation_repo(
+        action=action,
+        confirmation_repo=confirmation_repo,
+        invocations=[inv],
+    )
+    bot = AsyncMock()
+
+    # Should NOT raise — affected_user is authorized
+    summary = asyncio.run(
+        svc.execute_undo(
+            action_id=ACTION_ID,
+            requester_user_id=AFFECTED_USER_ID,
+            is_admin=False,
+            bot=bot,
+        )
+    )
+    assert summary is not None
+
+
+def test_non_affected_non_requester_non_admin_still_forbidden() -> None:
+    """A user who is neither requester nor affected_user nor admin remains forbidden.
+
+    The affected_user branch must NOT open the gate to arbitrary users.
+    """
+    STRANGER_ID = 555
+    action = _make_action(requester_tg_id=REQUESTER_ID)
+
+    # Confirmation repo has an affected_user row, but for a different user
+    confirmation_repo = FakeButlerActionConfirmationRepo(
+        rows=[
+            FakeButlerActionConfirmation(
+                id=1,
+                butler_action_id=ACTION_ID,
+                confirmer_tg_id=77,  # different user, not STRANGER_ID
+                confirmation_role="affected_user",
+                status="approved",
+            )
+        ]
+    )
+    svc = _make_service_with_confirmation_repo(
+        action=action,
+        confirmation_repo=confirmation_repo,
+    )
+
+    with pytest.raises(ButlerActionError) as exc_info:
+        asyncio.run(
+            svc.execute_undo(
+                action_id=ACTION_ID,
+                requester_user_id=STRANGER_ID,
+                is_admin=False,
+                bot=AsyncMock(),
+            )
+        )
+    assert exc_info.value.error_kind == "forbidden"
+
+
+# ---------------------------------------------------------------------------
+# Test 17: V2 — failed undo step must be retried on subsequent /butler_undo
+# ---------------------------------------------------------------------------
+
+
+def test_failed_undo_step_is_retried_not_skipped() -> None:
+    """V2: idempotency short-circuit must NOT treat 'failed' as terminal.
+
+    First call: undo row with status='failed' exists.
+    Second call: the step must be retried (not returned as already-done).
+
+    Spec: PLAN.md §724 best-effort + retry-safe intent.
+    """
+    inv = _make_invocation(
+        rollback_kind="delete_message",
+        inverse_op_payload={"rollback_kind": "delete_message", "chat_id": CHAT_ID, "message_id": 9999},
+    )
+    action = _make_action(status="succeeded")
+    undo_repo = FakeButlerUndoInvocationRepo()
+
+    # Pre-populate with a FAILED undo row (transient failure scenario)
+    failed_undo = FakeButlerUndoInvocation(
+        id=201,
+        butler_action_id=ACTION_ID,
+        butler_tool_invocation_id=INVOCATION_ID_1,
+        requester_user_id=REQUESTER_ID,
+        rollback_kind="delete_message",
+        status="failed",
+    )
+    undo_repo._rows[(ACTION_ID, INVOCATION_ID_1)] = failed_undo
+
+    bot = AsyncMock()
+    # Simulate successful delete on retry
+    bot.delete_message = AsyncMock(return_value=True)
+
+    svc = _make_service(action=action, invocations=[inv], undo_repo=undo_repo)
+
+    # This must NOT short-circuit — must attempt the delete again
+    asyncio.run(
+        svc.execute_undo(action_id=ACTION_ID, requester_user_id=REQUESTER_ID, bot=bot)
+    )
+
+    # Bot was called — the step was retried
+    bot.delete_message.assert_awaited_once()
