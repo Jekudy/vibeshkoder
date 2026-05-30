@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     NEO4J_AUTH_PASSWORD: str = "test_password_min_32_chars_for_neo4j_5"  # dev default
     NEO4J_DATABASE: str = "neo4j"
 
+    # ── Butler / T12-07 undo controls ────────────────────────────────────────
+    # How long after execution an action can be undone (minutes).
+    # Env var: BUTLER_UNDO_TTL_MINUTES (pydantic maps case-insensitively).
+    butler_undo_ttl_minutes: int = 60
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     @model_validator(mode="after")
