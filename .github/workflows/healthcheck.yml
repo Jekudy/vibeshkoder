@@ -27,9 +27,20 @@ jobs:
       - name: Set up Python venv (system python; setup-python@v5 has no prebuilt for Ubuntu 25.10)
         run: |
           python3 --version
-          python3 -m venv /tmp/healing-venv
-          /tmp/healing-venv/bin/pip install --upgrade pip
-          echo "/tmp/healing-venv/bin" >> "$GITHUB_PATH"
+          # Venv must NOT live in /tmp: systemd-tmpfiles ages out files >10d by
+          # atime, deleting package .py sources while __pycache__/dist-info
+          # survive — pip then reports "already satisfied" but imports resolve
+          # to empty namespace packages (incident 2026-06-01: httpx lost
+          # Client/HTTPError and every healthcheck run failed).
+          VENV_DIR="$HOME/healing-venv"
+          if [ -x "$VENV_DIR/bin/python" ] && ! "$VENV_DIR/bin/python" -c "import httpx, psycopg; httpx.Client; httpx.HTTPError" >/dev/null 2>&1; then
+            echo "::warning::venv at $VENV_DIR is broken — dumping httpx state and recreating"
+            ls -la "$VENV_DIR"/lib/python*/site-packages/httpx/ 2>&1 || true
+            rm -rf "$VENV_DIR"
+          fi
+          python3 -m venv "$VENV_DIR"
+          "$VENV_DIR/bin/pip" install --upgrade pip
+          echo "$VENV_DIR/bin" >> "$GITHUB_PATH"
 
       - name: Install dependencies
         run: pip install -e ".[dev,healing]"
