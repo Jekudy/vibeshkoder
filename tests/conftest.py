@@ -29,6 +29,8 @@ DEFAULT_LOCAL_POSTGRES_URL = (
 def app_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
     monkeypatch.setenv("COMMUNITY_CHAT_ID", "-1001234567890")
+    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", "-1001234567890")
+    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", "-1001234567890")
     monkeypatch.setenv("ADMIN_IDS", "[149820031]")
     # Set DATABASE_URL ONLY if it is not already set externally. CI provides the postgres-
     # service URL via env (`localhost:5432`); overriding it here would route DB-backed tests

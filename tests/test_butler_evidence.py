@@ -397,8 +397,8 @@ class TestEmptyQuery:
 
 class TestGovernanceExcludedCount:
     @pytest.mark.asyncio
-    async def test_excluded_count_increments_for_filtered_sources(self) -> None:
-        """When a source triggers a non-allowable policy, governance_excluded_count increases."""
+    async def test_legacy_marker_does_not_increment_excluded_count(self) -> None:
+        """Phase 13 keeps a normal source containing a legacy marker."""
         from bot.services.butler_evidence import build_butler_evidence
         from bot.services.search import SearchHit
 
@@ -443,9 +443,8 @@ class TestGovernanceExcludedCount:
                 visibility_scope="member",
             )
 
-        assert ctx.governance_excluded_count >= 1
-        # The hit must not appear in the bundle.
-        assert 101 not in ctx.bundle.evidence_ids
+        assert ctx.governance_excluded_count == 0
+        assert 101 in ctx.bundle.evidence_ids
 
     @pytest.mark.asyncio
     async def test_normal_policy_not_excluded(self) -> None:

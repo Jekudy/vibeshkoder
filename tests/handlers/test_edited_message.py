@@ -232,18 +232,16 @@ def test_edit_unchanged_content_no_version(app_env, monkeypatch) -> None:
     mock_insert_version.assert_not_awaited()
 
 
-# ─── Test 3: normal → offrecord flip: zero out content ────────────────────────
+# ─── Test 3: legacy marker remains ordinary content ──────────────────────────
 
 
-def test_edit_normal_to_offrecord_flip_zero_out(app_env, monkeypatch) -> None:
-    """Edit adding #offrecord flips policy, nulls text/caption/raw_json, sets is_redacted=True,
-    creates offrecord_marks row — all in same transaction."""
+def test_edit_legacy_offrecord_marker_stays_normal_and_versions(app_env, monkeypatch) -> None:
+    """Phase 13 stores an edit containing ``#offrecord`` as normal content."""
     handler = import_module("bot.handlers.edited_message")
 
     msg_id = _random_message_id()
     chat_id = -1001234567890
     user_id = _random_user_id()
-    # Edited message now contains #offrecord
     message = _make_message(
         message_id=msg_id, chat_id=chat_id, user_id=user_id, text="this is #offrecord content"
     )
@@ -256,12 +254,6 @@ def test_edit_normal_to_offrecord_flip_zero_out(app_env, monkeypatch) -> None:
         memory_policy="normal",
     )
 
-    # After _apply_offrecord_flip the row's text becomes None
-    def _refresh_side_effect(row):
-        row.text = None
-        row.caption = None
-        row.memory_policy = "offrecord"
-
     mock_find = AsyncMock(return_value=existing_row)
     mock_apply_flip = AsyncMock()
     mock_get_by_hash = AsyncMock(return_value=None)
@@ -269,7 +261,7 @@ def test_edit_normal_to_offrecord_flip_zero_out(app_env, monkeypatch) -> None:
     mock_mark_create = AsyncMock()
 
     session = AsyncMock()
-    session.refresh = AsyncMock(side_effect=_refresh_side_effect)
+    session.refresh = AsyncMock()
     session.execute = AsyncMock(
         return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=existing_row))
     )
@@ -283,17 +275,13 @@ def test_edit_normal_to_offrecord_flip_zero_out(app_env, monkeypatch) -> None:
 
     asyncio.run(handler.handle_edited_message(message, session))
 
-    # _apply_offrecord_flip must have been called (BLOCKER #1) — this is the audit
-    # trail: parent row content nulled + offrecord_marks row created.
-    mock_apply_flip.assert_awaited_once()
-
-    # Codex HIGH (privacy): on normal→offrecord flip the version row is NOT inserted —
-    # both the parent row's now-null content and the redacted-state lookup hash collapse
-    # to the same redacted-state chv1, so insert_version's idempotency path returns early.
-    # The state change is captured by the parent row update + offrecord_marks audit row.
-    # Storing a fresh version row here would either fingerprint the raw content (privacy
-    # leak Codex flagged) or be a redundant no-op row (no information gain).
-    mock_insert_version.assert_not_awaited()
+    mock_apply_flip.assert_not_awaited()
+    mock_mark_create.assert_not_awaited()
+    mock_insert_version.assert_awaited_once()
+    inserted = mock_insert_version.call_args.kwargs
+    assert inserted["text"] == "this is #offrecord content"
+    assert inserted["caption"] is None
+    assert inserted["is_redacted"] is False
 
 
 def test_apply_offrecord_flip_redacts_existing_message_versions(app_env) -> None:
@@ -470,9 +458,7 @@ def test_edited_message_offrecord_to_nomem_is_noop(app_env, monkeypatch) -> None
 
     msg_id = _random_message_id()
     chat_id = -1001234567890
-    message = _make_message(
-        message_id=msg_id, chat_id=chat_id, text="please #nomem this"
-    )
+    message = _make_message(message_id=msg_id, chat_id=chat_id, text="please #nomem this")
 
     existing_row = _make_chat_message_row(
         id=12,
@@ -511,9 +497,7 @@ def test_edited_message_offrecord_to_nomem_is_noop(app_env, monkeypatch) -> None
         assert kwargs.get("is_redacted") is True
 
 
-def test_edited_message_offrecord_caption_only_edit_is_noop(
-    app_env, monkeypatch
-) -> None:
+def test_edited_message_offrecord_caption_only_edit_is_noop(app_env, monkeypatch) -> None:
     """Sticky offrecord covers caption-only edits on media (Finding 3 caption coverage).
 
     A photo message that was offrecord-flipped must reject any later caption edit that
@@ -1041,6 +1025,7 @@ def test_handle_edited_message_threads_raw_update_id(app_env, monkeypatch) -> No
 
     # Simulate a raw_update row surfaced by RawUpdatePersistenceMiddleware.
     from types import SimpleNamespace as NS
+
     raw_update = NS(id=777)
 
     asyncio.run(handler.handle_edited_message(message, session, raw_update=raw_update))

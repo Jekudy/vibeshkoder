@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import html
 import logging
-import os
+from dataclasses import replace
 from datetime import datetime
-from decimal import Decimal
 from typing import Any
 
 from aiogram import Router
@@ -25,16 +24,21 @@ from bot.services.governance import detect_policy
 from bot.services.llm_gateway import (
     AnswerWithCitations,
     LLMGatewayConfig,
+    _safe_qa_provider_error_subtype,
+    load_gateway_config,
+    resolve_provider,
     synthesize_answer,
 )
 from bot.services.llm_providers import LLMProvider
-from bot.services.llm_providers.anthropic import (
-    DEFAULT_ANTHROPIC_MODEL,
-    AnthropicProvider,
-)
-from bot.services.llm_providers.openai import DEFAULT_OPENAI_MODEL, OpenAIProvider
 from bot.services.message_persistence import persist_message_with_policy
 from bot.services.qa import run_qa
+from bot.services.qa_guardrails import (
+    MAX_AI_ANSWER_CHARS,
+    acquire_daily_llm_question_slot,
+    build_guarded_llm_query,
+    limit_answer_text,
+)
+from bot.services.qa_trigger import ShkoderQuestionFilter, TriggeredQuestion
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +46,11 @@ router = Router(name="qa")
 
 QA_FEATURE_FLAG = "memory.qa.enabled"
 LLM_SYNTHESIS_FEATURE_FLAG = "memory.qa.llm_synthesis.enabled"
+QA_EVIDENCE_LIMIT = 3
 
-# Default prompt template version per contracts.md §12.5 ratification.
-# Stays in sync with whatever ``_build_prompt`` ships in the gateway today.
-DEFAULT_PROMPT_TEMPLATE_VERSION = "v1.0.0"
+# The evidence-bearing prompt shipped after the original v1.0.0 cache format.
+# Keep this pin explicit so old ungrounded cache rows can never be reused.
+DEFAULT_PROMPT_TEMPLATE_VERSION = "v1.1.0"
 
 
 def _short_chat_id(chat_id: int) -> str:
@@ -99,7 +104,7 @@ def _format_message_item(
     return (
         f"<blockquote>{snippet}</blockquote>\n"
         f"<i>— {author_name}, {date_text}</i> · "
-        f"<a href=\"{html.escape(link, quote=True)}\">сообщение</a> · "
+        f'<a href="{html.escape(link, quote=True)}">сообщение</a> · '
         f"<code>message_version_id:{item.message_version_id}</code>"
     )
 
@@ -126,7 +131,7 @@ def _format_card_item(item: EvidenceItem, short_chat_id: str) -> str:
     return (
         f"<blockquote>{snippet}</blockquote>\n"
         f"<i>\U0001f4cb Карточка, {date_text}</i> · "
-        f"<a href=\"{html.escape(anchor_link, quote=True)}\">первоисточник</a> · "
+        f'<a href="{html.escape(anchor_link, quote=True)}">первоисточник</a> · '
         f"<code>card_id:{item.card_id}</code> · "
         f"<code>sources:[{mvid_list}]</code>"
     )
@@ -152,7 +157,7 @@ def _format_response(bundle: EvidenceBundle, users_by_id: dict[int, object]) -> 
             parts.append(
                 f"<blockquote>{snippet}</blockquote>\n"
                 f"<i>— {author_name}, {date_text}</i> · "
-                f"<a href=\"{html.escape(link, quote=True)}\">сообщение</a> · "
+                f'<a href="{html.escape(link, quote=True)}">сообщение</a> · '
                 f"<code>message_version_id:{item.message_version_id}</code>"
             )
         return "\n\n".join(parts)
@@ -169,51 +174,17 @@ def _format_response(bundle: EvidenceBundle, users_by_id: dict[int, object]) -> 
 
 
 def _load_gateway_config() -> LLMGatewayConfig:
-    """Resolve LLM gateway config from env vars with sane defaults.
+    """Load the shared gateway config with the QA prompt-version pin."""
 
-    Reads:
-      * ``LLM_PROVIDER`` (default ``"anthropic"``) — gateway provider tag.
-      * ``LLM_MODEL`` (provider-specific default) — model id passed to
-        ``MODEL_PRICING`` and the provider SDK.
-      * ``LLM_DAILY_USD_CEILING`` (default ``Decimal("5.00")``).
-      * ``LLM_MONTHLY_USD_CEILING`` (default ``Decimal("50.00")``).
-
-    ``prompt_template_version`` is the ``v1.0.0`` baseline introduced
-    with T5-04b — see ``bot/services/llm_pricing.py`` + contracts.md §12.5.
-    """
-    provider = os.environ.get("LLM_PROVIDER", "anthropic")
-    if provider not in ("anthropic", "openai"):
-        # Reject typos early; the gateway expects a Literal["anthropic","openai"].
-        raise ValueError(f"unknown provider: {provider}")
-
-    default_model = (
-        DEFAULT_OPENAI_MODEL if provider == "openai" else DEFAULT_ANTHROPIC_MODEL
-    )
-    model = os.environ.get("LLM_MODEL", default_model)
-    daily = Decimal(os.environ.get("LLM_DAILY_USD_CEILING", "5.00"))
-    monthly = Decimal(os.environ.get("LLM_MONTHLY_USD_CEILING", "50.00"))
-    return LLMGatewayConfig(
-        provider=provider,  # type: ignore[arg-type]  # validated above
-        model=model,
-        daily_ceiling_usd=daily,
-        monthly_ceiling_usd=monthly,
+    return load_gateway_config(
         prompt_template_version=DEFAULT_PROMPT_TEMPLATE_VERSION,
     )
 
 
 def _resolve_provider(provider_name: str) -> LLMProvider:
-    """Instantiate Anthropic or OpenAI provider per config.
+    """Instantiate a configured provider through the shared resolver."""
 
-    Raises ``ValueError`` on unknown ``provider_name``. The handler catches
-    every exception from the LLM-synthesis branch and falls back to the
-    Phase 4 rendering path, so a misconfigured provider never crashes the
-    bot — but it does abstain from synthesis.
-    """
-    if provider_name == "anthropic":
-        return AnthropicProvider()
-    if provider_name == "openai":
-        return OpenAIProvider()
-    raise ValueError(f"unknown provider: {provider_name}")
+    return resolve_provider(provider_name)
 
 
 def _format_synthesized_response(
@@ -247,9 +218,7 @@ def _format_synthesized_response(
     if not has_card:
         # Phase 5 path — preserved byte-for-byte.
         for idx, item in enumerate(bundle.items, start=1):
-            author_name = _author_name(
-                users_by_id.get(item.user_id) if item.user_id else None
-            )
+            author_name = _author_name(users_by_id.get(item.user_id) if item.user_id else None)
             date_text = _format_date(item.message_date)
             snippet = _safe_headline(item.snippet)
             parts.append(f"[{idx}] {date_text} — {author_name}: {snippet}")
@@ -260,13 +229,85 @@ def _format_synthesized_response(
         if item.source_type == "card":
             parts.append(_format_synth_card_footer(idx, item))
         else:
-            author_name = _author_name(
-                users_by_id.get(item.user_id) if item.user_id else None
-            )
+            author_name = _author_name(users_by_id.get(item.user_id) if item.user_id else None)
             date_text = _format_date(item.message_date)
             snippet = _safe_headline(item.snippet)
             parts.append(f"[{idx}] {date_text} — {author_name}: {snippet}")
     return "\n".join(parts)
+
+
+def _escaped_text_with_budget(value: str, max_chars: int) -> str:
+    """Return normalized, escaped text without splitting an HTML entity."""
+
+    if max_chars <= 0:
+        return ""
+    normalized = limit_answer_text(value)
+    escaped = html.escape(normalized, quote=False)
+    if len(escaped) <= max_chars:
+        return escaped
+
+    candidate = normalized[: max(0, max_chars - 1)].rstrip()
+    while candidate:
+        escaped = html.escape(f"{candidate}…", quote=False)
+        if len(escaped) <= max_chars:
+            return escaped
+        candidate = candidate[:-1].rstrip()
+    return "…" if max_chars >= 1 else ""
+
+
+def _compact_author(user: object | None) -> str:
+    if user is None:
+        return "—"
+    first_name = getattr(user, "first_name", None)
+    last_name = getattr(user, "last_name", None)
+    username = getattr(user, "username", None)
+    if first_name:
+        raw = str(first_name)
+        if last_name:
+            raw = f"{raw} {last_name}"
+    elif username:
+        raw = f"@{username}"
+    else:
+        raw = "—"
+    return _escaped_text_with_budget(raw, 40)
+
+
+def _format_bounded_mention_response(
+    answer: AnswerWithCitations,
+    bundle: EvidenceBundle,
+    users_by_id: dict[int, object],
+) -> str:
+    """Render the entire mention answer, including sources, within 1200 chars."""
+
+    source_lines: list[str] = []
+    for idx, item in enumerate(bundle.items[:QA_EVIDENCE_LIMIT], start=1):
+        date_text = item.message_date.astimezone().strftime("%Y-%m-%d")
+        author = _compact_author(
+            users_by_id.get(item.user_id) if item.user_id is not None else None
+        )
+        snippet = _escaped_text_with_budget(item.snippet, 120)
+        source_lines.append(f"[{idx}] {date_text} — {author}: {snippet}")
+
+    footer = "\n\n<b>Источники:</b>\n" + "\n".join(source_lines)
+    answer_budget = MAX_AI_ANSWER_CHARS - len(footer)
+    if answer_budget < 1:
+        # Defensive fallback for future footer changes.  Evidence identifiers
+        # remain visible while untrusted snippets are omitted.
+        source_lines = [
+            f"[{idx}] message_version_id:{item.message_version_id}"
+            for idx, item in enumerate(
+                bundle.items[:QA_EVIDENCE_LIMIT],
+                start=1,
+            )
+        ]
+        footer = "\n\n<b>Источники:</b>\n" + "\n".join(source_lines)
+        answer_budget = MAX_AI_ANSWER_CHARS - len(footer)
+
+    answer_text = _escaped_text_with_budget(answer.answer_text, answer_budget)
+    rendered = f"{answer_text}{footer}"
+    if len(rendered) > MAX_AI_ANSWER_CHARS:
+        raise ValueError("bounded mention response exceeds configured limit")
+    return rendered
 
 
 def _format_synth_card_footer(idx: int, item: EvidenceItem) -> str:
@@ -290,6 +331,7 @@ async def _write_trace(
     evidence_ids: list[int],
     abstained: bool,
     redact_query: bool,
+    source_chat_message_id: int | None = None,
 ) -> None:
     await QaTraceRepo.create(
         session,
@@ -299,6 +341,7 @@ async def _write_trace(
         evidence_ids=evidence_ids,
         abstained=abstained,
         redact_query=redact_query,
+        source_chat_message_id=source_chat_message_id,
     )
 
 
@@ -402,6 +445,32 @@ async def recall_handler(
         and not result.bundle.abstained
         and len(result.bundle.evidence_ids) > 0
     ):
+        quota = await acquire_daily_llm_question_slot(
+            session,
+            user_tg_id=message.from_user.id,
+        )
+        if not quota.allowed:
+            deterministic_answer = _format_response(
+                result.bundle,
+                users_by_id,
+            )
+            await message.reply(
+                f"Лимит — {quota.limit} AI-вопроса в день. "
+                f"Показываю обычный поиск без AI.\n\n{deterministic_answer}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await _write_trace(
+                session,
+                user_tg_id=message.from_user.id,
+                chat_id=message.chat.id,
+                query=query,
+                evidence_ids=result.bundle.evidence_ids,
+                abstained=False,
+                redact_query=result.query_redacted,
+            )
+            return
+
         # BINDING 4-step ORDER per contracts.md §6.1. Tested in
         # tests/handlers/test_qa_llm_synthesis.py.
         #
@@ -439,11 +508,19 @@ async def recall_handler(
                 cache_repo=SynthesisCacheRepo(),
                 provider=provider,
             )
-        except Exception:
-            logger.exception(
-                "llm_synthesis_dispatch_failed; falling back to Phase 4 path",
-                extra={"qa_trace_id": trace.id, "chat_id": message.chat.id},
+        except Exception as exc:
+            logger.error(
+                "recall_llm_synthesis_failed",
+                extra={
+                    "qa_trace_id": trace.id,
+                    "chat_id": message.chat.id,
+                    "error_class": type(exc).__name__,
+                    "error_subtype": _safe_qa_provider_error_subtype(exc),
+                },
             )
+            # The trace (and any gateway ledger mutation completed before the
+            # exception) must survive an outbound Telegram failure.
+            await session.commit()
             await message.reply(
                 _format_response(result.bundle, users_by_id),
                 parse_mode="HTML",
@@ -466,11 +543,12 @@ async def recall_handler(
         # Step 4: render the AnswerWithCitations template OR fall back to
         # the Phase 4 evidence list on Abstention.
         if isinstance(synth_result, AnswerWithCitations):
-            reply_text = _format_synthesized_response(
-                synth_result, result.bundle, users_by_id
-            )
+            reply_text = _format_synthesized_response(synth_result, result.bundle, users_by_id)
         else:
             reply_text = _format_response(result.bundle, users_by_id)
+        # Keep paid usage/quota and the trace durable before the external send.
+        # DbSessionMiddleware rolls back when Telegram raises.
+        await session.commit()
         await message.reply(
             reply_text,
             parse_mode="HTML",
@@ -494,4 +572,225 @@ async def recall_handler(
         evidence_ids=result.bundle.evidence_ids,
         abstained=result.bundle.abstained,
         redact_query=result.query_redacted,
+    )
+
+
+@router.message(ShkoderQuestionFilter(settings.COMMUNITY_CHAT_ID))
+async def mention_question_handler(
+    message: Message,
+    qa_question: TriggeredQuestion,
+    session: AsyncSession,
+    raw_update: TelegramUpdate | None = None,
+) -> None:
+    """Answer a member's mention/reply question through the evidence-only LLM path.
+
+    Trigger eligibility is enforced by :class:`ShkoderQuestionFilter` before
+    this handler runs.  This handler still fails closed on sender/chat state so
+    direct calls or future router changes cannot widen the public Q&A surface.
+    """
+
+    sender = message.from_user
+    if sender is None or sender.is_bot or message.chat.id != settings.COMMUNITY_CHAT_ID:
+        return
+
+    # qa.router is above chat_messages.router.  A triggering question is
+    # consumed here, so persist it before any flag/access/LLM early return.
+    await UserRepo.upsert(
+        session,
+        telegram_id=sender.id,
+        username=getattr(sender, "username", None),
+        first_name=sender.first_name,
+        last_name=getattr(sender, "last_name", None),
+    )
+    persisted = await persist_message_with_policy(
+        session,
+        message,
+        raw_update_id=raw_update.id if raw_update is not None else None,
+        source="live",
+    )
+
+    if not await FeatureFlagRepo.get(session, QA_FEATURE_FLAG):
+        return
+
+    user = await UserRepo.get(session, sender.id)
+    if user is None or not (user.is_member or user.is_admin):
+        await message.reply("Доступ только участникам сообщества.")
+        return
+
+    existing_trace = await QaTraceRepo.get_by_source_chat_message_id(
+        session,
+        persisted.chat_message.id,
+    )
+    if existing_trace is not None:
+        if existing_trace.llm_response_summary:
+            previous = _escaped_text_with_budget(
+                existing_trace.llm_response_summary,
+                MAX_AI_ANSWER_CHARS - 32,
+            )
+            await message.reply(
+                f"Уже отвечал на этот вопрос:\n\n{previous}",
+                parse_mode="HTML",
+            )
+        else:
+            await message.reply("Этот вопрос уже обработан.")
+        return
+
+    query = qa_question.query
+    if not query:
+        await message.reply("Напиши вопрос после упоминания Шкодера или в ответе ему.")
+        await _write_trace(
+            session,
+            user_tg_id=sender.id,
+            chat_id=message.chat.id,
+            query="",
+            evidence_ids=[],
+            abstained=True,
+            redact_query=False,
+            source_chat_message_id=persisted.chat_message.id,
+        )
+        return
+
+    # Conversational questions are AI-only.  The deterministic search service
+    # remains an internal retrieval layer and is not exposed as a command.
+    if not await FeatureFlagRepo.get(session, LLM_SYNTHESIS_FEATURE_FLAG):
+        await message.reply("AI-поиск по памяти сейчас недоступен.")
+        await _write_trace(
+            session,
+            user_tg_id=sender.id,
+            chat_id=message.chat.id,
+            query=query,
+            evidence_ids=[],
+            abstained=True,
+            redact_query=False,
+            source_chat_message_id=persisted.chat_message.id,
+        )
+        return
+
+    result = await run_qa(
+        session,
+        query=query,
+        chat_id=message.chat.id,
+        redact_query_in_audit=False,
+        limit=QA_EVIDENCE_LIMIT,
+    )
+    if result.bundle.abstained or not result.bundle.evidence_ids:
+        await message.reply("Не нашёл достаточно подтверждений в памяти сообщества.")
+        await _write_trace(
+            session,
+            user_tg_id=sender.id,
+            chat_id=message.chat.id,
+            query=query,
+            evidence_ids=[],
+            abstained=True,
+            redact_query=False,
+            source_chat_message_id=persisted.chat_message.id,
+        )
+        return
+
+    users_by_id: dict[int, object] = {}
+    for item in result.bundle.items:
+        if item.user_id is None or item.user_id in users_by_id:
+            continue
+        author = await UserRepo.get(session, item.user_id)
+        if author is not None:
+            users_by_id[item.user_id] = author
+
+    quota = await acquire_daily_llm_question_slot(
+        session,
+        user_tg_id=sender.id,
+    )
+    if not quota.allowed:
+        deterministic_answer = _format_response(result.bundle, users_by_id)
+        await message.reply(
+            f"Лимит — {quota.limit} AI-вопроса в день. "
+            f"Показываю обычный поиск без AI.\n\n{deterministic_answer}",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        await _write_trace(
+            session,
+            user_tg_id=sender.id,
+            chat_id=message.chat.id,
+            query=query,
+            evidence_ids=result.bundle.evidence_ids,
+            abstained=False,
+            redact_query=False,
+            source_chat_message_id=persisted.chat_message.id,
+        )
+        return
+
+    # Trace-before-gateway preserves the Phase 5 cascade/ledger FK contract.
+    trace = await QaTraceRepo.create(
+        session,
+        user_tg_id=sender.id,
+        chat_id=message.chat.id,
+        query=query,
+        evidence_ids=result.bundle.evidence_ids,
+        abstained=False,
+        redact_query=False,
+        source_chat_message_id=persisted.chat_message.id,
+    )
+    try:
+        cfg = _load_gateway_config()
+        provider = _resolve_provider(cfg.provider)
+        synth_result = await synthesize_answer(
+            session,
+            bundle=result.bundle,
+            query=build_guarded_llm_query(query),
+            config=cfg,
+            qa_trace_id=trace.id,
+            ledger_repo=LedgerRepo(),
+            cache_repo=SynthesisCacheRepo(),
+            provider=provider,
+        )
+    except Exception as exc:
+        # Provider payloads may contain user content or credentials.  Log only
+        # the exception class and stable audit identifiers, then preserve the
+        # trace before attempting the deterministic Telegram fallback.
+        logger.error(
+            "mention_llm_synthesis_failed error_class=%s",
+            type(exc).__name__,
+            extra={"qa_trace_id": trace.id, "chat_id": message.chat.id},
+        )
+        await session.commit()
+        await message.reply(
+            _format_response(result.bundle, users_by_id),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    if isinstance(synth_result, AnswerWithCitations):
+        bounded_answer = limit_answer_text(synth_result.answer_text)
+        if bounded_answer:
+            bounded_result = replace(synth_result, answer_text=bounded_answer)
+            reply_text = _format_bounded_mention_response(
+                bounded_result,
+                result.bundle,
+                users_by_id,
+            )
+            response_summary: str | None = bounded_answer
+        else:
+            reply_text = _format_response(result.bundle, users_by_id)
+            response_summary = None
+    else:
+        reply_text = _format_response(result.bundle, users_by_id)
+        response_summary = None
+
+    await QaTraceRepo.update_llm_fields(
+        session,
+        qa_trace_id=trace.id,
+        llm_call_id=synth_result.llm_call_id,
+        llm_response_summary=response_summary,
+        llm_response_redacted=False,
+        cost_usd=synth_result.cost_usd,
+    )
+    # Provider usage, cache, trace, and the per-user quota ledger must survive
+    # an outbound Telegram failure.  The middleware may roll back after a send
+    # exception, so make the paid/audited transaction durable first.
+    await session.commit()
+    await message.reply(
+        reply_text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )

@@ -107,9 +107,7 @@ async def _make_chat_message_with_version(
     db_session.add(mv)
     await db_session.flush()
     await db_session.execute(
-        sa_update(ChatMessage)
-        .where(ChatMessage.id == cm.id)
-        .values(current_version_id=mv.id)
+        sa_update(ChatMessage).where(ChatMessage.id == cm.id).values(current_version_id=mv.id)
     )
     await db_session.flush()
     return cm.id, mv.id, chat_id, msg_id, uid, mv_ch
@@ -143,6 +141,44 @@ async def test_revalidate_sources_ok_for_healthy_source(db_session) -> None:
     assert payload is None
 
 
+async def test_revalidate_sources_blocks_non_current_version(db_session) -> None:
+    """An edited-away source cannot be promoted into derived memory."""
+    from sqlalchemy import update as sa_update
+
+    from bot.db.models import ChatMessage, MessageVersion
+    from bot.services.governance_revalidation import revalidate_sources
+
+    cm_id, stale_mvid, _, _, _, _ = await _make_chat_message_with_version(
+        db_session,
+        text="stale source",
+    )
+    replacement = MessageVersion(
+        chat_message_id=cm_id,
+        version_seq=2,
+        text="current source",
+        normalized_text="current source",
+        entities_json={},
+        content_hash=f"h{_uuid_module.uuid4().hex[:16]}",
+        is_redacted=False,
+    )
+    db_session.add(replacement)
+    await db_session.flush()
+    await db_session.execute(
+        sa_update(ChatMessage)
+        .where(ChatMessage.id == cm_id)
+        .values(current_version_id=replacement.id)
+    )
+    await db_session.flush()
+
+    status, payload = await revalidate_sources(db_session, [stale_mvid])
+
+    assert status == "blocked"
+    assert payload == {
+        "failure_reason": "source_not_current",
+        "mvid": stale_mvid,
+    }
+
+
 # ─── revalidate_sources — forget_tombstone_match (3 keys) ────────────────────
 
 
@@ -150,13 +186,9 @@ async def test_revalidate_sources_blocks_on_message_tombstone(db_session) -> Non
     """Tombstone key ``message:<chat>:<msg>`` blocks promotion."""
     from bot.services.governance_revalidation import revalidate_sources
 
-    _, mvid, chat_id, msg_id, _, _ = await _make_chat_message_with_version(
-        db_session
-    )
+    _, mvid, chat_id, msg_id, _, _ = await _make_chat_message_with_version(db_session)
     key = f"message:{chat_id}:{msg_id}"
-    await _make_forget_event(
-        db_session, target_type="message", target_id=mvid, tombstone_key=key
-    )
+    await _make_forget_event(db_session, target_type="message", target_id=mvid, tombstone_key=key)
 
     status, payload = await revalidate_sources(db_session, [mvid])
     assert status == "blocked"
@@ -196,9 +228,7 @@ async def test_revalidate_sources_blocks_on_user_tombstone(db_session) -> None:
 
     _, mvid, _, _, user_id, _ = await _make_chat_message_with_version(db_session)
     key = f"user:{user_id}"
-    await _make_forget_event(
-        db_session, target_type="user", target_id=user_id, tombstone_key=key
-    )
+    await _make_forget_event(db_session, target_type="user", target_id=user_id, tombstone_key=key)
 
     status, payload = await revalidate_sources(db_session, [mvid])
     assert status == "blocked"
@@ -212,9 +242,7 @@ async def test_revalidate_sources_blocks_on_chat_message_redacted(db_session) ->
     """``chat_messages.is_redacted=TRUE`` blocks promotion."""
     from bot.services.governance_revalidation import revalidate_sources
 
-    _, mvid, _, _, _, _ = await _make_chat_message_with_version(
-        db_session, is_redacted=True
-    )
+    _, mvid, _, _, _, _ = await _make_chat_message_with_version(db_session, is_redacted=True)
     status, payload = await revalidate_sources(db_session, [mvid])
     assert status == "blocked"
     assert payload["failure_reason"] == "source_redacted"
@@ -281,9 +309,7 @@ async def test_revalidate_sources_blocks_when_any_source_blocks(db_session) -> N
     _, mvid_bad, _, _, _, _ = await _make_chat_message_with_version(
         db_session, memory_policy="offrecord"
     )
-    status, payload = await revalidate_sources(
-        db_session, [mvid_good, mvid_bad]
-    )
+    status, payload = await revalidate_sources(db_session, [mvid_good, mvid_bad])
     assert status == "blocked"
     assert payload["mvid"] == mvid_bad
 
@@ -310,9 +336,7 @@ async def test_revalidate_sources_blocks_when_mvid_missing(db_session) -> None:
     from bot.services.governance_revalidation import revalidate_sources
 
     _, mvid_real, _, _, _, _ = await _make_chat_message_with_version(db_session)
-    status, payload = await revalidate_sources(
-        db_session, [mvid_real, 999_999_999]
-    )
+    status, payload = await revalidate_sources(db_session, [mvid_real, 999_999_999])
     assert status == "blocked"
 
 
@@ -345,9 +369,7 @@ async def test_tombstone_check_uses_mv_content_hash_not_chat_message_hash(
     from bot.db.models import ChatMessage
 
     c_hash = (
-        await db_session.execute(
-            select(ChatMessage.content_hash).where(ChatMessage.id == cm_id)
-        )
+        await db_session.execute(select(ChatMessage.content_hash).where(ChatMessage.id == cm_id))
     ).scalar()
     assert c_hash is None  # confirms the live-path scenario
 

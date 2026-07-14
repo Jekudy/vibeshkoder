@@ -11,6 +11,7 @@ real DB nor LLM SDK is touched. Phase 4 byte-for-byte preservation lives in
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -104,15 +105,23 @@ def _qa_result(*, abstained: bool, query_redacted: bool = False):
 
 def _patch_persist(handler, monkeypatch) -> None:
     from bot.services.message_persistence import PersistResult
+
     fake_cm = SimpleNamespace(id=1, current_version_id=None)
     monkeypatch.setattr(
         handler,
         "persist_message_with_policy",
-        AsyncMock(return_value=PersistResult(
-            chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
-        )),
+        AsyncMock(
+            return_value=PersistResult(
+                chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
+            )
+        ),
     )
     monkeypatch.setattr(handler.UserRepo, "upsert", AsyncMock())
+    monkeypatch.setattr(
+        handler,
+        "acquire_daily_llm_question_slot",
+        AsyncMock(return_value=SimpleNamespace(allowed=True, used=0, limit=2)),
+    )
 
 
 def _flag_get(
@@ -198,11 +207,14 @@ async def test_step_ordering_create_trace_before_synthesize(monkeypatch) -> None
     async def update_llm(*args, **kwargs):
         call_order.append("update_llm_fields")
 
-    async def synth_spy(synth_session, *, qa_trace_id, bundle, query, config, ledger_repo, cache_repo, provider):
+    async def synth_spy(
+        synth_session, *, qa_trace_id, bundle, query, config, ledger_repo, cache_repo, provider
+    ):
         call_order.append("synthesize_answer")
         # Step-1 structural proof: row MUST exist in DB at the moment synthesize_answer is called
         from bot.db.models import QaTrace as _QaTrace
         from sqlalchemy import select as _select
+
         row_result = await synth_session.execute(
             _select(_QaTrace).where(_QaTrace.id == qa_trace_id)
         )
@@ -214,9 +226,7 @@ async def test_step_ordering_create_trace_before_synthesize(monkeypatch) -> None
         return _answer_with_citations()
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
@@ -245,9 +255,7 @@ async def test_flag_off_runs_phase4_path(monkeypatch) -> None:
     synth = AsyncMock()
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=False)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=False))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
@@ -273,9 +281,7 @@ async def test_flag_on_empty_bundle_skips_synthesize(monkeypatch) -> None:
     synth = AsyncMock()
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(handler.UserRepo, "get", AsyncMock(return_value=_user()))
     monkeypatch.setattr(handler.QaTraceRepo, "create", AsyncMock())
     monkeypatch.setattr(handler, "run_qa", AsyncMock(return_value=_qa_result(abstained=True)))
@@ -287,6 +293,48 @@ async def test_flag_on_empty_bundle_skips_synthesize(monkeypatch) -> None:
     assert message.reply.call_args.args[0] == "Не нашёл подходящих свидетельств в истории чата."
 
 
+async def test_recall_ai_quota_falls_back_to_unlimited_deterministic_search(
+    monkeypatch,
+) -> None:
+    """The two-per-day limit covers /recall LLM calls, not ordinary FTS results."""
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    synth = AsyncMock()
+
+    _patch_persist(handler, monkeypatch)
+    monkeypatch.setattr(
+        handler.FeatureFlagRepo,
+        "get",
+        _flag_get(llm_synthesis_enabled=True),
+    )
+    monkeypatch.setattr(
+        handler.UserRepo,
+        "get",
+        AsyncMock(side_effect=[_user(), _user(user_id=2002, first_name="Author")]),
+    )
+    monkeypatch.setattr(
+        handler,
+        "run_qa",
+        AsyncMock(return_value=_qa_result(abstained=False)),
+    )
+    monkeypatch.setattr(
+        handler,
+        "acquire_daily_llm_question_slot",
+        AsyncMock(return_value=SimpleNamespace(allowed=False, used=2, limit=2)),
+    )
+    monkeypatch.setattr(handler.QaTraceRepo, "create", AsyncMock(return_value=_fake_trace()))
+    monkeypatch.setattr(handler, "synthesize_answer", synth)
+
+    await handler.recall_handler(message, _command("память"), session)
+
+    synth.assert_not_awaited()
+    response = message.reply.call_args.args[0]
+    assert "Лимит — 2 AI-вопроса в день" in response
+    assert "Показываю обычный поиск без AI" in response
+    assert "<b>Найденные свидетельства:</b>" in response
+
+
 async def test_synthesize_answer_called_with_all_required_kwargs(monkeypatch) -> None:
     """synthesize_answer called with bundle, query, config, qa_trace_id,
     ledger_repo, cache_repo, provider — all 7 kwargs.
@@ -296,7 +344,9 @@ async def test_synthesize_answer_called_with_all_required_kwargs(monkeypatch) ->
     session = AsyncMock()
     captured: dict = {}
 
-    async def synth_spy(s, *, bundle, query, config, qa_trace_id, ledger_repo, cache_repo, provider, **rest):
+    async def synth_spy(
+        s, *, bundle, query, config, qa_trace_id, ledger_repo, cache_repo, provider, **rest
+    ):
         captured["session"] = s
         captured["bundle"] = bundle
         captured["query"] = query
@@ -308,15 +358,15 @@ async def test_synthesize_answer_called_with_all_required_kwargs(monkeypatch) ->
         return _answer_with_citations()
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
         AsyncMock(side_effect=[_user(), _user(user_id=2002, first_name="Author")]),
     )
-    monkeypatch.setattr(handler.QaTraceRepo, "create", AsyncMock(return_value=_fake_trace(trace_id=999)))
+    monkeypatch.setattr(
+        handler.QaTraceRepo, "create", AsyncMock(return_value=_fake_trace(trace_id=999))
+    )
     monkeypatch.setattr(handler.QaTraceRepo, "update_llm_fields", AsyncMock(return_value=1))
     monkeypatch.setattr(handler, "run_qa", AsyncMock(return_value=_qa_result(abstained=False)))
     monkeypatch.setattr(handler, "synthesize_answer", synth_spy)
@@ -328,8 +378,8 @@ async def test_synthesize_answer_called_with_all_required_kwargs(monkeypatch) ->
     assert captured["qa_trace_id"] == 999
     # bundle is the Phase 4 EvidenceBundle (non-abstained, 1 item)
     assert captured["bundle"].evidence_ids == [500]
-    # config is an LLMGatewayConfig with v1.0.0 prompt template version
-    assert captured["config"].prompt_template_version == "v1.0.0"
+    # v1.1.0 is the first prompt that embeds bounded evidence snippets.
+    assert captured["config"].prompt_template_version == "v1.1.0"
     # ledger_repo / cache_repo / provider are concrete repo instances (Protocol-satisfying)
     assert captured["ledger_repo"] is not None
     assert captured["cache_repo"] is not None
@@ -351,15 +401,15 @@ async def test_answer_with_citations_renders_and_updates_trace(monkeypatch) -> N
     )
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
         AsyncMock(side_effect=[_user(), _user(user_id=2002, first_name="Author")]),
     )
-    monkeypatch.setattr(handler.QaTraceRepo, "create", AsyncMock(return_value=_fake_trace(trace_id=42)))
+    monkeypatch.setattr(
+        handler.QaTraceRepo, "create", AsyncMock(return_value=_fake_trace(trace_id=42))
+    )
     monkeypatch.setattr(handler.QaTraceRepo, "update_llm_fields", update_spy)
     monkeypatch.setattr(handler, "run_qa", AsyncMock(return_value=_qa_result(abstained=False)))
     monkeypatch.setattr(handler, "synthesize_answer", AsyncMock(return_value=answer))
@@ -379,6 +429,41 @@ async def test_answer_with_citations_renders_and_updates_trace(monkeypatch) -> N
     assert "<b>Источники:</b>" in response
 
 
+async def test_recall_paid_audit_is_committed_before_outbound_reply(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    order: list[str] = []
+
+    async def commit() -> None:
+        order.append("commit")
+
+    async def reply(*args, **kwargs) -> None:
+        order.append("reply")
+        raise RuntimeError("telegram unavailable")
+
+    session.commit.side_effect = commit
+    message.reply.side_effect = reply
+    _patch_persist(handler, monkeypatch)
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
+    monkeypatch.setattr(
+        handler.UserRepo,
+        "get",
+        AsyncMock(side_effect=[_user(), _user(user_id=2002, first_name="Author")]),
+    )
+    monkeypatch.setattr(handler.QaTraceRepo, "create", AsyncMock(return_value=_fake_trace()))
+    monkeypatch.setattr(handler.QaTraceRepo, "update_llm_fields", AsyncMock(return_value=1))
+    monkeypatch.setattr(handler, "run_qa", AsyncMock(return_value=_qa_result(abstained=False)))
+    monkeypatch.setattr(
+        handler, "synthesize_answer", AsyncMock(return_value=_answer_with_citations())
+    )
+
+    with pytest.raises(RuntimeError, match="telegram unavailable"):
+        await handler.recall_handler(message, _command("память"), session)
+
+    assert order == ["commit", "reply"]
+
+
 async def test_abstention_falls_back_to_phase4_reply(monkeypatch) -> None:
     """Abstention result → Phase 4 reply (_format_response) rendered.
     update_llm_fields called with llm_response_summary=None + cost_usd from result.
@@ -390,15 +475,15 @@ async def test_abstention_falls_back_to_phase4_reply(monkeypatch) -> None:
     abst = _abstention(reason="all_filtered", cost_usd=Decimal("0"), llm_call_id=7373)
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
         AsyncMock(side_effect=[_user(), _user(user_id=2002, first_name="Author")]),
     )
-    monkeypatch.setattr(handler.QaTraceRepo, "create", AsyncMock(return_value=_fake_trace(trace_id=42)))
+    monkeypatch.setattr(
+        handler.QaTraceRepo, "create", AsyncMock(return_value=_fake_trace(trace_id=42))
+    )
     monkeypatch.setattr(handler.QaTraceRepo, "update_llm_fields", update_spy)
     monkeypatch.setattr(handler, "run_qa", AsyncMock(return_value=_qa_result(abstained=False)))
     monkeypatch.setattr(handler, "synthesize_answer", AsyncMock(return_value=abst))
@@ -428,9 +513,7 @@ async def test_update_llm_fields_touches_only_phase5_kwargs(monkeypatch) -> None
     answer = _answer_with_citations()
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
@@ -445,7 +528,14 @@ async def test_update_llm_fields_touches_only_phase5_kwargs(monkeypatch) -> None
 
     update_spy.assert_awaited_once()
     kwargs = update_spy.await_args.kwargs
-    forbidden = {"query", "query_text", "evidence_ids", "abstained", "redact_query", "query_redacted"}
+    forbidden = {
+        "query",
+        "query_text",
+        "evidence_ids",
+        "abstained",
+        "redact_query",
+        "query_redacted",
+    }
     assert not (forbidden & set(kwargs.keys())), (
         f"update_llm_fields called with forbidden Phase 4 kwarg(s): {forbidden & set(kwargs.keys())}"
     )
@@ -458,9 +548,11 @@ async def test_update_llm_fields_touches_only_phase5_kwargs(monkeypatch) -> None
     }
 
 
-async def test_gateway_config_prompt_template_version_is_v1(monkeypatch) -> None:
+async def test_gateway_config_prompt_template_version_is_grounded_v1_1(
+    monkeypatch,
+) -> None:
     """_load_gateway_config() (called inside the handler) MUST pass
-    prompt_template_version='v1.0.0' to synthesize_answer per §12.5.
+    prompt_template_version='v1.1.0' to prevent reuse of ungrounded cache rows.
     """
     handler = import_module("bot.handlers.qa")
     message = _message()
@@ -472,9 +564,7 @@ async def test_gateway_config_prompt_template_version_is_v1(monkeypatch) -> None
         return _answer_with_citations()
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
@@ -487,7 +577,7 @@ async def test_gateway_config_prompt_template_version_is_v1(monkeypatch) -> None
 
     await handler.recall_handler(message, _command("память"), session)
 
-    assert captured["config"].prompt_template_version == "v1.0.0"
+    assert captured["config"].prompt_template_version == "v1.1.0"
 
 
 async def test_synthesized_reply_escapes_injected_html(monkeypatch) -> None:
@@ -498,9 +588,7 @@ async def test_synthesized_reply_escapes_injected_html(monkeypatch) -> None:
     answer = _answer_with_citations(answer_text="harmless <script>alert('xss')</script> body")
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
@@ -533,9 +621,7 @@ async def test_provider_resolve_failure_falls_back_to_phase4(monkeypatch) -> Non
         raise ValueError(f"unknown provider: {name}")
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
@@ -556,6 +642,51 @@ async def test_provider_resolve_failure_falls_back_to_phase4(monkeypatch) -> Non
     # Phase 4 reply rendered as the fallback.
     response = message.reply.call_args.args[0]
     assert "<b>Найденные свидетельства:</b>" in response
+
+
+async def test_recall_dispatch_failure_logs_taxonomy_without_secret_or_traceback(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    secret = "recall-provider-secret-sentinel"
+
+    _patch_persist(handler, monkeypatch)
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
+    monkeypatch.setattr(
+        handler.UserRepo,
+        "get",
+        AsyncMock(side_effect=[_user(), _user(user_id=2002, first_name="Author")]),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "create",
+        AsyncMock(return_value=_fake_trace(trace_id=8181)),
+    )
+    monkeypatch.setattr(handler.QaTraceRepo, "update_llm_fields", AsyncMock())
+    monkeypatch.setattr(handler, "run_qa", AsyncMock(return_value=_qa_result(abstained=False)))
+    monkeypatch.setattr(
+        handler,
+        "synthesize_answer",
+        AsyncMock(side_effect=RuntimeError(secret)),
+    )
+    caplog.set_level(logging.ERROR, logger=handler.__name__)
+
+    await handler.recall_handler(message, _command("память"), session)
+
+    records = [record for record in caplog.records if record.name == handler.__name__]
+    assert len(records) == 1
+    record = records[0]
+    assert record.getMessage() == "recall_llm_synthesis_failed"
+    assert record.error_class == "RuntimeError"
+    assert record.error_subtype == "unknown"
+    assert record.exc_info is None
+    assert secret not in repr(record.__dict__)
+    assert secret not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "<b>Найденные свидетельства:</b>" in message.reply.call_args.args[0]
 
 
 async def test_resolve_provider_rejects_unknown_name() -> None:
@@ -592,9 +723,7 @@ async def test_end_to_end_happy_path_with_fake_provider(monkeypatch) -> None:
     )
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
@@ -651,9 +780,7 @@ async def test_step_ordering_with_real_db_session_proves_trace_flushed_before_sy
         cache_repo,
         provider,
     ):
-        result = await session.execute(
-            select(QaTrace).where(QaTrace.id == qa_trace_id)
-        )
+        result = await session.execute(select(QaTrace).where(QaTrace.id == qa_trace_id))
         row = result.scalar_one_or_none()
         captured["trace_in_db_at_synth"] = row is not None
         captured["trace_id_received"] = qa_trace_id
@@ -667,9 +794,7 @@ async def test_step_ordering_with_real_db_session_proves_trace_flushed_before_sy
         )
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(
-        handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True)
-    )
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(llm_synthesis_enabled=True))
     monkeypatch.setattr(
         handler.UserRepo,
         "get",

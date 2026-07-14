@@ -142,7 +142,10 @@ async def _handle_daily_digest_now(
             window_start=window_start,
             window_end=window_end,
             ledger_repo=LedgerRepo(),
-            provider=resolve_provider(gateway_config.provider),
+            provider=resolve_provider(
+                gateway_config.provider,
+                deepseek_max_tokens=4_096,
+            ),
             config=gateway_config,
             digest_config=digest_config,
         )
@@ -247,9 +250,7 @@ async def _reply_weekly_status(
         )
     elif status == "approved_for_publish":
         admin_label = (
-            html_escape(str(digest.published_by_admin_id))
-            if digest.published_by_admin_id
-            else "?"
+            html_escape(str(digest.published_by_admin_id)) if digest.published_by_admin_id else "?"
         )
         await message.answer(
             f"⏳ Digest #<code>{digest.id}</code> одобрен админом "
@@ -259,8 +260,7 @@ async def _reply_weekly_status(
         )
     elif status == "posting":
         await message.answer(
-            f"⏳ Weekly digest #<code>{digest.id}</code> уже публикуется, "
-            "попробуйте через минуту.",
+            f"⏳ Weekly digest #<code>{digest.id}</code> уже публикуется, попробуйте через минуту.",
             parse_mode="HTML",
         )
     elif status == "posted":
@@ -344,15 +344,19 @@ async def _handle_weekly_digest_now(
             )
             # Re-read state UNDER lock — this is the authoritative view.
             existing_id_status = (
-                await session.execute(
-                    text(
-                        "SELECT id, status FROM digests "
-                        "WHERE type='weekly' AND window_start=:ws AND window_end=:we "
-                        "ORDER BY id DESC LIMIT 1"
-                    ),
-                    {"ws": window_start, "we": window_end},
+                (
+                    await session.execute(
+                        text(
+                            "SELECT id, status FROM digests "
+                            "WHERE type='weekly' AND window_start=:ws AND window_end=:we "
+                            "ORDER BY id DESC LIMIT 1"
+                        ),
+                        {"ws": window_start, "we": window_end},
+                    )
                 )
-            ).mappings().one_or_none()
+                .mappings()
+                .one_or_none()
+            )
             if existing_id_status is None:
                 await message.answer(
                     "Нет существующего weekly-дайджеста для этого окна — "
@@ -406,7 +410,10 @@ async def _handle_weekly_digest_now(
                 window_start=window_start,
                 window_end=window_end,
                 ledger_repo=LedgerRepo(),
-                provider=resolve_provider(gateway_config.provider),
+                provider=resolve_provider(
+                    gateway_config.provider,
+                    deepseek_max_tokens=4_096,
+                ),
                 config=gateway_config,
                 digest_config=digest_config,
             )
@@ -449,7 +456,10 @@ async def _handle_weekly_digest_now(
             window_start=window_start,
             window_end=window_end,
             ledger_repo=LedgerRepo(),
-            provider=resolve_provider(gateway_config.provider),
+            provider=resolve_provider(
+                gateway_config.provider,
+                deepseek_max_tokens=4_096,
+            ),
             config=gateway_config,
             digest_config=digest_config,
         )
@@ -501,9 +511,7 @@ async def cmd_digest_now(
     raw = (command.args or "").strip()
     tokens = raw.split() if raw else []
     type_arg = tokens[0].strip().lower() if tokens else "daily"
-    regenerate = any(
-        tok.lower() in ("--regenerate", "regenerate") for tok in tokens[1:]
-    )
+    regenerate = any(tok.lower() in ("--regenerate", "regenerate") for tok in tokens[1:])
 
     if type_arg == "weekly":
         await _handle_weekly_digest_now(message, bot, session, regenerate=regenerate)
@@ -518,8 +526,7 @@ async def cmd_digest_now(
 
     if regenerate:
         await message.answer(
-            "<code>--regenerate</code> поддерживается только для "
-            "<code>/digest_now weekly</code>.",
+            "<code>--regenerate</code> поддерживается только для <code>/digest_now weekly</code>.",
             parse_mode="HTML",
         )
         return
@@ -540,9 +547,7 @@ async def cmd_digest_preview(
     parts = (command.args or "").split()
     digest_type = parts[0].strip().lower() if parts else "daily"
     if digest_type == "weekly":
-        await message.answer(
-            "Weekly дайджест появится в Phase 8.", parse_mode="HTML"
-        )
+        await message.answer("Weekly дайджест появится в Phase 8.", parse_mode="HTML")
         return
     if digest_type != "daily":
         await message.answer(
@@ -565,17 +570,21 @@ async def cmd_digest_preview(
 
     # Find existing digest (no synthesis).
     row = (
-        await session.execute(
-            text(
-                "SELECT id, body_markdown, citations, status, posted_message_id, "
-                "       posted_chat_id, error_text "
-                "FROM digests "
-                "WHERE type = :t AND window_start = :ws AND window_end = :we "
-                "ORDER BY id DESC LIMIT 1"
-            ),
-            {"t": digest_type, "ws": window_start, "we": window_end},
+        (
+            await session.execute(
+                text(
+                    "SELECT id, body_markdown, citations, status, posted_message_id, "
+                    "       posted_chat_id, error_text "
+                    "FROM digests "
+                    "WHERE type = :t AND window_start = :ws AND window_end = :we "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"t": digest_type, "ws": window_start, "we": window_end},
+            )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
 
     if row is None:
         await message.answer(
@@ -586,13 +595,9 @@ async def cmd_digest_preview(
         return
 
     if row["body_markdown"]:
-        rendered = render_digest_html(
-            row["body_markdown"], window_start_utc=window_start
-        )
+        rendered = render_digest_html(row["body_markdown"], window_start_utc=window_start)
     else:
-        rendered = (
-            f"<i>(no body — status=<code>{html_escape(row['status'])}</code>)</i>"
-        )
+        rendered = f"<i>(no body — status=<code>{html_escape(row['status'])}</code>)</i>"
     citations = row["citations"] or []
     cite_lines = [
         f"  - kind=<code>{html_escape(str(c.get('kind')))}</code> "
@@ -623,17 +628,21 @@ async def cmd_digest_history(
         return
 
     rows = (
-        await session.execute(
-            text(
-                "SELECT id, type, window_start, window_end, status, "
-                "       jsonb_array_length(citations) AS citation_count, "
-                "       posted_chat_id, posted_message_id, error_text "
-                "FROM digests "
-                "ORDER BY id DESC "
-                "LIMIT 14"
+        (
+            await session.execute(
+                text(
+                    "SELECT id, type, window_start, window_end, status, "
+                    "       jsonb_array_length(citations) AS citation_count, "
+                    "       posted_chat_id, posted_message_id, error_text "
+                    "FROM digests "
+                    "ORDER BY id DESC "
+                    "LIMIT 14"
+                )
             )
         )
-    ).mappings().all()
+        .mappings()
+        .all()
+    )
 
     if not rows:
         await message.answer(
@@ -683,24 +692,26 @@ async def cmd_digest_review(
         return
 
     rows = (
-        await session.execute(
-            text(
-                "SELECT id, window_start, window_end, body_markdown, "
-                "       jsonb_array_length(citations) AS citation_count, "
-                "       awaiting_review_at, "
-                "       EXTRACT(EPOCH FROM (now() - awaiting_review_at))/3600.0 AS hours_waiting "
-                "FROM digests "
-                "WHERE type='weekly' AND status='awaiting_review' "
-                "ORDER BY awaiting_review_at ASC NULLS LAST "
-                "LIMIT 20"
+        (
+            await session.execute(
+                text(
+                    "SELECT id, window_start, window_end, body_markdown, "
+                    "       jsonb_array_length(citations) AS citation_count, "
+                    "       awaiting_review_at, "
+                    "       EXTRACT(EPOCH FROM (now() - awaiting_review_at))/3600.0 AS hours_waiting "
+                    "FROM digests "
+                    "WHERE type='weekly' AND status='awaiting_review' "
+                    "ORDER BY awaiting_review_at ASC NULLS LAST "
+                    "LIMIT 20"
+                )
             )
         )
-    ).mappings().all()
+        .mappings()
+        .all()
+    )
 
     if not rows:
-        await message.answer(
-            "Нет дайджестов на ревью — список пуст.", parse_mode="HTML"
-        )
+        await message.answer("Нет дайджестов на ревью — список пуст.", parse_mode="HTML")
         return
 
     msk = ZoneInfo("Europe/Moscow")
@@ -734,9 +745,7 @@ def _render_invalid_state_reply(exc: DigestReviewInvalidState) -> str:
     did = exc.digest_id
     cs = exc.current_status
     if cs is None:
-        return (
-            f"⚠️ Digest #<code>{did}</code> был удалён или больше не существует."
-        )
+        return f"⚠️ Digest #<code>{did}</code> был удалён или больше не существует."
     if cs == "rejected_by_admin":
         return (
             f"🚫 Digest #<code>{did}</code> уже отклонён "
@@ -823,15 +832,12 @@ async def cmd_digest_approve(
         )
         return
     except DigestReviewInvalidState as exc:
-        await message.answer(
-            _render_invalid_state_reply(exc), parse_mode="HTML"
-        )
+        await message.answer(_render_invalid_state_reply(exc), parse_mode="HTML")
         return
     except Exception as exc:
         logger.exception("cmd_digest_approve: approve_digest crashed")
         await message.answer(
-            f"❌ <code>approve_digest</code> crashed: "
-            f"<code>{html_escape(str(exc)[:300])}</code>",
+            f"❌ <code>approve_digest</code> crashed: <code>{html_escape(str(exc)[:300])}</code>",
             parse_mode="HTML",
         )
         return
@@ -839,9 +845,7 @@ async def cmd_digest_approve(
     link = _format_posted_link(result.posted_chat_id, result.posted_message_id)
     link_block = f"\n{link}" if link else ""
     extra = (
-        f"\nerror: <code>{html_escape(result.error_text[:200])}</code>"
-        if result.error_text
-        else ""
+        f"\nerror: <code>{html_escape(result.error_text[:200])}</code>" if result.error_text else ""
     )
     await message.answer(
         f"✅ Digest #<code>{result.digest_id}</code> опубликован.{link_block}{extra}",
@@ -901,22 +905,17 @@ async def cmd_digest_reject(
         )
         return
     except DigestReviewInvalidState as exc:
-        await message.answer(
-            _render_invalid_state_reply(exc), parse_mode="HTML"
-        )
+        await message.answer(_render_invalid_state_reply(exc), parse_mode="HTML")
         return
     except Exception as exc:
         logger.exception("cmd_digest_reject: reject_digest crashed")
         await message.answer(
-            f"❌ <code>reject_digest</code> crashed: "
-            f"<code>{html_escape(str(exc)[:300])}</code>",
+            f"❌ <code>reject_digest</code> crashed: <code>{html_escape(str(exc)[:300])}</code>",
             parse_mode="HTML",
         )
         return
 
-    reason_echo = (
-        f" Причина: <code>{html_escape(reason[:200])}</code>." if reason else ""
-    )
+    reason_echo = f" Причина: <code>{html_escape(reason[:200])}</code>." if reason else ""
     await message.answer(
         f"❌ Digest #<code>{digest_id}</code> отклонён.{reason_echo} "
         f"<code>/digest_now weekly --regenerate</code> — пересоздать.",

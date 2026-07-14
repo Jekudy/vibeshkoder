@@ -10,6 +10,9 @@ branch. The card branch enforces:
    ``forget_events`` with the canonical 3-status tombstone-key construction).
 3. NO source has ``memory_policy != 'normal'`` OR ``is_redacted=TRUE``
    (catches manual redaction without a ``forget_event``).
+4. Every source belongs to the requested ``chat_id``. Mixed-chat cards fail
+   closed, and neither the anchor nor the citation array can expose a foreign
+   message version.
 
 The cascade rule (``_cascade_card_sources_on_forget``) demotes a card to
 ``archived`` only when ALL sources are tombstoned; T6-06 enforces stricter
@@ -91,25 +94,57 @@ SELECT
     COALESCE(
         ts_headline(
             'russian',
-            concat_ws(' ', mv.normalized_text, mv.caption),
+            concat_ws(
+                ' ',
+                mv.normalized_text,
+                mv.caption,
+                CASE
+                    WHEN mm.description_status = 'ready' THEN mm.description
+                    ELSE NULL
+                END
+            ),
             q.tsq,
             :headline_options
         ),
         ''
     ) AS snippet,
-    ts_rank_cd(mv.search_tsv, q.tsq) AS rank,
+    GREATEST(
+        ts_rank_cd(mv.search_tsv, q.tsq),
+        ts_rank_cd(
+            to_tsvector(
+                'russian',
+                CASE
+                    WHEN mm.description_status = 'ready'
+                    THEN COALESCE(mm.description, '')
+                    ELSE ''
+                END
+            ),
+            q.tsq
+        )
+    ) AS rank,
     mv.captured_at AS captured_at,
     c.date AS message_date
 FROM message_versions AS mv
 JOIN chat_messages AS c
     ON c.id = mv.chat_message_id
     AND c.current_version_id = mv.id
+LEFT JOIN message_media AS mm ON mm.chat_message_id = c.id
 CROSS JOIN q
 WHERE c.chat_id = :chat_id
     AND c.memory_policy = 'normal'
     AND c.is_redacted = FALSE
     AND mv.is_redacted = FALSE
-    AND mv.search_tsv @@ q.tsq
+    AND (
+        mv.search_tsv @@ q.tsq
+        OR to_tsvector(
+            'russian',
+            CASE
+                WHEN mm.description_status = 'ready'
+                THEN COALESCE(mm.description, '')
+                ELSE ''
+            END
+        ) @@ q.tsq
+    )
     AND NOT EXISTS (
         SELECT 1
         FROM forget_events AS fe
@@ -155,13 +190,9 @@ LIMIT :limit
 #       ``message_versions``).
 #   - Resolves the anchor source (lowest-position ``card_sources`` row) so
 #     the hit carries a citable Telegram message_id / chat_id.
-#   - Aggregates ALL source mvids into ``card_source_message_version_ids``
+#   - Requires ALL sources to belong to ``:chat_id`` and aggregates their mvids
+#     into ``card_source_message_version_ids``
 #     so the renderer (T6-07) can list the full back-citation trace.
-#
-# Card hits are NOT filtered by ``:chat_id``: cards are admin-curated
-# canonical knowledge potentially bridging chats. Phase 6 ingestion only
-# touches a single community chat today, so this is a no-op; left permissive
-# for the multi-chat future per T6-06_design.md §3 (Chat scope for card hits).
 _PHASE6_SQL = """
 WITH q AS (
     SELECT plainto_tsquery('russian', :query) AS tsq
@@ -176,13 +207,34 @@ message_hits AS (
         COALESCE(
             ts_headline(
                 'russian',
-                concat_ws(' ', mv.normalized_text, mv.caption),
+                concat_ws(
+                    ' ',
+                    mv.normalized_text,
+                    mv.caption,
+                    CASE
+                        WHEN mm.description_status = 'ready' THEN mm.description
+                        ELSE NULL
+                    END
+                ),
                 q.tsq,
                 :headline_options
             ),
             ''
         ) AS snippet,
-        ts_rank_cd(mv.search_tsv, q.tsq) AS rank,
+        GREATEST(
+            ts_rank_cd(mv.search_tsv, q.tsq),
+            ts_rank_cd(
+                to_tsvector(
+                    'russian',
+                    CASE
+                        WHEN mm.description_status = 'ready'
+                        THEN COALESCE(mm.description, '')
+                        ELSE ''
+                    END
+                ),
+                q.tsq
+            )
+        ) AS rank,
         mv.captured_at AS captured_at,
         c.date AS message_date,
         'message'::text AS source_type,
@@ -192,12 +244,23 @@ message_hits AS (
     JOIN chat_messages AS c
         ON c.id = mv.chat_message_id
         AND c.current_version_id = mv.id
+    LEFT JOIN message_media AS mm ON mm.chat_message_id = c.id
     CROSS JOIN q
     WHERE c.chat_id = :chat_id
         AND c.memory_policy = 'normal'
         AND c.is_redacted = FALSE
         AND mv.is_redacted = FALSE
-        AND mv.search_tsv @@ q.tsq
+        AND (
+            mv.search_tsv @@ q.tsq
+            OR to_tsvector(
+                'russian',
+                CASE
+                    WHEN mm.description_status = 'ready'
+                    THEN COALESCE(mm.description, '')
+                    ELSE ''
+                END
+            ) @@ q.tsq
+        )
         AND NOT EXISTS (
             SELECT 1
             FROM forget_events AS fe
@@ -235,6 +298,30 @@ approved_card_hits AS (
     CROSS JOIN q
     WHERE kc.card_status = 'approved'
         AND kc.body_tsv @@ q.tsq
+        AND EXISTS (
+            -- A searchable card must be owned by the requested chat.
+            SELECT 1
+            FROM card_sources cs_scope
+            JOIN message_versions mv_scope
+                ON mv_scope.id = cs_scope.message_version_id
+            JOIN chat_messages c_scope
+                ON c_scope.id = mv_scope.chat_message_id
+            WHERE cs_scope.card_id = kc.id
+                AND c_scope.chat_id = :chat_id
+                AND c_scope.current_version_id = mv_scope.id
+        )
+        AND NOT EXISTS (
+            -- Extraction is chat-scoped. Fail closed for legacy or malformed
+            -- cards that bridge chats instead of leaking their canonical body.
+            SELECT 1
+            FROM card_sources cs_foreign
+            JOIN message_versions mv_foreign
+                ON mv_foreign.id = cs_foreign.message_version_id
+            JOIN chat_messages c_foreign
+                ON c_foreign.id = mv_foreign.chat_message_id
+            WHERE cs_foreign.card_id = kc.id
+                AND c_foreign.chat_id <> :chat_id
+        )
         AND NOT EXISTS (
             -- Defense-in-depth #1: exclude card if ANY source is tombstoned
             -- (forget_event open in pending|processing|completed status).
@@ -278,6 +365,7 @@ approved_card_hits AS (
                     c3.memory_policy <> 'normal'
                     OR c3.is_redacted = TRUE
                     OR mv3.is_redacted = TRUE
+                    OR c3.current_version_id IS DISTINCT FROM mv3.id
                 )
         )
 ),
@@ -302,6 +390,8 @@ unforgotten_card_sources AS (
     JOIN message_versions mv ON mv.id = cs.message_version_id
     JOIN chat_messages c ON c.id = mv.chat_message_id
     WHERE cs.card_id IN (SELECT card_id FROM approved_card_hits)
+        AND c.chat_id = :chat_id
+        AND c.current_version_id = mv.id
         AND NOT EXISTS (
             SELECT 1
             FROM forget_events AS fe
@@ -320,11 +410,7 @@ unforgotten_card_sources AS (
             AND fe.status IN ('pending', 'processing', 'completed')
         )
 ),
--- T6-06 chat-scope assumption: card hits are NOT filtered by :chat_id.
--- Phase 6 ingestion is single-chat (gatekeeper handler enforces
--- COMMUNITY_CHAT_ID at the boundary). Multi-chat support requires
--- adding EXISTS card_sources -> chat_messages WHERE chat_id=:chat_id.
--- See issue #279.
+-- Anchors and source lists consume only the already chat-scoped source CTE.
 card_anchors AS (
     SELECT DISTINCT ON (ucs.card_id)
         ucs.card_id,
@@ -428,9 +514,7 @@ async def search_messages(
         normalized_query = normalized_query[:MAX_QUERY_LENGTH].strip()
         if not normalized_query:
             return []
-    headline_options = (
-        f"MaxWords={headline_max_words},MinWords=10,ShortWord=2,HighlightAll=false"
-    )
+    headline_options = f"MaxWords={headline_max_words},MinWords=10,ShortWord=2,HighlightAll=false"
 
     # H2 (#278): fail-loud on non-Postgres dialects when include_cards=True.
     #

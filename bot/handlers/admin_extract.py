@@ -65,9 +65,7 @@ def parse_extract_window(raw: str) -> tuple[datetime, datetime]:
     human-readable so the admin handler can surface it directly.
     """
     if not raw or ".." not in raw:
-        raise WindowParseError(
-            "expected '<ISO8601-start>..<ISO8601-end>'"
-        )
+        raise WindowParseError("expected '<ISO8601-start>..<ISO8601-end>'")
     parts = raw.split("..", 1)
     if len(parts) != 2 or not parts[0] or not parts[1]:
         raise WindowParseError("missing start or end of window range")
@@ -85,8 +83,7 @@ def parse_extract_window(raw: str) -> tuple[datetime, datetime]:
 
     if end <= start:
         raise WindowParseError(
-            f"window range is empty or inverted: end={end.isoformat()} "
-            f"<= start={start.isoformat()}"
+            f"window range is empty or inverted: end={end.isoformat()} <= start={start.isoformat()}"
         )
 
     if (end - start) > timedelta(days=MAX_WINDOW_DAYS):
@@ -109,9 +106,7 @@ def _parse_iso8601(raw: str) -> datetime:
     if dt.tzinfo is None:
         # Reject naive datetimes — admin must supply UTC explicitly to
         # avoid timezone ambiguity in the audit trail.
-        raise ValueError(
-            "datetime missing timezone offset; supply '+00:00' or 'Z'"
-        )
+        raise ValueError("datetime missing timezone offset; supply '+00:00' or 'Z'")
     return dt
 
 
@@ -180,9 +175,7 @@ async def cmd_admin_extract(
     try:
         window_start, window_end = parse_extract_window(window_raw)
     except WindowParseError as exc:
-        await message.answer(
-            f"Ошибка окна: {exc}", parse_mode=None
-        )
+        await message.answer(f"Ошибка окна: {exc}", parse_mode=None)
         logger.info(
             "admin_extract_window_parse_failed",
             extra={
@@ -204,10 +197,8 @@ async def cmd_admin_extract(
 
     # T6-03 design §3: build the gateway locally (Phase 5 precedent).
     cfg = load_gateway_config()
-    provider = resolve_provider(cfg.provider)
-    gateway = LiveExtractCandidatesGateway(
-        ledger_repo=LedgerRepo(), provider=provider, config=cfg
-    )
+    provider = resolve_provider(cfg.provider, deepseek_max_tokens=8_192)
+    gateway = LiveExtractCandidatesGateway(ledger_repo=LedgerRepo(), provider=provider, config=cfg)
 
     result = await run_extraction_pass(
         session,
@@ -215,19 +206,17 @@ async def cmd_admin_extract(
         window_end=window_end,
         gateway=gateway,
         operator_user_id=message.from_user.id,
+        source_chat_id=settings.COMMUNITY_CHAT_ID,
     )
 
     summary_lines = [
         "<b>Extraction pass</b>",
-        f"window: <code>{window_start.isoformat()}</code> .. "
-        f"<code>{window_end.isoformat()}</code>",
+        f"window: <code>{window_start.isoformat()}</code> .. <code>{window_end.isoformat()}</code>",
         f"run_status: <code>{result.run_status}</code>",
         f"candidate_count: <code>{result.candidate_count}</code>",
         f"llm_usage_ledger_id: <code>{result.llm_usage_ledger_id}</code>",
         f"extraction_run_id: <code>{result.extraction_run_id}</code>",
     ]
     if result.failure_reason:
-        summary_lines.append(
-            f"failure_reason: <code>{result.failure_reason}</code>"
-        )
+        summary_lines.append(f"failure_reason: <code>{result.failure_reason}</code>")
     await message.answer("\n".join(summary_lines), parse_mode="HTML")

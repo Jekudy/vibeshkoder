@@ -18,9 +18,7 @@ def _validate_password_field(value: str | None, field_name: str, dev_mode: bool)
     """
     if value is None:
         if dev_mode:
-            logging.warning(
-                "%s is not set; generated an ephemeral dev password", field_name
-            )
+            logging.warning("%s is not set; generated an ephemeral dev password", field_name)
             return secrets.token_urlsafe(16)
         raise ValueError(f"{field_name} must be at least 12 characters in production")
 
@@ -28,9 +26,7 @@ def _validate_password_field(value: str | None, field_name: str, dev_mode: bool)
         return value
 
     if dev_mode:
-        logging.warning(
-            "%s is shorter than 12 characters; accepted in DEV_MODE only", field_name
-        )
+        logging.warning("%s is shorter than 12 characters; accepted in DEV_MODE only", field_name)
         return value
 
     raise ValueError(f"{field_name} must be at least 12 characters in production")
@@ -49,6 +45,9 @@ class Settings(BaseSettings):
     VOUCH_TIMEOUT_HOURS: int = 72
     NUDGE_TIMEOUT_HOURS: int = 48
     INTRO_REFRESH_DAYS: int = 90
+    DIGEST_HOUR_MSK: int = 9
+    DIGEST_WEEKLY_HOUR_MSK: int = 9
+    DIGEST_WEEKLY_MINUTE_MSK: int = 0
     # ── Web passwords ─────────────────────────────────────────────────────────
     # WEB_PASSWORD is kept for backward compatibility. If WEB_PASSWORD is set and
     # WEB_ADMIN_PASSWORD is NOT set, WEB_PASSWORD is aliased to WEB_ADMIN_PASSWORD
@@ -59,7 +58,9 @@ class Settings(BaseSettings):
     WEB_SESSION_SECRET: str | None = None
     DEV_MODE: bool = False  # Permissive checks (e.g. ephemeral web password / session secret).
     # Note: postgres is required regardless of DEV_MODE (T0-02). See docs/memory-system/DEV_SETUP.md.
-    HEALTHZ_PORT: int = 3000  # aiohttp /healthz server port (issue #168). Matches EXPOSE 3000 in Dockerfile.bot.
+    HEALTHZ_PORT: int = (
+        3000  # aiohttp /healthz server port (issue #168). Matches EXPOSE 3000 in Dockerfile.bot.
+    )
 
     # ── Neo4j (Phase 10 graph projection) ────────────────────────────────────
     # Production MUST set NEO4J_AUTH_PASSWORD to a 32+ char rotated value.

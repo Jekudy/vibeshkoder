@@ -29,6 +29,7 @@ class MessageVersionRepo:
             select(MessageVersion).where(
                 MessageVersion.chat_message_id == chat_message_id,
                 MessageVersion.content_hash == content_hash,
+                MessageVersion.is_redacted.is_(False),
             )
         )
         return result.scalar_one_or_none()
@@ -77,7 +78,7 @@ class MessageVersionRepo:
         Concurrency safety: the INSERT is wrapped in a savepoint (``session.begin_nested``).
         If two concurrent callers both pass the ``get_by_hash`` check (TOCTOU window) and
         race to insert the same ``(chat_message_id, content_hash)``, one of them will hit
-        the ``uq_message_versions_chat_message_content_hash`` unique constraint and receive
+        the active-version content-hash unique index and receive
         an ``IntegrityError``. The savepoint rolls back only the failed sub-transaction,
         leaving the outer session intact. The losing caller then reselects the winner's row
         via ``get_by_hash`` and returns it. Any other ``IntegrityError`` (FK violation, NOT
@@ -113,7 +114,7 @@ class MessageVersionRepo:
                 session.add(row)
                 await session.flush()
         except IntegrityError:
-            # Concurrent insert won the race on uq_message_versions_chat_message_content_hash.
+            # Concurrent insert won the race on the active content-hash index.
             # Reselect and return their row.
             existing = await MessageVersionRepo.get_by_hash(session, chat_message_id, content_hash)
             if existing is not None:

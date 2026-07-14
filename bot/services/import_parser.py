@@ -32,30 +32,58 @@ logger = logging.getLogger(__name__)
 
 PolicyMarker = Literal["normal", "nomem", "offrecord"]
 MessageKind = Literal[
-    "text", "photo", "video", "voice", "audio", "document", "sticker",
-    "animation", "video_note", "location", "contact", "poll", "dice",
-    "forward", "service", "unknown",
+    "text",
+    "photo",
+    "video",
+    "voice",
+    "audio",
+    "document",
+    "sticker",
+    "animation",
+    "video_note",
+    "location",
+    "contact",
+    "poll",
+    "dice",
+    "forward",
+    "service",
+    "unknown",
 ]
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-MEDIA_KINDS: frozenset[str] = frozenset({
-    "photo", "video", "voice", "audio", "document", "sticker",
-    "animation", "video_note",
-})
+MEDIA_KINDS: frozenset[str] = frozenset(
+    {
+        "photo",
+        "video",
+        "voice",
+        "audio",
+        "document",
+        "sticker",
+        "animation",
+        "video_note",
+    }
+)
 
-SUPPORTED_CHAT_TYPES: frozenset[str] = frozenset({
-    "personal_chat", "private_group", "private_supergroup",
-    "public_supergroup", "private_channel", "public_channel",
-    "saved_messages",
-})
+SUPPORTED_CHAT_TYPES: frozenset[str] = frozenset(
+    {
+        "personal_chat",
+        "private_group",
+        "private_supergroup",
+        "public_supergroup",
+        "private_channel",
+        "public_channel",
+        "saved_messages",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
 # Report dataclass
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class ImportDryRunReport:
@@ -127,6 +155,12 @@ class ImportDryRunReport:
     parse_warnings: list[str]
     """Soft-fail warnings from tolerant-reader. Empty for clean exports."""
 
+    excluded_author_message_count: int = field(default=0)
+    """Exact-author matches that apply would retain raw-only and omit from memory."""
+
+    excluded_author_message_counts: dict[str, int] = field(default_factory=dict)
+    """Per-normalized-author exact-match counts supplied by the HTML dry-run config."""
+
     # --- DB-aware fields (T2-02) ---
     # These are populated by parse_export_with_db(); parse_export() leaves them at defaults.
 
@@ -138,29 +172,29 @@ class ImportDryRunReport:
     """Sorted list of export message ids that collide with existing chat_messages rows.
     Set by parse_export_with_db(); empty list when no DB context."""
 
+    db_rehydrate_count: int = field(default=0)
+    """Existing rows that apply will restore instead of treating as duplicates."""
+
+    db_rehydrate_export_msg_ids: list[int] = field(default_factory=list)
+    """Sorted ids whose normalized/current-version state needs restoration."""
+
     db_broken_reply_count: int = field(default=0)
     """Count of replies whose target cannot be resolved via reply_resolver (DB-aware).
     Set by parse_export_with_db(); 0 when no DB context."""
 
-    # --- Tombstone collision fields (T2-NEW-D / #100) ---
-    # Populated by parse_export_with_db(); offline parse_export() leaves them at defaults.
-    # Separate from db_duplicate_* — different operator decision:
-    #   duplicate = already ingested OK (safe to skip)
-    #   tombstone = forgotten on purpose (NEVER reingest, requires operator attention)
+    # --- Retired tombstone compatibility fields ---
 
     tombstone_skip_count: int = field(default=0)
-    """Count of export messages whose tombstone_key matches an existing row in forget_events.
-    Set by parse_export_with_db(); 0 when no DB context."""
+    """Always zero under the complete-history policy."""
 
     tombstone_skip_export_msg_ids: list[int] = field(default_factory=list)
-    """Ordered list of export message ids that would be skipped due to existing tombstones.
-    Set by parse_export_with_db(); empty list when no DB context.
-    Capped at the same size as the export — bounded by export size, never content-bearing."""
+    """Always empty under the complete-history policy."""
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def parse_export(path: str | Path) -> ImportDryRunReport:
     """Parse a Telegram Desktop single-chat JSON export and return a dry-run report.
@@ -271,9 +305,7 @@ def parse_export(path: str | Path) -> ImportDryRunReport:
 
     # Post-pass aggregation
     known_ids: set[int] = set(all_msg_ids)
-    dangling_reply_count = sum(
-        1 for rid in all_reply_targets if rid not in known_ids
-    )
+    dangling_reply_count = sum(1 for rid in all_reply_targets if rid not in known_ids)
     duplicate_ids = _check_duplicates(all_msg_ids)
 
     distinct_from_ids = sorted(set(all_from_ids))
@@ -313,6 +345,7 @@ def parse_export(path: str | Path) -> ImportDryRunReport:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_envelope(path: Path, warnings: list[str]) -> dict:
     """Open, parse, and validate top-level shape.
 
@@ -340,9 +373,7 @@ def _load_envelope(path: Path, warnings: list[str]) -> dict:
         )
 
     if "messages" not in data:
-        raise ValueError(
-            f"Missing required 'messages' array in export envelope. File: {path}"
-        )
+        raise ValueError(f"Missing required 'messages' array in export envelope. File: {path}")
 
     if not isinstance(data["messages"], list):
         raise ValueError(
@@ -393,9 +424,7 @@ def _classify_td_kind(msg: dict, warnings: list[str] | None = None) -> MessageKi
         # Unknown media_type: return 'unknown' and emit a parse warning.
         # This prevents silently misclassifying new TD media kinds as 'text'.
         if warnings is not None:
-            warnings.append(
-                f"Unknown media_type {media_type!r}; classifying as 'unknown'."
-            )
+            warnings.append(f"Unknown media_type {media_type!r}; classifying as 'unknown'.")
         return "unknown"
 
     # photo field without media_type discriminator

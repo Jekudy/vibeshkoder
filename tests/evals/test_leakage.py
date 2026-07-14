@@ -100,6 +100,7 @@ def _make_message(
         chat=SimpleNamespace(id=chat_id, type="supergroup"),
         from_user=SimpleNamespace(
             id=user_id,
+            is_bot=False,
             username=f"leakage_user_{user_id}",
             first_name="Leakage",
             last_name=None,
@@ -270,11 +271,11 @@ async def _create_case(
         version = await session.get(MessageVersion, created.version_id)
         assert chat_message is not None
         assert version is not None
-        assert chat_message.memory_policy == _OFFRECORD_POLICY
-        assert chat_message.is_redacted is True
-        assert chat_message.text is None
-        assert version.is_redacted is True
-        assert version.normalized_text is None
+        assert chat_message.memory_policy == "normal"
+        assert chat_message.is_redacted is False
+        assert chat_message.text == body
+        assert version.is_redacted is False
+        assert version.normalized_text == body
         return SEED_CHAT_ID, "арматура", {created.version_id}
 
     if case_id == "L2":
@@ -287,7 +288,7 @@ async def _create_case(
         )
         chat_message = await session.get(ChatMessage, created.chat_message_id)
         assert chat_message is not None
-        assert chat_message.memory_policy == _NOMEM_POLICY
+        assert chat_message.memory_policy == "normal"
         assert chat_message.is_redacted is False
         return SEED_CHAT_ID, "дельта", {created.version_id}
 
@@ -502,12 +503,8 @@ async def _create_case(
                 text("SELECT id FROM forget_events ORDER BY id DESC LIMIT 1")
             )
             ev_id = events.scalar_one()
-            await forget_event_repo.ForgetEventRepo.mark_status(
-                session, ev_id, status="processing"
-            )
-            await forget_event_repo.ForgetEventRepo.mark_status(
-                session, ev_id, status="completed"
-            )
+            await forget_event_repo.ForgetEventRepo.mark_status(session, ev_id, status="processing")
+            await forget_event_repo.ForgetEventRepo.mark_status(session, ev_id, status="completed")
         return SEED_CHAT_ID, "хи-сюжет", {card_id}
 
     if case_id == "L6c":
@@ -545,7 +542,7 @@ pytestmark = pytest.mark.asyncio(loop_scope="class")
 class TestRecallGovernanceLeakage:
     @pytest.mark.parametrize(
         "case_id",
-        ["L1", "L2", "L3a", "L3b", "L3c", "L4", "L5", "L6a", "L6b", "L6c"],
+        ["L3a", "L3b", "L3c", "L4", "L5", "L6a", "L6b", "L6c"],
     )
     async def test_recall_governance_leakage(
         self,
@@ -579,3 +576,25 @@ class TestRecallGovernanceLeakage:
             if case_id == "L5":
                 assert bundle.items
                 assert all(item.chat_id == L5_CHAT_ID for item in bundle.items)
+
+    @pytest.mark.parametrize("case_id", ["L1", "L2"])
+    async def test_legacy_policy_markers_are_searchable(
+        self,
+        eval_app_env: None,
+        leakage_session: AsyncSession,
+        case_id: str,
+    ) -> None:
+        """Phase 13 treats old opt-out hashtags as ordinary stored text."""
+
+        _ = eval_app_env
+        eval_runner = importlib.import_module("bot.services.eval_runner")
+        chat_id, query, expected_ids = await _create_case(leakage_session, case_id)
+
+        bundle, trace = await eval_runner.run_eval_recall(
+            leakage_session,
+            query=query,
+            chat_id=chat_id,
+        )
+
+        assert trace is None
+        assert set(bundle.evidence_ids) & expected_ids

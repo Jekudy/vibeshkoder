@@ -57,9 +57,7 @@ class ExtractionCandidateRepo:
 
         Returns ``None`` if the candidate does not exist.
         """
-        stmt = select(ExtractionCandidate).where(
-            ExtractionCandidate.id == candidate_id
-        )
+        stmt = select(ExtractionCandidate).where(ExtractionCandidate.id == candidate_id)
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -84,6 +82,12 @@ class ExtractionCandidateRepo:
             select(ExtractionCandidate)
             .where(ExtractionCandidate.id == candidate_id)
             .with_for_update()
+            # The same transaction reads the row before acquiring source
+            # advisory locks. If another promoter commits while this session
+            # waits, SQLAlchemy's identity map would otherwise keep returning
+            # that stale pre-lock ``pending`` state even though PostgreSQL
+            # returned the now-terminal row from this locking SELECT.
+            .execution_options(populate_existing=True)
         )
         result = await session.execute(stmt)
         return result.scalar_one_or_none()

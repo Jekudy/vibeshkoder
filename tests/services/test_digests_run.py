@@ -24,6 +24,8 @@ import pytest
 
 pytestmark = pytest.mark.usefixtures("app_env")
 
+COMMUNITY_CHAT_ID = -1001234567890
+
 _user_counter = itertools.count(start=8_300_000_000)
 _msg_counter = itertools.count(start=830_000)
 _chat_counter = itertools.count(start=8300)
@@ -59,8 +61,13 @@ async def _make_user(db_session) -> int:
 
 
 async def _make_msg_and_version(
-    db_session, *, chat_id: int, ts: datetime, text: str = "hello",
-    memory_policy: str = "normal", is_redacted: bool = False
+    db_session,
+    *,
+    chat_id: int,
+    ts: datetime,
+    text: str = "hello",
+    memory_policy: str = "normal",
+    is_redacted: bool = False,
 ) -> tuple[int, int]:
     from bot.db.models import ChatMessage, MessageVersion
 
@@ -146,8 +153,14 @@ def _make_digest_config(**overrides) -> "DigestConfig":  # noqa: F821
 class _StubProvider:
     """Test provider — returns canned answer_text."""
 
-    def __init__(self, *, answer_text: str, tokens_in: int = 100, tokens_out: int = 50,
-                 raise_on_call: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        answer_text: str,
+        tokens_in: int = 100,
+        tokens_out: int = 50,
+        raise_on_call: Exception | None = None,
+    ):
         self.answer_text = answer_text
         self.tokens_in = tokens_in
         self.tokens_out = tokens_out
@@ -176,8 +189,8 @@ class _StubProvider:
 def test_load_digest_config_reads_env_vars(monkeypatch):
     monkeypatch.setenv("DIGEST_DAILY_USD_CEILING", "2.50")
     monkeypatch.setenv("DIGEST_MONTHLY_USD_CEILING", "25.00")
-    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", "-12345")
-    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", "-67890")
+    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", str(COMMUNITY_CHAT_ID))
+    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", str(COMMUNITY_CHAT_ID))
     monkeypatch.setenv("DIGEST_HOUR_MSK", "11")
     monkeypatch.setenv("DIGEST_MIN_CARDS_THRESHOLD", "5")
     monkeypatch.setenv("DIGEST_RAW_MESSAGE_TOP_N", "20")
@@ -188,22 +201,67 @@ def test_load_digest_config_reads_env_vars(monkeypatch):
     cfg = load_digest_config()
     assert cfg.daily_cost_ceiling_usd == Decimal("2.50")
     assert cfg.monthly_cost_ceiling_usd == Decimal("25.00")
-    assert cfg.source_chat_id == -12345
-    assert cfg.destination_chat_id == -67890
+    assert cfg.source_chat_id == COMMUNITY_CHAT_ID
+    assert cfg.destination_chat_id == COMMUNITY_CHAT_ID
     assert cfg.hour_msk == 11
     assert cfg.min_cards_threshold == 5
     assert cfg.raw_message_top_n == 20
     assert cfg.token_budget_input == 4000
 
 
-def test_load_digest_config_raises_when_src_equals_dst(monkeypatch):
-    """F5: src==dst is an echo-loop misconfiguration and must raise ConfigurationError."""
-    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", "-99999")
-    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", "-99999")
+def test_load_digest_config_allows_community_as_src_and_dst(monkeypatch):
+    """The configured community is both source and publication chat."""
+    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", str(COMMUNITY_CHAT_ID))
+    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", str(COMMUNITY_CHAT_ID))
 
-    from bot.services.digests import ConfigurationError, load_digest_config
+    from bot.services.digests import load_digest_config
 
-    with pytest.raises(ConfigurationError, match="echo loop"):
+    config = load_digest_config()
+
+    assert config.source_chat_id == COMMUNITY_CHAT_ID
+    assert config.destination_chat_id == COMMUNITY_CHAT_ID
+
+
+def test_load_digest_config_rejects_equal_non_community_route(monkeypatch):
+    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", "-1009999999999")
+    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", "-1009999999999")
+
+    from bot.services.digests import load_digest_config
+
+    with pytest.raises(ValueError, match="COMMUNITY_CHAT_ID"):
+        load_digest_config()
+
+
+def test_load_digest_config_requires_both_chat_ids(monkeypatch):
+    from bot.services.digests import load_digest_config
+
+    monkeypatch.delenv("DIGEST_SOURCE_CHAT_ID", raising=False)
+    monkeypatch.delenv("DIGEST_DESTINATION_CHAT_ID", raising=False)
+
+    with pytest.raises(ValueError, match="DIGEST_SOURCE_CHAT_ID"):
+        load_digest_config()
+
+
+@pytest.mark.parametrize(
+    ("source", "destination", "error"),
+    [
+        ("0", "0", "negative"),
+        ("12345", "12345", "negative"),
+        ("-12345", "-67890", "same chat"),
+    ],
+)
+def test_load_digest_config_rejects_unsafe_chat_routes(
+    monkeypatch,
+    source: str,
+    destination: str,
+    error: str,
+):
+    from bot.services.digests import load_digest_config
+
+    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", source)
+    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", destination)
+
+    with pytest.raises(ValueError, match=error):
         load_digest_config()
 
 
@@ -248,10 +306,7 @@ def test_parse_citations_preserves_duplicate_positions():
 
     # Same mv:123 cited in two different bullets (positions 0 and 1)
     body = (
-        "TL;DR text.\n"
-        "\n"
-        "- Bullet A [[mv:123]] first mention\n"
-        "- Bullet B [[mv:123]] second mention\n"
+        "TL;DR text.\n\n- Bullet A [[mv:123]] first mention\n- Bullet B [[mv:123]] second mention\n"
     )
     citations, dropped = _parse_digest_citations(
         body, valid_card_source_ids=frozenset(), valid_mv_ids=frozenset({123})
@@ -307,7 +362,7 @@ async def test_run_digest_rejects_unknown_type(db_session):
         )
 
 
-async def test_run_digest_empty_window_skipped(db_session):
+async def test_run_digest_empty_window_creates_zero_cost_quiet_draft(db_session):
     from bot.services.digests import run_digest
 
     chat_id = _next_chat_id()
@@ -324,7 +379,9 @@ async def test_run_digest_empty_window_skipped(db_session):
         config=cfg,
         digest_config=dcfg,
     )
-    assert digest.status == "skipped"
+    assert digest.status == "draft"
+    assert digest.body_markdown == "За прошедший день новых обсуждений не было."
+    assert digest.llm_usage_ledger_id is None
 
 
 async def test_run_digest_idempotency(db_session):
@@ -339,16 +396,28 @@ async def test_run_digest_idempotency(db_session):
     we = now
 
     d1 = await run_digest(
-        db_session, type="daily", window_start=ws, window_end=we,
-        ledger_repo=None, provider=None, config=cfg, digest_config=dcfg,
+        db_session,
+        type="daily",
+        window_start=ws,
+        window_end=we,
+        ledger_repo=None,
+        provider=None,
+        config=cfg,
+        digest_config=dcfg,
     )
     await db_session.flush()
     d2 = await run_digest(
-        db_session, type="daily", window_start=ws, window_end=we,
-        ledger_repo=None, provider=None, config=cfg, digest_config=dcfg,
+        db_session,
+        type="daily",
+        window_start=ws,
+        window_end=we,
+        ledger_repo=None,
+        provider=None,
+        config=cfg,
+        digest_config=dcfg,
     )
     assert d1.id == d2.id
-    assert d2.status == "skipped"  # both empty-window
+    assert d2.status == "draft"  # both resolve to the same quiet-window draft
 
 
 async def test_run_digest_cost_ceiling_separate_bucket(db_session):
@@ -420,10 +489,13 @@ async def test_run_digest_happy_path(db_session):
     await db_session.flush()
     # Fetch card_source.id for use in canned response
     from sqlalchemy import text as _t
-    cs_row = (await db_session.execute(
-        _t("SELECT id FROM card_sources WHERE card_id = :cid LIMIT 1"),
-        {"cid": str(card_id)},
-    )).scalar_one()
+
+    cs_row = (
+        await db_session.execute(
+            _t("SELECT id FROM card_sources WHERE card_id = :cid LIMIT 1"),
+            {"cid": str(card_id)},
+        )
+    ).scalar_one()
     cs_id_str = str(cs_row)
 
     body = (
@@ -535,11 +607,7 @@ async def test_synthesize_digest_raises_on_bullet_without_citations(db_session):
         ],
     )
     # Bullet cites a hallucinated id (99999 is not in input).
-    body = (
-        "TL;DR text one. Two. Three.\n"
-        "\n"
-        "- Topic [[mv:99999]] hallucinated\n"
-    )
+    body = "TL;DR text one. Two. Three.\n\n- Topic [[mv:99999]] hallucinated\n"
     provider = _StubProvider(answer_text=body)
     cfg = _make_gateway_config()
 

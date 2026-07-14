@@ -21,18 +21,84 @@ DO NOT import bot.services.import_apply here — that is Stream Delta (#103).
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import ChatMessage
+from bot.db.models import ChatMessage, MessageVersion
 from bot.db.repos.ingestion_run import IngestionRunRepo
 from bot.services.import_parser import ImportDryRunReport, parse_export
 from bot.services.import_reply_resolver import resolve_reply_batch
-from bot.services.import_tombstone import batch_check_tombstones_by_message_key
 
 logger = logging.getLogger(__name__)
+
+
+async def parse_html_export_with_db(
+    path: str | Path,
+    session: AsyncSession,
+    chat_id: int,
+    *,
+    excluded_author_names: frozenset[str] = frozenset(),
+) -> ImportDryRunReport:
+    """DB-aware dry-run for a Telegram Desktop HTML directory.
+
+    HTML parsing produces the same canonical message dictionaries as apply, then
+    this function reuses the JSON pipeline's duplicate and reply
+    resolution services. It never commits and never includes content in the report.
+    """
+    from bot.services.import_html_parser import iter_html_messages, parse_html_export
+
+    source = Path(path).expanduser().resolve()
+    base_report = parse_html_export(
+        source,
+        excluded_author_names=excluded_author_names,
+    )
+    messages = list(iter_html_messages(source))
+    all_export_ids = [message["id"] for message in messages if isinstance(message.get("id"), int)]
+
+    duplicate_ids, rehydrate_ids = await _classify_db_existing(session, chat_id, all_export_ids)
+
+    dry_run_row = await IngestionRunRepo.create(
+        session,
+        run_type="dry_run",
+        source_name=str(source),
+    )
+
+    reply_targets = [
+        message["reply_to_message_id"]
+        for message in messages
+        if message.get("type") != "service" and isinstance(message.get("reply_to_message_id"), int)
+    ]
+    export_id_set = set(all_export_ids)
+    external_targets = [item for item in reply_targets if item not in export_id_set]
+    broken_reply_count = 0
+    if external_targets:
+        resolutions = await resolve_reply_batch(
+            session,
+            export_msg_ids=list(dict.fromkeys(external_targets)),
+            ingestion_run_id=dry_run_row.id,
+            chat_id=chat_id,
+        )
+        broken_reply_count = sum(
+            1
+            for target_id in external_targets
+            if resolutions.get(target_id) is not None
+            and resolutions[target_id].resolved_via == "unresolved"
+        )
+
+    return replace(
+        base_report,
+        chat_id=chat_id,
+        db_duplicate_count=len(duplicate_ids),
+        db_duplicate_export_msg_ids=duplicate_ids,
+        db_rehydrate_count=len(rehydrate_ids),
+        db_rehydrate_export_msg_ids=rehydrate_ids,
+        db_broken_reply_count=broken_reply_count,
+        tombstone_skip_count=0,
+        tombstone_skip_export_msg_ids=[],
+    )
 
 
 async def parse_export_with_db(
@@ -73,24 +139,13 @@ async def parse_export_with_db(
     # Step 2: Collect all export message ids (int) from the parsed export.
     all_export_ids = _extract_export_msg_ids(path)
 
-    # Step 2a: Tombstone collision detection (T2-NEW-D / #100).
-    # Must be computed BEFORE duplicate detection so that the precedence rule
-    # (tombstone bucket wins over duplicate bucket) can be applied correctly.
-    # One batch SELECT only — no per-message N+1.
-    tombstone_hit_ids: set[int] = await batch_check_tombstones_by_message_key(
-        session,
-        chat_id=chat_id,
-        export_msg_ids=all_export_ids,
+    # Step 2a: DB duplicate detection. Legacy tombstones are audit-only under
+    # the complete-history policy and never remove ids from this set.
+    db_duplicate_export_msg_ids, db_rehydrate_export_msg_ids = await _classify_db_existing(
+        session, chat_id, all_export_ids
     )
-    tombstone_skip_export_msg_ids: list[int] = sorted(tombstone_hit_ids)
-    tombstone_skip_count = len(tombstone_skip_export_msg_ids)
-
-    # Step 2b: DB duplicate detection.
-    # Exclude ids that are already classified as tombstone hits so that the tombstone
-    # bucket wins over the duplicate bucket on collision (task contract §4).
-    non_tombstone_ids = [mid for mid in all_export_ids if mid not in tombstone_hit_ids]
-    db_duplicate_export_msg_ids = await _find_db_duplicates(session, chat_id, non_tombstone_ids)
     db_duplicate_count = len(db_duplicate_export_msg_ids)
+    db_rehydrate_count = len(db_rehydrate_export_msg_ids)
 
     # Step 3: Create synthetic dry_run ingestion_run for reply resolver scope.
     # We must flush so the row has an id, but we do NOT commit.
@@ -128,7 +183,8 @@ async def parse_export_with_db(
             # ``resolutions`` is keyed by target_id (deduplicated); we iterate over the full
             # per-message list to count each message individually.
             db_broken_reply_count = sum(
-                1 for target_id in db_reply_targets
+                1
+                for target_id in db_reply_targets
                 if resolutions.get(target_id) is not None
                 and resolutions[target_id].resolved_via == "unresolved"
             )
@@ -159,9 +215,11 @@ async def parse_export_with_db(
         parse_warnings=base_report.parse_warnings,
         db_duplicate_count=db_duplicate_count,
         db_duplicate_export_msg_ids=db_duplicate_export_msg_ids,
+        db_rehydrate_count=db_rehydrate_count,
+        db_rehydrate_export_msg_ids=db_rehydrate_export_msg_ids,
         db_broken_reply_count=db_broken_reply_count,
-        tombstone_skip_count=tombstone_skip_count,
-        tombstone_skip_export_msg_ids=tombstone_skip_export_msg_ids,
+        tombstone_skip_count=0,
+        tombstone_skip_export_msg_ids=[],
     )
 
 
@@ -212,25 +270,48 @@ def _extract_reply_targets(path: Path) -> list[int]:
     return result
 
 
-async def _find_db_duplicates(
+async def _classify_db_existing(
     session: AsyncSession,
     chat_id: int,
     export_msg_ids: list[int],
-) -> list[int]:
-    """Return sorted list of export_msg_ids that already exist in chat_messages for this chat.
+) -> tuple[list[int], list[int]]:
+    """Return ``(duplicate_ids, rehydrate_ids)`` for existing normalized rows.
 
     Issues a single bulk SELECT. Returns an empty list when export_msg_ids is empty.
     """
     if not export_msg_ids:
-        return []
+        return [], []
 
     stmt = (
-        select(ChatMessage.message_id)
+        select(
+            ChatMessage.message_id,
+            ChatMessage.memory_policy,
+            ChatMessage.is_redacted,
+            ChatMessage.current_version_id,
+            MessageVersion.is_redacted,
+        )
+        .outerjoin(MessageVersion, MessageVersion.id == ChatMessage.current_version_id)
         .where(
             ChatMessage.chat_id == chat_id,
             ChatMessage.message_id.in_(export_msg_ids),
         )
     )
-    result = await session.execute(stmt)
-    found = sorted(row[0] for row in result.all())
-    return found
+    rows = (await session.execute(stmt)).all()
+    rehydrate = sorted(
+        int(row[0])
+        for row in rows
+        if row[1] != "normal" or bool(row[2]) or row[3] is None or bool(row[4])
+    )
+    rehydrate_set = set(rehydrate)
+    duplicates = sorted(int(row[0]) for row in rows if int(row[0]) not in rehydrate_set)
+    return duplicates, rehydrate
+
+
+async def _find_db_duplicates(
+    session: AsyncSession,
+    chat_id: int,
+    export_msg_ids: list[int],
+) -> list[int]:
+    """Backward-compatible duplicate-only helper used by older callers/tests."""
+    duplicates, _rehydrate = await _classify_db_existing(session, chat_id, export_msg_ids)
+    return duplicates

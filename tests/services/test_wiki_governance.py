@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import pytest
 
 pytestmark = pytest.mark.usefixtures("app_env")
+SOURCE_CHAT_ID = -1001234567890
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -40,7 +41,13 @@ async def _make_user(session) -> int:
     return uid
 
 
-async def _make_chat_message(session, *, user_id: int, memory_policy: str = "normal"):
+async def _make_chat_message(
+    session,
+    *,
+    user_id: int,
+    memory_policy: str = "normal",
+    chat_id: int = SOURCE_CHAT_ID,
+):
     """Create a ChatMessage row and return the full ORM instance.
 
     Tests access ``.id`` for FK linking and ``.chat_id`` / ``.message_id`` when
@@ -51,7 +58,7 @@ async def _make_chat_message(session, *, user_id: int, memory_policy: str = "nor
 
     cm = ChatMessage(
         message_id=int(uuid.uuid4().int & 0x7FFFFFFF),
-        chat_id=-1001234567890,
+        chat_id=chat_id,
         user_id=user_id,
         text="test content",
         date=_now(),
@@ -71,7 +78,7 @@ async def _make_message_version(
     content_hash: str | None = None,
     is_redacted: bool = False,
 ) -> int:
-    from bot.db.models import MessageVersion
+    from bot.db.models import ChatMessage, MessageVersion
 
     if content_hash is None:
         content_hash = f"h-{uuid.uuid4().hex[:16]}"
@@ -86,6 +93,10 @@ async def _make_message_version(
         is_redacted=is_redacted,
     )
     session.add(mv)
+    await session.flush()
+    chat_message = await session.get(ChatMessage, chat_message_id)
+    assert chat_message is not None
+    chat_message.current_version_id = mv.id
     await session.flush()
     return mv.id
 
@@ -111,13 +122,19 @@ async def _make_knowledge_card(
     return card.id
 
 
-async def _make_card_source(session, *, card_id: uuid.UUID, message_version_id: int) -> None:
+async def _make_card_source(
+    session,
+    *,
+    card_id: uuid.UUID,
+    message_version_id: int,
+    position: int = 0,
+) -> None:
     from bot.db.models import CardSource
 
     cs = CardSource(
         card_id=card_id,
         message_version_id=message_version_id,
-        position=0,
+        position=position,
     )
     session.add(cs)
     await session.flush()
@@ -503,10 +520,7 @@ def test_no_graph_imports_in_wiki_governance() -> None:
     from pathlib import Path
 
     source = (
-        Path(__file__).resolve().parents[2]
-        / "bot"
-        / "services"
-        / "wiki_governance.py"
+        Path(__file__).resolve().parents[2] / "bot" / "services" / "wiki_governance.py"
     ).read_text()
     tree = ast.parse(source)
     for node in ast.walk(tree):
@@ -572,3 +586,117 @@ async def test_tombstone_match_uses_tombstone_key_not_target_id(db_session) -> N
     assert result.valid is False
     assert mv_id in result.invalid_mvids
     assert result.reasons[f"mvid:{mv_id}"] == "tombstone:user"
+
+
+async def test_scoped_validation_rejects_foreign_direct_and_transitive_sources(
+    db_session,
+) -> None:
+    from bot.services.wiki_governance import validate_sources
+
+    uid = await _make_user(db_session)
+    foreign_cm = await _make_chat_message(
+        db_session,
+        user_id=uid,
+        chat_id=SOURCE_CHAT_ID - 1,
+    )
+    foreign_mvid = await _make_message_version(
+        db_session,
+        chat_message_id=foreign_cm.id,
+    )
+    card_id = await _make_knowledge_card(db_session, admin_user_id=uid)
+    await _make_card_source(
+        db_session,
+        card_id=card_id,
+        message_version_id=foreign_mvid,
+    )
+    page_id = await _make_wiki_page(db_session)
+    await _link_card(db_session, page_id=page_id, card_id=card_id)
+    await _link_mv(db_session, page_id=page_id, message_version_id=foreign_mvid)
+
+    result = await validate_sources(
+        db_session,
+        page_id=page_id,
+        source_chat_id=SOURCE_CHAT_ID,
+    )
+
+    assert result.valid is False
+    assert result.reasons[f"mvid:{foreign_mvid}"] == "wrong_chat"
+    assert result.reasons[f"card:{card_id}"] == "wrong_chat"
+
+
+async def test_scoped_validation_rejects_mixed_card_even_with_clean_local_source(
+    db_session,
+) -> None:
+    from bot.services.wiki_governance import validate_sources
+
+    uid = await _make_user(db_session)
+    local_cm = await _make_chat_message(db_session, user_id=uid)
+    local_mvid = await _make_message_version(db_session, chat_message_id=local_cm.id)
+    foreign_cm = await _make_chat_message(
+        db_session,
+        user_id=uid,
+        chat_id=SOURCE_CHAT_ID - 1,
+    )
+    foreign_mvid = await _make_message_version(
+        db_session,
+        chat_message_id=foreign_cm.id,
+    )
+    card_id = await _make_knowledge_card(db_session, admin_user_id=uid)
+    await _make_card_source(
+        db_session,
+        card_id=card_id,
+        message_version_id=local_mvid,
+        position=0,
+    )
+    await _make_card_source(
+        db_session,
+        card_id=card_id,
+        message_version_id=foreign_mvid,
+        position=1,
+    )
+    page_id = await _make_wiki_page(db_session)
+    await _link_card(db_session, page_id=page_id, card_id=card_id)
+
+    result = await validate_sources(
+        db_session,
+        page_id=page_id,
+        source_chat_id=SOURCE_CHAT_ID,
+    )
+
+    assert result.valid is False
+    assert result.reasons[f"card:{card_id}"] == "wrong_chat"
+
+
+async def test_validation_rejects_non_current_version(db_session) -> None:
+    from bot.db.models import ChatMessage, MessageVersion
+    from bot.services.wiki_governance import validate_sources
+
+    uid = await _make_user(db_session)
+    cm = await _make_chat_message(db_session, user_id=uid)
+    old_mvid = await _make_message_version(db_session, chat_message_id=cm.id)
+    replacement = MessageVersion(
+        chat_message_id=cm.id,
+        version_seq=2,
+        text="replacement",
+        normalized_text="replacement",
+        entities_json={},
+        content_hash=f"h-{uuid.uuid4().hex[:16]}",
+        is_redacted=False,
+    )
+    db_session.add(replacement)
+    await db_session.flush()
+    current_message = await db_session.get(ChatMessage, cm.id)
+    assert current_message is not None
+    current_message.current_version_id = replacement.id
+    await db_session.flush()
+    page_id = await _make_wiki_page(db_session)
+    await _link_mv(db_session, page_id=page_id, message_version_id=old_mvid)
+
+    result = await validate_sources(
+        db_session,
+        page_id=page_id,
+        source_chat_id=SOURCE_CHAT_ID,
+    )
+
+    assert result.valid is False
+    assert result.reasons[f"mvid:{old_mvid}"] == "non_current"

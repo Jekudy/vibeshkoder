@@ -1,9 +1,8 @@
 """Handler-level redelivery idempotency test (Issue #67, Codex MEDIUM).
 
-Calls the ``save_chat_message`` handler twice for the same message carrying
-``#offrecord`` in the text and asserts that exactly one ``chat_messages`` row and
-exactly one ``offrecord_marks`` row are produced — redelivery must be a true no-op
-at the persistence layer.
+Calls the ``save_chat_message`` handler twice for the same message carrying the legacy
+``#offrecord`` token.  The row remains normal memory, no opt-out mark is created, and
+redelivery is a true no-op at the persistence layer.
 
 Strategy:
 - Uses the real ``db_session`` fixture (postgres-backed, outer-tx isolation).
@@ -56,10 +55,8 @@ def _make_offrecord_message(
 ) -> SimpleNamespace:
     """Build a minimal SimpleNamespace shaped like an aiogram Message.
 
-    The ``model_dump`` Mock is required because ``save_chat_message`` calls
-    ``message.model_dump(mode="json", exclude_none=True)`` on the ``message.text``
-    path — for offrecord messages the handler skips this (policy=="offrecord"),
-    but we include it for safety in case the policy branch logic changes.
+    The ``model_dump`` Mock is required because normal text persistence records the
+    source payload via ``message.model_dump(mode="json", exclude_none=True)``.
     """
     raw_json = {"message_id": message_id, "text": text}
     return SimpleNamespace(
@@ -70,6 +67,7 @@ def _make_offrecord_message(
             username=f"u{user_id}",
             first_name="Test",
             last_name=None,
+            is_bot=False,
         ),
         text=text,
         caption=None,
@@ -99,17 +97,13 @@ def _make_offrecord_message(
     )
 
 
-async def test_handler_redelivery_does_not_duplicate_offrecord_marks(db_session) -> None:
+async def test_handler_redelivery_keeps_legacy_token_as_one_normal_row(db_session) -> None:
     """Deliver the same #offrecord message through save_chat_message twice.
 
     Asserts:
     - Exactly 1 chat_messages row for the (chat_id, message_id) pair.
-    - Exactly 1 offrecord_marks row for the resulting chat_message_id.
-
-    This is the handler-level complement to
-    ``test_create_for_message_idempotent_on_duplicate_call`` in
-    ``tests/db/test_offrecord_mark_repo.py`` (which tests the repo in isolation).
-    Together they cover the full redelivery path end-to-end.
+    - The row has normal memory policy.
+    - No offrecord_marks row is created.
     """
     from bot.db.models import ChatMessage, OffrecordMark
     from bot.handlers.chat_messages import save_chat_message
@@ -145,13 +139,14 @@ async def test_handler_redelivery_does_not_duplicate_offrecord_marks(db_session)
         )
     )
     assert chat_msg_row is not None
+    assert chat_msg_row.memory_policy == "normal"
+    assert chat_msg_row.is_redacted is False
+    assert chat_msg_row.text == "#offrecord secret note"
 
-    # Exactly one offrecord_marks row.
+    # No legacy opt-out mark.
     mark_count = await db_session.scalar(
         select(func.count())
         .select_from(OffrecordMark)
         .where(OffrecordMark.chat_message_id == chat_msg_row.id)
     )
-    assert mark_count == 1, (
-        f"Expected 1 offrecord_marks row after double delivery, got {mark_count}"
-    )
+    assert mark_count == 0

@@ -158,9 +158,7 @@ async def test_offrecord_then_stale_duplicate_then_normal_edit_does_not_restore_
     assert stale2.is_redacted is True, (
         "PRIVACY VIOLATION: second stale duplicate delivery unset is_redacted"
     )
-    assert stale2.text is None, (
-        "PRIVACY VIOLATION: second stale duplicate delivery restored text"
-    )
+    assert stale2.text is None, "PRIVACY VIOLATION: second stale duplicate delivery restored text"
 
 
 async def test_offrecord_row_accepts_repeated_offrecord_saves_idempotently(
@@ -331,22 +329,10 @@ def _make_aiogram_message(
     )
 
 
-async def test_handler_offrecord_flip_then_attempted_revert_stays_sticky_end_to_end(
+async def test_handler_legacy_offrecord_marker_remains_complete_history_end_to_end(
     db_session,
 ) -> None:
-    """End-to-end (Codex Sprint #80 Finding 3 / MEDIUM): the obsolete invariant test
-    asserted that an offrecord→normal edit succeeds via ``_update_memory_policy``.
-    This new test asserts the post-fix sticky behavior through real DB + real handler.
-
-    Scenario:
-    1. Save original message via ``MessageRepo.save`` (normal policy).
-    2. Invoke ``handle_edited_message`` with text containing ``#offrecord`` —
-       handler runs ``_apply_offrecord_flip`` → row becomes redacted.
-    3. Invoke ``handle_edited_message`` with text WITHOUT ``#offrecord`` (user
-       attempts to remove the tag) — handler must take the new sticky branch and
-       leave the row offrecord, no version row carrying restored text, no duplicate
-       offrecord_marks row.
-    """
+    """Phase 13 stores both marker-bearing and later clean edits as normal versions."""
     from sqlalchemy import func
 
     from bot.db.models import ChatMessage, MessageVersion, OffrecordMark
@@ -374,7 +360,7 @@ async def test_handler_offrecord_flip_then_attempted_revert_stays_sticky_end_to_
     assert saved.memory_policy == "normal"
     assert saved.is_redacted is False
 
-    # Step 2: edit adds #offrecord — handler flips the row to offrecord.
+    # Step 2: the legacy marker is ordinary content.
     edit_offrecord = _make_aiogram_message(
         message_id=message_id,
         chat_id=chat_id,
@@ -383,30 +369,22 @@ async def test_handler_offrecord_flip_then_attempted_revert_stays_sticky_end_to_
     )
     await handle_edited_message(edit_offrecord, db_session)
 
-    # Verify the flip took effect.
-    flipped = (
-        await db_session.execute(
-            select(ChatMessage).where(ChatMessage.id == saved.id)
-        )
+    after_marker_edit = (
+        await db_session.execute(select(ChatMessage).where(ChatMessage.id == saved.id))
     ).scalar_one()
-    await db_session.refresh(flipped)
-    assert flipped.memory_policy == "offrecord", (
-        f"Setup precondition: handler flip to offrecord did not apply. "
-        f"Got memory_policy={flipped.memory_policy!r}"
-    )
-    assert flipped.is_redacted is True
-    assert flipped.text is None
+    await db_session.refresh(after_marker_edit)
+    assert after_marker_edit.memory_policy == "normal"
+    assert after_marker_edit.is_redacted is False
+    assert after_marker_edit.text == "A — the original content #offrecord"
 
     marks_after_flip = await db_session.scalar(
         select(func.count())
         .select_from(OffrecordMark)
         .where(OffrecordMark.chat_message_id == saved.id)
     )
-    assert marks_after_flip == 1, (
-        f"Expected exactly 1 offrecord_marks row after flip, got {marks_after_flip}"
-    )
+    assert marks_after_flip == 0
 
-    # Step 3: user "removes" the #offrecord tag — handler MUST take sticky path.
+    # Step 3: a later clean edit is another ordinary version.
     edit_revert = _make_aiogram_message(
         message_id=message_id,
         chat_id=chat_id,
@@ -415,55 +393,37 @@ async def test_handler_offrecord_flip_then_attempted_revert_stays_sticky_end_to_
     )
     await handle_edited_message(edit_revert, db_session)
 
-    # Step 4: assert sticky invariant on the parent row.
     after_revert_attempt = (
-        await db_session.execute(
-            select(ChatMessage).where(ChatMessage.id == saved.id)
-        )
+        await db_session.execute(select(ChatMessage).where(ChatMessage.id == saved.id))
     ).scalar_one()
     await db_session.refresh(after_revert_attempt)
 
-    assert after_revert_attempt.memory_policy == "offrecord", (
-        f"PRIVACY VIOLATION (sticky): handler downgraded memory_policy from "
-        f"'offrecord' to {after_revert_attempt.memory_policy!r} on a flip-back edit."
-    )
-    assert after_revert_attempt.is_redacted is True, (
-        "PRIVACY VIOLATION (sticky): handler unset is_redacted on a flip-back edit."
-    )
-    assert after_revert_attempt.text is None, (
-        f"PRIVACY VIOLATION: handler restored text {after_revert_attempt.text!r} on a "
-        f"flip-back edit. Irreversibility doctrine violated."
-    )
+    assert after_revert_attempt.memory_policy == "normal"
+    assert after_revert_attempt.is_redacted is False
+    assert after_revert_attempt.text == "A — the original content (clean)"
     assert after_revert_attempt.caption is None
 
-    # Step 5: assert no message_versions row carries restored content.
+    # Both edits remain auditable and searchable.
     version_rows = (
-        await db_session.execute(
-            select(MessageVersion).where(MessageVersion.chat_message_id == saved.id)
+        (
+            await db_session.execute(
+                select(MessageVersion)
+                .where(MessageVersion.chat_message_id == saved.id)
+                .order_by(MessageVersion.version_seq)
+            )
         )
-    ).scalars().all()
-    for v in version_rows:
-        assert v.text is None, (
-            f"PRIVACY VIOLATION: message_versions row v{v.version_seq} "
-            f"(content_hash={v.content_hash[:16]}…) carries restored text {v.text!r} "
-            f"after sticky flip-back attempt."
-        )
-        assert v.caption is None, (
-            f"PRIVACY VIOLATION: message_versions row v{v.version_seq} carries "
-            f"restored caption {v.caption!r}."
-        )
-        assert v.is_redacted is True, (
-            f"PRIVACY VIOLATION: message_versions row v{v.version_seq} has "
-            f"is_redacted=False after sticky flip-back attempt."
-        )
+        .scalars()
+        .all()
+    )
+    assert [v.text for v in version_rows] == [
+        "A — the original content #offrecord",
+        "A — the original content (clean)",
+    ]
+    assert all(v.caption is None and v.is_redacted is False for v in version_rows)
 
-    # Step 6: no duplicate offrecord_marks row created (no transition occurred).
     marks_after_revert = await db_session.scalar(
         select(func.count())
         .select_from(OffrecordMark)
         .where(OffrecordMark.chat_message_id == saved.id)
     )
-    assert marks_after_revert == 1, (
-        f"Expected exactly 1 offrecord_marks row (no new audit row on sticky path), "
-        f"got {marks_after_revert}."
-    )
+    assert marks_after_revert == 0

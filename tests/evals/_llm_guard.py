@@ -30,6 +30,7 @@ LLM_PROVIDER_HOSTNAMES: frozenset[str] = frozenset(
     [
         "api.anthropic.com",
         "api.openai.com",
+        "api.deepseek.com",
         "generativelanguage.googleapis.com",
         "api.together.xyz",
         "api.groq.com",

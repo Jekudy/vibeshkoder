@@ -60,9 +60,11 @@ async def test_create_inserts_approved_card(db_session) -> None:
         title="Title",
         body_markdown="Body",
         approved_by_user_id=admin,
+        topic_slug="test-topic",
     )
     assert card.id is not None
     assert card.title == "Title"
+    assert card.topic_slug == "test-topic"
     assert card.body_markdown == "Body"
     assert card.card_status == "approved"
     assert card.approved_by_user_id == admin
@@ -103,9 +105,7 @@ async def test_list_approved_returns_only_approved(db_session) -> None:
     db_session.add(archived_card)
     await db_session.flush()
 
-    rows = await KnowledgeCardRepo.list_approved(
-        db_session, limit=10, offset=0
-    )
+    rows = await KnowledgeCardRepo.list_approved(db_session, limit=10, offset=0)
     ids = [r.id for r in rows]
     assert approved.id in ids
     assert draft_card.id not in ids
@@ -138,15 +138,11 @@ async def test_list_approved_orders_by_approved_at_desc(db_session) -> None:
         .values(approved_at=base - timedelta(minutes=10))
     )
     await db_session.execute(
-        update(KnowledgeCard)
-        .where(KnowledgeCard.id == newer.id)
-        .values(approved_at=base)
+        update(KnowledgeCard).where(KnowledgeCard.id == newer.id).values(approved_at=base)
     )
     await db_session.flush()
 
-    rows = await KnowledgeCardRepo.list_approved(
-        db_session, limit=10, offset=0
-    )
+    rows = await KnowledgeCardRepo.list_approved(db_session, limit=10, offset=0)
     ids = [r.id for r in rows]
     assert ids.index(newer.id) < ids.index(older.id)
 
@@ -164,12 +160,8 @@ async def test_list_approved_pagination(db_session) -> None:
             approved_by_user_id=admin,
         )
 
-    page1 = await KnowledgeCardRepo.list_approved(
-        db_session, limit=2, offset=0
-    )
-    page2 = await KnowledgeCardRepo.list_approved(
-        db_session, limit=2, offset=2
-    )
+    page1 = await KnowledgeCardRepo.list_approved(db_session, limit=2, offset=0)
+    page2 = await KnowledgeCardRepo.list_approved(db_session, limit=2, offset=2)
     assert len(page1) == 2
     assert len(page2) == 2
     p1_ids = {r.id for r in page1}

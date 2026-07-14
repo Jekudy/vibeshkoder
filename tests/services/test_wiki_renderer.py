@@ -230,6 +230,8 @@ async def test_valid_mv_token_renders_as_citation_link(db_session) -> None:
     uid = await _make_user(db_session)
     cm = await _make_chat_message(db_session, user_id=uid)
     mv_id = await _make_message_version(db_session, chat_message_id=cm.id)
+    cm.current_version_id = mv_id
+    await db_session.flush()
 
     page_id = await _make_wiki_page(db_session, body_markdown=f"See [^mv:{mv_id}] here.")
     await _link_mv(db_session, page_id=page_id, message_version_id=mv_id)
@@ -261,11 +263,13 @@ async def test_invalid_mv_suppressed_for_member(db_session) -> None:
     from bot.services.wiki_renderer import render_wiki_page
 
     uid = await _make_user(db_session)
-    cm = await _make_chat_message(db_session, user_id=uid)
-    good_mv = await _make_message_version(db_session, chat_message_id=cm.id)
-    bad_mv = await _make_message_version(
-        db_session, chat_message_id=cm.id, is_redacted=True
-    )
+    good_cm = await _make_chat_message(db_session, user_id=uid)
+    good_mv = await _make_message_version(db_session, chat_message_id=good_cm.id)
+    good_cm.current_version_id = good_mv
+    bad_cm = await _make_chat_message(db_session, user_id=uid)
+    bad_mv = await _make_message_version(db_session, chat_message_id=bad_cm.id, is_redacted=True)
+    bad_cm.current_version_id = bad_mv
+    await db_session.flush()
 
     body = f"Good [^mv:{good_mv}] and bad [^mv:{bad_mv}] here."
     page_id = await _make_wiki_page(db_session, body_markdown=body)
@@ -300,11 +304,13 @@ async def test_invalid_mv_shown_as_unavailable_for_admin(db_session) -> None:
     from bot.services.wiki_renderer import render_wiki_page
 
     uid = await _make_user(db_session)
-    cm = await _make_chat_message(db_session, user_id=uid)
-    good_mv = await _make_message_version(db_session, chat_message_id=cm.id)
-    bad_mv = await _make_message_version(
-        db_session, chat_message_id=cm.id, is_redacted=True
-    )
+    good_cm = await _make_chat_message(db_session, user_id=uid)
+    good_mv = await _make_message_version(db_session, chat_message_id=good_cm.id)
+    good_cm.current_version_id = good_mv
+    bad_cm = await _make_chat_message(db_session, user_id=uid)
+    bad_mv = await _make_message_version(db_session, chat_message_id=bad_cm.id, is_redacted=True)
+    bad_cm.current_version_id = bad_mv
+    await db_session.flush()
 
     body = f"Good [^mv:{good_mv}] and bad [^mv:{bad_mv}] here."
     page_id = await _make_wiki_page(db_session, body_markdown=body)
@@ -433,11 +439,15 @@ async def test_unlinked_mv_token_treated_as_invalid(db_session) -> None:
     from bot.services.wiki_renderer import render_wiki_page
 
     uid = await _make_user(db_session)
-    cm = await _make_chat_message(db_session, user_id=uid)
+    linked_cm = await _make_chat_message(db_session, user_id=uid)
     # Linked good source for the page (so the page isn't fully invalid).
-    linked_mv = await _make_message_version(db_session, chat_message_id=cm.id)
+    linked_mv = await _make_message_version(db_session, chat_message_id=linked_cm.id)
+    linked_cm.current_version_id = linked_mv
     # Unlinked mv — exists in DB but never tied to this page.
-    unlinked_mv = await _make_message_version(db_session, chat_message_id=cm.id)
+    unlinked_cm = await _make_chat_message(db_session, user_id=uid)
+    unlinked_mv = await _make_message_version(db_session, chat_message_id=unlinked_cm.id)
+    unlinked_cm.current_version_id = unlinked_mv
+    await db_session.flush()
 
     body = f"Linked [^mv:{linked_mv}] and unlinked [^mv:{unlinked_mv}]."
     page_id = await _make_wiki_page(db_session, body_markdown=body)
@@ -476,12 +486,15 @@ async def test_transitive_offrecord_mv_token_not_rendered_as_citation(db_session
     uid = await _make_user(db_session)
     cm = await _make_chat_message(db_session, user_id=uid, memory_policy="offrecord")
     mv_offrecord = await _make_message_version(db_session, chat_message_id=cm.id)
+    cm.current_version_id = mv_offrecord
     card_id = await _make_knowledge_card(db_session, admin_user_id=uid, card_status="approved")
     await _make_card_source(db_session, card_id=card_id, message_version_id=mv_offrecord)
 
     # Direct valid mv so the page isn't fully invalid (would archive).
     cm_clean = await _make_chat_message(db_session, user_id=uid)
     mv_clean = await _make_message_version(db_session, chat_message_id=cm_clean.id)
+    cm_clean.current_version_id = mv_clean
+    await db_session.flush()
 
     body = f"Good [^mv:{mv_clean}] and offrecord [^mv:{mv_offrecord}] here."
     page_id = await _make_wiki_page(db_session, body_markdown=body)
@@ -515,10 +528,7 @@ def test_no_llm_or_graph_imports_in_wiki_renderer() -> None:
     from pathlib import Path
 
     source = (
-        Path(__file__).resolve().parents[2]
-        / "bot"
-        / "services"
-        / "wiki_renderer.py"
+        Path(__file__).resolve().parents[2] / "bot" / "services" / "wiki_renderer.py"
     ).read_text()
     tree = ast.parse(source)
     forbidden_prefixes = ("neo4j",)

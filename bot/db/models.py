@@ -302,10 +302,12 @@ class MessageVersion(Base):
             "version_seq",
             name="uq_message_versions_chat_message_seq",
         ),
-        UniqueConstraint(
+        Index(
+            "uq_message_versions_chat_message_content_hash_active",
             "chat_message_id",
             "content_hash",
-            name="uq_message_versions_chat_message_content_hash",
+            unique=True,
+            postgresql_where=text("is_redacted = false"),
         ),
         Index("ix_message_versions_content_hash", "content_hash"),
         Index("ix_message_versions_captured_at", "captured_at"),
@@ -361,6 +363,152 @@ class MessageVersion(Base):
         TSVECTOR().with_variant(Text(), "sqlite"),
         Computed(MessageVersionSearchVectorExpression(), persisted=True),
         nullable=True,
+    )
+
+
+class MessageMedia(Base):
+    """Telegram photo provenance and its bounded vision description."""
+
+    __tablename__ = "message_media"
+    __table_args__ = (
+        UniqueConstraint("chat_message_id", name="uq_message_media_chat_message_id"),
+        CheckConstraint("media_kind = 'photo'", name="ck_message_media_kind"),
+        CheckConstraint(
+            "description_status IN ('pending','processing','ready','failed','missing_source')",
+            name="ck_message_media_description_status",
+        ),
+        CheckConstraint(
+            "(description_status = 'processing') = "
+            "(description_claim_token IS NOT NULL AND description_claimed_at IS NOT NULL)",
+            name="ck_message_media_processing_claim",
+        ),
+        Index("ix_message_media_description_status", "description_status"),
+        Index(
+            "ix_message_media_pending_due",
+            "description_status",
+            "next_attempt_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_message_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "chat_messages.id",
+            name="fk_message_media_chat_message_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    media_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    telegram_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    telegram_file_unique_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_message_url: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    description_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    description_attempts: Mapped[int] = mapped_column(
+        SmallInteger,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    description_claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    description_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    llm_usage_ledger_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "llm_usage_ledger.id",
+            name="fk_message_media_llm_usage_ledger_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class ImageDescriptionResolution(Base):
+    """Append-only operator decision for one ambiguous image provider claim."""
+
+    __tablename__ = "image_description_resolutions"
+    __table_args__ = (
+        UniqueConstraint(
+            "message_media_id",
+            "attempt_no",
+            name="uq_image_description_resolutions_media_attempt",
+        ),
+        CheckConstraint(
+            "action IN ('risk_accepted_retry','abandon')",
+            name="ck_image_description_resolutions_action",
+        ),
+        CheckConstraint(
+            "attempt_no >= 1",
+            name="ck_image_description_resolutions_attempt_no_positive",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 1 AND 500",
+            name="ck_image_description_resolutions_reason_bounded",
+        ),
+        CheckConstraint(
+            "evidence_hash IS NULL OR evidence_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_image_description_resolutions_evidence_hash",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "(action = 'abandon' AND accept_memory_gap) "
+            "OR (action <> 'abandon' AND NOT accept_memory_gap)",
+            name="ck_image_description_resolutions_gap_acceptance",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    message_media_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "message_media.id",
+            name="fk_image_description_resolutions_message_media_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    attempt_no: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "users.id",
+            name="fk_image_description_resolutions_actor_user_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    evidence_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    accept_memory_gap: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
     )
 
 
@@ -485,7 +633,7 @@ class ForgetEvent(Base):
             name="ck_forget_events_policy",
         ),
         CheckConstraint(
-            "status IN ('pending','processing','completed','failed')",
+            "status IN ('pending','processing','completed','failed','superseded')",
             name="ck_forget_events_status",
         ),
         UniqueConstraint("tombstone_key", name="uq_forget_events_tombstone_key"),
@@ -540,9 +688,24 @@ class QaTrace(Base):
         Index("ix_qa_traces_user_tg_id", "user_tg_id"),
         Index("ix_qa_traces_chat_id_created_at", "chat_id", "created_at"),
         Index("ix_qa_traces_llm_call_id", "llm_call_id"),  # Phase 5 / 025
+        Index(
+            "uq_qa_traces_source_chat_message_id",
+            "source_chat_message_id",
+            unique=True,
+            postgresql_where=text("source_chat_message_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source_chat_message_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey(
+            "chat_messages.id",
+            name="fk_qa_traces_source_chat_message_id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
     user_tg_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     query_redacted: Mapped[bool] = mapped_column(
@@ -864,9 +1027,10 @@ class LlmUsageLedger(Base):
     request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # call_type added in migration 064 (T10-03). Canonical 8-value allow-list (migration 071 CHECK):
+    # call_type added in migration 064; migration 080 adds wiki/image rollout calls.
     # 'unknown' (legacy / default), 'qa_synthesis', 'digest_daily', 'digest_weekly',
-    # 'graph_projection', 'extract_candidates', 'butler_decision', 'butler_summary'.
+    # 'graph_projection', 'extract_candidates', 'butler_decision', 'butler_summary',
+    # 'wiki_compilation', 'image_description'.
     # Caller SHOULD always pass explicitly; 'unknown' is the fallback only for legacy rows.
     call_type: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default=text("'unknown'")
@@ -959,6 +1123,69 @@ class ExtractionRun(Base):
         ),
         Index("ix_extraction_runs_created_at", "created_at"),
         Index("ix_extraction_runs_run_status", "run_status"),
+        Index(
+            "ix_extraction_runs_source_chat_id_window_end",
+            "source_chat_id",
+            "ingestion_window_end",
+            postgresql_where=text("source_chat_id IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "(semantic_key IS NULL AND source_snapshot_hash IS NULL "
+            "AND prompt_template_version IS NULL AND provider IS NULL "
+            "AND model IS NULL AND selection_mode IS NULL) OR "
+            "(semantic_key IS NOT NULL AND source_snapshot_hash IS NOT NULL "
+            "AND prompt_template_version IS NOT NULL AND provider IS NOT NULL "
+            "AND model IS NOT NULL AND selection_mode IS NOT NULL)",
+            name="ck_extraction_runs_semantic_identity_complete",
+        ),
+        CheckConstraint(
+            "(semantic_key IS NULL OR semantic_key ~ '^[0-9a-f]{64}$') AND "
+            "(source_snapshot_hash IS NULL "
+            "OR source_snapshot_hash ~ '^[0-9a-f]{64}$')",
+            name="ck_extraction_runs_semantic_hashes",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "(selection_mode IS NULL "
+            "AND cursor_start_message_version_id IS NULL "
+            "AND cursor_end_message_version_id IS NULL) OR "
+            "(selection_mode = 'event_time' "
+            "AND cursor_start_message_version_id IS NULL "
+            "AND cursor_end_message_version_id IS NULL) OR "
+            "(selection_mode = 'version_cursor' "
+            "AND source_chat_id IS NOT NULL "
+            "AND cursor_start_message_version_id IS NOT NULL "
+            "AND cursor_end_message_version_id IS NOT NULL "
+            "AND cursor_start_message_version_id >= 0 "
+            "AND cursor_end_message_version_id >= cursor_start_message_version_id)",
+            name="ck_extraction_runs_selection_cursor",
+        ),
+        CheckConstraint(
+            "attempt_no >= 1",
+            name="ck_extraction_runs_attempt_no_positive",
+        ),
+        CheckConstraint(
+            "(attempt_no = 1 AND retry_of_run_id IS NULL) OR "
+            "(attempt_no > 1 AND retry_of_run_id IS NOT NULL AND retry_of_run_id <> id)",
+            name="ck_extraction_runs_retry_link",
+        ),
+        CheckConstraint(
+            "dispatch_state IN "
+            "('not_dispatched','rejected_pre_accept','response_received','unknown')",
+            name="ck_extraction_runs_dispatch_state",
+        ),
+        UniqueConstraint(
+            "semantic_key",
+            "attempt_no",
+            name="uq_extraction_runs_semantic_attempt",
+        ),
+        Index(
+            "ix_extraction_runs_unresolved_cursor",
+            "source_chat_id",
+            "cursor_start_message_version_id",
+            postgresql_where=text(
+                "selection_mode = 'version_cursor' AND run_status IN ('running','failed')"
+            ),
+        ),
     )
 
     id: Mapped[_uuid_module.UUID] = mapped_column(
@@ -987,6 +1214,40 @@ class ExtractionRun(Base):
     # NULL when the pass was scheduler-driven (no operator). Stored as
     # Telegram user id (no FK to users.id — see migration 035 rationale).
     operator_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Source chat boundary for per-chat scheduler watermarks (alembic 083).
+    # Legacy/manual all-chat runs remain NULL and never advance targeted jobs.
+    source_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Durable semantic identity for exactly-once provider spend (alembic 085).
+    # Legacy runs keep all identity columns NULL and are never guessed/matched.
+    semantic_key: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    source_snapshot_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    prompt_template_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    selection_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    cursor_start_message_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cursor_end_message_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempt_no: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
+    retry_of_run_id: Mapped[_uuid_module.UUID | None] = mapped_column(
+        Uuid(),
+        ForeignKey(
+            "extraction_runs.id",
+            name="fk_extraction_runs_retry_of_run_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    dispatch_state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="not_dispatched",
+        server_default=text("'not_dispatched'"),
+    )
     # Provider-level error from llm_gateway.extract_candidates (alembic 036).
     # NULL on success or empty-bundle short-circuit. Non-NULL means the gateway
     # returned ``gateway_error`` — extractor sets run_status='failed' and
@@ -994,6 +1255,95 @@ class ExtractionRun(Base):
     # the gateway to avoid DB bloat from giant stack traces.
     gateway_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class ExtractionRunResolution(Base):
+    """Append-only operator decision for one non-completed extraction attempt."""
+
+    __tablename__ = "extraction_run_resolutions"
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uq_extraction_run_resolutions_run_id"),
+        CheckConstraint(
+            "action IN ('safe_retry','risk_accepted_retry','abandon')",
+            name="ck_extraction_run_resolutions_action",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 1 AND 500",
+            name="ck_extraction_run_resolutions_reason_bounded",
+        ),
+        CheckConstraint(
+            "evidence_hash IS NULL OR evidence_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_extraction_run_resolutions_evidence_hash",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "(action = 'abandon' AND accept_memory_gap) "
+            "OR (action <> 'abandon' AND NOT accept_memory_gap)",
+            name="ck_extraction_run_resolutions_gap_acceptance",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[_uuid_module.UUID] = mapped_column(
+        Uuid(),
+        ForeignKey(
+            "extraction_runs.id",
+            name="fk_extraction_run_resolutions_run_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "users.id",
+            name="fk_extraction_run_resolutions_actor_user_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    evidence_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    accept_memory_gap: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class ExtractionCursor(Base):
+    """Per-chat high-water mark for live current-version extraction."""
+
+    __tablename__ = "extraction_cursors"
+    __table_args__ = (
+        CheckConstraint(
+            "last_message_version_id >= 0",
+            name="ck_extraction_cursors_last_message_version_id_nonnegative",
+        ),
+    )
+
+    source_chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    last_message_version_id: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
@@ -1040,6 +1390,16 @@ class ExtractionCandidate(Base):
         Index("ix_extraction_candidates_status", "status"),
         Index("ix_extraction_candidates_extraction_run_id", "extraction_run_id"),
         Index("ix_extraction_candidates_created_at", "created_at"),
+        CheckConstraint(
+            "payload_schema_version IS NULL OR payload_schema_version = 'karpathy-wiki-v1'",
+            name="ck_extraction_candidates_payload_schema_version",
+        ),
+        Index(
+            "ix_extraction_candidates_pending_legacy",
+            "created_at",
+            "id",
+            postgresql_where=text("status = 'pending' AND payload_schema_version IS NULL"),
+        ),
     )
 
     def __init__(self, **kwargs: object) -> None:
@@ -1074,6 +1434,8 @@ class ExtractionCandidate(Base):
         server_default="'[]'",  # align ORM with migration (PG migration uses ::jsonb cast)
     )
     status: Mapped[str] = mapped_column(Text, nullable=False)
+    # NULL means a pre-085 legacy payload whose shape must not be guessed.
+    payload_schema_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     reviewed_by: Mapped[int | None] = mapped_column(
         BigInteger,
         ForeignKey(
@@ -1120,12 +1482,25 @@ class KnowledgeCard(Base):
             "(approved_by_user_id IS NOT NULL AND approved_at IS NOT NULL)",
             name="ck_knowledge_cards_approved_attribution",
         ),
+        CheckConstraint(
+            "topic_slug IS NULL OR ("
+            "char_length(topic_slug) BETWEEN 1 AND 100 "
+            "AND topic_slug = lower(topic_slug) "
+            "AND topic_slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'"
+            ")",
+            name="ck_knowledge_cards_topic_slug",
+        ).ddl_if(dialect="postgresql"),
         Index(
             "ix_knowledge_cards_body_tsv",
             "body_tsv",
             postgresql_using="gin",
         ),
         Index("ix_knowledge_cards_card_status", "card_status"),
+        Index(
+            "ix_knowledge_cards_topic_slug",
+            "topic_slug",
+            postgresql_where=text("topic_slug IS NOT NULL"),
+        ),
         Index("ix_knowledge_cards_created_at", "created_at"),
     )
 
@@ -1134,6 +1509,7 @@ class KnowledgeCard(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
+    topic_slug: Mapped[str | None] = mapped_column(Text, nullable=True)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     body_markdown: Mapped[str] = mapped_column(Text, nullable=False)
     body_tsv: Mapped[str | None] = mapped_column(
@@ -1359,11 +1735,10 @@ class Digest(Base):
             " AND posted_at IS NOT NULL)",
             name="ck_digests_posted_fields_required",
         ),
-        # T8-01: weekly approval audit — when status crosses approve / publish,
-        # admin attribution columns must be set. Daily exempt by predicate
-        # (auto-publish leaves audit cols NULL by design).
+        # Manual weekly approval requires attribution. Automatic weekly
+        # publishing moves draft → posting → posted without an admin.
         CheckConstraint(
-            "status NOT IN ('approved_for_publish','posting','posted')"
+            "status <> 'approved_for_publish'"
             " OR type <> 'weekly'"
             " OR (published_by_admin_id IS NOT NULL"
             " AND approved_at IS NOT NULL)",
@@ -1860,8 +2235,7 @@ class ButlerAction(Base):
             name="ck_butler_actions_executed_has_inverse",
         ),
         CheckConstraint(
-            "status IN ('rejected','expired','cancelled') "
-            "OR llm_usage_ledger_id IS NOT NULL",
+            "status IN ('rejected','expired','cancelled') OR llm_usage_ledger_id IS NOT NULL",
             name="ck_butler_actions_ledger_required_post_plan",
         ),
         Index(
@@ -2042,9 +2416,7 @@ class ButlerToolInvocation(Base):
         nullable=False,
     )
     tool_name: Mapped[str] = mapped_column(Text, nullable=False)
-    invocation_seq: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("1")
-    )
+    invocation_seq: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     idempotency_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     request_payload: Mapped[dict] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),
@@ -2130,9 +2502,7 @@ class ButlerActionConfirmation(Base):
     # migration 074: opaque per-confirmation token (secrets.token_urlsafe(32)).
     # UNIQUE index enforced at DB level (uq_butler_action_confirmations_token).
     # confirm_action verifies presented token == stored token; bad token → bad_token error_kind.
-    confirmation_token: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=text("''")
-    )
+    confirmation_token: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -2320,9 +2690,7 @@ class ButlerUndoInvocation(Base):
     )
     requester_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     rollback_kind: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=text("'pending'")
-    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
     error_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

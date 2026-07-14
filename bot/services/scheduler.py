@@ -8,6 +8,7 @@ from typing import Any
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from bot.config import settings
 from bot.db.engine import async_session
@@ -19,12 +20,13 @@ from bot.db.repos.user import UserRepo
 from bot.html_escape import html_escape
 from bot.db.repos.butler_action import ButlerActionRepo
 from bot.services.extractor import extraction_scheduler_tick
-from bot.services.forget_cascade import cascade_worker_tick
 from bot.services.graph_projector import default_projector_config, project_incremental
 from bot.services.graph_purge_worker import graph_purge_worker_tick
+from bot.services.image_memory import process_next_pending_photo
 from bot.services.invite_worker import process_invite_outbox
 from bot.services.llm_gateway import (
     LiveExtractCandidatesGateway,
+    LiveWikiCompilerGateway,
     load_gateway_config,
     resolve_provider,
 )
@@ -38,6 +40,34 @@ from bot.texts import (
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="UTC")
+
+PHOTO_DESCRIPTION_FEATURE_FLAG = "memory.images.description.enabled"
+AUTO_PROMOTION_FEATURE_FLAG = "memory.candidates.auto_promote.enabled"
+WIKI_COMPILER_FEATURE_FLAG = "memory.wiki.compiler.enabled"
+WIKI_STATIC_PUBLISH_FEATURE_FLAG = "memory.wiki.static_publish.enabled"
+DEEPSEEK_EXTRACTION_MAX_TOKENS = 8_192
+DEEPSEEK_DIGEST_MAX_TOKENS = 4_096
+DEEPSEEK_WIKI_MAX_TOKENS = 8_192
+MAX_WIKI_TOPICS_PER_JOB = 256
+
+
+class WikiAutomationJobError(RuntimeError):
+    """Safe scheduler-visible wiki failure without provider/source content."""
+
+
+def _load_automation_actor_user_id() -> int:
+    raw_value = os.environ.get("MEMORY_AUTOMATION_ACTOR_USER_ID", "")
+    if not raw_value.isdecimal():
+        raise ValueError("MEMORY_AUTOMATION_ACTOR_USER_ID must be a positive integer")
+    actor_user_id = int(raw_value)
+    if actor_user_id <= 0:
+        raise ValueError("MEMORY_AUTOMATION_ACTOR_USER_ID must be a positive integer")
+    return actor_user_id
+
+
+async def _require_automation_actor(session: Any, actor_user_id: int) -> None:
+    if await UserRepo.get(session, actor_user_id) is None:
+        raise ValueError("MEMORY_AUTOMATION_ACTOR_USER_ID does not identify an existing user")
 
 
 def format_admin_nudge(name: str, username: str, app_id: int) -> str:
@@ -152,6 +182,27 @@ async def check_vouch_deadlines(bot: Bot) -> None:
         await session.commit()
 
 
+async def photo_description_worker_job(bot: Bot) -> None:
+    """Process at most one queued human photo and durably store its description."""
+
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+
+    try:
+        async with async_session() as session:
+            if not await FeatureFlagRepo.get(
+                session,
+                PHOTO_DESCRIPTION_FEATURE_FLAG,
+            ):
+                return
+            await process_next_pending_photo(session, bot=bot)
+            await session.commit()
+    except SQLAlchemyError as exc:
+        logger.error(
+            "photo_description_worker_database_failed",
+            extra={"error_class": type(exc).__name__},
+        )
+
+
 async def check_intro_refresh(bot: Bot) -> None:
     """Daily job: remind members with stale intros to refresh."""
     async with async_session() as session:
@@ -239,46 +290,231 @@ async def sync_google_sheets() -> None:
 
 
 async def run_extraction_scheduler_tick() -> None:
-    """T6-03 wrapper — wires the Phase 6 extraction tick into apscheduler.
+    """Extract one forward-only window, commit it, then promote candidates.
 
-    PHASE6_PLAN.md §5.B + T6-03 design §3-§4:
-
-    * Opens a fresh ``async_session()``.
-    * Builds ``LiveExtractCandidatesGateway`` locally via env-derived config
-      (same pattern as the QA handler at ``bot/handlers/qa.py:332-343``).
-    * Calls ``extraction_scheduler_tick`` from ``bot.services.extractor``,
-      which short-circuits when the feature flag is OFF (default).
-    * Commits on success; logs + ignores any exception so the scheduler
-      keeps running (per Phase 5 invite-outbox precedent).
-
-    The flag default is OFF so this job is a strict no-op until an operator
-    flips ``memory.extraction.scheduler.enabled`` in the ``feature_flags``
-    table. The 15-min interval mirrors ``check_vouch_deadlines``; the
-    actual tick runtime is dominated by gateway HTTP latency (~5-15s) when
-    the flag is on.
+    The transaction boundary is deliberate: a promotion failure must leave the
+    completed extraction, paid-call ledger, and pending candidates resumable so
+    the next recovery sweep never repeats the provider call.
     """
+
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+    from bot.services.candidate_promotion import promote_run_candidates
+    from bot.services.extractor import MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG
+
+    auto_promote = False
+    actor_user_id: int | None = None
+    extraction_result = None
     try:
         async with async_session() as session:
             try:
+                if not await FeatureFlagRepo.get(
+                    session,
+                    MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG,
+                ):
+                    return
+                auto_promote = await FeatureFlagRepo.get(
+                    session,
+                    AUTO_PROMOTION_FEATURE_FLAG,
+                )
+                actor_user_id: int | None = None
+                if auto_promote:
+                    # Validate the durable audit actor before a paid provider call.
+                    actor_user_id = _load_automation_actor_user_id()
+                    await _require_automation_actor(session, actor_user_id)
+
                 cfg = load_gateway_config()
-                provider = resolve_provider(cfg.provider)
+                provider = resolve_provider(
+                    cfg.provider,
+                    deepseek_max_tokens=DEEPSEEK_EXTRACTION_MAX_TOKENS,
+                )
                 gateway = LiveExtractCandidatesGateway(
                     ledger_repo=LedgerRepo(), provider=provider, config=cfg
                 )
-                await extraction_scheduler_tick(session, gateway=gateway)
+                tick = await extraction_scheduler_tick(
+                    session,
+                    gateway=gateway,
+                    source_chat_id=settings.COMMUNITY_CHAT_ID,
+                )
+                extraction_result = tick.extraction_result
                 await session.commit()
             except Exception:
-                # Rollback the per-tick transaction so the scheduler can
-                # retry on the next fire without poisoning the session.
                 try:
                     await session.rollback()
                 except Exception:
                     logger.exception("extraction_scheduler_tick rollback failed")
                 logger.exception("extraction_scheduler_tick crashed")
+                return
     except Exception:
-        # Catch-all — the wrapper must NEVER let an exception propagate to
-        # apscheduler, which would mark the job as failed and stop firing.
         logger.exception("extraction_scheduler_tick session setup failed")
+        return
+
+    if not (
+        auto_promote
+        and actor_user_id is not None
+        and extraction_result is not None
+        and extraction_result.run_status == "completed"
+    ):
+        return
+    try:
+        async with async_session() as promotion_session:
+            try:
+                await promote_run_candidates(
+                    promotion_session,
+                    extraction_run_id=extraction_result.extraction_run_id,
+                    actor_user_id=actor_user_id,
+                )
+                await promotion_session.commit()
+            except Exception:
+                try:
+                    await promotion_session.rollback()
+                except Exception:
+                    logger.exception("candidate_auto_promotion rollback failed")
+                logger.exception("candidate_auto_promotion failed")
+    except Exception:
+        logger.exception("candidate_auto_promotion session setup failed")
+
+
+async def wiki_automation_job() -> None:
+    """Promote recovery candidates, compile changed topics, export, and publish.
+
+    The compiler flag is the master gate.  Public upload has a separate flag
+    and requires a non-empty VPS-origin denylist.  Each durable database stage
+    commits before the next external side effect.
+    """
+
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+
+    try:
+        async with async_session() as session:
+            if not await FeatureFlagRepo.get(session, WIKI_COMPILER_FEATURE_FLAG):
+                return
+            from bot.services.candidate_promotion import (
+                LegacyPendingCandidatesError,
+                promote_pending_candidates,
+            )
+
+            auto_promote = await FeatureFlagRepo.get(session, AUTO_PROMOTION_FEATURE_FLAG)
+            actor_user_id = _load_automation_actor_user_id()
+            await _require_automation_actor(session, actor_user_id)
+            if auto_promote:
+                try:
+                    await promote_pending_candidates(
+                        session,
+                        actor_user_id=actor_user_id,
+                        limit=100,
+                    )
+                except LegacyPendingCandidatesError as exc:
+                    logger.error(
+                        "wiki_automation_legacy_candidates_blocked",
+                        extra={"legacy_pending_count": exc.count},
+                    )
+                    raise
+            await session.commit()
+
+        # Heavy static-site dependencies stay behind the master feature flag.
+        # A flag-off production process can therefore remain a strict no-op.
+        from bot.services.cloudflare_pages import publish_static_generation
+        from bot.services.wiki_orchestrator import (
+            compile_changed_topics,
+            export_static_wiki,
+        )
+        from bot.services.wiki_runtime import load_wiki_runtime_config
+
+        gateway_config = load_gateway_config()
+        wiki_gateway = LiveWikiCompilerGateway(
+            config=gateway_config,
+            ledger_repo=LedgerRepo(),
+            provider=resolve_provider(
+                gateway_config.provider,
+                deepseek_max_tokens=DEEPSEEK_WIKI_MAX_TOKENS,
+            ),
+        )
+        topics_seen = 0
+        topics_compiled = 0
+        for _topic_number in range(MAX_WIKI_TOPICS_PER_JOB):
+            async with async_session() as session:
+                if not await FeatureFlagRepo.get(session, WIKI_COMPILER_FEATURE_FLAG):
+                    return
+                compile_result = await compile_changed_topics(
+                    session,
+                    actor_user_id=actor_user_id,
+                    gateway=wiki_gateway,
+                    publication_authorized=True,
+                    source_chat_id=settings.COMMUNITY_CHAT_ID,
+                    max_topics=1,
+                )
+                await session.commit()
+            topics_seen = compile_result.topics_seen
+            topics_compiled += compile_result.compiled_topics
+            if compile_result.remaining_changed_topics == 0:
+                break
+        else:
+            raise WikiAutomationJobError("wiki topic batch limit reached")
+
+        # Keep this transaction (and export_static_wiki's page/source locks)
+        # open through the one-way upload, closing the validation→publish race.
+        async with async_session() as session:
+            if not await FeatureFlagRepo.get(session, WIKI_COMPILER_FEATURE_FLAG):
+                return
+            static_publish = await FeatureFlagRepo.get(
+                session,
+                WIKI_STATIC_PUBLISH_FEATURE_FLAG,
+            )
+            runtime_config = load_wiki_runtime_config(
+                require_forbidden_origins=static_publish,
+            )
+            export_result = await export_static_wiki(
+                session,
+                publish_dir=runtime_config.publish_dir,
+                site_title=runtime_config.site_title,
+                forbidden_origins=runtime_config.forbidden_origins,
+                publication_authorized=True,
+                source_chat_id=settings.COMMUNITY_CHAT_ID,
+            )
+            publish_status = "disabled"
+            if static_publish:
+                master_still_enabled = await FeatureFlagRepo.get(
+                    session,
+                    WIKI_COMPILER_FEATURE_FLAG,
+                )
+                publish_still_enabled = await FeatureFlagRepo.get(
+                    session,
+                    WIKI_STATIC_PUBLISH_FEATURE_FLAG,
+                )
+                if not master_still_enabled or not publish_still_enabled:
+                    return
+                # Reload after the long-running compiler/export steps. A public
+                # upload needs both the original and current authorization plus
+                # the current non-empty VPS denylist.
+                runtime_config = load_wiki_runtime_config(
+                    require_forbidden_origins=True,
+                )
+                publish_result = await publish_static_generation(
+                    export_result.generation_dir,
+                    expected_manifest_sha256=export_result.manifest_sha256,
+                    forbidden_origins=runtime_config.forbidden_origins,
+                )
+                publish_status = publish_result.status
+            await session.commit()
+        logger.info(
+            "wiki_automation_completed",
+            extra={
+                "topics_seen": topics_seen,
+                "topics_compiled": topics_compiled,
+                "page_count": export_result.page_count,
+                "manifest_sha256": export_result.manifest_sha256,
+                "publish_status": publish_status,
+            },
+        )
+    except WikiAutomationJobError:
+        logger.error("wiki_automation_job failed", extra={"error_class": "WikiAutomationJobError"})
+        raise
+    except Exception as exc:
+        logger.error(
+            "wiki_automation_job failed",
+            extra={"error_class": type(exc).__name__},
+        )
+        raise WikiAutomationJobError(f"wiki automation failed: {type(exc).__name__}") from None
 
 
 # ─── T7-04: Phase 7 daily-digest scheduler jobs ─────────────────────────────
@@ -298,9 +534,7 @@ async def digest_daily_job(bot: Bot) -> None:
         async with async_session() as session:
             from bot.db.repos.feature_flag import FeatureFlagRepo
 
-            flag_enabled = await FeatureFlagRepo.get(
-                session, "memory.digests.daily.enabled"
-            )
+            flag_enabled = await FeatureFlagRepo.get(session, "memory.digests.daily.enabled")
             if not flag_enabled:
                 logger.info("digest_daily_job: flag disabled, skipping")
                 return
@@ -312,12 +546,8 @@ async def digest_daily_job(bot: Bot) -> None:
 
             msk = ZoneInfo("Europe/Moscow")
             now_msk = datetime.now(tz=msk)
-            today_msk_midnight = now_msk.replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-            yesterday_msk_midnight = today_msk_midnight.replace(
-                day=today_msk_midnight.day
-            )
+            today_msk_midnight = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+            yesterday_msk_midnight = today_msk_midnight.replace(day=today_msk_midnight.day)
             from datetime import timedelta as _td
 
             yesterday_msk_midnight = today_msk_midnight - _td(days=1)
@@ -333,7 +563,10 @@ async def digest_daily_job(bot: Bot) -> None:
                     window_start=window_start,
                     window_end=window_end,
                     ledger_repo=LedgerRepo(),
-                    provider=resolve_provider(gateway_config.provider),
+                    provider=resolve_provider(
+                        gateway_config.provider,
+                        deepseek_max_tokens=DEEPSEEK_DIGEST_MAX_TOKENS,
+                    ),
                     config=gateway_config,
                     digest_config=digest_config,
                 )
@@ -362,9 +595,7 @@ async def digest_daily_job(bot: Bot) -> None:
                         try:
                             await session.rollback()
                         except Exception:
-                            logger.exception(
-                                "digest_daily_job: publish rollback failed"
-                            )
+                            logger.exception("digest_daily_job: publish rollback failed")
                         logger.exception("digest_daily_job: publish_digest failed")
 
             except Exception:
@@ -402,7 +633,7 @@ async def digest_stale_posting_reaper_job() -> None:
     approve-then-publish sequence normally completes in <30s; 5 min handles
     network hiccups + Telegram retries.
 
-    Per row, ``error_text`` is set to ``stale_posting_reaper`` or
+    Per row, ``error_text`` is set to ``delivery_uncertain_no_auto_retry`` or
     ``stale_approved_reaper`` depending on the source status (the RETURNING
     branch reads it back).
     """
@@ -415,7 +646,7 @@ async def digest_stale_posting_reaper_job() -> None:
                     UPDATE digests
                     SET status='failed',
                         error_text=CASE
-                          WHEN status='posting' THEN 'stale_posting_reaper'
+                          WHEN status='posting' THEN 'delivery_uncertain_no_auto_retry'
                           WHEN status='approved_for_publish'
                               THEN 'stale_approved_reaper'
                         END,
@@ -446,8 +677,7 @@ async def digest_stale_posting_reaper_job() -> None:
                     {"id": row.id, "err": row.error_text},
                 )
                 logger.warning(
-                    "digest_stale_posting_reaper: reaped digest_id=%s "
-                    "error_text=%s",
+                    "digest_stale_posting_reaper: reaped digest_id=%s error_text=%s",
                     row.id,
                     row.error_text,
                 )
@@ -468,28 +698,14 @@ async def digest_weekly_job(bot: Bot) -> None:
     is OFF. Window is the most recently completed ISO week:
     ``last_monday 00:00 MSK..this_monday 00:00 MSK`` (stored as UTC).
 
-    H8 stagger: registered at 09:15 MSK so the LLM gateway has 15 minutes of
-    slack past the daily 09:00 cron — avoids contention on Mondays.
-
-    H4 status-aware match block: ``run_digest`` may return either a fresh
-    ``draft`` (happy path → transition to ``awaiting_review`` + admin DM)
-    or — via the per-(type,ws,we) idempotency lock — an EXISTING row in any
-    status. Each branch handles the discovered terminal state explicitly;
-    cron NEVER auto-regenerates rejected runs. The wrapping try/except
-    chain ensures apscheduler never sees an exception — every outcome is
-    persisted via ``digests`` / ``digest_runs`` rows.
-
-    T8-04 (parallel sprint) owns ``bot.services.digest_review``. If the
-    module isn't merged yet the import is guarded and the job logs a
-    warning — the draft row is still created, just not advanced.
+    A fresh draft is published automatically. Idempotent re-runs do not
+    republish rows that already advanced beyond ``draft``.
     """
     try:
         async with async_session() as session:
             from bot.db.repos.feature_flag import FeatureFlagRepo
 
-            flag_enabled = await FeatureFlagRepo.get(
-                session, "memory.digests.weekly.enabled"
-            )
+            flag_enabled = await FeatureFlagRepo.get(session, "memory.digests.weekly.enabled")
             if not flag_enabled:
                 logger.info("digest_weekly_job: flag disabled, skipping")
                 return
@@ -500,9 +716,7 @@ async def digest_weekly_job(bot: Bot) -> None:
 
             msk = ZoneInfo("Europe/Moscow")
             now_msk = datetime.now(tz=msk)
-            today_msk_midnight = now_msk.replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
+            today_msk_midnight = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
             # ISO: Mon=1, Tue=2, ..., Sun=7. days_since_monday=0 when cron
             # fires on Mon. The "most recent Monday 00:00 MSK" is therefore
             # ``today_msk_midnight - timedelta(days=days_since_monday)``.
@@ -522,7 +736,10 @@ async def digest_weekly_job(bot: Bot) -> None:
                     window_start=window_start,
                     window_end=window_end,
                     ledger_repo=LedgerRepo(),
-                    provider=resolve_provider(gateway_config.provider),
+                    provider=resolve_provider(
+                        gateway_config.provider,
+                        deepseek_max_tokens=DEEPSEEK_DIGEST_MAX_TOKENS,
+                    ),
                     config=gateway_config,
                     digest_config=digest_config,
                 )
@@ -535,50 +752,24 @@ async def digest_weekly_job(bot: Bot) -> None:
                     digest.status,
                 )
 
-                # H4 status-aware match block — see §5.G.
+                # Fully automatic path: no admin review gate.
                 if digest.status == "draft":
-                    # Happy path: fresh draft → review-gate transition.
                     try:
-                        from bot.services.digest_review import (
-                            transition_to_awaiting_review,
-                        )
-                    except ImportError:
-                        logger.warning(
-                            "digest_weekly_job: bot.services.digest_review not "
-                            "merged yet (T8-04 parallel sprint); weekly draft "
-                            "id=%s created but cannot transition to "
-                            "awaiting_review",
-                            digest.id,
-                        )
-                        return
+                        from bot.services.digest_publisher import publish_digest
 
-                    try:
-                        await transition_to_awaiting_review(
-                            session, digest_id=digest.id
+                        await publish_digest(
+                            session,
+                            bot=bot,
+                            digest=digest,
+                            digest_config=digest_config,
                         )
                         await session.commit()
-                        # §5.J: weekly_awaiting_review handoff DM.
-                        from bot.services.digest_admin_notify import (
-                            notify_admins_digest_failure,
-                        )
-
-                        await notify_admins_digest_failure(
-                            bot,
-                            digest_id=digest.id,
-                            status="awaiting_review",
-                            error_text="weekly_awaiting_review",
-                        )
                     except Exception:
                         try:
                             await session.rollback()
                         except Exception:
-                            logger.exception(
-                                "digest_weekly_job: review transition "
-                                "rollback failed"
-                            )
-                        logger.exception(
-                            "digest_weekly_job: transition_to_awaiting_review failed"
-                        )
+                            logger.exception("digest_weekly_job: publish rollback failed")
+                        logger.exception("digest_weekly_job: publish_digest failed")
                 elif digest.status in (
                     "awaiting_review",
                     "approved_for_publish",
@@ -611,14 +802,10 @@ async def digest_weekly_job(bot: Bot) -> None:
                         bot,
                         digest_id=digest.id,
                         status=digest.status,
-                        error_text=(
-                            digest.error_text
-                            or "weekly_digest_window_in_error_state"
-                        ),
+                        error_text=(digest.error_text or "weekly_digest_window_in_error_state"),
                     )
                     logger.error(
-                        "digest_weekly_job: window in error state %s id=%s, "
-                        "admin DM dispatched",
+                        "digest_weekly_job: window in error state %s id=%s, admin DM dispatched",
                         digest.status,
                         digest.id,
                     )
@@ -714,9 +901,7 @@ async def digest_stale_review_reaper_job(bot: Bot) -> None:
                     ),
                     {"id": digest_id},
                 )
-                logger.warning(
-                    "digest_stale_review_reaper: rejected digest_id=%s", digest_id
-                )
+                logger.warning("digest_stale_review_reaper: rejected digest_id=%s", digest_id)
             await session.commit()
             # 7d-pass admin DMs — dispatched after commit so the row is durable
             # before the side-effect.
@@ -811,9 +996,7 @@ async def graph_projection_nightly_job(bot: Bot) -> None:
         async with async_session() as session:
             from bot.db.repos.feature_flag import FeatureFlagRepo
 
-            flag_enabled = await FeatureFlagRepo.get(
-                session, "memory.graph.projection.enabled"
-            )
+            flag_enabled = await FeatureFlagRepo.get(session, "memory.graph.projection.enabled")
             if not flag_enabled:
                 logger.info("graph_projection_nightly_job: flag disabled, skipping")
                 return
@@ -862,9 +1045,7 @@ async def graph_purge_worker_job() -> None:
 
             adapter = Neo4jAdapter()
             try:
-                tick_result = await graph_purge_worker_tick(
-                    session, adapter=adapter, batch_size=20
-                )
+                tick_result = await graph_purge_worker_tick(session, adapter=adapter, batch_size=20)
                 await session.commit()
                 logger.info(
                     "graph_purge_worker_job: processed=%s errors=%s skipped_paused=%s",
@@ -958,9 +1139,7 @@ async def butler_expire_tick(*, bot: Bot, session: Any) -> int:
             async with session.begin_nested():
                 updated = await _expire_action_inline(session, action.id, action_repo=_ActionRepo)
         except Exception:
-            logger.exception(
-                "butler_expire_tick: expire_action failed for action_id=%s", action.id
-            )
+            logger.exception("butler_expire_tick: expire_action failed for action_id=%s", action.id)
         if getattr(updated, "status", None) == "expired":
             expired_count += 1
 
@@ -1019,6 +1198,17 @@ def start_scheduler(bot: Bot) -> None:
         misfire_grace_time=60,
     )
     scheduler.add_job(
+        photo_description_worker_job,
+        "interval",
+        seconds=30,
+        args=[bot],
+        id="photo_description_worker",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    scheduler.add_job(
         check_vouch_deadlines,
         "interval",
         minutes=15,
@@ -1041,22 +1231,6 @@ def start_scheduler(bot: Bot) -> None:
         minutes=5,
         id="sync_google_sheets",
         replace_existing=True,
-    )
-    # T3-04 (#96): forget cascade worker. Default 30s interval matches the
-    # invite outbox precedent (lowest-latency persistent queue we operate).
-    # Gated by feature flag ``memory.forget.cascade_worker.enabled`` (default
-    # OFF) — the tick reads the flag every fire and is a strict no-op when
-    # disabled, so this wiring is safe to land in production with the flag off.
-    scheduler.add_job(
-        cascade_worker_tick,
-        "interval",
-        seconds=30,
-        args=[bot],  # F2: thread bot through so Telegram redaction side-effect fires
-        id="forget_cascade_worker",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=60,
     )
     # T6-03: Phase 6 extraction scheduler. Default OFF via flag
     # ``memory.extraction.scheduler.enabled`` (see bot/services/extractor.py).
@@ -1107,12 +1281,11 @@ def start_scheduler(bot: Bot) -> None:
         coalesce=True,
         misfire_grace_time=60,
     )
-    # T8-05: Phase 8 weekly digest. Mon 09:15 MSK — H8 stagger past the daily
-    # 09:00 cron so the LLM gateway has 15 minutes of slack on Mondays.
+    # Weekly digest. Monday at 09:00 MSK, matching the product contract.
     # Gated by feature flag ``memory.digests.weekly.enabled`` (default OFF);
     # job body re-checks the flag and is a strict no-op when disabled.
     digest_weekly_hour_msk = int(getattr(settings, "DIGEST_WEEKLY_HOUR_MSK", 9))
-    digest_weekly_minute_msk = int(getattr(settings, "DIGEST_WEEKLY_MINUTE_MSK", 15))
+    digest_weekly_minute_msk = int(getattr(settings, "DIGEST_WEEKLY_MINUTE_MSK", 0))
     scheduler.add_job(
         digest_weekly_job,
         "cron",
@@ -1125,6 +1298,20 @@ def start_scheduler(bot: Bot) -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,  # 1h grace — weekly cadence is forgiving
+        timezone=msk,
+    )
+    # Automatic Karpathy-style wiki revision and one-way static publication.
+    # The master/compiler and public-upload gates are both explicit DB flags.
+    scheduler.add_job(
+        wiki_automation_job,
+        "cron",
+        hour=9,
+        minute=30,
+        id="wiki_automation",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
         timezone=msk,
     )
     # T8-05: Phase 8 stale-review reaper. Every 30 min, no flag gate —
@@ -1176,9 +1363,7 @@ def start_scheduler(bot: Bot) -> None:
     # T12-08: Butler TTL expiry worker. Default 60s interval; gated by
     # ``memory.butler.enabled`` feature flag (default OFF) in the job body.
     # F2 pattern: bot threaded through args=[bot] per T7 FHR fix df4bb71.
-    butler_expire_tick_seconds = int(
-        os.environ.get("BUTLER_EXPIRE_TICK_SECONDS", "60")
-    )
+    butler_expire_tick_seconds = int(os.environ.get("BUTLER_EXPIRE_TICK_SECONDS", "60"))
     scheduler.add_job(
         butler_expire_tick_job,
         "interval",

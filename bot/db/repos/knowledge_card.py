@@ -23,6 +23,7 @@ class KnowledgeCardRepo:
         title: str,
         body_markdown: str,
         approved_by_user_id: int,
+        topic_slug: str | None = None,
     ) -> KnowledgeCard:
         """Insert an approved card with audit columns populated.
 
@@ -32,6 +33,7 @@ class KnowledgeCardRepo:
         ``card_status='approved'`` — both are written here.
         """
         card = KnowledgeCard(
+            topic_slug=topic_slug,
             title=title,
             body_markdown=body_markdown,
             card_status="approved",

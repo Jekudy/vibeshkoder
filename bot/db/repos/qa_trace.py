@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import QaTrace
@@ -25,6 +25,7 @@ class QaTraceRepo:
         evidence_ids: list[int],
         abstained: bool,
         redact_query: bool,
+        source_chat_message_id: int | None = None,
     ) -> QaTrace:
         """Insert a q&a audit trace. Flushes; caller commits."""
         trace = QaTrace(
@@ -34,10 +35,22 @@ class QaTraceRepo:
             query_text=None if redact_query else query,
             evidence_ids=list(evidence_ids),
             abstained=abstained,
+            source_chat_message_id=source_chat_message_id,
         )
         session.add(trace)
         await session.flush()
         return trace
+
+    @staticmethod
+    async def get_by_source_chat_message_id(
+        session: AsyncSession,
+        source_chat_message_id: int,
+    ) -> QaTrace | None:
+        """Return the one audit trace bound to an incoming Telegram message."""
+
+        return await session.scalar(
+            select(QaTrace).where(QaTrace.source_chat_message_id == source_chat_message_id)
+        )
 
     @staticmethod
     async def update_llm_fields(

@@ -1,9 +1,7 @@
-"""T1-12 governance detector tests (replaces T1-04 stub tests).
+"""Memory governance and legacy raw-payload redactor tests.
 
-The T1-04 stub always returned ('normal', None). T1-12 implements REAL
-deterministic detection over text + caption tokens. These tests pin that
-contract — case-insensitive, hashtag-bounded, offrecord-precedence — and the
-``redact_raw_for_offrecord`` content stripping.
+Phase 13 makes ``normal`` the only live/import content policy.  The redactor remains
+covered for maintenance of historical offrecord payloads.
 """
 
 from __future__ import annotations
@@ -32,28 +30,23 @@ def test_detect_policy_normal_for_none_inputs(app_env) -> None:
     assert mark is None
 
 
-# ─── detect_policy: nomem ──────────────────────────────────────────────────────────────────
+# ─── opt-out-looking content remains normal memory ──────────────────────────
 
 
 def test_detect_policy_nomem_in_text(app_env) -> None:
     from bot.services.governance import detect_policy
 
     policy, mark = detect_policy("important #nomem note", None)
-    assert policy == "nomem"
-    assert mark is not None
-    assert mark["in_text"] is True
-    assert mark["in_caption"] is False
-    assert "detected_by" in mark
+    assert policy == "normal"
+    assert mark is None
 
 
 def test_detect_policy_nomem_in_caption(app_env) -> None:
     from bot.services.governance import detect_policy
 
     policy, mark = detect_policy(None, "see photo #nomem")
-    assert policy == "nomem"
-    assert mark is not None
-    assert mark["in_text"] is False
-    assert mark["in_caption"] is True
+    assert policy == "normal"
+    assert mark is None
 
 
 def test_detect_policy_nomem_case_insensitive(app_env) -> None:
@@ -61,27 +54,23 @@ def test_detect_policy_nomem_case_insensitive(app_env) -> None:
 
     for variant in ("#NoMem", "#NOMEM", "#nomem", "#NOmem"):
         policy, _ = detect_policy(f"hello {variant} world", None)
-        assert policy == "nomem", f"failed for variant: {variant!r}"
-
-
-# ─── detect_policy: offrecord ──────────────────────────────────────────────────────────────
+        assert policy == "normal", f"failed for variant: {variant!r}"
 
 
 def test_detect_policy_offrecord_in_text(app_env) -> None:
     from bot.services.governance import detect_policy
 
     policy, mark = detect_policy("secret #offrecord note", None)
-    assert policy == "offrecord"
-    assert mark is not None
-    assert mark["in_text"] is True
-    assert mark["in_caption"] is False
+    assert policy == "normal"
+    assert mark is None
 
 
 def test_detect_policy_offrecord_in_caption(app_env) -> None:
     from bot.services.governance import detect_policy
 
-    policy, _ = detect_policy(None, "media caption #offrecord")
-    assert policy == "offrecord"
+    policy, mark = detect_policy(None, "media caption #offrecord")
+    assert policy == "normal"
+    assert mark is None
 
 
 def test_detect_policy_offrecord_case_insensitive(app_env) -> None:
@@ -89,18 +78,16 @@ def test_detect_policy_offrecord_case_insensitive(app_env) -> None:
 
     for variant in ("#OffRecord", "#OFFRECORD", "#offrecord", "#offRECORD"):
         policy, _ = detect_policy(variant, None)
-        assert policy == "offrecord", f"failed for variant: {variant!r}"
-
-
-# ─── detect_policy: precedence ─────────────────────────────────────────────────────────────
+        assert policy == "normal", f"failed for variant: {variant!r}"
 
 
 def test_offrecord_takes_precedence_over_nomem(app_env) -> None:
-    """Both tokens present → offrecord (stricter wins)."""
+    """Both legacy tokens are stored as ordinary content."""
     from bot.services.governance import detect_policy
 
-    policy, _ = detect_policy("#nomem and #offrecord both", None)
-    assert policy == "offrecord"
+    policy, mark = detect_policy("#nomem and #offrecord both", None)
+    assert policy == "normal"
+    assert mark is None
 
 
 # ─── detect_policy: token boundaries ───────────────────────────────────────────────────────
@@ -127,15 +114,14 @@ def test_detect_policy_does_not_match_when_attached_to_word(app_env) -> None:
 
 
 def test_detect_policy_matches_with_trailing_punctuation(app_env) -> None:
-    """``#nomem.`` and ``#offrecord!`` should still match — the negative lookahead is
-    on word chars, not punctuation."""
+    """Punctuation does not make legacy tokens active opt-outs."""
     from bot.services.governance import detect_policy
 
     policy, _ = detect_policy("note #nomem.", None)
-    assert policy == "nomem"
+    assert policy == "normal"
 
     policy, _ = detect_policy("urgent #offrecord!", None)
-    assert policy == "offrecord"
+    assert policy == "normal"
 
 
 # ─── redact_raw_for_offrecord ──────────────────────────────────────────────────────────────
@@ -347,37 +333,36 @@ def test_redact_scrubs_pinned_and_external_reply(app_env) -> None:
 
 
 def test_detect_policy_offrecord_in_poll_question(app_env) -> None:
-    """#offrecord in poll_question → offrecord policy, in_poll_question=True."""
+    """Legacy token in a poll remains normal memory."""
     from bot.services.governance import detect_policy
 
     policy, mark = detect_policy(None, None, poll_question="hello #offrecord")
-    assert policy == "offrecord"
-    assert mark is not None
-    assert mark.get("in_poll_question") is True
+    assert policy == "normal"
+    assert mark is None
 
 
 def test_detect_policy_nomem_in_contact_name(app_env) -> None:
-    """#nomem in contact_name → nomem policy, in_contact_name=True."""
+    """Legacy token in a contact remains normal memory."""
     from bot.services.governance import detect_policy
 
     policy, mark = detect_policy(None, None, contact_name="Alice #nomem")
-    assert policy == "nomem"
-    assert mark is not None
-    assert mark.get("in_contact_name") is True
+    assert policy == "normal"
+    assert mark is None
 
 
 def test_detect_policy_offrecord_in_forward_text(app_env) -> None:
-    """#offrecord in forward_text → offrecord policy."""
+    """Legacy token in forwarded content remains normal memory."""
     from bot.services.governance import detect_policy
 
     policy, mark = detect_policy(None, None, forward_text="see #offrecord")
-    assert policy == "offrecord"
-    assert mark is not None
+    assert policy == "normal"
+    assert mark is None
 
 
 def test_detect_policy_offrecord_precedence_over_nomem_across_fields(app_env) -> None:
-    """#nomem in text + #offrecord in poll_question → offrecord wins (stricter)."""
+    """Legacy tokens across fields still do not activate an opt-out."""
     from bot.services.governance import detect_policy
 
-    policy, _ = detect_policy("a #nomem", None, poll_question="b #offrecord")
-    assert policy == "offrecord"
+    policy, mark = detect_policy("a #nomem", None, poll_question="b #offrecord")
+    assert policy == "normal"
+    assert mark is None

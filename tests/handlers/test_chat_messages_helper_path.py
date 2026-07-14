@@ -1,16 +1,15 @@
-"""End-to-end integration test: poll with #offrecord through the handler (Sprint #89 Commit 3).
+"""End-to-end integration test: legacy token in a poll through the handler.
 
-Proves that after migrating chat_messages.py to use persist_message_with_policy, the
-broadened detection (poll_question kwarg added in Commit 2) works end-to-end through the
-real handler + real DB.
+Proves that a token inside a non-text field follows the complete-history policy
+end-to-end through the real handler and database.
 
 Strategy:
 - DB-backed test (requires postgres via db_session fixture).
 - Builds a SimpleNamespace message that carries a poll whose question contains #offrecord.
 - Calls save_chat_message directly.
 - Asserts:
-  1. chat_messages row exists with memory_policy='offrecord' and is_redacted=True.
-  2. offrecord_marks row exists for the saved row.
+  1. chat_messages row exists with memory_policy='normal' and is_redacted=False.
+  2. no offrecord mark is created.
 
 If postgres is unavailable, the test is auto-skipped (consistent with all other DB-backed
 tests in this repo).
@@ -44,6 +43,7 @@ def _make_poll_offrecord_message(*, message_id: int, user_id: int) -> SimpleName
             username=f"u{user_id}",
             first_name="PollTest",
             last_name=None,
+            is_bot=False,
         ),
         text=None,
         caption=None,
@@ -76,11 +76,8 @@ def _make_poll_offrecord_message(*, message_id: int, user_id: int) -> SimpleName
     )
 
 
-async def test_handler_poll_offrecord_persisted_correctly(db_session) -> None:
-    """Poll with #offrecord in question: handler saves row with offrecord policy.
-
-    Verifies the helper-broadened detection works end-to-end through the handler.
-    """
+async def test_handler_poll_legacy_token_persisted_as_normal_memory(db_session) -> None:
+    """A poll with #offrecord remains usable memory under the complete-history policy."""
     from bot.db.models import ChatMessage, OffrecordMark
     from bot.handlers.chat_messages import save_chat_message
 
@@ -91,7 +88,7 @@ async def test_handler_poll_offrecord_persisted_correctly(db_session) -> None:
 
     await save_chat_message(message, db_session)
 
-    # 1. chat_messages row has offrecord policy
+    # 1. chat_messages row has normal policy
     chat_msg = await db_session.scalar(
         select(ChatMessage).where(
             ChatMessage.chat_id == COMMUNITY_CHAT_ID,
@@ -99,18 +96,16 @@ async def test_handler_poll_offrecord_persisted_correctly(db_session) -> None:
         )
     )
     assert chat_msg is not None, "chat_messages row not found after handler call"
-    assert chat_msg.memory_policy == "offrecord", (
-        f"Expected memory_policy='offrecord', got {chat_msg.memory_policy!r}"
+    assert chat_msg.memory_policy == "normal", (
+        f"Expected memory_policy='normal', got {chat_msg.memory_policy!r}"
     )
-    assert chat_msg.is_redacted is True, "Expected is_redacted=True for offrecord poll"
-    assert chat_msg.text is None, "Expected text=None (redacted) for offrecord poll"
+    assert chat_msg.is_redacted is False
+    assert chat_msg.text is None  # polls have no text field; this is not redaction
 
-    # 2. offrecord_marks row exists
+    # 2. no legacy opt-out mark is created
     mark_count = await db_session.scalar(
         select(__import__("sqlalchemy", fromlist=["func"]).func.count())
         .select_from(OffrecordMark)
         .where(OffrecordMark.chat_message_id == chat_msg.id)
     )
-    assert mark_count == 1, (
-        f"Expected 1 offrecord_marks row, got {mark_count}"
-    )
+    assert mark_count == 0

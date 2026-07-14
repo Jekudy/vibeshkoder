@@ -125,9 +125,7 @@ async def _seed_message(
     await db_session.flush()
 
     await db_session.execute(
-        sa_update(ChatMessage)
-        .where(ChatMessage.id == msg.id)
-        .values(current_version_id=mv.id)
+        sa_update(ChatMessage).where(ChatMessage.id == msg.id).values(current_version_id=mv.id)
     )
     await db_session.flush()
 
@@ -170,6 +168,9 @@ class _FakeGateway:
     llm_usage_ledger_id: int | None = None
     calls: list[dict[str, Any]] = None  # type: ignore[assignment]
 
+    extraction_provider = "p6-fake"
+    extraction_model = "p6-test-model"
+
     def __post_init__(self) -> None:
         if self.calls is None:
             self.calls = []
@@ -187,6 +188,17 @@ class _FakeGateway:
                 "prompt_template_version": prompt_template_version,
             }
         )
+        from bot.db.models import LlmUsageLedger
+
+        ledger = LlmUsageLedger(
+            provider=self.extraction_provider,
+            model=self.extraction_model,
+            tokens_in=0,
+            tokens_out=0,
+        )
+        session.add(ledger)
+        await session.flush()
+        self.llm_usage_ledger_id = ledger.id
         return {
             "candidates": list(self.candidates_to_emit),
             "llm_usage_ledger_id": self.llm_usage_ledger_id,
@@ -239,12 +251,16 @@ async def _run_extraction(
 
     # Fetch the candidate the extractor wrote.
     cands = (
-        await db_session.execute(
-            select(ExtractionCandidate).where(
-                ExtractionCandidate.extraction_run_id == result.extraction_run_id
+        (
+            await db_session.execute(
+                select(ExtractionCandidate).where(
+                    ExtractionCandidate.extraction_run_id == result.extraction_run_id
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     return result, cands[0] if cands else None
 
@@ -283,9 +299,7 @@ async def _approve_candidate(
     )
 
     # Step 6: INSERT card_sources.
-    await CardSourceRepo.bulk_create(
-        db_session, card_id=card.id, message_version_ids=mvids
-    )
+    await CardSourceRepo.bulk_create(db_session, card_id=card.id, message_version_ids=mvids)
 
     # Step 7: UPDATE candidate status.
     await ExtractionCandidateRepo.mark_status(
@@ -412,11 +426,12 @@ async def test_phase6_full_pipeline_candidate_to_card_to_recall(db_session) -> N
 
     # Assert card_sources row exists.
     from bot.db.models import CardSource
+
     sources = (
-        await db_session.execute(
-            select(CardSource).where(CardSource.card_id == card.id)
-        )
-    ).scalars().all()
+        (await db_session.execute(select(CardSource).where(CardSource.card_id == card.id)))
+        .scalars()
+        .all()
+    )
     assert len(sources) == 1
     assert sources[0].message_version_id == seed.version_id
 
@@ -430,18 +445,14 @@ async def test_phase6_full_pipeline_candidate_to_card_to_recall(db_session) -> N
 
     assert not qa_result.bundle.abstained, "Expected /recall to return results, not abstain"
 
-    card_hits = [
-        item for item in qa_result.bundle.items if item.source_type == "card"
-    ]
+    card_hits = [item for item in qa_result.bundle.items if item.source_type == "card"]
     assert len(card_hits) >= 1, (
         f"Expected at least one card hit in /recall result, got items: "
         f"{[(i.source_type, i.card_id) for i in qa_result.bundle.items]}"
     )
 
     hit = card_hits[0]
-    assert hit.card_id == card.id, (
-        f"Expected card_id={card.id}, got {hit.card_id}"
-    )
+    assert hit.card_id == card.id, f"Expected card_id={card.id}, got {hit.card_id}"
     assert len(hit.card_source_message_version_ids) >= 1, (
         "card_source_message_version_ids must be non-empty"
     )
@@ -513,9 +524,7 @@ async def test_phase6_cascade_forget_demotes_card_and_excludes_from_recall(
         chat_id=chat_id,
         redact_query_in_audit=False,
     )
-    card_hits_before = [
-        item for item in qa_before.bundle.items if item.source_type == "card"
-    ]
+    card_hits_before = [item for item in qa_before.bundle.items if item.source_type == "card"]
     assert len(card_hits_before) >= 1, "Card must appear in /recall before forget"
 
     # Step 2: create forget_event for the source message (pending so cascade can claim it).
@@ -548,9 +557,7 @@ async def test_phase6_cascade_forget_demotes_card_and_excludes_from_recall(
         chat_id=chat_id,
         redact_query_in_audit=False,
     )
-    card_hits_after = [
-        item for item in qa_after.bundle.items if item.source_type == "card"
-    ]
+    card_hits_after = [item for item in qa_after.bundle.items if item.source_type == "card"]
     assert len(card_hits_after) == 0, (
         f"Expected no card hits after cascade demote, got: "
         f"{[(i.source_type, i.card_id) for i in qa_after.bundle.items]}"
@@ -614,10 +621,10 @@ async def test_phase6_partial_source_forget_card_approved_but_excluded_from_reca
 
     # Confirm card is approved with 3 sources.
     sources_before = (
-        await db_session.execute(
-            select(CardSource).where(CardSource.card_id == card.id)
-        )
-    ).scalars().all()
+        (await db_session.execute(select(CardSource).where(CardSource.card_id == card.id)))
+        .scalars()
+        .all()
+    )
     assert len(sources_before) == 3
 
     # /recall returns card BEFORE forget.
@@ -627,9 +634,7 @@ async def test_phase6_partial_source_forget_card_approved_but_excluded_from_reca
         chat_id=chat_id,
         redact_query_in_audit=False,
     )
-    card_hits_before = [
-        item for item in qa_before.bundle.items if item.source_type == "card"
-    ]
+    card_hits_before = [item for item in qa_before.bundle.items if item.source_type == "card"]
     assert len(card_hits_before) >= 1, "Card must appear before any forget"
 
     # Tombstone source #1 directly as completed (no cascade worker — we keep
@@ -662,9 +667,7 @@ async def test_phase6_partial_source_forget_card_approved_but_excluded_from_reca
         chat_id=chat_id,
         redact_query_in_audit=False,
     )
-    card_hits_after = [
-        item for item in qa_after.bundle.items if item.source_type == "card"
-    ]
+    card_hits_after = [item for item in qa_after.bundle.items if item.source_type == "card"]
     assert len(card_hits_after) == 0, (
         f"Expected no card hits after tombstoning one source (L6a), "
         f"got: {[(i.source_type, i.card_id) for i in qa_after.bundle.items]}"
@@ -730,12 +733,14 @@ async def test_phase6_rejected_candidate_produces_no_card(db_session) -> None:
 
     # Assert ExtractionDecision exists with action='rejected'.
     decision_rows = (
-        await db_session.execute(
-            select(ExtractionDecision).where(
-                ExtractionDecision.candidate_id == candidate.id
+        (
+            await db_session.execute(
+                select(ExtractionDecision).where(ExtractionDecision.candidate_id == candidate.id)
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(decision_rows) == 1
     assert decision_rows[0].action == "rejected"
 
@@ -745,12 +750,16 @@ async def test_phase6_rejected_candidate_produces_no_card(db_session) -> None:
 
     # Assert NO knowledge_cards row was created.
     all_cards = (
-        await db_session.execute(
-            select(KnowledgeCard)
-            # Filter by approved_by_user_id to scope to this test's admin only.
-            .where(KnowledgeCard.approved_by_user_id == admin_user_id)
+        (
+            await db_session.execute(
+                select(KnowledgeCard)
+                # Filter by approved_by_user_id to scope to this test's admin only.
+                .where(KnowledgeCard.approved_by_user_id == admin_user_id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(all_cards) == 0, (
         f"Rejection must not produce any knowledge_cards; found: {all_cards}"
     )
@@ -762,9 +771,5 @@ async def test_phase6_rejected_candidate_produces_no_card(db_session) -> None:
         chat_id=chat_id,
         redact_query_in_audit=False,
     )
-    card_hits = [
-        item for item in qa_result.bundle.items if item.source_type == "card"
-    ]
-    assert len(card_hits) == 0, (
-        f"Expected no card hits after rejection; got: {card_hits}"
-    )
+    card_hits = [item for item in qa_result.bundle.items if item.source_type == "card"]
+    assert len(card_hits) == 0, f"Expected no card hits after rejection; got: {card_hits}"

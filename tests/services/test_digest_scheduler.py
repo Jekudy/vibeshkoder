@@ -62,16 +62,18 @@ async def test_reaper_reaps_row_older_than_threshold(db_session):
     # than via the scheduler to keep the test deterministic and in-transaction).
     # The job body uses async_session(); here we exercise the same SQL on the
     # test session.
-    result = await db_session.execute(text("""
+    result = await db_session.execute(
+        text("""
         UPDATE digests
         SET status='failed',
-            error_text='stale_posting_reaper',
+            error_text='delivery_uncertain_no_auto_retry',
             posting_started_at=NULL,
             updated_at=now()
         WHERE status='posting'
           AND posting_started_at < now() - interval '2 minutes'
         RETURNING id
-    """))
+    """)
+    )
     rows = result.fetchall()
     assert len(rows) >= 1
     reaped_ids = {r.id for r in rows}
@@ -84,7 +86,7 @@ async def test_reaper_reaps_row_older_than_threshold(db_session):
     )
     row = refreshed.mappings().one()
     assert row["status"] == "failed"
-    assert row["error_text"] == "stale_posting_reaper"
+    assert row["error_text"] == "delivery_uncertain_no_auto_retry"
     assert row["posting_started_at"] is None
 
 
@@ -107,17 +109,20 @@ async def test_reaper_skips_fresh_posting_row(db_session):
     await db_session.flush()
     digest_id = digest.id
 
-    result = await db_session.execute(text("""
+    result = await db_session.execute(
+        text("""
         UPDATE digests
         SET status='failed',
-            error_text='stale_posting_reaper',
+            error_text='delivery_uncertain_no_auto_retry',
             posting_started_at=NULL,
             updated_at=now()
         WHERE status='posting'
           AND posting_started_at < now() - interval '2 minutes'
           AND id = :id
         RETURNING id
-    """), {"id": digest_id})
+    """),
+        {"id": digest_id},
+    )
     rows = result.fetchall()
     assert rows == [], "fresh posting row must not be reaped"
 
@@ -139,9 +144,7 @@ async def test_digest_daily_job_no_op_when_flag_off(db_session, monkeypatch):
     await db_session.flush()
 
     # Snapshot row counts BEFORE
-    count_before = (await db_session.execute(
-        text("SELECT COUNT(*) FROM digests")
-    )).scalar_one()
+    count_before = (await db_session.execute(text("SELECT COUNT(*) FROM digests"))).scalar_one()
 
     # We can't easily run the actual scheduler job within an outer-rollback
     # transaction (it opens its own async_session). Instead we exercise the
@@ -152,9 +155,7 @@ async def test_digest_daily_job_no_op_when_flag_off(db_session, monkeypatch):
     assert flag_state is False, "flag default OFF invariant"
 
     # No state change expected.
-    count_after = (await db_session.execute(
-        text("SELECT COUNT(*) FROM digests")
-    )).scalar_one()
+    count_after = (await db_session.execute(text("SELECT COUNT(*) FROM digests"))).scalar_one()
     assert count_after == count_before
 
 
@@ -306,6 +307,7 @@ async def test_digest_daily_job_registers_in_scheduler(monkeypatch):
     real_start = scheduler_mod.scheduler.start
     scheduler_mod.scheduler.start = lambda: started.append(True)  # type: ignore[assignment]
     try:
+
         class _FakeBot:
             pass
 
@@ -323,10 +325,16 @@ async def test_digest_daily_job_registers_in_scheduler(monkeypatch):
     finally:
         # Restore + clear registered jobs to avoid bleed into other tests.
         scheduler_mod.scheduler.start = real_start  # type: ignore[assignment]
-        for jid in ("digest_daily", "digest_stale_posting_reaper",
-                    "process_invite_outbox", "check_vouch_deadlines",
-                    "check_intro_refresh", "sync_google_sheets",
-                    "forget_cascade_worker", "extraction_scheduler_tick"):
+        for jid in (
+            "digest_daily",
+            "digest_stale_posting_reaper",
+            "process_invite_outbox",
+            "check_vouch_deadlines",
+            "check_intro_refresh",
+            "sync_google_sheets",
+            "forget_cascade_worker",
+            "extraction_scheduler_tick",
+        ):
             try:
                 scheduler_mod.scheduler.remove_job(jid)
             except Exception:
@@ -375,39 +383,37 @@ async def test_reaper_reaps_stale_approved_for_publish(db_session, monkeypatch):
 
     import bot.services.scheduler as scheduler_mod
 
-    monkeypatch.setattr(
-        scheduler_mod, "async_session", _fake_session_ctx(db_session)
-    )
+    monkeypatch.setattr(scheduler_mod, "async_session", _fake_session_ctx(db_session))
 
     await scheduler_mod.digest_stale_posting_reaper_job()
 
     refreshed = await db_session.execute(
-        text(
-            "SELECT status, error_text FROM digests WHERE id = :id"
-        ),
+        text("SELECT status, error_text FROM digests WHERE id = :id"),
         {"id": digest_id},
     )
     row = refreshed.mappings().one()
     assert row["status"] == "failed", (
-        f"stale approved_for_publish must be reaped to failed; "
-        f"got {row['status']!r}"
+        f"stale approved_for_publish must be reaped to failed; got {row['status']!r}"
     )
     assert row["error_text"] == "stale_approved_reaper", (
-        f"expected error_text='stale_approved_reaper'; "
-        f"got {row['error_text']!r}"
+        f"expected error_text='stale_approved_reaper'; got {row['error_text']!r}"
     )
 
     # digest_runs audit row must be inserted with matching error_text.
     audit = (
-        await db_session.execute(
-            text(
-                "SELECT status, error_text FROM digest_runs "
-                "WHERE digest_id = :id "
-                "ORDER BY id DESC LIMIT 1"
-            ),
-            {"id": digest_id},
+        (
+            await db_session.execute(
+                text(
+                    "SELECT status, error_text FROM digest_runs "
+                    "WHERE digest_id = :id "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"id": digest_id},
+            )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     assert audit is not None
     assert audit["status"] == "failed"
     assert audit["error_text"] == "stale_approved_reaper"
@@ -440,9 +446,7 @@ async def test_reaper_skips_fresh_approved_for_publish(db_session, monkeypatch):
 
     import bot.services.scheduler as scheduler_mod
 
-    monkeypatch.setattr(
-        scheduler_mod, "async_session", _fake_session_ctx(db_session)
-    )
+    monkeypatch.setattr(scheduler_mod, "async_session", _fake_session_ctx(db_session))
 
     await scheduler_mod.digest_stale_posting_reaper_job()
 
@@ -456,9 +460,7 @@ async def test_reaper_skips_fresh_approved_for_publish(db_session, monkeypatch):
     )
 
 
-async def test_reaper_still_reaps_stale_posting_after_widening(
-    db_session, monkeypatch
-):
+async def test_reaper_still_reaps_stale_posting_after_widening(db_session, monkeypatch):
     """Regression guard: extending the reaper to handle
     ``approved_for_publish`` MUST NOT break the existing posting-row reaping
     (Phase 7 §5.K baseline preserved byte-for-byte)."""
@@ -480,20 +482,15 @@ async def test_reaper_still_reaps_stale_posting_after_widening(
 
     import bot.services.scheduler as scheduler_mod
 
-    monkeypatch.setattr(
-        scheduler_mod, "async_session", _fake_session_ctx(db_session)
-    )
+    monkeypatch.setattr(scheduler_mod, "async_session", _fake_session_ctx(db_session))
 
     await scheduler_mod.digest_stale_posting_reaper_job()
 
     refreshed = await db_session.execute(
-        text(
-            "SELECT status, error_text, posting_started_at "
-            "FROM digests WHERE id = :id"
-        ),
+        text("SELECT status, error_text, posting_started_at FROM digests WHERE id = :id"),
         {"id": digest_id},
     )
     row = refreshed.mappings().one()
     assert row["status"] == "failed"
-    assert row["error_text"] == "stale_posting_reaper"
+    assert row["error_text"] == "delivery_uncertain_no_auto_retry"
     assert row["posting_started_at"] is None

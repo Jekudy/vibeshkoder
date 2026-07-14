@@ -21,10 +21,15 @@ from bot.keyboards.inline import (
     confirm_keyboard,
     vouch_keyboard,
 )
+from bot.services.referral_username import (
+    InvalidReferralUsername,
+    normalize_referral_username,
+)
 from bot.states.questionnaire import STATES_LIST, QuestionnaireForm
 from bot.texts import (
     CONFIRM_PROMPT,
     INTRO_TEMPLATE,
+    INVALID_REFERRAL_USERNAME,
     NEXT_QUESTION,
     NOT_TEXT_ERROR,
     QUESTIONS,
@@ -117,6 +122,14 @@ async def handle_answer(
     if application_id is None:
         return
 
+    answer_text = message.text
+    if idx == 2:
+        try:
+            answer_text = normalize_referral_username(answer_text)
+        except InvalidReferralUsername:
+            await message.answer(INVALID_REFERRAL_USERNAME)
+            return
+
     # Save answer
     await QuestionnaireRepo.save_answer(
         session,
@@ -124,7 +137,7 @@ async def handle_answer(
         application_id=application_id,
         question_index=idx,
         question_text=QUESTIONS[idx],
-        answer_text=message.text,
+        answer_text=answer_text,
     )
 
     # Advance to next state or confirm

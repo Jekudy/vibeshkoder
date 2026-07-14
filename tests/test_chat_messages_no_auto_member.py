@@ -22,6 +22,7 @@ def test_save_chat_message_does_not_auto_mark_member(app_env, monkeypatch) -> No
         chat=SimpleNamespace(id=-1001234567890),
         from_user=SimpleNamespace(
             id=222,
+            is_bot=False,
             username="not_member_yet",
             first_name="Alice",
             last_name="Example",
@@ -119,6 +120,7 @@ def test_save_chat_message_threads_raw_update_id(app_env, monkeypatch) -> None:
         chat=SimpleNamespace(id=-1001234567890),
         from_user=SimpleNamespace(
             id=333,
+            is_bot=False,
             username="testuser",
             first_name="Bob",
             last_name=None,

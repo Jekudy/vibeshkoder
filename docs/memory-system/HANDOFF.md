@@ -861,8 +861,10 @@ ON ONLY after T1-12 / T1-13 land AND the `#offrecord` ordering rule is verifiabl
 
 ### Transaction boundaries
 
-- Raw update insert in its own safe transaction OR at the beginning of the update transaction.
-- Normalization in same transaction after raw insert.
+- Raw update insert, policy detection, and redaction commit in their own safe transaction
+  before downstream dispatch.
+- Normalization starts a new transaction after the raw commit. Handler rollback cannot
+  delete the source archive.
 - Derived jobs queued only after commit.
 - Duplicate conflicts handled in repos, not broad handler rollback.
 

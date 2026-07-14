@@ -108,7 +108,9 @@ def _build_synthetic_td_export(case: dict) -> str:
     return tmp.name
 
 
-async def _create_import_run(db_session, *, source_path: str, chat_id: int, source_hash: str) -> int:
+async def _create_import_run(
+    db_session, *, source_path: str, chat_id: int, source_hash: str
+) -> int:
     """Insert an ingestion_runs row for the import-path eval seed (mirrors test_import_apply.py)."""
     from sqlalchemy import text as sa_text
 
@@ -135,8 +137,9 @@ async def _seed_case_via_import_path(db_session, case: dict) -> None:
     """Drive the full import_apply pipeline for an imp_* case.
 
     Builds a synthetic Telegram Desktop export from case["messages"] and runs
-    the full run_apply path. Asserts that non-offrecord messages have
-    current_version_id set (CRITICAL 2 inverse-test).
+    the full run_apply path. Phase 13 treats historical opt-out hashtags as
+    ordinary content, so every imported human message must get a current
+    version.
     """
     from bot.services.import_apply import run_apply
     from bot.services.import_chunking import ChunkingConfig
@@ -162,21 +165,13 @@ async def _seed_case_via_import_path(db_session, case: dict) -> None:
     )
     assert report.error_count == 0, f"{case['id']}: import apply had errors: {report}"
 
-    # Verify non-offrecord messages have current_version_id set (CRITICAL 2 inverse-test).
+    # Every human message, including text containing old policy hashtags, is
+    # normalized under the complete-history contract.
     from bot.db.models import ChatMessage
     from sqlalchemy import select
 
     for msg in case["messages"]:
         if msg.get("type") != "message":
-            continue
-        # Determine expected policy from text (detect_policy token match).
-        text = msg.get("text", "")
-        if isinstance(text, list):
-            text = " ".join(
-                part if isinstance(part, str) else part.get("text", "") for part in text
-            )
-        is_offrecord = "#offrecord" in text.lower()
-        if is_offrecord:
             continue
         result = await db_session.execute(
             select(ChatMessage).where(
@@ -185,9 +180,7 @@ async def _seed_case_via_import_path(db_session, case: dict) -> None:
             )
         )
         cm = result.scalar_one_or_none()
-        assert cm is not None, (
-            f"{case['id']}: message_id={msg['id']} not found after import"
-        )
+        assert cm is not None, f"{case['id']}: message_id={msg['id']} not found after import"
         assert cm.current_version_id is not None, (
             f"{case['id']}: message_id={msg['id']} current_version_id IS NULL — CRITICAL 2 regression"
         )
@@ -234,15 +227,30 @@ async def _seed_case_via_real_path(db_session, case: dict) -> None:
             ),
             text=text,
             caption=caption,
-            date=captured_at if captured_at.tzinfo is not None else captured_at.replace(tzinfo=timezone.utc),
+            date=captured_at
+            if captured_at.tzinfo is not None
+            else captured_at.replace(tzinfo=timezone.utc),
             model_dump=lambda **_: {},
             reply_to_message=None,
             message_thread_id=None,
-            photo=None, video=None, voice=None, audio=None, document=None,
-            sticker=None, animation=None, video_note=None, location=None,
-            contact=None, poll=None, dice=None, forward_origin=None,
-            new_chat_members=None, left_chat_member=None, pinned_message=None,
-            entities=None, caption_entities=None,
+            photo=None,
+            video=None,
+            voice=None,
+            audio=None,
+            document=None,
+            sticker=None,
+            animation=None,
+            video_note=None,
+            location=None,
+            contact=None,
+            poll=None,
+            dice=None,
+            forward_origin=None,
+            new_chat_members=None,
+            left_chat_member=None,
+            pinned_message=None,
+            entities=None,
+            caption_entities=None,
         )
 
         result = await persist_message_with_policy(

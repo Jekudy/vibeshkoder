@@ -200,9 +200,17 @@ async def test_persist_normal_text_message_returns_result(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_row)) as mock_save,
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()) as mock_mark,
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=_fake_v1())),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save",
+            new=AsyncMock(return_value=fake_row),
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ) as mock_mark,
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=_fake_v1()),
+        ),
     ):
         result = await persist_message_with_policy(session, message)
 
@@ -232,9 +240,17 @@ async def test_persist_normal_sets_raw_json_for_text_message(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_row)) as mock_save,
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=_fake_v1())),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save",
+            new=AsyncMock(return_value=fake_row),
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=_fake_v1()),
+        ),
     ):
         await persist_message_with_policy(session, message)
 
@@ -253,9 +269,17 @@ async def test_persist_normal_no_raw_json_for_caption_only(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_row)) as mock_save,
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=_fake_v1())),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save",
+            new=AsyncMock(return_value=fake_row),
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=_fake_v1()),
+        ),
     ):
         await persist_message_with_policy(session, message)
 
@@ -264,11 +288,11 @@ async def test_persist_normal_no_raw_json_for_caption_only(app_env) -> None:
     assert call_kwargs["caption"] == "nice photo"
 
 
-# ─── Nomem policy ─────────────────────────────────────────────────────────────
+# ─── Legacy policy markers are ordinary content ───────────────────────────────
 
 
-async def test_persist_nomem_text_message(app_env) -> None:
-    """#nomem text: policy='nomem', mark created, content NOT nulled."""
+async def test_persist_nomem_marker_as_normal_text_message(app_env) -> None:
+    """Phase 13: ``#nomem`` is stored verbatim as normal searchable text."""
     from bot.services.message_persistence import PersistResult, persist_message_with_policy
 
     message = _make_text_message(text="important #nomem note")
@@ -278,34 +302,34 @@ async def test_persist_nomem_text_message(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_row)) as mock_save,
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()) as mock_mark,
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=_fake_v1())),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save",
+            new=AsyncMock(return_value=fake_row),
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ) as mock_mark,
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=_fake_v1()),
+        ),
     ):
         result = await persist_message_with_policy(session, message)
 
     assert isinstance(result, PersistResult)
-    assert result.policy == "nomem"
-    assert result.is_offrecord_mark_created is True
+    assert result.policy == "normal"
+    assert result.is_offrecord_mark_created is False
 
-    # Content must be preserved for nomem
+    # The marker has no policy side effect and remains part of the content.
     call_kwargs = mock_save.call_args.kwargs
     assert call_kwargs["text"] == "important #nomem note"
     assert call_kwargs["is_redacted"] is False
-    assert call_kwargs["memory_policy"] == "nomem"
-
-    # OffrecordMarkRepo must be called
-    mock_mark.assert_awaited_once()
-    mark_kwargs = mock_mark.call_args.kwargs
-    assert mark_kwargs["mark_type"] == "nomem"
-    assert mark_kwargs["chat_message_id"] == 10
+    assert call_kwargs["memory_policy"] == "normal"
+    mock_mark.assert_not_awaited()
 
 
-# ─── Offrecord policy ─────────────────────────────────────────────────────────
-
-
-async def test_persist_offrecord_text_message_nulls_content(app_env) -> None:
-    """#offrecord text: content fields nulled, is_redacted=True, mark created."""
+async def test_persist_offrecord_marker_as_normal_text_message(app_env) -> None:
+    """Phase 13: ``#offrecord`` is stored verbatim without redaction."""
     from bot.services.message_persistence import PersistResult, persist_message_with_policy
 
     message = _make_text_message(text="secret #offrecord info")
@@ -315,33 +339,38 @@ async def test_persist_offrecord_text_message_nulls_content(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_row)) as mock_save,
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()) as mock_mark,
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=_fake_v1())),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save",
+            new=AsyncMock(return_value=fake_row),
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ) as mock_mark,
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=_fake_v1()),
+        ),
     ):
         result = await persist_message_with_policy(session, message)
 
     assert isinstance(result, PersistResult)
-    assert result.policy == "offrecord"
-    assert result.is_offrecord_mark_created is True
+    assert result.policy == "normal"
+    assert result.is_offrecord_mark_created is False
 
-    # Content MUST be nulled for offrecord
     call_kwargs = mock_save.call_args.kwargs
-    assert call_kwargs["text"] is None
+    assert call_kwargs["text"] == "secret #offrecord info"
     assert call_kwargs["caption"] is None
-    assert call_kwargs["raw_json"] is None
-    assert call_kwargs["is_redacted"] is True
-    assert call_kwargs["memory_policy"] == "offrecord"
-
-    # OffrecordMarkRepo must be called with offrecord mark type
-    mock_mark.assert_awaited_once()
-    mark_kwargs = mock_mark.call_args.kwargs
-    assert mark_kwargs["mark_type"] == "offrecord"
-    assert mark_kwargs["chat_message_id"] == 20
+    assert call_kwargs["raw_json"] == {
+        "message_id": message.message_id,
+        "text": "secret #offrecord info",
+    }
+    assert call_kwargs["is_redacted"] is False
+    assert call_kwargs["memory_policy"] == "normal"
+    mock_mark.assert_not_awaited()
 
 
-async def test_persist_offrecord_caption_only_photo(app_env) -> None:
-    """#offrecord in caption of photo: content nulled, is_redacted=True."""
+async def test_persist_offrecord_marker_in_caption_as_normal_photo(app_env) -> None:
+    """Legacy marker in a photo caption is preserved as normal content."""
     from bot.services.message_persistence import persist_message_with_policy
 
     message = _make_photo_message(caption="photo #offrecord secret")
@@ -351,18 +380,29 @@ async def test_persist_offrecord_caption_only_photo(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_row)) as mock_save,
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=_fake_v1())),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save",
+            new=AsyncMock(return_value=fake_row),
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message",
+            new=AsyncMock(),
+        ) as mock_mark,
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=_fake_v1()),
+        ),
     ):
         result = await persist_message_with_policy(session, message)
 
-    assert result.policy == "offrecord"
+    assert result.policy == "normal"
     call_kwargs = mock_save.call_args.kwargs
     assert call_kwargs["text"] is None
-    assert call_kwargs["caption"] is None
+    assert call_kwargs["caption"] == "photo #offrecord secret"
     assert call_kwargs["raw_json"] is None
-    assert call_kwargs["is_redacted"] is True
+    assert call_kwargs["is_redacted"] is False
+    assert call_kwargs["memory_policy"] == "normal"
+    mock_mark.assert_not_awaited()
 
 
 # ─── Duck (importer-shaped) ───────────────────────────────────────────────────
@@ -379,9 +419,17 @@ async def test_persist_duck_message_normal(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_row)) as mock_save,
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=_fake_v1())),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save",
+            new=AsyncMock(return_value=fake_row),
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=_fake_v1()),
+        ),
     ):
         result = await persist_message_with_policy(session, message, source="import")
 
@@ -418,8 +466,13 @@ async def test_persist_advisory_lock_called_before_save(app_env) -> None:
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", side_effect=mock_lock),
         patch("bot.services.message_persistence.MessageRepo.save", side_effect=mock_save),
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=_fake_v1())),
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=_fake_v1()),
+        ),
     ):
         await persist_message_with_policy(session, message)
 
@@ -446,9 +499,17 @@ async def test_persist_passes_raw_update_id(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_row)) as mock_save,
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=fake_v1)),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save",
+            new=AsyncMock(return_value=fake_row),
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=fake_v1),
+        ),
     ):
         await persist_message_with_policy(session, message, raw_update_id=12345)
 
@@ -478,7 +539,9 @@ async def test_persist_creates_v1_with_current_version_fk(db_session) -> None:
         last_name=None,
     )
 
-    message = _make_text_message(message_id=msg_id, chat_id=chat_id, user_id=user_id, text="hello v1")
+    message = _make_text_message(
+        message_id=msg_id, chat_id=chat_id, user_id=user_id, text="hello v1"
+    )
     result = await persist_message_with_policy(db_session, message)
 
     assert result.policy == "normal"
@@ -499,8 +562,8 @@ async def test_persist_creates_v1_with_current_version_fk(db_session) -> None:
     assert cm.current_version_id == v1.id
 
 
-async def test_persist_offrecord_creates_redacted_v1(db_session) -> None:
-    """#offrecord → v1 with text=None, caption=None, is_redacted=True; hash = null-state hash."""
+async def test_persist_offrecord_marker_creates_normal_v1(db_session) -> None:
+    """Phase 13: a legacy marker creates a complete, non-redacted v1."""
     from bot.db.models import MessageVersion
     from bot.db.repos.user import UserRepo
     from bot.services.content_hash import compute_content_hash
@@ -511,23 +574,34 @@ async def test_persist_offrecord_creates_redacted_v1(db_session) -> None:
     chat_id = -1_002_000_000_002
     msg_id = 10_002
 
-    await UserRepo.upsert(db_session, telegram_id=user_id, username="u77002", first_name="T", last_name=None)
+    await UserRepo.upsert(
+        db_session, telegram_id=user_id, username="u77002", first_name="T", last_name=None
+    )
 
-    message = _make_text_message(message_id=msg_id, chat_id=chat_id, user_id=user_id, text="secret #offrecord info")
+    message = _make_text_message(
+        message_id=msg_id, chat_id=chat_id, user_id=user_id, text="secret #offrecord info"
+    )
     result = await persist_message_with_policy(db_session, message)
 
-    assert result.policy == "offrecord"
+    assert result.policy == "normal"
     cm = result.chat_message
     assert cm.current_version_id is not None
 
-    v1 = (await db_session.execute(
-        select(MessageVersion).where(MessageVersion.chat_message_id == cm.id)
-    )).scalar_one()
+    v1 = (
+        await db_session.execute(
+            select(MessageVersion).where(MessageVersion.chat_message_id == cm.id)
+        )
+    ).scalar_one()
 
-    assert v1.text is None
+    assert v1.text == "secret #offrecord info"
     assert v1.caption is None
-    assert v1.is_redacted is True
-    expected_hash = compute_content_hash(text=None, caption=None, message_kind="text", entities=None)
+    assert v1.is_redacted is False
+    expected_hash = compute_content_hash(
+        text="secret #offrecord info",
+        caption=None,
+        message_kind="text",
+        entities=None,
+    )
     assert v1.content_hash == expected_hash
 
 
@@ -542,18 +616,24 @@ async def test_persist_caption_only_photo_creates_v1(db_session) -> None:
     chat_id = -1_002_000_000_003
     msg_id = 10_003
 
-    await UserRepo.upsert(db_session, telegram_id=user_id, username="u77003", first_name="T", last_name=None)
+    await UserRepo.upsert(
+        db_session, telegram_id=user_id, username="u77003", first_name="T", last_name=None
+    )
 
-    message = _make_photo_message(message_id=msg_id, chat_id=chat_id, user_id=user_id, caption="nice photo")
+    message = _make_photo_message(
+        message_id=msg_id, chat_id=chat_id, user_id=user_id, caption="nice photo"
+    )
     result = await persist_message_with_policy(db_session, message)
 
     assert result.policy == "normal"
     cm = result.chat_message
     assert cm.current_version_id is not None
 
-    v1 = (await db_session.execute(
-        select(MessageVersion).where(MessageVersion.chat_message_id == cm.id)
-    )).scalar_one()
+    v1 = (
+        await db_session.execute(
+            select(MessageVersion).where(MessageVersion.chat_message_id == cm.id)
+        )
+    ).scalar_one()
 
     assert v1.text is None
     assert v1.caption == "nice photo"
@@ -571,17 +651,27 @@ async def test_persist_idempotent_on_telegram_retry(db_session) -> None:
     chat_id = -1_002_000_000_004
     msg_id = 10_004
 
-    await UserRepo.upsert(db_session, telegram_id=user_id, username="u77004", first_name="T", last_name=None)
-    message = _make_text_message(message_id=msg_id, chat_id=chat_id, user_id=user_id, text="retry text")
+    await UserRepo.upsert(
+        db_session, telegram_id=user_id, username="u77004", first_name="T", last_name=None
+    )
+    message = _make_text_message(
+        message_id=msg_id, chat_id=chat_id, user_id=user_id, text="retry text"
+    )
 
     r1 = await persist_message_with_policy(db_session, message)
     r2 = await persist_message_with_policy(db_session, message)
 
     assert r1.chat_message.current_version_id == r2.chat_message.current_version_id
 
-    versions = (await db_session.execute(
-        select(MessageVersion).where(MessageVersion.chat_message_id == r1.chat_message.id)
-    )).scalars().all()
+    versions = (
+        (
+            await db_session.execute(
+                select(MessageVersion).where(MessageVersion.chat_message_id == r1.chat_message.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(versions) == 1
     assert versions[0].version_seq == 1
 
@@ -616,8 +706,13 @@ async def test_persist_v1_advisory_lock_called_before_insert_version(app_env) ->
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", side_effect=mock_lock),
         patch("bot.services.message_persistence.MessageRepo.save", side_effect=mock_save),
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", side_effect=mock_insert),
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            side_effect=mock_insert,
+        ),
     ):
         await persist_message_with_policy(session, message)
 
@@ -642,9 +737,16 @@ async def test_persist_v1_imported_final_flag_for_import_source(app_env) -> None
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_cm)),
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=fake_v1)) as mock_insert,
+        patch(
+            "bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_cm)
+        ),
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=fake_v1),
+        ) as mock_insert,
     ):
         await persist_message_with_policy(session, message, source="import")
 
@@ -668,9 +770,16 @@ async def test_persist_failure_rolls_back_v1(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_cm)),
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", side_effect=raise_error),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_cm)
+        ),
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            side_effect=raise_error,
+        ),
     ):
         with pytest.raises(RuntimeError, match="simulated insert failure"):
             await persist_message_with_policy(session, message)
@@ -695,11 +804,24 @@ async def test_persist_anonymous_channel_post_creates_v1(app_env) -> None:
         model_dump=None,  # no model_dump for anon duck
         reply_to_message=None,
         message_thread_id=None,
-        photo=None, video=None, voice=None, audio=None, document=None,
-        sticker=None, animation=None, video_note=None, location=None,
-        contact=None, poll=None, dice=None, forward_origin=None,
-        new_chat_members=None, left_chat_member=None, pinned_message=None,
-        entities=None, caption_entities=None,
+        photo=None,
+        video=None,
+        voice=None,
+        audio=None,
+        document=None,
+        sticker=None,
+        animation=None,
+        video_note=None,
+        location=None,
+        contact=None,
+        poll=None,
+        dice=None,
+        forward_origin=None,
+        new_chat_members=None,
+        left_chat_member=None,
+        pinned_message=None,
+        entities=None,
+        caption_entities=None,
     )
 
     fake_cm = _fake_cm(88)
@@ -708,9 +830,16 @@ async def test_persist_anonymous_channel_post_creates_v1(app_env) -> None:
 
     with (
         patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_cm)) as mock_save,
-        patch("bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()),
-        patch("bot.services.message_persistence.MessageVersionRepo.insert_version", new=AsyncMock(return_value=fake_v)) as mock_insert,
+        patch(
+            "bot.services.message_persistence.MessageRepo.save", new=AsyncMock(return_value=fake_cm)
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message", new=AsyncMock()
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=fake_v),
+        ) as mock_insert,
     ):
         result = await persist_message_with_policy(session, message)
 
@@ -736,7 +865,9 @@ async def test_persist_forwarded_text_creates_v1_with_kind_forward(db_session) -
     chat_id = -1_002_000_000_009
     msg_id = 10_009
 
-    await UserRepo.upsert(db_session, telegram_id=user_id, username="u77009", first_name="T", last_name=None)
+    await UserRepo.upsert(
+        db_session, telegram_id=user_id, username="u77009", first_name="T", last_name=None
+    )
 
     message = SimpleNamespace(
         message_id=msg_id,
@@ -748,22 +879,40 @@ async def test_persist_forwarded_text_creates_v1_with_kind_forward(db_session) -
         model_dump=MagicMock(return_value={"text": "forwarded text"}),
         reply_to_message=None,
         message_thread_id=None,
-        photo=None, video=None, voice=None, audio=None, document=None,
-        sticker=None, animation=None, video_note=None, location=None,
-        contact=None, poll=None, dice=None,
+        photo=None,
+        video=None,
+        voice=None,
+        audio=None,
+        document=None,
+        sticker=None,
+        animation=None,
+        video_note=None,
+        location=None,
+        contact=None,
+        poll=None,
+        dice=None,
         forward_origin=SimpleNamespace(type="user"),  # makes kind="forward"
-        new_chat_members=None, left_chat_member=None, pinned_message=None,
-        entities=None, caption_entities=None,
+        new_chat_members=None,
+        left_chat_member=None,
+        pinned_message=None,
+        entities=None,
+        caption_entities=None,
     )
 
     result = await persist_message_with_policy(db_session, message)
     cm = result.chat_message
-    v1 = (await db_session.execute(
-        select(MessageVersion).where(MessageVersion.chat_message_id == cm.id)
-    )).scalar_one()
+    v1 = (
+        await db_session.execute(
+            select(MessageVersion).where(MessageVersion.chat_message_id == cm.id)
+        )
+    ).scalar_one()
 
-    forward_hash = compute_content_hash(text="forwarded text", caption=None, message_kind="forward", entities=None)
-    native_hash = compute_content_hash(text="forwarded text", caption=None, message_kind="text", entities=None)
+    forward_hash = compute_content_hash(
+        text="forwarded text", caption=None, message_kind="forward", entities=None
+    )
+    native_hash = compute_content_hash(
+        text="forwarded text", caption=None, message_kind="text", entities=None
+    )
     assert v1.content_hash == forward_hash
     assert v1.content_hash != native_hash
 
@@ -780,17 +929,23 @@ async def test_persist_threads_captured_at_to_v1(db_session) -> None:
     msg_id = 10_011
     override_ts = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
-    await UserRepo.upsert(db_session, telegram_id=user_id, username="u77011", first_name="T", last_name=None)
+    await UserRepo.upsert(
+        db_session, telegram_id=user_id, username="u77011", first_name="T", last_name=None
+    )
 
-    message = _make_text_message(message_id=msg_id, chat_id=chat_id, user_id=user_id, text="captured at test")
+    message = _make_text_message(
+        message_id=msg_id, chat_id=chat_id, user_id=user_id, text="captured at test"
+    )
     result = await persist_message_with_policy(db_session, message, captured_at=override_ts)
 
     cm = result.chat_message
     assert cm.current_version_id is not None
 
-    v1 = (await db_session.execute(
-        select(MessageVersion).where(MessageVersion.chat_message_id == cm.id)
-    )).scalar_one()
+    v1 = (
+        await db_session.execute(
+            select(MessageVersion).where(MessageVersion.chat_message_id == cm.id)
+        )
+    ).scalar_one()
 
     assert v1.captured_at.replace(microsecond=0) == override_ts.replace(microsecond=0)
 
@@ -814,8 +969,12 @@ async def test_persist_does_not_overwrite_existing_current_version_id(db_session
     chat_id = -1_002_000_000_012
     msg_id = 10_012
 
-    await UserRepo.upsert(db_session, telegram_id=user_id, username="u77012", first_name="T", last_name=None)
-    message = _make_text_message(message_id=msg_id, chat_id=chat_id, user_id=user_id, text="original text")
+    await UserRepo.upsert(
+        db_session, telegram_id=user_id, username="u77012", first_name="T", last_name=None
+    )
+    message = _make_text_message(
+        message_id=msg_id, chat_id=chat_id, user_id=user_id, text="original text"
+    )
 
     # First delivery: v1 is created.
     r1 = await persist_message_with_policy(db_session, message)

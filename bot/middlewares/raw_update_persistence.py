@@ -1,10 +1,10 @@
 """Raw update persistence middleware (T1-04).
 
-Sits INSIDE ``DbSessionMiddleware`` (registered after it, so it runs nested) so the
-session is open and the persistence happens in the SAME transaction the handler will
-later commit. Per the ``#offrecord`` ordering rule from
-``docs/memory-system/AUTHORIZED_SCOPE.md``, the raw row + policy detection + any
-redaction land in one atomic commit.
+Sits INSIDE ``DbSessionMiddleware`` (registered after it, so it runs nested) and commits
+the raw source row before normalized persistence or product dispatch.  A later handler
+failure can therefore roll back its own transaction without deleting the source archive.
+Per the ``#offrecord`` ordering rule from ``docs/memory-system/AUTHORIZED_SCOPE.md``,
+policy detection, any redaction, and the raw insert still land in that one durable commit.
 
 Behavior is gated by feature flag ``memory.ingestion.raw_updates.enabled`` (default OFF).
 """
@@ -26,19 +26,12 @@ logger = logging.getLogger(__name__)
 class RawUpdatePersistenceMiddleware(BaseMiddleware):
     """Persist the raw aiogram ``Update`` before the handler runs.
 
-    Failure-isolation policy (explicit, approved exception to global no-blanket-catch
-    rule from CLAUDE.md):
-
-    Raw-archive failure MUST NOT break the gatekeeper handler — uptime of onboarding,
-    vouching, intro refresh outweighs archive completeness in this cycle. We isolate the
-    failure with a SQL SAVEPOINT (``session.begin_nested()``) so a DB error inside
-    ``record_update`` rolls back ONLY the raw insert, leaving the outer transaction
-    clean for the handler. We catch ``SQLAlchemyError`` (the only family that can leave
-    the session in a failed-tx state) and log with the update_id; non-DB exceptions
-    propagate to ``DbSessionMiddleware`` for a normal full rollback.
-
-    This is the ONE approved site in the codebase for this pattern. Other services must
-    follow the global re-raise policy.
+    Raw persistence is the source-of-truth boundary.  Its transaction commits before
+    downstream dispatch for every aiogram ``Update`` shape.  A failed raw write therefore
+    aborts the update before normalized/derived persistence or product handlers can run.
+    Database errors are logged using taxonomy-only structured fields and then re-raised;
+    exception messages, SQL parameters, update payloads and tracebacks are deliberately
+    excluded from this middleware's log record.
     """
 
     async def __call__(
@@ -51,17 +44,24 @@ class RawUpdatePersistenceMiddleware(BaseMiddleware):
             session = data.get("session")
             if session is not None:
                 try:
-                    async with session.begin_nested():
-                        live_run_id = data.get("live_ingestion_run_id")
-                        raw_row = await record_update(session, event, ingestion_run_id=live_run_id)
-                        if raw_row is not None:
-                            data["raw_update"] = raw_row
+                    live_run_id = data.get("live_ingestion_run_id")
+                    raw_row = await record_update(session, event, ingestion_run_id=live_run_id)
+                    if raw_row is not None:
+                        # This is an intentional durability boundary.  The same session
+                        # starts a fresh transaction when downstream middleware next uses
+                        # it, and DbSessionMiddleware may roll that later transaction back
+                        # without removing the already archived source update.
+                        await session.commit()
+                        data["raw_update"] = raw_row
                 except SQLAlchemyError as exc:
-                    logger.warning(
-                        "raw update persistence failed; continuing to handler",
-                        extra={"update_id": getattr(event, "update_id", None)},
-                        exc_info=exc,
+                    logger.error(
+                        "raw_update_persistence_failed",
+                        extra={
+                            "update_id": getattr(event, "update_id", None),
+                            "error_class": type(exc).__name__,
+                        },
                     )
-                # Non-DB exceptions propagate so DbSessionMiddleware can roll back
-                # the entire outer transaction and aiogram can log the trace.
+                    raise
+                # Non-DB exceptions propagate.  A downstream rollback cannot undo the
+                # raw commit above.
         return await handler(event, data)

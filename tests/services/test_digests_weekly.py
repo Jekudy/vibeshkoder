@@ -62,7 +62,11 @@ async def _make_user(db_session) -> int:
 
 
 async def _make_msg_and_version(
-    db_session, *, chat_id: int, ts: datetime, text: str = "hello",
+    db_session,
+    *,
+    chat_id: int,
+    ts: datetime,
+    text: str = "hello",
 ) -> tuple[int, int]:
     from bot.db.models import ChatMessage, MessageVersion
 
@@ -141,13 +145,15 @@ def test_weekly_prompt_module_exports_required_symbols():
     assert mod.PROMPT_VERSION == "digest-weekly-v0.1.0"
     assert isinstance(mod.SYSTEM_PROMPT, str) and "EMPTY_WINDOW" in mod.SYSTEM_PROMPT
     assert isinstance(mod.SECTION_NAME_ALLOWLIST, frozenset)
-    assert mod.SECTION_NAME_ALLOWLIST == frozenset({
-        "Объявления",
-        "Обсуждения",
-        "Знания и ресурсы",
-        "Встречи и события",
-        "Прочее",
-    })
+    assert mod.SECTION_NAME_ALLOWLIST == frozenset(
+        {
+            "Объявления",
+            "Обсуждения",
+            "Знания и ресурсы",
+            "Встречи и события",
+            "Прочее",
+        }
+    )
     assert callable(mod.build_user_prompt)
 
 
@@ -185,12 +191,14 @@ def test_weekly_prompt_user_template_emits_window_and_cards_and_messages():
         ts: datetime
 
     cards = [_Card(title="C1", body_markdown="body", card_source_ids=["uuid-a"])]
-    msgs = [_Msg(
-        message_version_id=12345,
-        author_display="Alice",
-        text="hello world",
-        ts=datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc),
-    )]
+    msgs = [
+        _Msg(
+            message_version_id=12345,
+            author_display="Alice",
+            text="hello world",
+            ts=datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc),
+        )
+    ]
     out = build_user_prompt(
         window_start_msk="2026-05-04T00:00:00",
         window_end_msk="2026-05-11T00:00:00",
@@ -424,9 +432,10 @@ async def test_run_digest_accepts_weekly_type_and_calls_context_with_weekly(
     assert captured.get("type") == "weekly", f"got kwargs={captured}"
     assert captured["window_start"] == ws
     assert captured["window_end"] == we
-    # Row exists with type='weekly', skipped on empty window.
+    # Row exists with type='weekly' and remains publishable without an LLM call.
     assert digest.type == "weekly"
-    assert digest.status == "skipped"
+    assert digest.status == "draft"
+    assert digest.body_markdown == "За прошедшую неделю новых обсуждений не было."
 
 
 async def test_run_digest_weekly_cost_ceiling_fires_before_llm(db_session):
@@ -486,9 +495,9 @@ async def test_run_digest_weekly_cost_ceiling_fires_before_llm(db_session):
     assert digest.status == "cost_exceeded"
     assert digest.error_text == "weekly digest budget exceeded"
     # digest_runs row also created.
-    run_row = (await db_session.execute(
-        select(DigestRun).where(DigestRun.digest_id == digest.id)
-    )).scalar_one()
+    run_row = (
+        await db_session.execute(select(DigestRun).where(DigestRun.digest_id == digest.id))
+    ).scalar_one()
     assert run_row.status == "cost_exceeded"
     assert run_row.error_text == "weekly digest budget exceeded"
 
@@ -521,22 +530,32 @@ async def test_run_digest_weekly_idempotency(db_session, monkeypatch):
     monkeypatch.setattr(digests_module, "build_digest_context", _stub_build_context)
 
     d1 = await run_digest(
-        db_session, type="weekly", window_start=ws, window_end=we,
-        ledger_repo=None, provider=None, config=cfg, digest_config=dcfg,
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        ledger_repo=None,
+        provider=None,
+        config=cfg,
+        digest_config=dcfg,
     )
     await db_session.flush()
     d2 = await run_digest(
-        db_session, type="weekly", window_start=ws, window_end=we,
-        ledger_repo=None, provider=None, config=cfg, digest_config=dcfg,
+        db_session,
+        type="weekly",
+        window_start=ws,
+        window_end=we,
+        ledger_repo=None,
+        provider=None,
+        config=cfg,
+        digest_config=dcfg,
     )
     assert d1.id == d2.id
     assert d2.type == "weekly"
-    assert d2.status == "skipped"
+    assert d2.status == "draft"
 
 
-async def test_run_digest_weekly_daily_cost_buckets_are_isolated(
-    db_session, monkeypatch
-):
+async def test_run_digest_weekly_daily_cost_buckets_are_isolated(db_session, monkeypatch):
     """A weekly run does NOT trip the daily bucket and vice versa (Q7).
 
     `build_digest_context` is mocked (T8-03 territory) — the assertion is
@@ -599,11 +618,16 @@ async def test_run_digest_weekly_daily_cost_buckets_are_isolated(
     # Weekly call: daily ledger row does NOT trip weekly bucket — should not
     # be cost_exceeded.
     weekly = await run_digest(
-        db_session, type="weekly",
-        window_start=now - timedelta(days=7), window_end=now,
-        ledger_repo=None, provider=None, config=cfg, digest_config=dcfg,
+        db_session,
+        type="weekly",
+        window_start=now - timedelta(days=7),
+        window_end=now,
+        ledger_repo=None,
+        provider=None,
+        config=cfg,
+        digest_config=dcfg,
     )
-    assert weekly.status == "skipped", (
+    assert weekly.status == "draft", (
         f"weekly cost ceiling falsely tripped by daily ledger; got {weekly.status!r}, "
         f"error_text={weekly.error_text!r}"
     )
@@ -741,11 +765,7 @@ async def test_synthesize_digest_type_daily_keeps_daily_prompt(db_session):
             from bot.services.llm_providers import ProviderResult
 
             seen_prompts.append(prompt)
-            body = (
-                "TL;DR одна фраза. Вторая. Третья.\n"
-                "\n"
-                f"- Topic [[mv:{mv_id}]] summary\n"
-            )
+            body = f"TL;DR одна фраза. Вторая. Третья.\n\n- Topic [[mv:{mv_id}]] summary\n"
             return ProviderResult(
                 answer_text=body,
                 citation_ids=(),
@@ -815,9 +835,7 @@ def test_extract_sections_handles_no_bullets_under_header():
     assert sections[1][1] == ["- a [[mv:1]]"]
 
 
-async def test_synthesize_digest_weekly_warns_on_off_allowlist_section(
-    db_session, caplog
-):
+async def test_synthesize_digest_weekly_warns_on_off_allowlist_section(db_session, caplog):
     """M1 soft contract: a section title outside SECTION_NAME_ALLOWLIST logs a
     structured warning but does NOT raise."""
     from bot.db.repos.llm_usage_ledger import LedgerRepo
@@ -883,8 +901,7 @@ async def test_synthesize_digest_weekly_warns_on_off_allowlist_section(
     assert len(result.citations) == 1
     # Warning emitted, naming the off-allowlist title.
     warn_records = [
-        r for r in caplog.records
-        if r.levelno == logging.WARNING and "Совет" in r.getMessage()
+        r for r in caplog.records if r.levelno == logging.WARNING and "Совет" in r.getMessage()
     ]
     assert len(warn_records) == 1, (
         f"expected exactly one allowlist warning naming 'Совет'; got "
@@ -892,9 +909,7 @@ async def test_synthesize_digest_weekly_warns_on_off_allowlist_section(
     )
 
 
-async def test_synthesize_digest_weekly_no_warning_when_all_titles_in_allowlist(
-    db_session, caplog
-):
+async def test_synthesize_digest_weekly_no_warning_when_all_titles_in_allowlist(db_session, caplog):
     """No allowlist-warning emitted when every section title is allowlisted."""
     from bot.db.repos.llm_usage_ledger import LedgerRepo
     from bot.services.digest_context import DigestContext, DigestContextMessage
@@ -925,12 +940,7 @@ async def test_synthesize_digest_weekly_no_warning_when_all_titles_in_allowlist(
         ],
     )
 
-    body = (
-        "TL;DR a. b. c.\n"
-        "\n"
-        "## Раздел: Обсуждения\n"
-        f"- topic [[mv:{mv_id}]] summary\n"
-    )
+    body = f"TL;DR a. b. c.\n\n## Раздел: Обсуждения\n- topic [[mv:{mv_id}]] summary\n"
 
     class _Provider:
         async def call(self, *, prompt: str, model: str):
@@ -957,10 +967,13 @@ async def test_synthesize_digest_weekly_no_warning_when_all_titles_in_allowlist(
         )
     # No allowlist-related warning. ("Совет" / "off-allowlist" should not appear.)
     off_warns = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.levelno == logging.WARNING
-        and ("off-allowlist" in r.getMessage().lower()
-             or "not in allowlist" in r.getMessage().lower())
+        and (
+            "off-allowlist" in r.getMessage().lower()
+            or "not in allowlist" in r.getMessage().lower()
+        )
     ]
     assert off_warns == []
 
@@ -1080,13 +1093,14 @@ async def test_synthesize_digest_provider_exception_updates_ledger_weekly(
     # The placeholder ledger row MUST have been updated. Pull the most recent
     # row in this test session.
     row = (
-        await db_session.execute(
-            _text(
-                "SELECT id, error FROM llm_usage_ledger "
-                "ORDER BY id DESC LIMIT 1"
+        (
+            await db_session.execute(
+                _text("SELECT id, error FROM llm_usage_ledger ORDER BY id DESC LIMIT 1")
             )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     assert row is not None, "placeholder ledger row missing"
     # Must NOT be 'TypeError' (that's the bug signature) and MUST be the
     # provider exception class name.
@@ -1153,12 +1167,14 @@ async def test_synthesize_digest_provider_exception_updates_ledger_daily(
     await db_session.flush()
 
     row = (
-        await db_session.execute(
-            _text(
-                "SELECT error FROM llm_usage_ledger ORDER BY id DESC LIMIT 1"
+        (
+            await db_session.execute(
+                _text("SELECT error FROM llm_usage_ledger ORDER BY id DESC LIMIT 1")
             )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     assert row is not None
     assert row["error"] == "_DailyProviderError"
 

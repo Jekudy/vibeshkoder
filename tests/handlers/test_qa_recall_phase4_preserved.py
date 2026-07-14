@@ -1,9 +1,9 @@
-"""T5-04: Phase 4 byte-for-byte preservation regression tests (contracts.md §6.2).
+"""T5-04: Phase 4 deterministic reply preservation tests (contracts.md §6.2).
 
 When ``memory.qa.llm_synthesis.enabled = False``, the /recall handler MUST
-produce reply text + audit trace shape byte-identical to Phase 4 behavior
-(the path landed in T4-04 / PR #162). These tests pin the exact Phase 4
-output so a future refactor cannot silently drift.
+produce reply text identical to Phase 4 behavior (the path landed in T4-04 /
+PR #162).  Migration 081 legitimately extended the audit trace create shape
+with ``source_chat_message_id``; the tests pin that current schema separately.
 
 The Phase 4 expected strings below were captured from
 ``bot/handlers/qa.py::_format_response`` on commit ``71d6eff`` (T5-04c —
@@ -105,13 +105,16 @@ def _qa_result(*, abstained: bool):
 
 def _patch_persist(handler, monkeypatch) -> None:
     from bot.services.message_persistence import PersistResult
+
     fake_cm = SimpleNamespace(id=1, current_version_id=None)
     monkeypatch.setattr(
         handler,
         "persist_message_with_policy",
-        AsyncMock(return_value=PersistResult(
-            chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
-        )),
+        AsyncMock(
+            return_value=PersistResult(
+                chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
+            )
+        ),
     )
     monkeypatch.setattr(handler.UserRepo, "upsert", AsyncMock())
 
@@ -214,13 +217,12 @@ async def test_non_empty_reply_byte_identical_when_llm_flag_off(monkeypatch) -> 
     handler.synthesize_answer.assert_not_awaited()
 
 
-async def test_audit_trace_shape_byte_identical_when_llm_flag_off(monkeypatch) -> None:
-    """Phase 4 audit trace row shape MUST contain ONLY the Phase 4 columns.
+async def test_audit_trace_includes_source_message_field_when_llm_flag_off(monkeypatch) -> None:
+    """The deterministic path writes the current post-migration trace shape.
 
     The flag-OFF path calls ``QaTraceRepo.create`` (via ``_write_trace``) with
-    exactly: user_tg_id, chat_id, query, evidence_ids, abstained, redact_query.
-    No Phase 5 columns (llm_call_id / llm_response_summary / etc.) appear in
-    the create kwargs.
+    the original audit fields plus migration 081's optional source message id.
+    LLM result columns are still populated only through ``update_llm_fields``.
     """
     handler = import_module("bot.handlers.qa")
     message = _message(user_id=4242)
@@ -242,7 +244,7 @@ async def test_audit_trace_shape_byte_identical_when_llm_flag_off(monkeypatch) -
 
     trace_create.assert_awaited_once()
     kwargs = trace_create.await_args.kwargs
-    # Phase 4 column set exactly — no Phase 5 keys.
+    # Current create shape — no LLM result fields.
     assert set(kwargs.keys()) == {
         "user_tg_id",
         "chat_id",
@@ -250,6 +252,7 @@ async def test_audit_trace_shape_byte_identical_when_llm_flag_off(monkeypatch) -
         "evidence_ids",
         "abstained",
         "redact_query",
+        "source_chat_message_id",
     }
     assert kwargs["user_tg_id"] == 4242
     assert kwargs["chat_id"] == COMMUNITY_CHAT_ID
@@ -257,6 +260,7 @@ async def test_audit_trace_shape_byte_identical_when_llm_flag_off(monkeypatch) -
     assert kwargs["evidence_ids"] == [500]
     assert kwargs["abstained"] is False
     assert kwargs["redact_query"] is False
+    assert kwargs["source_chat_message_id"] is None
 
 
 async def test_reply_kwargs_byte_identical_when_llm_flag_off(monkeypatch) -> None:
@@ -372,7 +376,7 @@ async def test_multi_item_reply_snapshot_when_llm_flag_off(monkeypatch) -> None:
         "get",
         AsyncMock(
             side_effect=[
-                _user(),               # calling user
+                _user(),  # calling user
                 _user(user_id=2002, first_name="Author"),
                 _user(user_id=3003, first_name="Second"),
             ]

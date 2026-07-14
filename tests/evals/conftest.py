@@ -195,8 +195,7 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _canonical_jsonl_bytes(rows: list[dict[str, Any]]) -> bytes:
     body = "\n".join(
-        json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        for row in rows
+        json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for row in rows
     )
     return f"{body}\n".encode("utf-8")
 
@@ -218,6 +217,7 @@ def _message_from_seed(row: dict[str, Any]) -> SimpleNamespace:
         chat=SimpleNamespace(id=SEED_CHAT_ID, type="supergroup"),
         from_user=SimpleNamespace(
             id=user_id,
+            is_bot=False,
             username=f"seed_user_{user_id}",
             first_name=f"Seed {user_id}",
             last_name=None,
@@ -299,7 +299,9 @@ async def _persist_seed_message(session: Any, row: dict[str, Any]) -> int:
     chat_message.current_version_id = version.id
     await session.flush()
 
-    persisted_version = await session.scalar(select(MessageVersion).where(MessageVersion.id == version.id))
+    persisted_version = await session.scalar(
+        select(MessageVersion).where(MessageVersion.id == version.id)
+    )
     if persisted_version is None:
         raise AssertionError(f"seed version was not persisted: {row['seed_local_id']}")
     if persisted_version.is_redacted:

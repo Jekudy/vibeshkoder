@@ -1,0 +1,11 @@
+{
+  "name": "shkoderbot-wrangler-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": "22.19.0"
+  },
+  "dependencies": {
+    "wrangler": "4.110.0"
+  }
+}
