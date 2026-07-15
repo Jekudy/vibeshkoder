@@ -43,7 +43,7 @@ _CITATION_RE = re.compile(
 )
 _MAX_TITLE_LENGTH = 240
 _MAX_BODY_LENGTH = 100_000
-_PROMPT_VERSION = "wiki-revision-v0.1.0"
+WIKI_PROMPT_TEMPLATE_VERSION = "wiki-revision-v0.1.0"
 
 _MESSAGE_SOURCES_SQL = """
 SELECT
@@ -362,7 +362,7 @@ async def compile_topic_page(
         prior_revision_seq=base.revision_seq if base else 0,
         source_cards=cards,
         source_messages=messages,
-        prompt_template_version=_PROMPT_VERSION,
+        prompt_template_version=WIKI_PROMPT_TEMPLATE_VERSION,
         source_chat_id=source_chat_id,
     )
     title, body, ledger_id, cited_cards, cited_mvids = _validate_draft(
@@ -722,6 +722,7 @@ def _slug_lock_id(slug: str) -> int:
 
 
 __all__ = [
+    "WIKI_PROMPT_TEMPLATE_VERSION",
     "WikiCompilationResult",
     "WikiCompilerContractError",
     "WikiCompilerError",

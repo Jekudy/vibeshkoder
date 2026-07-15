@@ -346,7 +346,8 @@ async def test_wiki_automation_runs_promote_compile_export_publish_pipeline(
         "bot.services.candidate_promotion.promote_pending_candidates",
         promote,
     )
-    monkeypatch.setattr(scheduler_module, "load_gateway_config", Mock(return_value=gateway_config))
+    gateway_config_load = Mock(return_value=gateway_config)
+    monkeypatch.setattr(scheduler_module, "load_gateway_config", gateway_config_load)
     monkeypatch.setattr(scheduler_module, "resolve_provider", Mock(return_value=object()))
     monkeypatch.setattr("bot.services.wiki_orchestrator.compile_changed_topics", compile_topics)
     monkeypatch.setattr("bot.services.wiki_orchestrator.export_static_wiki", export)
@@ -354,6 +355,7 @@ async def test_wiki_automation_runs_promote_compile_export_publish_pipeline(
 
     await scheduler_module.wiki_automation_job()
 
+    gateway_config_load.assert_called_once_with(prompt_template_version="wiki-revision-v0.1.0")
     require_actor.assert_awaited_once_with(sessions[0], 42)
     promote.assert_awaited_once_with(sessions[0], actor_user_id=42, limit=100)
     sessions[0].commit.assert_awaited_once()
