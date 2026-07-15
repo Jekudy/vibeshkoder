@@ -43,6 +43,8 @@ _SECRET_RE = re.compile(
     r")"
 )
 PUBLIC_GENERATION_MANIFEST_PATH = "generation-manifest.json"
+_NETWORK_REDACTION_MARKER = "[external reference removed]"
+_NON_WHITESPACE_TOKEN_RE = re.compile(r"\S+")
 _DANGEROUS_ELEMENT_RE = re.compile(
     r"<(script|style|iframe|form|object|embed|applet|base|link|meta)"
     r"(?:\s[^>]*)?>.*?</\1>",
@@ -244,14 +246,14 @@ def _validate_inputs(
             raise ValueError("page body and positive revision_seq are required")
         if not _CITATION_RE.search(page.body_markdown):
             raise ValueError("every exported page must contain at least one source citation")
-        _scan_user_content(page.title, forbidden_origins=forbidden_origins)
-        _scan_user_content(page.body_markdown, forbidden_origins=forbidden_origins)
+        public_title = _prepare_public_text(page.title, forbidden_origins=forbidden_origins)
+        public_body = _prepare_public_text(page.body_markdown, forbidden_origins=forbidden_origins)
         slugs.add(page.slug)
         normalized.append(
             StaticWikiPage(
                 slug=page.slug,
-                title=page.title.strip(),
-                body_markdown=page.body_markdown.strip(),
+                title=public_title.strip(),
+                body_markdown=public_body.strip(),
                 revision_seq=page.revision_seq,
             )
         )
@@ -264,6 +266,31 @@ def _scan_user_content(value: str, *, forbidden_origins: tuple[str, ...]) -> Non
         raise StaticExportSecurityError("network reference is forbidden in static export")
     if _SECRET_RE.search(value):
         raise StaticExportSecurityError("secret-like material is forbidden in static export")
+
+
+def _prepare_public_text(value: str, *, forbidden_origins: tuple[str, ...]) -> str:
+    """Redact network tokens after fail-closed checks on the private source."""
+    _assert_no_forbidden_origin(value, forbidden_origins=forbidden_origins)
+    if _SECRET_RE.search(value):
+        raise StaticExportSecurityError("secret-like material is forbidden in static export")
+    redacted = _redact_network_references(value)
+    _scan_user_content(redacted, forbidden_origins=forbidden_origins)
+    return redacted
+
+
+def _redact_network_references(value: str) -> str:
+    """Conservatively replace every whitespace-delimited token containing a network ref."""
+
+    def redact_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if not _NETWORK_RE.search(token):
+            return token
+        citations = "".join(citation.group(0) for citation in _CITATION_RE.finditer(token))
+        return f"{_NETWORK_REDACTION_MARKER}{citations}"
+
+    # ponytail: redact the whole token; use Markdown-aware spans only if public copy
+    # quality requires it.
+    return _NON_WHITESPACE_TOKEN_RE.sub(redact_token, value)
 
 
 def _normalize_forbidden_origins(values: Iterable[str]) -> tuple[str, ...]:
