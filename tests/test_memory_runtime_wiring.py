@@ -9,15 +9,12 @@ from __future__ import annotations
 
 import ast
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
-from aiogram.types import Chat, Message, MessageEntity, Update, User
+from aiogram import Dispatcher
 
 from tests.conftest import import_module
 
@@ -71,56 +68,14 @@ def test_runtime_lock_contains_static_wiki_dependencies() -> None:
     assert {"bleach", "markdown-it-py", "mdurl", "webencodings"} <= packages
 
 
-async def test_recall_command_is_registered_and_reachable_through_aiogram(
-    monkeypatch,
-) -> None:
-    """The public ``/recall`` entry point must be a real aiogram route."""
+def test_recall_command_is_not_publicly_registered() -> None:
+    """Member Q&A is mention/reply-only; the legacy command is not a route."""
 
     qa = import_module("bot.handlers.qa")
-    registered_handlers = [
-        handler for handler in qa.router.message.handlers if handler.callback is qa.recall_handler
-    ]
-    assert len(registered_handlers) == 1
+    callbacks = [handler.callback for handler in qa.router.message.handlers]
 
-    command_filters = [
-        filter_object.callback
-        for filter_object in registered_handlers[0].filters
-        if isinstance(filter_object.callback, Command)
-    ]
-    assert len(command_filters) == 1
-    assert command_filters[0].commands == ("recall",)
-
-    feature_flag_get = AsyncMock(return_value=False)
-    monkeypatch.setattr(qa.FeatureFlagRepo, "get", feature_flag_get)
-
-    dispatcher = Dispatcher()
-    dispatcher.include_router(qa.router)
-    bot = Bot(token="123456:test-token")
-    bot._me = User(
-        id=123456,
-        is_bot=True,
-        first_name="Shkoder",
-        username="vibeshkoder_dev_bot",
-    )
-    session = AsyncMock()
-    update = Update(
-        update_id=1,
-        message=Message(
-            message_id=10,
-            date=datetime.now(timezone.utc),
-            chat=Chat(id=-1009999999999, type="supergroup", title="Runtime test"),
-            from_user=User(id=42, is_bot=False, first_name="Member"),
-            text="/recall память",
-            entities=[MessageEntity(type="bot_command", offset=0, length=7)],
-        ),
-    )
-
-    try:
-        await dispatcher.feed_update(bot, update, session=session)
-    finally:
-        await bot.session.close()
-
-    feature_flag_get.assert_awaited_once_with(session, qa.QA_FEATURE_FLAG)
+    assert qa.recall_handler not in callbacks
+    assert callbacks.count(qa.mention_question_handler) == 1
 
 
 def test_forget_routers_are_not_imported_or_registered() -> None:

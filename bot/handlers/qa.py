@@ -8,7 +8,7 @@ from typing import Any
 
 from aiogram import Router
 from aiogram.exceptions import TelegramForbiddenError
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import CommandObject
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -345,7 +345,6 @@ async def _write_trace(
     )
 
 
-@router.message(Command("recall"))
 async def recall_handler(
     message: Message,
     command: CommandObject,
