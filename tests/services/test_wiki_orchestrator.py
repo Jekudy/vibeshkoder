@@ -234,6 +234,50 @@ async def test_changed_topics_can_be_committed_one_at_a_time(db_session) -> None
     assert [call["slug"] for call in gateway.calls] == ["alpha", "beta"]
 
 
+async def test_targeted_changed_topic_compiles_that_slug_only(db_session) -> None:
+    from bot.services.wiki_orchestrator import compile_changed_topics
+
+    actor_id = await _make_user(db_session)
+    await _make_card(db_session, actor_id=actor_id, topic_slug="alpha", title="Alpha")
+    await _make_card(db_session, actor_id=actor_id, topic_slug="beta", title="Beta")
+    gateway = _Gateway()
+
+    targeted = await compile_changed_topics(
+        db_session,
+        actor_user_id=actor_id,
+        gateway=gateway,
+        publication_authorized=True,
+        source_chat_id=SOURCE_CHAT_ID,
+        max_topics=1,
+        target_topic_slug="beta",
+    )
+
+    assert targeted.compiled_topics == 1
+    assert targeted.remaining_changed_topics == 1
+    assert [call["slug"] for call in gateway.calls] == ["beta"]
+
+
+async def test_missing_targeted_topic_never_falls_back_to_another_slug(db_session) -> None:
+    from bot.services.wiki_orchestrator import WikiOrchestrationError, compile_changed_topics
+
+    actor_id = await _make_user(db_session)
+    await _make_card(db_session, actor_id=actor_id, topic_slug="alpha", title="Alpha")
+    gateway = _Gateway()
+
+    with pytest.raises(WikiOrchestrationError, match="no longer changed and eligible"):
+        await compile_changed_topics(
+            db_session,
+            actor_user_id=actor_id,
+            gateway=gateway,
+            publication_authorized=True,
+            source_chat_id=SOURCE_CHAT_ID,
+            max_topics=1,
+            target_topic_slug="missing",
+        )
+
+    assert gateway.calls == []
+
+
 async def test_static_export_acquires_and_uses_governed_snapshot_locks(
     db_session,
     tmp_path,

@@ -181,6 +181,22 @@ class WikiGatewayContractError(WikiGatewayError):
     """The provider returned a malformed or unsupported wiki revision."""
 
 
+class WikiGatewayResponseContractError(WikiGatewayContractError):
+    """The provider response text failed strict wiki revision validation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        topic_slug: str,
+        llm_usage_ledger_id: int,
+    ) -> None:
+        if not isinstance(topic_slug, str) or not topic_slug:
+            raise ValueError("topic_slug must be a non-empty string")
+        super().__init__(message, llm_usage_ledger_id=llm_usage_ledger_id)
+        self.topic_slug = topic_slug
+
+
 class WikiGatewayBudgetExceeded(WikiGatewayError):
     """Wiki compilation was refused by the shared LLM cost ceiling."""
 
@@ -1994,6 +2010,7 @@ def _unwrap_whole_response_json_fence(answer_text: str) -> str:
 def _validate_wiki_provider_response(
     answer_text: str,
     *,
+    topic_slug: str,
     allowed_card_ids: set[str],
     allowed_mvids: set[int],
     llm_usage_ledger_id: int,
@@ -2001,37 +2018,43 @@ def _validate_wiki_provider_response(
     try:
         payload = json.loads(_unwrap_whole_response_json_fence(answer_text))
     except json.JSONDecodeError as exc:
-        raise WikiGatewayContractError(
+        raise WikiGatewayResponseContractError(
             "wiki provider response is not valid JSON",
+            topic_slug=topic_slug,
             llm_usage_ledger_id=llm_usage_ledger_id,
         ) from exc
     if not isinstance(payload, dict) or set(payload) != {"title", "body_markdown"}:
-        raise WikiGatewayContractError(
+        raise WikiGatewayResponseContractError(
             "wiki provider response must use the exact object schema",
+            topic_slug=topic_slug,
             llm_usage_ledger_id=llm_usage_ledger_id,
         )
     title = payload["title"]
     body = payload["body_markdown"]
     if not isinstance(title, str) or not title.strip() or len(title.strip()) > 240:
-        raise WikiGatewayContractError(
+        raise WikiGatewayResponseContractError(
             "wiki provider title is invalid",
+            topic_slug=topic_slug,
             llm_usage_ledger_id=llm_usage_ledger_id,
         )
     if not isinstance(body, str) or not body.strip() or len(body) > MAX_WIKI_PRIOR_BODY_CHARS:
-        raise WikiGatewayContractError(
+        raise WikiGatewayResponseContractError(
             "wiki provider body_markdown is invalid",
+            topic_slug=topic_slug,
             llm_usage_ledger_id=llm_usage_ledger_id,
         )
 
     cited_cards, cited_mvids = _wiki_citation_sets(body)
     if not cited_cards and not cited_mvids:
-        raise WikiGatewayContractError(
+        raise WikiGatewayResponseContractError(
             "wiki provider body must contain at least one citation",
+            topic_slug=topic_slug,
             llm_usage_ledger_id=llm_usage_ledger_id,
         )
     if cited_cards - allowed_card_ids or cited_mvids - allowed_mvids:
-        raise WikiGatewayContractError(
+        raise WikiGatewayResponseContractError(
             "wiki provider returned an unsupported citation",
+            topic_slug=topic_slug,
             llm_usage_ledger_id=llm_usage_ledger_id,
         )
     return title.strip(), body.strip()
@@ -2432,6 +2455,7 @@ async def revise_wiki_topic(
     try:
         title, body = _validate_wiki_provider_response(
             provider_result.answer_text,
+            topic_slug=slug,
             allowed_card_ids=allowed_card_ids,
             allowed_mvids=allowed_mvids,
             llm_usage_ledger_id=ledger_id,
@@ -4244,6 +4268,7 @@ __all__ = [
     "WikiGatewayContractError",
     "WikiGatewayError",
     "WikiGatewayProviderError",
+    "WikiGatewayResponseContractError",
     "WikiGatewaySourceStaleError",
     "_cache_input_hash",
     "_normalize_query",

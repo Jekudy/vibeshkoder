@@ -32,11 +32,16 @@ async def save_chat_message(
     if message.from_user is None:
         return
 
-    # The bot's own digest/Q&A/wiki posts are output, never source memory.  Skipping
-    # before UserRepo/persistence prevents feedback loops while raw transport audit can
-    # still be retained by the upstream middleware.
+    # This bot's own digest/Q&A/wiki posts are output, never source memory. Other bots
+    # remain valid source authors. Skipping only the running bot before
+    # UserRepo/persistence prevents feedback loops while the upstream middleware still
+    # retains every delivered raw update.
     if message.from_user.is_bot:
-        return
+        runtime_bot = message.bot
+        if runtime_bot is None:
+            raise RuntimeError("bot-authored message requires an attached bot instance")
+        if message.from_user.id == runtime_bot.id:
+            return
 
     # Keep sender profile fresh for message attribution and admin lookups.
     await UserRepo.upsert(

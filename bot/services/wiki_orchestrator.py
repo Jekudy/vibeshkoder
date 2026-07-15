@@ -183,13 +183,18 @@ async def compile_changed_topics(
     publication_authorized: bool,
     source_chat_id: int,
     max_topics: int | None = None,
+    target_topic_slug: str | None = None,
 ) -> WikiOrchestrationResult:
-    """Compile every changed topic exactly once in the caller transaction."""
+    """Compile changed topics, optionally pinning one exact retry slug."""
     if publication_authorized is not True:
         raise WikiOrchestrationError("explicit publication authorization is required")
     _require_source_chat_id(source_chat_id)
     if max_topics is not None and (type(max_topics) is not int or not 1 <= max_topics <= 256):
         raise ValueError("max_topics must be an integer from 1 to 256")
+    if target_topic_slug is not None and (
+        not isinstance(target_topic_slug, str) or not target_topic_slug
+    ):
+        raise ValueError("target_topic_slug must be a non-empty string")
     await _require_actor(session, actor_user_id)
     if session.bind is not None and session.bind.dialect.name == "postgresql":
         await session.execute(
@@ -237,7 +242,12 @@ async def compile_changed_topics(
         )
     )
 
-    selected_topics = changed if max_topics is None else changed[:max_topics]
+    if target_topic_slug is None:
+        selected_topics = changed if max_topics is None else changed[:max_topics]
+    else:
+        selected_topics = [topic for topic in changed if topic.slug == target_topic_slug]
+        if not selected_topics:
+            raise WikiOrchestrationError("target topic is no longer changed and eligible")
     revisions: list[WikiCompilationResult] = []
     for topic in selected_topics:
         revisions.append(

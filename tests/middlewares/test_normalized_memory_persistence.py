@@ -13,15 +13,21 @@ pytestmark = pytest.mark.usefixtures("app_env")
 COMMUNITY_CHAT_ID = -1001234567890
 
 
-def _update(*, is_bot: bool = False, photo: bool = False) -> Update:
-    return Update(
+def _update(
+    *,
+    is_bot: bool = False,
+    sender_id: int = 701,
+    runtime_bot_id: int | None = None,
+    photo: bool = False,
+) -> Update:
+    update = Update(
         update_id=9001,
         message=Message(
             message_id=7001,
             date=datetime.now(timezone.utc),
             chat=Chat(id=COMMUNITY_CHAT_ID, type="supergroup"),
             from_user=User(
-                id=701,
+                id=sender_id,
                 is_bot=is_bot,
                 first_name="Shkoder" if is_bot else "Member",
                 username="shkoder_bot" if is_bot else "member",
@@ -41,6 +47,10 @@ def _update(*, is_bot: bool = False, photo: bool = False) -> Update:
             ),
         ),
     )
+    if runtime_bot_id is not None:
+        assert update.message is not None
+        update.message.as_(SimpleNamespace(id=runtime_bot_id))
+    return update
 
 
 async def test_persists_command_before_specific_handler_and_commits(monkeypatch):
@@ -101,7 +111,7 @@ async def test_queues_photo_even_when_later_handler_consumes_message(monkeypatch
     session.commit.assert_awaited_once()
 
 
-async def test_bot_output_is_not_written_to_normalized_memory(monkeypatch):
+async def test_own_bot_output_is_not_written_to_normalized_memory(monkeypatch):
     from bot.middlewares import normalized_memory_persistence as module
 
     upsert = AsyncMock()
@@ -115,7 +125,7 @@ async def test_bot_output_is_not_written_to_normalized_memory(monkeypatch):
 
     await module.NormalizedMemoryPersistenceMiddleware()(
         downstream,
-        _update(is_bot=True),
+        _update(is_bot=True, sender_id=701, runtime_bot_id=701),
         {"session": session},
     )
 
@@ -124,3 +134,42 @@ async def test_bot_output_is_not_written_to_normalized_memory(monkeypatch):
     enqueue.assert_not_awaited()
     session.commit.assert_not_awaited()
     downstream.assert_awaited_once()
+
+
+async def test_other_bot_output_is_written_to_normalized_memory(monkeypatch):
+    from bot.middlewares import normalized_memory_persistence as module
+
+    upsert = AsyncMock()
+    persist = AsyncMock(return_value=SimpleNamespace(chat_message=SimpleNamespace(id=993)))
+    downstream = AsyncMock()
+    session = AsyncMock()
+    monkeypatch.setattr(module.UserRepo, "upsert", upsert)
+    monkeypatch.setattr(module, "persist_message_with_policy", persist)
+    monkeypatch.setattr(module, "enqueue_photo_memory", AsyncMock())
+
+    await module.NormalizedMemoryPersistenceMiddleware()(
+        downstream,
+        _update(is_bot=True, sender_id=702, runtime_bot_id=701),
+        {"session": session},
+    )
+
+    upsert.assert_awaited_once()
+    persist.assert_awaited_once()
+    session.commit.assert_awaited_once()
+    downstream.assert_awaited_once()
+
+
+async def test_bot_authored_message_without_runtime_bot_fails_fast(monkeypatch):
+    from bot.middlewares import normalized_memory_persistence as module
+
+    persist = AsyncMock()
+    monkeypatch.setattr(module, "persist_message_with_policy", persist)
+
+    with pytest.raises(RuntimeError, match="attached bot"):
+        await module.NormalizedMemoryPersistenceMiddleware()(
+            AsyncMock(),
+            _update(is_bot=True, sender_id=701),
+            {"session": AsyncMock()},
+        )
+
+    persist.assert_not_awaited()

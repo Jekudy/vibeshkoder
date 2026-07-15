@@ -19,6 +19,8 @@ COMMUNITY_CHAT_ID = -1001234567890
 def _message(
     *,
     is_bot: bool,
+    sender_id: int = 777,
+    runtime_bot_id: int | None = None,
     text: str = "сообщение",
     with_photo: bool = False,
 ) -> SimpleNamespace:
@@ -26,12 +28,13 @@ def _message(
         message_id=701,
         chat=SimpleNamespace(id=COMMUNITY_CHAT_ID, type="supergroup"),
         from_user=SimpleNamespace(
-            id=777,
+            id=sender_id,
             username="shkoder" if is_bot else "member",
             first_name="Shkoder" if is_bot else "Member",
             last_name=None,
             is_bot=is_bot,
         ),
+        bot=SimpleNamespace(id=runtime_bot_id) if runtime_bot_id is not None else None,
         text=text,
         caption=None,
         date=datetime.now(timezone.utc),
@@ -74,7 +77,7 @@ async def test_catch_all_persists_human_message(monkeypatch) -> None:
     enqueue.assert_not_awaited()
 
 
-async def test_catch_all_skips_bot_authored_message_before_any_normalized_write(
+async def test_catch_all_skips_own_bot_message_before_any_normalized_write(
     monkeypatch,
 ) -> None:
     handler = import_module("bot.handlers.chat_messages")
@@ -86,13 +89,57 @@ async def test_catch_all_skips_bot_authored_message_before_any_normalized_write(
     monkeypatch.setattr(handler, "enqueue_photo_memory", enqueue)
 
     await handler.save_chat_message(
-        _message(is_bot=True, text="Дневной дайджест от Шкодера"),
+        _message(
+            is_bot=True,
+            sender_id=777,
+            runtime_bot_id=777,
+            text="Дневной дайджест от Шкодера",
+        ),
         AsyncMock(),
     )
 
     upsert.assert_not_awaited()
     persist.assert_not_awaited()
     enqueue.assert_not_awaited()
+
+
+async def test_catch_all_persists_other_bot_message(monkeypatch) -> None:
+    handler = import_module("bot.handlers.chat_messages")
+    upsert = AsyncMock()
+    persist = AsyncMock(
+        return_value=SimpleNamespace(
+            policy="normal",
+            is_offrecord_mark_created=False,
+            chat_message=SimpleNamespace(id=803),
+        )
+    )
+    monkeypatch.setattr(handler.UserRepo, "upsert", upsert)
+    monkeypatch.setattr(handler, "persist_message_with_policy", persist)
+    monkeypatch.setattr(handler, "enqueue_photo_memory", AsyncMock())
+
+    await handler.save_chat_message(
+        _message(is_bot=True, sender_id=888, runtime_bot_id=777),
+        AsyncMock(),
+    )
+
+    upsert.assert_awaited_once()
+    persist.assert_awaited_once()
+
+
+async def test_catch_all_bot_authored_message_without_runtime_bot_fails_fast(
+    monkeypatch,
+) -> None:
+    handler = import_module("bot.handlers.chat_messages")
+    persist = AsyncMock()
+    monkeypatch.setattr(handler, "persist_message_with_policy", persist)
+
+    with pytest.raises(RuntimeError, match="attached bot"):
+        await handler.save_chat_message(
+            _message(is_bot=True, sender_id=777),
+            AsyncMock(),
+        )
+
+    persist.assert_not_awaited()
 
 
 async def test_catch_all_queues_human_photo_after_normalized_persistence(

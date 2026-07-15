@@ -1,4 +1,4 @@
-"""Durably persist every human community message before router dispatch."""
+"""Durably persist every community source message before router dispatch."""
 
 from __future__ import annotations
 
@@ -15,13 +15,14 @@ from bot.services.message_persistence import persist_message_with_policy
 
 
 class NormalizedMemoryPersistenceMiddleware(BaseMiddleware):
-    """Archive human messages even when a higher-priority router consumes them.
+    """Archive source messages even when a higher-priority router consumes them.
 
     The archive transaction commits before the product handler runs.  A later
     command failure can therefore roll back its own side effects without
-    silently losing the source conversation.  Bot-authored output is excluded
-    from normalized/derived memory to prevent feedback loops; raw update
-    persistence remains the audit boundary for those updates.
+    silently losing the source conversation.  Only output authored by this
+    running bot is excluded from normalized/derived memory to prevent feedback
+    loops; other bots remain valid sources.  Raw update persistence remains the
+    audit boundary for every delivered update.
     """
 
     async def __call__(
@@ -35,8 +36,14 @@ class NormalizedMemoryPersistenceMiddleware(BaseMiddleware):
 
         message = event.message
         sender = message.from_user
-        if sender is None or sender.is_bot or message.chat.id != settings.COMMUNITY_CHAT_ID:
+        if sender is None or message.chat.id != settings.COMMUNITY_CHAT_ID:
             return await handler(event, data)
+        if sender.is_bot:
+            runtime_bot = message.bot
+            if runtime_bot is None:
+                raise RuntimeError("bot-authored message requires an attached bot instance")
+            if sender.id == runtime_bot.id:
+                return await handler(event, data)
 
         session = data.get("session")
         if session is None:
