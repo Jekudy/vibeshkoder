@@ -347,8 +347,9 @@ async def test_wiki_automation_runs_promote_compile_export_publish_pipeline(
         promote,
     )
     gateway_config_load = Mock(return_value=gateway_config)
+    provider_resolve = Mock(return_value=object())
     monkeypatch.setattr(scheduler_module, "load_gateway_config", gateway_config_load)
-    monkeypatch.setattr(scheduler_module, "resolve_provider", Mock(return_value=object()))
+    monkeypatch.setattr(scheduler_module, "resolve_provider", provider_resolve)
     monkeypatch.setattr("bot.services.wiki_orchestrator.compile_changed_topics", compile_topics)
     monkeypatch.setattr("bot.services.wiki_orchestrator.export_static_wiki", export)
     monkeypatch.setattr("bot.services.cloudflare_pages.publish_static_generation", publish)
@@ -356,6 +357,11 @@ async def test_wiki_automation_runs_promote_compile_export_publish_pipeline(
     await scheduler_module.wiki_automation_job()
 
     gateway_config_load.assert_called_once_with(prompt_template_version="wiki-revision-v0.1.0")
+    provider_resolve.assert_called_once_with(
+        "deepseek",
+        deepseek_max_tokens=scheduler_module.DEEPSEEK_WIKI_MAX_TOKENS,
+        deepseek_json_output=True,
+    )
     require_actor.assert_awaited_once_with(sessions[0], 42)
     promote.assert_awaited_once_with(sessions[0], actor_user_id=42, limit=100)
     sessions[0].commit.assert_awaited_once()
