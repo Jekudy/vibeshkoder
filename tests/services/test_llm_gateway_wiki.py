@@ -291,6 +291,7 @@ def test_validate_wiki_provider_response_accepts_one_whole_json_fence(
 
     assert _validate_wiki_provider_response(
         f"```json{newline}{bare}{newline}```",
+        topic_slug="topic",
         allowed_card_ids=set(),
         allowed_mvids={123},
         llm_usage_ledger_id=7,
@@ -312,17 +313,51 @@ def test_validate_wiki_provider_response_rejects_non_exact_json_fences(
     answer_text: str,
 ) -> None:
     from bot.services.llm_gateway import (
-        WikiGatewayContractError,
+        WikiGatewayResponseContractError,
         _validate_wiki_provider_response,
     )
 
-    with pytest.raises(WikiGatewayContractError, match="not valid JSON"):
+    with pytest.raises(WikiGatewayResponseContractError, match="not valid JSON"):
         _validate_wiki_provider_response(
             answer_text,
+            topic_slug="topic",
             allowed_card_ids=set(),
             allowed_mvids={123},
             llm_usage_ledger_id=7,
         )
+
+
+@pytest.mark.parametrize(
+    "answer_text",
+    [
+        json.dumps({"title": "Topic", "body_markdown": "Fact [^mv:123].", "extra": True}),
+        json.dumps({"title": "", "body_markdown": "Fact [^mv:123]."}),
+        json.dumps({"title": "Topic", "body_markdown": ""}),
+        json.dumps({"title": "Topic", "body_markdown": "No citation."}),
+        json.dumps({"title": "Topic", "body_markdown": "Fact [^mv:999]."}),
+    ],
+)
+def test_wiki_response_validation_failures_use_narrow_retryable_subclass(
+    answer_text: str,
+) -> None:
+    from bot.services.llm_gateway import (
+        WikiGatewayContractError,
+        WikiGatewayResponseContractError,
+        _validate_wiki_provider_response,
+    )
+
+    with pytest.raises(WikiGatewayResponseContractError) as raised:
+        _validate_wiki_provider_response(
+            answer_text,
+            topic_slug="topic",
+            allowed_card_ids=set(),
+            allowed_mvids={123},
+            llm_usage_ledger_id=7,
+        )
+
+    assert isinstance(raised.value, WikiGatewayContractError)
+    assert raised.value.llm_usage_ledger_id == 7
+    assert raised.value.topic_slug == "topic"
 
 
 async def test_revise_wiki_topic_commits_priced_reservation_before_provider_finishes(
@@ -857,6 +892,7 @@ async def test_revise_wiki_topic_terminally_audits_malformed_provider_result(
         await caller_savepoint.rollback()
 
     ledger_id = raised.value.llm_usage_ledger_id
+    assert type(raised.value) is WikiGatewayContractError
     assert isinstance(ledger_id, int) and ledger_id > 0
     async with durable_ledger_factory() as fresh_session:
         row = (

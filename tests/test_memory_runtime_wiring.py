@@ -34,6 +34,44 @@ def _function_source(path: Path, function_name: str) -> str:
     raise AssertionError(f"function {function_name!r} not found in {path}")
 
 
+def _patch_wiki_compile_job(
+    monkeypatch,
+    scheduler_module,
+    *,
+    sessions: list[AsyncMock],
+    flag_values: list[bool],
+    compile_side_effect: object,
+    export_result: object | None = None,
+) -> tuple[AsyncMock, AsyncMock]:
+    session_iter = iter(sessions)
+
+    @asynccontextmanager
+    async def session_context():
+        yield next(session_iter)
+
+    monkeypatch.setattr(scheduler_module, "async_session", session_context)
+    monkeypatch.setattr(
+        "bot.db.repos.feature_flag.FeatureFlagRepo.get",
+        AsyncMock(side_effect=flag_values),
+    )
+    monkeypatch.setattr(scheduler_module, "_load_automation_actor_user_id", lambda: 42)
+    monkeypatch.setattr(scheduler_module, "_require_automation_actor", AsyncMock())
+    monkeypatch.setattr(
+        scheduler_module,
+        "load_gateway_config",
+        Mock(return_value=SimpleNamespace(provider="deepseek")),
+    )
+    monkeypatch.setattr(scheduler_module, "resolve_provider", Mock(return_value=object()))
+    compile_topics = AsyncMock(side_effect=compile_side_effect)
+    export = AsyncMock(return_value=export_result)
+    monkeypatch.setattr(
+        "bot.services.wiki_orchestrator.compile_changed_topics",
+        compile_topics,
+    )
+    monkeypatch.setattr("bot.services.wiki_orchestrator.export_static_wiki", export)
+    return compile_topics, export
+
+
 def test_memory_middlewares_are_registered_in_runtime_order() -> None:
     """DB must wrap raw, raw must wrap normalized, all before routers run."""
 
@@ -514,6 +552,170 @@ async def test_wiki_topics_commit_individually_and_provider_errors_are_sanitized
     sessions[2].commit.assert_not_awaited()
     assert "sentinel-secret" not in str(caught.value)
     assert "sentinel-secret" not in caplog.text
+
+
+async def test_wiki_response_contract_failure_retries_once_in_fresh_session(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+) -> None:
+    scheduler_module = import_module("bot.services.scheduler")
+    gateway_module = import_module("bot.services.llm_gateway")
+    caplog.set_level("INFO", logger="bot.services.scheduler")
+    sessions = [AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock()]
+    export_result = SimpleNamespace(
+        generation_dir=tmp_path / "generation",
+        manifest_sha256="c" * 64,
+        page_count=1,
+    )
+    compile_topics, export = _patch_wiki_compile_job(
+        monkeypatch,
+        scheduler_module,
+        sessions=sessions,
+        flag_values=[True, False, True, True, True, False],
+        compile_side_effect=[
+            gateway_module.WikiGatewayResponseContractError(
+                "sentinel-secret-provider-response",
+                llm_usage_ledger_id=101,
+                topic_slug="topic-a",
+            ),
+            SimpleNamespace(
+                topics_seen=1,
+                compiled_topics=1,
+                remaining_changed_topics=0,
+            ),
+        ],
+        export_result=export_result,
+    )
+    monkeypatch.setattr(
+        "bot.services.wiki_runtime.load_wiki_runtime_config",
+        Mock(
+            return_value=SimpleNamespace(
+                publish_dir=tmp_path / "current",
+                site_title="Shkoder Wiki",
+                forbidden_origins=("187.77.98.73",),
+            )
+        ),
+    )
+    publish = AsyncMock()
+    monkeypatch.setattr("bot.services.cloudflare_pages.publish_static_generation", publish)
+
+    await scheduler_module.wiki_automation_job()
+
+    assert compile_topics.await_count == 2
+    assert compile_topics.await_args_list[0].args[0] is sessions[1]
+    assert compile_topics.await_args_list[1].args[0] is sessions[2]
+    assert "target_topic_slug" not in compile_topics.await_args_list[0].kwargs
+    assert compile_topics.await_args_list[1].kwargs["target_topic_slug"] == "topic-a"
+    sessions[1].commit.assert_not_awaited()
+    sessions[2].commit.assert_awaited_once()
+    export.assert_awaited_once()
+    publish.assert_not_awaited()
+    assert "sentinel-secret" not in caplog.text
+    retry_record = next(
+        record
+        for record in caplog.records
+        if record.message == "wiki_automation_response_contract_retry"
+    )
+    assert (retry_record.attempt, retry_record.max_attempts, retry_record.failed_ledger_id) == (
+        1,
+        2,
+        101,
+    )
+    completed_record = next(
+        record for record in caplog.records if record.message == "wiki_automation_completed"
+    )
+    assert (completed_record.compile_attempts, completed_record.contract_retries) == (2, 1)
+
+
+async def test_wiki_response_contract_retry_exhaustion_is_sanitized_and_does_not_export(
+    monkeypatch,
+    caplog,
+) -> None:
+    scheduler_module = import_module("bot.services.scheduler")
+    gateway_module = import_module("bot.services.llm_gateway")
+    sessions = [AsyncMock(), AsyncMock(), AsyncMock()]
+    compile_topics, export = _patch_wiki_compile_job(
+        monkeypatch,
+        scheduler_module,
+        sessions=sessions,
+        flag_values=[True, False, True, True],
+        compile_side_effect=[
+            gateway_module.WikiGatewayResponseContractError(
+                "sentinel-secret-first",
+                llm_usage_ledger_id=201,
+                topic_slug="topic-a",
+            ),
+            gateway_module.WikiGatewayResponseContractError(
+                "sentinel-secret-second",
+                llm_usage_ledger_id=202,
+                topic_slug="topic-a",
+            ),
+        ],
+    )
+
+    with pytest.raises(
+        scheduler_module.WikiAutomationJobError,
+        match="wiki response contract attempts exhausted",
+    ) as caught:
+        await scheduler_module.wiki_automation_job()
+
+    assert compile_topics.await_count == 2
+    assert compile_topics.await_args_list[1].kwargs["target_topic_slug"] == "topic-a"
+    export.assert_not_awaited()
+    assert "sentinel-secret" not in str(caught.value)
+    assert "sentinel-secret" not in caplog.text
+    exhausted_record = next(
+        record
+        for record in caplog.records
+        if record.message == "wiki_automation_response_contract_exhausted"
+    )
+    assert (
+        exhausted_record.attempt,
+        exhausted_record.max_attempts,
+        exhausted_record.failed_ledger_id,
+    ) == (2, 2, 202)
+
+
+@pytest.mark.parametrize(
+    "error_name",
+    [
+        "WikiGatewayContractError",
+        "WikiGatewayProviderError",
+        "WikiGatewaySourceStaleError",
+        "WikiGatewayBudgetExceeded",
+        "RuntimeError",
+    ],
+)
+async def test_wiki_non_response_contract_errors_are_not_retried(
+    monkeypatch,
+    error_name: str,
+) -> None:
+    scheduler_module = import_module("bot.services.scheduler")
+    gateway_module = import_module("bot.services.llm_gateway")
+    sessions = [AsyncMock(), AsyncMock()]
+
+    error_cls = (
+        RuntimeError if error_name == "RuntimeError" else getattr(gateway_module, error_name)
+    )
+    error = (
+        error_cls("sentinel-secret", llm_usage_ledger_id=301)
+        if error_name != "RuntimeError"
+        else error_cls("sentinel-secret")
+    )
+    compile_topics, export = _patch_wiki_compile_job(
+        monkeypatch,
+        scheduler_module,
+        sessions=sessions,
+        flag_values=[True, False, True],
+        compile_side_effect=error,
+    )
+
+    with pytest.raises(scheduler_module.WikiAutomationJobError):
+        await scheduler_module.wiki_automation_job()
+
+    compile_topics.assert_awaited_once()
+    export.assert_not_awaited()
 
 
 def test_wiki_automation_is_registered_for_0930_moscow(monkeypatch) -> None:

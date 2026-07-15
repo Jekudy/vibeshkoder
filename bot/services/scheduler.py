@@ -27,6 +27,7 @@ from bot.services.invite_worker import process_invite_outbox
 from bot.services.llm_gateway import (
     LiveExtractCandidatesGateway,
     LiveWikiCompilerGateway,
+    WikiGatewayResponseContractError,
     load_gateway_config,
     resolve_provider,
 )
@@ -49,6 +50,7 @@ DEEPSEEK_EXTRACTION_MAX_TOKENS = 8_192
 DEEPSEEK_DIGEST_MAX_TOKENS = 4_096
 DEEPSEEK_WIKI_MAX_TOKENS = 8_192
 MAX_WIKI_TOPICS_PER_JOB = 256
+MAX_WIKI_RESPONSE_ATTEMPTS_PER_TOPIC = 2
 
 
 class WikiAutomationJobError(RuntimeError):
@@ -435,19 +437,58 @@ async def wiki_automation_job() -> None:
         )
         topics_seen = 0
         topics_compiled = 0
+        compile_attempts = 0
+        contract_retries = 0
         for _topic_number in range(MAX_WIKI_TOPICS_PER_JOB):
-            async with async_session() as session:
-                if not await FeatureFlagRepo.get(session, WIKI_COMPILER_FEATURE_FLAG):
-                    return
-                compile_result = await compile_changed_topics(
-                    session,
-                    actor_user_id=actor_user_id,
-                    gateway=wiki_gateway,
-                    publication_authorized=True,
-                    source_chat_id=settings.COMMUNITY_CHAT_ID,
-                    max_topics=1,
-                )
-                await session.commit()
+            retry_topic_slug: str | None = None
+            for attempt in range(1, MAX_WIKI_RESPONSE_ATTEMPTS_PER_TOPIC + 1):
+                try:
+                    async with async_session() as session:
+                        if not await FeatureFlagRepo.get(
+                            session,
+                            WIKI_COMPILER_FEATURE_FLAG,
+                        ):
+                            return
+                        compile_attempts += 1
+                        compile_kwargs = {
+                            "actor_user_id": actor_user_id,
+                            "gateway": wiki_gateway,
+                            "publication_authorized": True,
+                            "source_chat_id": settings.COMMUNITY_CHAT_ID,
+                            "max_topics": 1,
+                        }
+                        if retry_topic_slug is not None:
+                            compile_kwargs["target_topic_slug"] = retry_topic_slug
+                        compile_result = await compile_changed_topics(session, **compile_kwargs)
+                        await session.commit()
+                    break
+                except WikiGatewayResponseContractError as exc:
+                    if retry_topic_slug is not None and exc.topic_slug != retry_topic_slug:
+                        raise WikiAutomationJobError(
+                            "wiki response contract retry topic changed"
+                        ) from None
+                    retry_topic_slug = exc.topic_slug
+                    if attempt == MAX_WIKI_RESPONSE_ATTEMPTS_PER_TOPIC:
+                        logger.error(
+                            "wiki_automation_response_contract_exhausted",
+                            extra={
+                                "attempt": attempt,
+                                "max_attempts": MAX_WIKI_RESPONSE_ATTEMPTS_PER_TOPIC,
+                                "failed_ledger_id": exc.llm_usage_ledger_id,
+                            },
+                        )
+                        raise WikiAutomationJobError(
+                            "wiki response contract attempts exhausted"
+                        ) from None
+                    contract_retries += 1
+                    logger.warning(
+                        "wiki_automation_response_contract_retry",
+                        extra={
+                            "attempt": attempt,
+                            "max_attempts": MAX_WIKI_RESPONSE_ATTEMPTS_PER_TOPIC,
+                            "failed_ledger_id": exc.llm_usage_ledger_id,
+                        },
+                    )
             topics_seen = compile_result.topics_seen
             topics_compiled += compile_result.compiled_topics
             if compile_result.remaining_changed_topics == 0:
@@ -505,6 +546,8 @@ async def wiki_automation_job() -> None:
             extra={
                 "topics_seen": topics_seen,
                 "topics_compiled": topics_compiled,
+                "compile_attempts": compile_attempts,
+                "contract_retries": contract_retries,
                 "page_count": export_result.page_count,
                 "manifest_sha256": export_result.manifest_sha256,
                 "publish_status": publish_status,
