@@ -277,6 +277,54 @@ async def test_revise_wiki_topic_uses_bounded_untrusted_prompt_and_audits_succes
     )
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_validate_wiki_provider_response_accepts_one_whole_json_fence(
+    newline: str,
+) -> None:
+    from bot.services.llm_gateway import _validate_wiki_provider_response
+
+    body = "Supported fact [^mv:123]."
+    bare = json.dumps(
+        {"title": "Topic", "body_markdown": body},
+        ensure_ascii=False,
+    )
+
+    assert _validate_wiki_provider_response(
+        f"```json{newline}{bare}{newline}```",
+        allowed_card_ids=set(),
+        allowed_mvids={123},
+        llm_usage_ledger_id=7,
+    ) == ("Topic", body)
+
+
+@pytest.mark.parametrize(
+    "answer_text",
+    [
+        'prefix\n```json\n{"title":"Topic","body_markdown":"Fact [^mv:123]."}\n```',
+        '```json\n{"title":"Topic","body_markdown":"Fact [^mv:123]."}\n```\nsuffix',
+        '```\n{"title":"Topic","body_markdown":"Fact [^mv:123]."}\n```',
+        '```JSON\n{"title":"Topic","body_markdown":"Fact [^mv:123]."}\n```',
+        '```json\n{"title":"Topic","body_markdown":"Fact [^mv:123]."}\n```\n'
+        '```json\n{"title":"Other","body_markdown":"Other [^mv:123]."}\n```',
+    ],
+)
+def test_validate_wiki_provider_response_rejects_non_exact_json_fences(
+    answer_text: str,
+) -> None:
+    from bot.services.llm_gateway import (
+        WikiGatewayContractError,
+        _validate_wiki_provider_response,
+    )
+
+    with pytest.raises(WikiGatewayContractError, match="not valid JSON"):
+        _validate_wiki_provider_response(
+            answer_text,
+            allowed_card_ids=set(),
+            allowed_mvids={123},
+            llm_usage_ledger_id=7,
+        )
+
+
 async def test_revise_wiki_topic_commits_priced_reservation_before_provider_finishes(
     db_session,
     durable_ledger_factory,
