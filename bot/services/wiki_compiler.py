@@ -16,7 +16,24 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
-from sqlalchemy import text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    Uuid,
+    bindparam,
+    cast,
+    column,
+    func,
+    literal,
+    select,
+    table,
+    text,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
 
 _SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
@@ -84,52 +101,137 @@ GROUP BY kc.id, kc.title, kc.body_markdown
 ORDER BY kc.id
 """
 
-_PAGE_SQL = """
-SELECT
-    wp.id,
-    wp.title,
-    wp.body_markdown,
-    wp.updated_at,
-    wp.page_status,
-    wp.visibility,
-    wp.public_enabled,
-    wp.robots_policy,
-    wp.validation_status,
-    COALESCE((
-        SELECT max(wr.revision_seq) FROM wiki_revisions wr WHERE wr.wiki_page_id = wp.id
-    ), 0) AS revision_seq,
-    (
-        SELECT wr.edit_reason
-        FROM wiki_revisions wr
-        WHERE wr.wiki_page_id = wp.id
-        ORDER BY wr.revision_seq DESC
-        LIMIT 1
-    ) AS latest_edit_reason,
-    COALESCE((
-        SELECT wr.source_card_ids_snapshot
-        FROM wiki_revisions wr
-        WHERE wr.wiki_page_id = wp.id
-        ORDER BY wr.revision_seq DESC
-        LIMIT 1
-    ), '[]'::jsonb) AS input_card_ids,
-    COALESCE((
-        SELECT wr.source_message_version_ids_snapshot
-        FROM wiki_revisions wr
-        WHERE wr.wiki_page_id = wp.id
-        ORDER BY wr.revision_seq DESC
-        LIMIT 1
-    ), '[]'::jsonb) AS input_mvids,
-    ARRAY(
-        SELECT wpcs.card_id::text FROM wiki_page_card_sources wpcs
-        WHERE wpcs.wiki_page_id = wp.id ORDER BY wpcs.position, wpcs.card_id
-    ) AS card_ids,
-    ARRAY(
-        SELECT wpms.message_version_id FROM wiki_page_message_sources wpms
-        WHERE wpms.wiki_page_id = wp.id ORDER BY wpms.position, wpms.message_version_id
-    ) AS mvids
-FROM wiki_pages wp
-WHERE wp.slug = :slug
-"""
+_WIKI_PAGES = table(
+    "wiki_pages",
+    column("id", Uuid()),
+    column("slug", String(255)),
+    column("title", Text()),
+    column("body_markdown", Text()),
+    column("updated_at", DateTime(timezone=True)),
+    column("page_status", String(32)),
+    column("visibility", String(32)),
+    column("public_enabled", Boolean()),
+    column("robots_policy", String(16)),
+    column("validation_status", String(32)),
+)
+_WIKI_REVISIONS = table(
+    "wiki_revisions",
+    column("wiki_page_id", Uuid()),
+    column("revision_seq", Integer()),
+    column("edit_reason", Text()),
+    column("source_card_ids_snapshot", JSONB()),
+    column("source_message_version_ids_snapshot", JSONB()),
+)
+_WIKI_PAGE_CARD_SOURCES = table(
+    "wiki_page_card_sources",
+    column("wiki_page_id", Uuid()),
+    column("card_id", Uuid()),
+    column("position", Integer()),
+)
+_WIKI_PAGE_MESSAGE_SOURCES = table(
+    "wiki_page_message_sources",
+    column("wiki_page_id", Uuid()),
+    column("message_version_id", BigInteger()),
+    column("position", Integer()),
+)
+
+_WP = _WIKI_PAGES.alias("wp")
+_WR = _WIKI_REVISIONS.alias("wr")
+_WPCS = _WIKI_PAGE_CARD_SOURCES.alias("wpcs")
+_WPMS = _WIKI_PAGE_MESSAGE_SOURCES.alias("wpms")
+
+
+def _build_page_select():
+    latest_revision = (
+        select(_WR.c.revision_seq)
+        .where(_WR.c.wiki_page_id == _WP.c.id)
+        .order_by(_WR.c.revision_seq.desc())
+        .limit(1)
+    )
+    latest_edit_reason = (
+        select(_WR.c.edit_reason)
+        .where(_WR.c.wiki_page_id == _WP.c.id)
+        .order_by(_WR.c.revision_seq.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    latest_card_snapshot = (
+        select(_WR.c.source_card_ids_snapshot)
+        .where(_WR.c.wiki_page_id == _WP.c.id)
+        .order_by(_WR.c.revision_seq.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    latest_message_snapshot = (
+        select(_WR.c.source_message_version_ids_snapshot)
+        .where(_WR.c.wiki_page_id == _WP.c.id)
+        .order_by(_WR.c.revision_seq.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    live_card_ids = (
+        select(
+            func.array_agg(
+                aggregate_order_by(
+                    cast(_WPCS.c.card_id, Text),
+                    _WPCS.c.position,
+                    _WPCS.c.card_id,
+                )
+            )
+        )
+        .where(_WPCS.c.wiki_page_id == _WP.c.id)
+        .scalar_subquery()
+    )
+    live_message_ids = (
+        select(
+            func.array_agg(
+                aggregate_order_by(
+                    _WPMS.c.message_version_id,
+                    _WPMS.c.position,
+                    _WPMS.c.message_version_id,
+                )
+            )
+        )
+        .where(_WPMS.c.wiki_page_id == _WP.c.id)
+        .scalar_subquery()
+    )
+    return (
+        select(
+            _WP.c.id,
+            _WP.c.title,
+            _WP.c.body_markdown,
+            _WP.c.updated_at,
+            _WP.c.page_status,
+            _WP.c.visibility,
+            _WP.c.public_enabled,
+            _WP.c.robots_policy,
+            _WP.c.validation_status,
+            func.coalesce(latest_revision.scalar_subquery(), 0).label("revision_seq"),
+            latest_edit_reason.label("latest_edit_reason"),
+            func.coalesce(
+                latest_card_snapshot,
+                literal([], type_=JSONB()),
+            ).label("input_card_ids"),
+            func.coalesce(
+                latest_message_snapshot,
+                literal([], type_=JSONB()),
+            ).label("input_mvids"),
+            func.coalesce(
+                live_card_ids,
+                literal([], type_=ARRAY(Text())),
+            ).label("card_ids"),
+            func.coalesce(
+                live_message_ids,
+                literal([], type_=ARRAY(BigInteger())),
+            ).label("mvids"),
+        )
+        .select_from(_WP)
+        .where(_WP.c.slug == bindparam("slug"))
+    )
+
+
+_PAGE_SELECT = _build_page_select()
+_PAGE_SELECT_FOR_UPDATE = _PAGE_SELECT.with_for_update(of=_WP)
 
 _PAGE_SOURCE_CHAT_IDS_SQL = """
 SELECT array_agg(DISTINCT cm.chat_id ORDER BY cm.chat_id) AS chat_ids
@@ -533,8 +635,8 @@ async def _assert_wiki_ledger(session: AsyncSession, *, ledger_id: int) -> None:
 async def _load_page(
     session: AsyncSession, *, slug: str, for_update: bool = False
 ) -> _PageState | None:
-    sql = _PAGE_SQL + (" FOR UPDATE OF wp" if for_update else "")
-    row = (await session.execute(text(sql), {"slug": slug})).one_or_none()
+    statement = _PAGE_SELECT_FOR_UPDATE if for_update else _PAGE_SELECT
+    row = (await session.execute(statement, {"slug": slug})).one_or_none()
     if row is None:
         return None
     return _PageState(

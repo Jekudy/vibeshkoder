@@ -59,7 +59,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol, Seq
 if TYPE_CHECKING:
     from bot.services.butler_evidence import ButlerEvidenceContext
 
-from sqlalchemy import text, update as sa_update
+from sqlalchemy import and_, bindparam, func, select, text, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -70,7 +70,7 @@ from bot.services.extraction_schema import (
     serialize_untrusted_source_versions,
     validate_candidate_envelope,
 )
-from bot.services.forget_predicate import forget_excludes_sql_fragment
+from bot.services.forget_predicate import forget_excludes_expression, forget_excludes_sql_fragment
 from bot.services.llm_providers import (
     LLMProvider,
     ProviderResult,
@@ -1545,52 +1545,66 @@ _WIKI_CITATION_RE = re.compile(
 _WIKI_CARD_KEYS = frozenset({"card_id", "title", "body_markdown", "source_message_version_ids"})
 _WIKI_MESSAGE_KEYS = frozenset({"message_version_id", "content"})
 
-_WIKI_MESSAGE_REVALIDATE_SQL = text(
-    f"""
-    SELECT
-        mv.id AS message_version_id,
-        COALESCE(mv.normalized_text, mv.text, mv.caption, '') AS content
-    FROM message_versions mv
-    JOIN chat_messages cm ON cm.id = mv.chat_message_id
-    WHERE mv.id = ANY(CAST(:ids AS bigint[]))
-      AND cm.chat_id = :source_chat_id
-      AND cm.current_version_id = mv.id
-      AND cm.memory_policy = 'normal'
-      AND cm.is_redacted = false
-      AND mv.is_redacted = false
-      AND {_FORGET_EXCLUDES}
-    ORDER BY mv.id
-    """
-)
 
-# One row per card-source edge.  Governance is evaluated per edge in SQL and
-# then ``all(...)`` is enforced in Python.  Filtering invalid edges in WHERE
-# would be unsafe because a partially-invalid card could otherwise appear as
-# a smaller, apparently-valid source set.
-_WIKI_CARD_REVALIDATE_SQL = text(
-    f"""
-    SELECT
-        kc.id AS card_id,
-        kc.title,
-        kc.body_markdown,
-        cs.message_version_id,
-        (
-            cm.chat_id = :source_chat_id
-            AND cm.current_version_id = mv.id
-            AND cm.memory_policy = 'normal'
-            AND cm.is_redacted = false
-            AND mv.is_redacted = false
-            AND {_FORGET_EXCLUDES}
-        ) AS governed
-    FROM knowledge_cards kc
-    JOIN card_sources cs ON cs.card_id = kc.id
-    JOIN message_versions mv ON mv.id = cs.message_version_id
-    JOIN chat_messages cm ON cm.id = mv.chat_message_id
-    WHERE kc.id = ANY(CAST(:ids AS uuid[]))
-      AND kc.card_status = 'approved'
-    ORDER BY kc.id, cs.position, cs.message_version_id
-    """
-)
+def _wiki_message_revalidate_stmt():
+    from bot.db.models import ChatMessage, MessageVersion
+
+    return (
+        select(
+            MessageVersion.id.label("message_version_id"),
+            func.coalesce(
+                MessageVersion.normalized_text,
+                MessageVersion.text,
+                MessageVersion.caption,
+                "",
+            ).label("content"),
+        )
+        .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
+        .where(
+            MessageVersion.id.in_(bindparam("ids", expanding=True)),
+            ChatMessage.chat_id == bindparam("source_chat_id"),
+            ChatMessage.current_version_id == MessageVersion.id,
+            ChatMessage.memory_policy == "normal",
+            ChatMessage.is_redacted.is_(False),
+            MessageVersion.is_redacted.is_(False),
+            forget_excludes_expression(),
+        )
+        .order_by(MessageVersion.id)
+    )
+
+
+def _wiki_card_revalidate_stmt():
+    """Return one row per edge so one invalid edge rejects the whole card."""
+
+    from bot.db.models import CardSource, ChatMessage, KnowledgeCard, MessageVersion
+
+    governed = and_(
+        ChatMessage.chat_id == bindparam("source_chat_id"),
+        ChatMessage.current_version_id == MessageVersion.id,
+        ChatMessage.memory_policy == "normal",
+        ChatMessage.is_redacted.is_(False),
+        MessageVersion.is_redacted.is_(False),
+        forget_excludes_expression(),
+    ).label("governed")
+    return (
+        select(
+            KnowledgeCard.id.label("card_id"),
+            KnowledgeCard.title,
+            KnowledgeCard.body_markdown,
+            CardSource.message_version_id,
+            governed,
+        )
+        .select_from(KnowledgeCard)
+        .join(CardSource, CardSource.card_id == KnowledgeCard.id)
+        .join(MessageVersion, MessageVersion.id == CardSource.message_version_id)
+        .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
+        .where(
+            KnowledgeCard.id.in_(bindparam("ids", expanding=True)),
+            KnowledgeCard.card_status == "approved",
+        )
+        .order_by(KnowledgeCard.id, CardSource.position, CardSource.message_version_id)
+    )
+
 
 _WIKI_PRIOR_PAGE_SQL = text(
     """
@@ -1764,8 +1778,11 @@ async def _load_current_wiki_sources(
         card_rows = (
             (
                 await session.execute(
-                    _WIKI_CARD_REVALIDATE_SQL,
-                    {"ids": list(card_ids), "source_chat_id": source_chat_id},
+                    _wiki_card_revalidate_stmt(),
+                    {
+                        "ids": [uuid.UUID(value) for value in card_ids],
+                        "source_chat_id": source_chat_id,
+                    },
                 )
             )
             .mappings()
@@ -1797,7 +1814,7 @@ async def _load_current_wiki_sources(
         rows = (
             (
                 await session.execute(
-                    _WIKI_MESSAGE_REVALIDATE_SQL,
+                    _wiki_message_revalidate_stmt(),
                     {
                         "ids": list(message_version_ids),
                         "source_chat_id": source_chat_id,

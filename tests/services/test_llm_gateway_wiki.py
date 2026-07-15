@@ -388,6 +388,77 @@ async def test_revise_wiki_topic_rejects_non_current_card_provenance_before_prov
     assert provider.calls == []
 
 
+@pytest.mark.parametrize(
+    ("target_type", "status"),
+    [
+        ("message", "pending"),
+        ("user", "processing"),
+        ("message_hash", "completed"),
+    ],
+)
+async def test_revise_wiki_topic_rejects_each_active_forget_target_before_provider(
+    db_session,
+    durable_ledger_factory,
+    target_type: str,
+    status: str,
+) -> None:
+    from bot.db.models import ChatMessage, ForgetEvent, MessageVersion
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import WikiGatewaySourceStaleError, revise_wiki_topic
+
+    actor_id = await _make_user(db_session)
+    chat_message_id, mvid = await _make_message(
+        db_session,
+        user_id=actor_id,
+        content="source removed from derived memory",
+    )
+    chat_message = await db_session.get(ChatMessage, chat_message_id)
+    version = await db_session.get(MessageVersion, mvid)
+    assert chat_message is not None
+    assert version is not None
+    target_ids = {
+        "message": str(chat_message.id),
+        "user": str(chat_message.user_id),
+        "message_hash": version.content_hash,
+    }
+    db_session.add(
+        ForgetEvent(
+            target_type=target_type,
+            target_id=target_ids[target_type],
+            actor_user_id=actor_id,
+            authorized_by="admin",
+            tombstone_key=f"wiki-gateway-core:{uuid.uuid4()}",
+            reason="fail-closed gateway test",
+            policy="forgotten",
+            status=status,
+            cascade_status={},
+        )
+    )
+    await db_session.flush()
+    provider = _Provider(answer="should not be called")
+
+    with pytest.raises(WikiGatewaySourceStaleError) as raised:
+        await revise_wiki_topic(
+            db_session,
+            slug=f"forgotten-{target_type.replace('_', '-')}",
+            title_hint="Forgotten source",
+            prior_title=None,
+            prior_body_markdown=None,
+            prior_revision_seq=0,
+            source_cards=[],
+            source_messages=await _direct_snapshot(db_session, mvid),
+            prompt_template_version="wiki-revision-v0.1.0",
+            source_chat_id=SOURCE_CHAT_ID,
+            config=_config(),
+            ledger_repo=LedgerRepo(),
+            provider=provider,
+            ledger_session_factory=durable_ledger_factory,
+        )
+
+    assert raised.value.llm_usage_ledger_id is None
+    assert provider.calls == []
+
+
 async def test_revise_wiki_topic_records_ledger_before_post_provider_stale_rejection(
     db_session,
     durable_ledger_factory,

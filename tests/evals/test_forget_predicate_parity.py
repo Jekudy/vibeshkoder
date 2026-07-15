@@ -12,6 +12,7 @@ Privacy-critical: this predicate is the SINGLE source of truth across:
 
 If the snapshot drifts, one of the call sites diverged — privacy leak risk.
 """
+
 from __future__ import annotations
 
 
@@ -97,11 +98,12 @@ def test_digest_context_uses_shared_predicate() -> None:
 
 
 def test_llm_gateway_uses_shared_predicate() -> None:
-    """llm_gateway.py must import and use forget_predicate._FORGET_EXCLUDES.
+    """llm_gateway.py must use both shared SQL and Core predicates.
 
     Checks that the source file:
     1. Imports from bot.services.forget_predicate
-    2. Embeds _FORGET_EXCLUDES at least twice (_DIGEST_REVALIDATE_MV_SQL + _CS_SQL)
+    2. Embeds _FORGET_EXCLUDES in both digest revalidation queries
+    3. Calls forget_excludes_expression() in wiki Core revalidation queries
     """
     import inspect
 
@@ -119,4 +121,8 @@ def test_llm_gateway_uses_shared_predicate() -> None:
         f"llm_gateway.py must reference {{_FORGET_EXCLUDES}} in SQL at least twice "
         f"(_DIGEST_REVALIDATE_MV_SQL + _DIGEST_REVALIDATE_CS_SQL), found {count}. "
         "Ensure both inline NOT EXISTS clauses are replaced."
+    )
+    assert source.count("forget_excludes_expression()") >= 2, (
+        "llm_gateway.py must use forget_excludes_expression() for both wiki "
+        "message and card-source revalidation queries."
     )

@@ -1,9 +1,9 @@
-"""Shared SQL predicate for excluding forgotten content from any context.
+"""Shared SQL predicates for excluding forgotten content from any context.
 
 Privacy-critical: this module is the SINGLE source of truth across:
 - forget_cascade.py  (cascade worker — _cascade_message_versions)
 - digest_context.py  (digest source queries — cards + raw fallback)
-- llm_gateway.py     (pre-provider revalidation — _DIGEST_REVALIDATE_*_SQL)
+- llm_gateway.py     (pre-provider revalidation, including wiki Core queries)
 
 If you need to change the predicate semantics (e.g., add a new target_type),
 change this module — do NOT inline new logic in caller sites.  Any change here
@@ -12,6 +12,7 @@ and all three call sites in the same commit.
 
 Issue #291 tracks the consolidation of three textual copies into this module.
 """
+
 from __future__ import annotations
 
 
@@ -49,3 +50,38 @@ def forget_excludes_sql_fragment() -> str:
         "      )\n"
         ")"
     )
+
+
+def forget_excludes_expression():
+    """Return the SQLAlchemy Core equivalent of :func:`forget_excludes_sql_fragment`.
+
+    Callers that build Core/ORM statements must use this helper instead of
+    duplicating the privacy-critical target types or active statuses.
+    """
+    from sqlalchemy import Text, and_, cast, or_, select
+
+    from bot.db.models import ChatMessage, ForgetEvent, MessageVersion
+
+    active_forget = (
+        select(ForgetEvent.id)
+        .where(
+            ForgetEvent.status.in_(("pending", "processing", "completed")),
+            or_(
+                and_(
+                    ForgetEvent.target_type == "message",
+                    ForgetEvent.target_id == cast(ChatMessage.id, Text),
+                ),
+                and_(
+                    ForgetEvent.target_type == "user",
+                    ForgetEvent.target_id == cast(ChatMessage.user_id, Text),
+                ),
+                and_(
+                    ForgetEvent.target_type == "message_hash",
+                    ForgetEvent.target_id == MessageVersion.content_hash,
+                ),
+            ),
+        )
+        .correlate(ChatMessage, MessageVersion)
+        .exists()
+    )
+    return ~active_forget
