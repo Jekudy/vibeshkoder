@@ -414,13 +414,16 @@ async def wiki_automation_job() -> None:
         # Heavy static-site dependencies stay behind the master feature flag.
         # A flag-off production process can therefore remain a strict no-op.
         from bot.services.cloudflare_pages import publish_static_generation
+        from bot.services.wiki_compiler import WIKI_PROMPT_TEMPLATE_VERSION
         from bot.services.wiki_orchestrator import (
             compile_changed_topics,
             export_static_wiki,
         )
         from bot.services.wiki_runtime import load_wiki_runtime_config
 
-        gateway_config = load_gateway_config()
+        gateway_config = load_gateway_config(
+            prompt_template_version=WIKI_PROMPT_TEMPLATE_VERSION,
+        )
         wiki_gateway = LiveWikiCompilerGateway(
             config=gateway_config,
             ledger_repo=LedgerRepo(),
