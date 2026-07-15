@@ -1977,6 +1977,18 @@ def _build_wiki_revision_prompt(
     return prompt
 
 
+_WHOLE_RESPONSE_JSON_FENCE_RE = re.compile(
+    r"\A```json\r?\n(?P<payload>.*?)\r?\n```\Z",
+    re.DOTALL,
+)
+
+
+def _unwrap_whole_response_json_fence(answer_text: str) -> str:
+    """Return bare JSON or the payload of one exact lowercase json fence."""
+    fenced = _WHOLE_RESPONSE_JSON_FENCE_RE.fullmatch(answer_text.strip())
+    return fenced.group("payload") if fenced is not None else answer_text
+
+
 def _validate_wiki_provider_response(
     answer_text: str,
     *,
@@ -1985,7 +1997,7 @@ def _validate_wiki_provider_response(
     llm_usage_ledger_id: int,
 ) -> tuple[str, str]:
     try:
-        payload = json.loads(answer_text)
+        payload = json.loads(_unwrap_whole_response_json_fence(answer_text))
     except json.JSONDecodeError as exc:
         raise WikiGatewayContractError(
             "wiki provider response is not valid JSON",
@@ -2517,12 +2529,6 @@ def _build_extraction_prompt(
     )
 
 
-_EXTRACTION_JSON_FENCE_RE = re.compile(
-    r"\A```json\r?\n(?P<payload>.*?)\r?\n```\Z",
-    re.DOTALL,
-)
-
-
 def _parse_extraction_response(answer_text: str) -> list[dict[str, Any]]:
     """Parse the provider response into a list of candidate dicts.
 
@@ -2534,11 +2540,8 @@ def _parse_extraction_response(answer_text: str) -> list[dict[str, Any]]:
     keeps the SAVEPOINT in ``run_extraction_pass`` clean and lets the
     audit layer record ``error="no_valid_candidates"`` on the ledger row.
     """
-    stripped = answer_text.strip()
-    fenced = _EXTRACTION_JSON_FENCE_RE.fullmatch(stripped)
-    payload = fenced.group("payload") if fenced is not None else answer_text
     try:
-        parsed = json.loads(payload)
+        parsed = json.loads(_unwrap_whole_response_json_fence(answer_text))
     except (json.JSONDecodeError, ValueError):
         return []
     if not isinstance(parsed, list):
