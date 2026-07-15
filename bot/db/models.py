@@ -923,8 +923,8 @@ class TelegramUpdate(Base):
     (T2-01 dry-run / T2-03 apply). Live updates carry a non-null ``update_id`` (Telegram
     guarantees uniqueness per bot), and the partial unique index
     ``ix_telegram_updates_update_id`` prevents duplicates on polling retries. Synthetic
-    import updates leave ``update_id`` NULL; the importer enforces its own idempotency
-    via ``raw_hash`` + ``ingestion_run_id``.
+    import updates leave ``update_id`` NULL; migration 088 enforces one canonical
+    ``import_message`` row per non-null ``(chat_id, message_id)`` source identity.
 
     No content is logged here; ``raw_json`` is the unmodified Telegram payload until the
     governance detector (T1-12) marks it offrecord, at which point ``is_redacted`` and
@@ -944,6 +944,17 @@ class TelegramUpdate(Base):
             "ix_telegram_updates_update_type_received_at",
             "update_type",
             "received_at",
+        ),
+        Index(
+            "uq_telegram_updates_import_message_source",
+            "update_type",
+            "chat_id",
+            "message_id",
+            unique=True,
+            postgresql_where=text(
+                "update_id IS NULL AND update_type = 'import_message' "
+                "AND chat_id IS NOT NULL AND message_id IS NOT NULL"
+            ),
         ),
         Index(
             "ix_telegram_updates_chat_id_message_id",

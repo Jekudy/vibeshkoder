@@ -15,9 +15,9 @@ Pipeline per export message (chronological order, in-chunk):
                       are created with ``is_imported_only=True``.
     5. Reply resolver   — ``import_reply_resolver`` priority order (same_run > prior_run
                       > live > unresolved) (#98). Translates cm PK to message_id.
-    6. Synthetic raw    — Write a ``telegram_updates`` row with ``update_id=NULL`` and
-                      ``ingestion_run_id`` set. Audit row stays even when governance
-                      rejects the content.
+    6. Synthetic raw    — Atomically upsert one canonical ``telegram_updates`` row with
+                      ``update_id=NULL`` per source message. The first writer keeps
+                      ``ingestion_run_id`` ownership across duplicate runs.
     7. Persist          — ``persist_message_with_policy`` writes new rows; the explicit
                       import-only rehydrator restores rows hidden by retired policy.
     8. Edit history     — ``MessageVersionRepo.insert_version(imported_final=True)`` per
@@ -37,14 +37,14 @@ Hard invariants (verified by tests in tests/services/test_import_apply.py):
 - Idempotent: re-running on the same export produces zero net DB changes.
 - ``persist_message_with_policy`` is the sole creator of imported ``chat_messages``;
   exact-author repair may only redact an existing row.
-- Synthetic ``telegram_updates.update_id`` is always NULL; ``ingestion_run_id``
-  always matches the apply run.
+- Synthetic ``telegram_updates.update_id`` is always NULL; canonical source identity is
+  unique and conflict updates preserve the first owning ``ingestion_run_id``.
 - ``message_versions.imported_final=TRUE`` for every imported version row.
 
-Out of scope (next ticket — #104 logical rollback):
-- Rolling back an apply run via ``ingestion_run_id``.
-- The synthetic ``telegram_updates`` rows are deliberately tagged so #104 can
-  cascade DELETE them along with the run.
+Rollback ownership:
+- New imported ``chat_messages`` link to their synthetic raw row and roll back with it.
+- Existing normalized rows never adopt import raw ownership; rehydrated versions may link
+  to it and keep their row when the FK is cleared on rollback.
 """
 
 from __future__ import annotations
@@ -258,6 +258,13 @@ async def run_apply(
                 # swap the connection underneath the lock.
                 async with async_engine.connect() as connection:
                     async with acquire_advisory_lock(connection, ingestion_run_id):
+                        # pg_advisory_lock() autobegins a root transaction on this
+                        # explicit connection. End that transaction before binding the
+                        # worker session; otherwise its per-chunk commit only joins the
+                        # external transaction and the connection context rolls every
+                        # apparently successful chunk back on exit. Session-level
+                        # advisory locks survive COMMIT and remain held until unlock.
+                        await connection.commit()
                         async with AsyncSession(
                             bind=connection,
                             expire_on_commit=False,
@@ -453,6 +460,20 @@ async def _apply_one_message(
         or existing.current_version_is_redacted
     )
     if existing is not None and not needs_rehydrate:
+        await _upsert_synthetic_import_raw(
+            session,
+            raw_payload=_build_raw_payload(msg, chat_id=chat_id, msg_id=msg_id),
+            chat_id=chat_id,
+            message_id=msg_id,
+            ingestion_run_id=ingestion_run_id,
+        )
+        await _record_import_photo_if_needed(
+            session,
+            message_kind=_classify_td_kind(msg, warnings=None),
+            chat_message_id=existing.chat_message_id,
+            chat_id=chat_id,
+            message_id=msg_id,
+        )
         if existing.is_live:
             report.skipped_overlap_count += 1
         else:
@@ -516,16 +537,12 @@ async def _apply_one_message(
     # 6. Synthetic raw row — full canonical payload, tagged
     # with ingestion_run_id so #104 rollback can locate it. update_id MUST be NULL.
     raw_payload = _build_raw_payload(msg, chat_id=chat_id, msg_id=msg_id)
-    raw_row = await TelegramUpdateRepo.insert(
+    raw_row = await _upsert_synthetic_import_raw(
         session,
-        update_type=_IMPORT_UPDATE_TYPE,
-        update_id=None,  # synthetic — partial unique index is on update_id IS NOT NULL
-        raw_json=raw_payload,
-        raw_hash=None,
+        raw_payload=raw_payload,
         chat_id=chat_id,
         message_id=msg_id,
         ingestion_run_id=ingestion_run_id,
-        is_redacted=False,
     )
 
     # 7. Build the message duck.
@@ -542,12 +559,22 @@ async def _apply_one_message(
 
     # Close the read→insert race: a normal live row may appear after the initial
     # state lookup but before our synthetic raw insert.
-    if existing is None and await _check_live_overlap_pre_persist(
-        session,
-        chat_id=chat_id,
-        message_id=msg_id,
-        current_import_raw_update_id=raw_row.id,
-    ):
+    live_overlap_chat_message_id = None
+    if existing is None:
+        live_overlap_chat_message_id = await _check_live_overlap_pre_persist(
+            session,
+            chat_id=chat_id,
+            message_id=msg_id,
+            current_import_raw_update_id=raw_row.id,
+        )
+    if live_overlap_chat_message_id is not None:
+        await _record_import_photo_if_needed(
+            session,
+            message_kind=kind,
+            chat_message_id=live_overlap_chat_message_id,
+            chat_id=chat_id,
+            message_id=msg_id,
+        )
         report.skipped_overlap_count += 1
         return msg_id
 
@@ -574,20 +601,56 @@ async def _apply_one_message(
         )
         report.applied_count += 1
 
-    if kind == "photo":
-        from bot.services.image_memory import record_missing_import_photo
-
-        await record_missing_import_photo(
-            session,
-            chat_message_id=persist_result.chat_message.id,
-            chat_id=chat_id,
-            message_id=msg_id,
-        )
+    await _record_import_photo_if_needed(
+        session,
+        message_kind=kind,
+        chat_message_id=persist_result.chat_message.id,
+        chat_id=chat_id,
+        message_id=msg_id,
+    )
 
     return msg_id
 
 
-# ─── Internal helpers ─────────────────────────────────────────────────────────
+# ─── Internal helpers ────────────────────────────────────────
+
+
+async def _upsert_synthetic_import_raw(
+    session: AsyncSession,
+    *,
+    raw_payload: dict[str, Any],
+    chat_id: int,
+    message_id: int,
+    ingestion_run_id: int,
+) -> TelegramUpdate:
+    """Keep duplicate/overlap imports raw-first without taking normalized ownership."""
+    return await TelegramUpdateRepo.upsert_import_message(
+        session,
+        raw_json=raw_payload,
+        chat_id=chat_id,
+        message_id=message_id,
+        ingestion_run_id=ingestion_run_id,
+    )
+
+
+async def _record_import_photo_if_needed(
+    session: AsyncSession,
+    *,
+    message_kind: str,
+    chat_message_id: int,
+    chat_id: int,
+    message_id: int,
+) -> None:
+    if message_kind != "photo":
+        return
+    from bot.services.image_memory import record_missing_import_photo
+
+    await record_missing_import_photo(
+        session,
+        chat_message_id=chat_message_id,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
 
 
 def _iter_export_messages(path: Path) -> Iterable[dict[str, Any]]:
@@ -882,7 +945,7 @@ async def _check_live_overlap_pre_persist(
     chat_id: int,
     message_id: int,
     current_import_raw_update_id: int,
-) -> bool:
+) -> int | None:
     stmt = (
         select(ChatMessage.id)
         .join(TelegramUpdate, TelegramUpdate.id == ChatMessage.raw_update_id)
@@ -894,7 +957,7 @@ async def _check_live_overlap_pre_persist(
         )
         .limit(1)
     )
-    return (await session.execute(stmt)).scalar_one_or_none() is not None
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 async def _ensure_excluded_author_raw_only(
@@ -918,37 +981,26 @@ async def _ensure_excluded_author_raw_only(
                 TelegramUpdate.chat_id == chat_id,
                 TelegramUpdate.message_id == message_id,
                 TelegramUpdate.update_type == _IMPORT_UPDATE_TYPE,
+                TelegramUpdate.update_id.is_(None),
             )
             .order_by(TelegramUpdate.id)
             .limit(1)
             .with_for_update()
         )
     ).scalar_one_or_none()
-    changed = False
-    if raw_row is None:
-        await TelegramUpdateRepo.insert(
-            session,
-            update_type=_IMPORT_UPDATE_TYPE,
-            update_id=None,
-            raw_json=raw_payload,
-            raw_hash=None,
-            chat_id=chat_id,
-            message_id=message_id,
-            ingestion_run_id=ingestion_run_id,
-            is_redacted=False,
-        )
-        changed = True
-    elif (
+    changed = raw_row is None or (
         raw_row.raw_json != raw_payload
         or raw_row.raw_hash is not None
         or raw_row.is_redacted
         or raw_row.redaction_reason is not None
-    ):
-        raw_row.raw_json = copy.deepcopy(raw_payload)
-        raw_row.raw_hash = None
-        raw_row.is_redacted = False
-        raw_row.redaction_reason = None
-        changed = True
+    )
+    await _upsert_synthetic_import_raw(
+        session,
+        raw_payload=raw_payload,
+        chat_id=chat_id,
+        message_id=message_id,
+        ingestion_run_id=ingestion_run_id,
+    )
 
     normalized_row = (
         await session.execute(

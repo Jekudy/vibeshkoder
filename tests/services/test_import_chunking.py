@@ -214,8 +214,13 @@ def test_cli_chunk_size_zero_rejected() -> None:
     exit_code = None
     try:
         with (
-            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
-            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch(
+                "bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)
+            ),
+            patch(
+                "bot.services.import_checkpoint.init_or_resume_run",
+                new=AsyncMock(return_value=mock_decision),
+            ),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
         ):
@@ -268,8 +273,13 @@ def test_cli_chunk_size_negative_rejected() -> None:
     exit_code = None
     try:
         with (
-            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
-            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch(
+                "bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)
+            ),
+            patch(
+                "bot.services.import_checkpoint.init_or_resume_run",
+                new=AsyncMock(return_value=mock_decision),
+            ),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
         ):
@@ -321,8 +331,13 @@ def test_cli_chunk_size_excessive_rejected() -> None:
     exit_code = None
     try:
         with (
-            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
-            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch(
+                "bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)
+            ),
+            patch(
+                "bot.services.import_checkpoint.init_or_resume_run",
+                new=AsyncMock(return_value=mock_decision),
+            ),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("sys.modules", {"bot.services.import_apply": fake_module}),
         ):
@@ -387,8 +402,13 @@ def test_cli_chunk_size_overrides_invalid_env() -> None:
     exit_code = None
     try:
         with (
-            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
-            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch(
+                "bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)
+            ),
+            patch(
+                "bot.services.import_checkpoint.init_or_resume_run",
+                new=AsyncMock(return_value=mock_decision),
+            ),
             patch("bot.services.import_checkpoint.finalize_run", new=AsyncMock()),
             patch("bot.db.engine.async_session", return_value=mock_session),
             # env has invalid IMPORT_APPLY_CHUNK_SIZE but CLI provides valid --chunk-size
@@ -436,11 +456,10 @@ async def test_acquire_advisory_lock_happy_path(postgres_engine) -> None:
 
 
 async def test_acquire_advisory_lock_releases_on_exception(postgres_engine) -> None:
-    """Lock is released (pg_advisory_unlock) even when the body raises.
+    """Session lock survives COMMIT and is released when the body raises.
 
-    Verifies from a SEPARATE DB connection that the lock is truly released —
-    not merely re-acquirable from the same connection (stacked locks would
-    allow same-connection re-acquisition even if unlock was missed).
+    Both assertions use a SEPARATE DB connection so same-session stacked-lock
+    behavior cannot mask either an early release or a missed unlock.
     """
     from bot.services.import_chunking import _derive_lock_id, acquire_advisory_lock
     from sqlalchemy import text
@@ -452,13 +471,20 @@ async def test_acquire_advisory_lock_releases_on_exception(postgres_engine) -> N
     async with postgres_engine.connect() as conn1:
         with pytest.raises(RuntimeError, match="boom"):
             async with acquire_advisory_lock(conn1, ingestion_run_id):
+                # Production ends the implicit transaction opened by the lock
+                # SELECT before binding its worker session. Session-level locks
+                # must remain held across that transaction boundary.
+                await conn1.commit()
+                async with postgres_engine.connect() as observer:
+                    result = await observer.execute(
+                        text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}
+                    )
+                    assert result.scalar() is False, "lock must survive COMMIT"
                 raise RuntimeError("boom")
 
     # Verify from a SEPARATE connection that the lock is released.
     async with postgres_engine.connect() as conn2:
-        result = await conn2.execute(
-            text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id}
-        )
+        result = await conn2.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id})
         assert result.scalar() is True, "lock should be releasable from another connection"
         # Cleanup: release the lock we just acquired on conn2.
         await conn2.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": lock_id})
@@ -551,8 +577,13 @@ def test_cli_import_apply_passes_chunking_config_to_run_apply() -> None:
 
     try:
         with (
-            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
-            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch(
+                "bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)
+            ),
+            patch(
+                "bot.services.import_checkpoint.init_or_resume_run",
+                new=AsyncMock(return_value=mock_decision),
+            ),
             patch("bot.services.import_checkpoint.finalize_run", new=AsyncMock()),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("os.environ", {"IMPORT_APPLY_CHUNK_SIZE": "100"}),
@@ -575,7 +606,9 @@ def test_cli_import_apply_passes_chunking_config_to_run_apply() -> None:
     kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
     # chunking_config should be a ChunkingConfig with chunk_size=100 (env override)
     chunking_config = kwargs.get("chunking_config")
-    assert chunking_config is not None, f"run_apply must receive chunking_config kwarg. Got kwargs: {kwargs}"
+    assert chunking_config is not None, (
+        f"run_apply must receive chunking_config kwarg. Got kwargs: {kwargs}"
+    )
     assert isinstance(chunking_config, ChunkingConfig)
     assert chunking_config.chunk_size == 100, (
         f"chunk_size should be 100 (from env IMPORT_APPLY_CHUNK_SIZE=100), "
@@ -626,8 +659,13 @@ def test_cli_import_apply_chunk_size_cli_arg_overrides_env() -> None:
 
     try:
         with (
-            patch("bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)),
-            patch("bot.services.import_checkpoint.init_or_resume_run", new=AsyncMock(return_value=mock_decision)),
+            patch(
+                "bot.db.repos.feature_flag.FeatureFlagRepo.get", new=AsyncMock(return_value=True)
+            ),
+            patch(
+                "bot.services.import_checkpoint.init_or_resume_run",
+                new=AsyncMock(return_value=mock_decision),
+            ),
             patch("bot.services.import_checkpoint.finalize_run", new=AsyncMock()),
             patch("bot.db.engine.async_session", return_value=mock_session),
             patch.dict("os.environ", {"IMPORT_APPLY_CHUNK_SIZE": "300"}),
@@ -646,7 +684,9 @@ def test_cli_import_apply_chunk_size_cli_arg_overrides_env() -> None:
     call_kwargs = run_apply_mock.call_args
     kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
     chunking_config = kwargs.get("chunking_config")
-    assert chunking_config is not None, f"run_apply must receive chunking_config kwarg. Got: {kwargs}"
+    assert chunking_config is not None, (
+        f"run_apply must receive chunking_config kwarg. Got: {kwargs}"
+    )
     assert isinstance(chunking_config, ChunkingConfig)
     assert chunking_config.chunk_size == 75, (
         f"--chunk-size 75 CLI arg must override env IMPORT_APPLY_CHUNK_SIZE=300. "
