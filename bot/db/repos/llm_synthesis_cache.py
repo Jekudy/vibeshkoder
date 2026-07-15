@@ -85,6 +85,23 @@ class SynthesisCacheRepo:
         _log.debug("llm_synthesis_cache: bumped hit_count for id=%s", cache_id)
 
     @staticmethod
+    async def delete_by_id(
+        session: AsyncSession,
+        *,
+        cache_id: int,
+    ) -> int:
+        """Delete one exact cache row and return the affected-row count."""
+
+        result = await session.execute(
+            delete(LlmSynthesisCache).where(LlmSynthesisCache.id == cache_id)
+        )
+        rowcount = int(result.rowcount or 0)
+        if rowcount:
+            await session.flush()
+        _log.debug("llm_synthesis_cache: deleted unsafe row id=%s", cache_id)
+        return rowcount
+
+    @staticmethod
     async def invalidate_by_citation(
         session: AsyncSession,
         *,
@@ -129,9 +146,7 @@ class SynthesisCacheRepo:
                 if message_version_id in (citation_ids or [])
             ]
             if matching_ids:
-                del_stmt = delete(LlmSynthesisCache).where(
-                    LlmSynthesisCache.id.in_(matching_ids)
-                )
+                del_stmt = delete(LlmSynthesisCache).where(LlmSynthesisCache.id.in_(matching_ids))
                 del_result = await session.execute(del_stmt)
                 rowcount = del_result.rowcount
             else:

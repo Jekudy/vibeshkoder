@@ -78,6 +78,7 @@ from bot.services.llm_providers import (
     ProviderStructuralError,
     ProviderTransientError,
 )
+from bot.services.qa_guardrails import contains_secret_like_data, limit_answer_text
 
 # Shared forget-event exclusion predicate — sourced from forget_predicate.py (#291).
 # Do NOT change this inline; update bot/services/forget_predicate.py instead.
@@ -95,6 +96,8 @@ AbstentionReason = Literal[
     "budget_exceeded",
     "provider_error",
     "forget_invalidated",
+    "sensitive_input",
+    "sensitive_output",
 ]
 
 
@@ -282,6 +285,8 @@ class SynthesisCacheRepoProtocol(Protocol):
 
     async def bump_hit(self, session: Any, *, cache_id: int) -> None: ...
 
+    async def delete_by_id(self, session: Any, *, cache_id: int) -> int: ...
+
     async def invalidate_by_citation(self, session: Any, *, message_version_id: int) -> int: ...
 
 
@@ -347,6 +352,30 @@ def _response_hash(answer_text: str) -> str:
     return hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
 
 
+_SENSITIVE_INPUT_PROMPT_HASH = _prompt_hash("qa-sensitive-input-v1")
+_SAFE_QA_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
+
+
+def _safe_qa_request_id(request_id: object) -> str | None:
+    if not isinstance(request_id, str):
+        return None
+    if _SAFE_QA_REQUEST_ID_RE.fullmatch(request_id) is None:
+        return None
+    if contains_secret_like_data(request_id):
+        return None
+    return request_id
+
+
+def _contains_sensitive_qa_output(answer_text: str) -> bool:
+    """Validate both raw and exact post-limit representations."""
+
+    try:
+        limit_answer_text(answer_text)
+    except ValueError:
+        return True
+    return False
+
+
 def _build_prompt(
     query_normalized: str,
     surviving_ids: tuple[int, ...] | list[int],
@@ -360,6 +389,9 @@ def _build_prompt(
     eligible, and at most three records leave the process.
     """
 
+    if contains_secret_like_data(query_normalized):
+        raise ValueError("sensitive Q&A input refused")
+
     surviving_set = set(surviving_ids)
     selected: list[EvidenceItem] = []
     seen: set[int] = set()
@@ -371,6 +403,9 @@ def _build_prompt(
         seen.add(evidence_id)
         if len(selected) == MAX_QA_EVIDENCE_ITEMS:
             break
+
+    if any(contains_secret_like_data(item.snippet) for item in selected):
+        raise ValueError("sensitive Q&A evidence refused")
 
     records = [
         json.dumps(
@@ -577,6 +612,34 @@ async def synthesize_answer(
             call_type="qa_synthesis",
         )
 
+    async def _reject_sensitive_cache(cached_row: Any, *, prompt_hash: str) -> Abstention:
+        await cache_repo.delete_by_id(session, cache_id=cached_row.id)
+        ledger_row = await _ledger(
+            error="sensitive_output",
+            cache_hit=True,
+            response_hash=None,
+            prompt_hash=prompt_hash,
+        )
+        return Abstention(
+            reason="sensitive_output",
+            cost_usd=Decimal("0"),
+            llm_call_id=ledger_row.id,
+        )
+
+    if contains_secret_like_data(query) or any(
+        contains_secret_like_data(item.snippet) for item in bundle.items
+    ):
+        row = await _ledger(
+            error="sensitive_input",
+            response_hash=None,
+            prompt_hash=_SENSITIVE_INPUT_PROMPT_HASH,
+        )
+        return Abstention(
+            reason="sensitive_input",
+            cost_usd=Decimal("0"),
+            llm_call_id=row.id,
+        )
+
     # Invariant 1 — empty bundle short-circuit.
     if not bundle.evidence_ids:
         # Empty bundle has no surviving set so we use an empty-prompt hash
@@ -658,15 +721,18 @@ async def synthesize_answer(
     )
     cached = await cache_repo.get_or_none(session, input_hash=cache_input_hash)
     if cached is not None:
+        if _contains_sensitive_qa_output(cached.answer_text):
+            return await _reject_sensitive_cache(cached, prompt_hash=prompt_hash)
+        cached_answer = cached.answer_text
         await cache_repo.bump_hit(session, cache_id=cached.id)
         row = await _ledger(
             error=None,
             cache_hit=True,
-            response_hash=_response_hash(cached.answer_text),
+            response_hash=_response_hash(cached_answer),
             prompt_hash=prompt_hash,
         )
         return AnswerWithCitations(
-            answer_text=cached.answer_text,
+            answer_text=cached_answer,
             citation_ids=tuple(cached.citation_ids),
             cost_usd=Decimal("0"),
             cache_hit=True,
@@ -712,15 +778,21 @@ async def synthesize_answer(
         # (a) re-check cache under the lock.
         cached_under_lock = await cache_repo.get_or_none(session, input_hash=cache_input_hash)
         if cached_under_lock is not None:
+            if _contains_sensitive_qa_output(cached_under_lock.answer_text):
+                return await _reject_sensitive_cache(
+                    cached_under_lock,
+                    prompt_hash=prompt_hash,
+                )
+            cached_answer = cached_under_lock.answer_text
             await cache_repo.bump_hit(session, cache_id=cached_under_lock.id)
             row = await _ledger(
                 error=None,
                 cache_hit=True,
-                response_hash=_response_hash(cached_under_lock.answer_text),
+                response_hash=_response_hash(cached_answer),
                 prompt_hash=prompt_hash,
             )
             return AnswerWithCitations(
-                answer_text=cached_under_lock.answer_text,
+                answer_text=cached_answer,
                 citation_ids=tuple(cached_under_lock.citation_ids),
                 cost_usd=Decimal("0"),
                 cache_hit=True,
@@ -764,6 +836,7 @@ async def synthesize_answer(
         provider_result = await provider.call(prompt=prompt, model=config.model)
     except ProviderTransientError as exc:
         latency = int((time.monotonic() - started) * 1000)
+        error_subtype = _safe_qa_provider_error_subtype(exc)
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
@@ -773,13 +846,14 @@ async def synthesize_answer(
             tokens_out=0,
             request_id=None,
             latency_ms=latency,
-            error=f"provider_transient:{exc.subtype}",
+            error=f"provider_transient:{error_subtype}",
         )
         return Abstention(
             reason="provider_error",
             cost_usd=Decimal("0"),
             llm_call_id=placeholder_row.id,
         )
+
     except ProviderStructuralError as exc:
         error_subtype = _safe_qa_provider_error_subtype(exc)
         logger.error(
@@ -836,6 +910,32 @@ async def synthesize_answer(
             llm_call_id=placeholder_row.id,
         )
 
+    request_id = _safe_qa_request_id(provider_result.request_id)
+    answer_text = provider_result.answer_text
+    if _contains_sensitive_qa_output(answer_text):
+        latency = int((time.monotonic() - started) * 1000)
+        sensitive_output_cost = _estimate_cost(
+            config=config,
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+        )
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=sensitive_output_cost,
+            response_hash=None,
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=request_id,
+            latency_ms=latency,
+            error="sensitive_output",
+        )
+        return Abstention(
+            reason="sensitive_output",
+            cost_usd=sensitive_output_cost,
+            llm_call_id=placeholder_row.id,
+        )
+
     # F5 — defensive abort when provider returns empty citation_ids while
     # bundle has surviving evidence. The real AnthropicProvider /
     # OpenAIProvider currently return ``tuple()`` unconditionally (T5-04
@@ -850,10 +950,10 @@ async def synthesize_answer(
             session,
             llm_call_id=placeholder_row.id,
             cost_usd=Decimal("0"),
-            response_hash=_response_hash(provider_result.answer_text),
+            response_hash=_response_hash(answer_text),
             tokens_in=provider_result.tokens_in,
             tokens_out=provider_result.tokens_out,
-            request_id=provider_result.request_id,
+            request_id=request_id,
             latency_ms=latency,
             error="provider_returned_no_citations",
         )
@@ -873,10 +973,10 @@ async def synthesize_answer(
             session,
             llm_call_id=placeholder_row.id,
             cost_usd=Decimal("0"),
-            response_hash=_response_hash(provider_result.answer_text),
+            response_hash=_response_hash(answer_text),
             tokens_in=provider_result.tokens_in,
             tokens_out=provider_result.tokens_out,
-            request_id=provider_result.request_id,
+            request_id=request_id,
             latency_ms=latency,
             error="citation_hallucination",
         )
@@ -902,13 +1002,17 @@ async def synthesize_answer(
     # validate the code shape via FakeCacheRepo's IntegrityError-on-duplicate
     # behaviour.
     try:
-        await cache_repo.store(
-            session,
-            input_hash=cache_input_hash,
-            answer_text=provider_result.answer_text,
-            citation_ids=list(provider_result.citation_ids),
-            model=config.model,
-        )
+        # Keep a UNIQUE-conflict rollback scoped to this SAVEPOINT. Without a
+        # nested transaction, PostgreSQL marks the caller's outer transaction
+        # failed and the race-recovery get/delete operations cannot run.
+        async with session.begin_nested():
+            await cache_repo.store(
+                session,
+                input_hash=cache_input_hash,
+                answer_text=answer_text,
+                citation_ids=list(provider_result.citation_ids),
+                model=config.model,
+            )
     except IntegrityError:
         # Another concurrent call beat us to STORE. Re-fetch and return that
         # row as the canonical answer; record this call's ledger row as a
@@ -917,19 +1021,38 @@ async def synthesize_answer(
         existing = await cache_repo.get_or_none(session, input_hash=cache_input_hash)
         if existing is not None:
             latency = int((time.monotonic() - started) * 1000)
+            if _contains_sensitive_qa_output(existing.answer_text):
+                await cache_repo.delete_by_id(session, cache_id=existing.id)
+                await ledger_repo.update_placeholder(
+                    session,
+                    llm_call_id=placeholder_row.id,
+                    cost_usd=cost_usd,
+                    response_hash=None,
+                    tokens_in=provider_result.tokens_in,
+                    tokens_out=provider_result.tokens_out,
+                    request_id=request_id,
+                    latency_ms=latency,
+                    error="sensitive_output",
+                )
+                return Abstention(
+                    reason="sensitive_output",
+                    cost_usd=cost_usd,
+                    llm_call_id=placeholder_row.id,
+                )
+            existing_answer = existing.answer_text
             await ledger_repo.update_placeholder(
                 session,
                 llm_call_id=placeholder_row.id,
                 cost_usd=cost_usd,
-                response_hash=_response_hash(existing.answer_text),
+                response_hash=_response_hash(existing_answer),
                 tokens_in=provider_result.tokens_in,
                 tokens_out=provider_result.tokens_out,
-                request_id=provider_result.request_id,
+                request_id=request_id,
                 latency_ms=latency,
                 error="cache_store_race_loser",
             )
             return AnswerWithCitations(
-                answer_text=existing.answer_text,
+                answer_text=existing_answer,
                 citation_ids=tuple(existing.citation_ids),
                 cost_usd=cost_usd,
                 cache_hit=False,  # provider was called; we just lost the store race
@@ -949,7 +1072,7 @@ async def synthesize_answer(
             response_hash=None,
             tokens_in=provider_result.tokens_in,
             tokens_out=provider_result.tokens_out,
-            request_id=provider_result.request_id,
+            request_id=request_id,
             latency_ms=latency,
             error="cache_store_race_winner_invalidated",
         )
@@ -968,15 +1091,15 @@ async def synthesize_answer(
         session,
         llm_call_id=placeholder_row.id,
         cost_usd=cost_usd,
-        response_hash=_response_hash(provider_result.answer_text),
+        response_hash=_response_hash(answer_text),
         tokens_in=provider_result.tokens_in,
         tokens_out=provider_result.tokens_out,
-        request_id=provider_result.request_id,
+        request_id=request_id,
         latency_ms=latency,
         error=None,
     )
     return AnswerWithCitations(
-        answer_text=provider_result.answer_text,
+        answer_text=answer_text,
         citation_ids=provider_result.citation_ids,
         cost_usd=cost_usd,
         cache_hit=False,

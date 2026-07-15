@@ -28,6 +28,7 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from bot.services.evidence import EvidenceBundle
 from bot.services.llm_gateway import (
@@ -36,8 +37,11 @@ from bot.services.llm_gateway import (
     AnswerWithCitations,
     LLMGatewayConfig,
     SynthesisResult,
+    _build_prompt,
+    _cache_input_hash,
     _estimate_cost,
     _normalize_query,
+    _prompt_hash,
     synthesize_answer,
 )
 from bot.services.llm_providers import (
@@ -46,6 +50,24 @@ from bot.services.llm_providers import (
     ProviderTransientError,
 )
 from bot.services.search import SearchHit
+
+FAKE_GENERIC_ASSIGNED_SECRET = "Az9!FAKE_TOKEN_0123456789"
+FAKE_LONG_PREFIX_ASSIGNMENT = 'token="' + ("a" * 256) + FAKE_GENERIC_ASSIGNED_SECRET + '"'
+FAKE_ESCAPED_INTERNAL_DELIMITER_ASSIGNMENT = (
+    r"token=\"prefix\\\" " + FAKE_GENERIC_ASSIGNED_SECRET + r"\""
+)
+
+FAKE_SECRET_FAMILIES = (
+    "sk-" + "proj-FAKEOPENAI0123456789",
+    "cfat_" + "FAKECLOUDFLARE012345678901",
+    "123456789" + ":FAKETELEGRAMBOT_TOKEN_0123456789",
+    "DATABASE_" + "PASSWORD='Az9!FAKE.DB/0123456789'",
+    "s\x00k-A1b2FAKECONTROL0123456789",
+    "to\x00ken=Az9!FAKE_CONTROL_0123456789",
+    'token="' + "Az9!FAKE_TOKEN_0123456789" + " explanatory text",
+    FAKE_LONG_PREFIX_ASSIGNMENT,
+    FAKE_ESCAPED_INTERNAL_DELIMITER_ASSIGNMENT,
+)
 
 
 # ─── Fakes for T5-03 repos and forget-event surface ──────────────────────────
@@ -105,6 +127,8 @@ class SynthesisCacheRepoProtocol(Protocol):
     ) -> Any: ...
 
     async def bump_hit(self, session: Any, *, cache_id: int) -> None: ...
+
+    async def delete_by_id(self, session: Any, *, cache_id: int) -> int: ...
 
     async def invalidate_by_citation(self, session: Any, *, message_version_id: int) -> int: ...
 
@@ -230,6 +254,7 @@ class _CacheRow:
 class FakeCacheRepo:
     rows: dict[str, _CacheRow] = field(default_factory=dict)
     invalidated_ids: list[int] = field(default_factory=list)
+    deleted_ids: list[int] = field(default_factory=list)
     _next_id: int = 1
 
     async def get_or_none(self, session: Any, *, input_hash: str) -> _CacheRow | None:
@@ -260,6 +285,12 @@ class FakeCacheRepo:
             if row.id == cache_id:
                 row.hit_count += 1
                 return
+
+    async def delete_by_id(self, session: Any, *, cache_id: int) -> int:
+        self.deleted_ids.append(cache_id)
+        before = len(self.rows)
+        self.rows = {key: row for key, row in self.rows.items() if row.id != cache_id}
+        return before - len(self.rows)
 
     async def invalidate_by_citation(self, session: Any, *, message_version_id: int) -> int:
         self.invalidated_ids.append(message_version_id)
@@ -347,6 +378,18 @@ class _SessionExecutor:
         return _SessionResult(self._rows).scalar()
 
 
+class _FakeNestedTransaction:
+    def __init__(self, session: FakeSession) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> _FakeNestedTransaction:
+        self._session.nested_depth += 1
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self._session.nested_depth -= 1
+
+
 @dataclass
 class FakeSession:
     """Minimal ``AsyncSession`` stand-in.
@@ -362,6 +405,12 @@ class FakeSession:
     """
 
     query_results: list[list[dict[str, Any]]] = field(default_factory=list)
+    nested_depth: int = 0
+    nested_entries: int = 0
+
+    def begin_nested(self) -> _FakeNestedTransaction:
+        self.nested_entries += 1
+        return _FakeNestedTransaction(self)
 
     async def execute(self, *args: Any, **kwargs: Any) -> _SessionExecutor:
         stmt = args[0] if args else kwargs.get("statement")
@@ -377,7 +426,11 @@ class FakeSession:
 # ─── Helper: build a non-empty bundle ────────────────────────────────────────
 
 
-def _make_bundle(version_ids: tuple[int, ...] = (100, 101)) -> EvidenceBundle:
+def _make_bundle(
+    version_ids: tuple[int, ...] = (100, 101),
+    *,
+    snippet: str | None = None,
+) -> EvidenceBundle:
     timestamp = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
     hits = [
         SearchHit(
@@ -386,7 +439,7 @@ def _make_bundle(version_ids: tuple[int, ...] = (100, 101)) -> EvidenceBundle:
             chat_id=-1001,
             message_id=300 + idx,
             user_id=42,
-            snippet=f"<b>match</b>{idx}",
+            snippet=snippet if snippet is not None else f"<b>match</b>{idx}",
             ts_rank=0.5 - idx * 0.01,
             captured_at=timestamp,
             message_date=timestamp,
@@ -600,6 +653,349 @@ async def test_source_filter_partial_keeps_subset() -> None:
     assert isinstance(res, AnswerWithCitations)
     assert res.citation_ids == (100,)
     assert len(provider.calls) == 1
+
+
+@pytest.mark.parametrize("secret", FAKE_SECRET_FAMILIES)
+@pytest.mark.parametrize("location", ["query", "evidence"])
+@pytest.mark.asyncio
+async def test_sensitive_input_abstains_before_cache_or_provider(
+    secret: str,
+    location: str,
+) -> None:
+    bundle = _make_bundle(
+        (100,),
+        snippet=secret if location == "evidence" else None,
+    )
+    ledger = FakeLedgerRepo()
+    cache = FakeCacheRepo()
+    provider = FakeProvider(citation_ids=(100,))
+
+    result = await synthesize_answer(
+        FakeSession(),  # type: ignore[arg-type]
+        bundle=bundle,
+        query=secret if location == "query" else "safe question",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "sensitive_input"
+    assert provider.calls == []
+    assert cache.rows == {}
+    assert cache.deleted_ids == []
+    assert len(ledger.rows) == 1
+    assert ledger.rows[0].error == "sensitive_input"
+    assert ledger.rows[0].response_hash is None
+    assert secret not in repr(ledger.rows)
+
+
+@pytest.mark.parametrize("secret", FAKE_SECRET_FAMILIES)
+@pytest.mark.asyncio
+async def test_sensitive_provider_output_records_usage_but_is_never_cached_or_returned(
+    secret: str,
+) -> None:
+    bundle = _make_bundle((100,))
+    ledger = FakeLedgerRepo()
+    cache = FakeCacheRepo()
+    provider = FakeProvider(answer_text=f"provider echoed {secret}", citation_ids=(100,))
+
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"message_version_id": 100}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=bundle,
+        query="safe question",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "sensitive_output"
+    assert len(provider.calls) == 1
+    assert cache.rows == {}
+    row = ledger.rows[-1]
+    assert row.error == "sensitive_output"
+    assert row.response_hash is None
+    assert row.tokens_in == provider.tokens_in
+    assert row.tokens_out == provider.tokens_out
+    assert row.cost_usd > 0
+    assert secret not in repr(ledger.rows)
+
+
+@pytest.mark.asyncio
+async def test_provider_output_is_refused_before_cache_when_post_limit_check_fails(
+    monkeypatch,
+) -> None:
+    def _reject_after_transform(_value: str) -> str:
+        raise ValueError("sensitive transformed output")
+
+    monkeypatch.setitem(
+        synthesize_answer.__globals__,
+        "contains_secret_like_data",
+        lambda _value: False,
+    )
+    monkeypatch.setitem(
+        synthesize_answer.__globals__,
+        "limit_answer_text",
+        _reject_after_transform,
+    )
+    bundle = _make_bundle((100,))
+    ledger = FakeLedgerRepo()
+    cache = FakeCacheRepo()
+    provider = FakeProvider(answer_text="apparently safe raw output", citation_ids=(100,))
+
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"message_version_id": 100}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=bundle,
+        query="safe question",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "sensitive_output"
+    assert cache.rows == {}
+    assert ledger.rows[-1].error == "sensitive_output"
+    assert ledger.rows[-1].response_hash is None
+
+
+@pytest.mark.parametrize("secret", FAKE_SECRET_FAMILIES)
+@pytest.mark.asyncio
+async def test_sensitive_cached_answer_is_deleted_without_bump_or_provider(
+    secret: str,
+) -> None:
+    bundle = _make_bundle((100,))
+    ledger = FakeLedgerRepo()
+    cache = FakeCacheRepo()
+    provider = FakeProvider(citation_ids=(100,))
+    cfg = _config()
+    prompt = _build_prompt("q", (100,), evidence_items=bundle.items)
+    expected_hash = _cache_input_hash(
+        query_normalized="q",
+        citation_ids=(100,),
+        model=cfg.model,
+        prompt_template_version=f"{cfg.prompt_template_version}:{_prompt_hash(prompt)}",
+    )
+    cached = await cache.store(
+        FakeSession(),
+        input_hash=expected_hash,
+        answer_text=f"unsafe cached {secret}",
+        citation_ids=[100],
+        model=cfg.model,
+    )
+
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"message_version_id": 100}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=cfg,
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "sensitive_output"
+    assert provider.calls == []
+    assert cache.rows == {}
+    assert cache.deleted_ids == [cached.id]
+    assert cached.hit_count == 0
+    assert ledger.rows[-1].error == "sensitive_output"
+    assert ledger.rows[-1].response_hash is None
+    assert secret not in repr(ledger.rows)
+
+
+@pytest.mark.asyncio
+async def test_cached_answer_is_quarantined_when_post_limit_check_fails(monkeypatch) -> None:
+    def _reject_after_transform(_value: str) -> str:
+        raise ValueError("sensitive transformed output")
+
+    monkeypatch.setitem(
+        synthesize_answer.__globals__,
+        "contains_secret_like_data",
+        lambda _value: False,
+    )
+    monkeypatch.setitem(
+        synthesize_answer.__globals__,
+        "limit_answer_text",
+        _reject_after_transform,
+    )
+    bundle = _make_bundle((100,))
+    ledger = FakeLedgerRepo()
+    cache = FakeCacheRepo()
+    provider = FakeProvider(citation_ids=(100,))
+    cfg = _config()
+    prompt = _build_prompt("q", (100,), evidence_items=bundle.items)
+    expected_hash = _cache_input_hash(
+        query_normalized="q",
+        citation_ids=(100,),
+        model=cfg.model,
+        prompt_template_version=f"{cfg.prompt_template_version}:{_prompt_hash(prompt)}",
+    )
+    cached = await cache.store(
+        FakeSession(),
+        input_hash=expected_hash,
+        answer_text="apparently safe cached output",
+        citation_ids=[100],
+        model=cfg.model,
+    )
+
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"message_version_id": 100}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=cfg,
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "sensitive_output"
+    assert provider.calls == []
+    assert cache.rows == {}
+    assert cache.deleted_ids == [cached.id]
+    assert ledger.rows[-1].error == "sensitive_output"
+    assert ledger.rows[-1].response_hash is None
+
+
+@pytest.mark.asyncio
+async def test_long_prefix_sensitive_cache_found_under_lock_is_quarantined() -> None:
+    class _UnderLockCache(FakeCacheRepo):
+        get_calls: int = 0
+
+        async def get_or_none(self, session: Any, *, input_hash: str) -> _CacheRow | None:
+            self.get_calls += 1
+            if self.get_calls == 1:
+                return None
+            row = _CacheRow(
+                id=self._next_id,
+                input_hash=input_hash,
+                answer_text=FAKE_LONG_PREFIX_ASSIGNMENT,
+                citation_ids=[100],
+                model=_config().model,
+            )
+            self.rows[input_hash] = row
+            self._next_id += 1
+            return row
+
+    bundle = _make_bundle((100,))
+    ledger = FakeLedgerRepo()
+    cache = _UnderLockCache()
+    provider = FakeProvider(citation_ids=(100,))
+
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"message_version_id": 100}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "sensitive_output"
+    assert provider.calls == []
+    assert cache.rows == {}
+    assert cache.deleted_ids == [1]
+    assert ledger.rows[-1].error == "sensitive_output"
+    assert ledger.rows[-1].response_hash is None
+    assert FAKE_GENERIC_ASSIGNED_SECRET not in repr(ledger.rows)
+
+
+@pytest.mark.asyncio
+async def test_cache_store_race_unsafe_winner_is_deleted_and_abstained() -> None:
+    secret = FAKE_LONG_PREFIX_ASSIGNMENT
+
+    class _RaceCache(FakeCacheRepo):
+        async def store(
+            self,
+            session: Any,
+            *,
+            input_hash: str,
+            answer_text: str,
+            citation_ids: list[int],
+            model: str,
+        ) -> _CacheRow:
+            assert session.nested_depth == 1
+            winner = _CacheRow(
+                id=self._next_id,
+                input_hash=input_hash,
+                answer_text=f"unsafe winner {secret}",
+                citation_ids=list(citation_ids),
+                model=model,
+            )
+            self.rows[input_hash] = winner
+            self._next_id += 1
+            raise IntegrityError("cache insert", {}, RuntimeError("duplicate"))
+
+    bundle = _make_bundle((100,))
+    ledger = FakeLedgerRepo()
+    cache = _RaceCache()
+    provider = FakeProvider(answer_text="safe answer", citation_ids=(100,))
+    session = FakeSession(
+        query_results=[
+            [{"message_version_id": 100}],
+            [],
+        ]
+    )
+    result = await synthesize_answer(
+        session,  # type: ignore[arg-type]
+        bundle=bundle,
+        query="safe question",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "sensitive_output"
+    assert cache.rows == {}
+    assert cache.deleted_ids == [1]
+    assert session.nested_entries == 1
+    assert session.nested_depth == 0
+    assert ledger.rows[-1].error == "sensitive_output"
+    assert ledger.rows[-1].response_hash is None
+    assert ledger.rows[-1].cost_usd > 0
+    assert secret not in repr(ledger.rows)
 
 
 # ─── Tests: invariant 3 — three-key tombstone gate ──────────────────────────
@@ -1007,6 +1403,83 @@ async def test_provider_transient_error_abstains(subtype: str) -> None:
     assert isinstance(res, Abstention)
     assert res.reason == "provider_error"
     assert ledger.rows[-1].error == f"provider_transient:{subtype}"
+
+
+@pytest.mark.asyncio
+async def test_provider_transient_subtype_is_sanitized_through_safe_taxonomy(caplog) -> None:
+    unsafe_subtype = "sk-" + "FAKEEXCEPTIONSUBTYPE0123456789"
+    ledger = FakeLedgerRepo()
+    provider = FakeProvider(
+        raise_exc=ProviderTransientError(unsafe_subtype, message=unsafe_subtype)
+    )
+    caplog.set_level(logging.ERROR, logger="bot.services.llm_gateway")
+
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"message_version_id": 100}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=_make_bundle((100,)),
+        query="safe question",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=FakeCacheRepo(),
+        provider=provider,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "provider_error"
+    assert ledger.rows[-1].error == "provider_transient:unknown"
+    assert unsafe_subtype not in repr(ledger.rows)
+    assert unsafe_subtype not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("request_id", "expected"),
+    [
+        ("req_SAFE-123.abc:def", "req_SAFE-123.abc:def"),
+        ("req contains spaces", None),
+        ("r" * 129, None),
+        ("sk-" + "FAKEREQUESTID0123456789", None),
+        ("req_sk-" + "FAKEWRAPPEDREQUEST0123456789", None),
+        ("prefix_cfat_" + "FAKEWRAPPEDREQUEST0123456789", None),
+        ("req_12345678" + ":FAKEWRAPPEDREQUEST0123456789", None),
+        ("req/unsupported", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_provider_request_id_uses_strict_safe_allowlist(
+    request_id: str,
+    expected: str | None,
+) -> None:
+    ledger = FakeLedgerRepo()
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"message_version_id": 100}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=_make_bundle((100,)),
+        query="safe question",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=FakeCacheRepo(),
+        provider=FakeProvider(
+            answer_text="safe answer",
+            citation_ids=(100,),
+            request_id=request_id,
+        ),
+    )
+
+    assert isinstance(result, AnswerWithCitations)
+    assert ledger.rows[-1].request_id == expected
+    if expected is None:
+        assert request_id not in repr(ledger.rows)
 
 
 @pytest.mark.parametrize(
