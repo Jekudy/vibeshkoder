@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import logging
-from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -34,8 +33,11 @@ from bot.services.message_persistence import persist_message_with_policy
 from bot.services.qa import run_qa
 from bot.services.qa_guardrails import (
     MAX_AI_ANSWER_CHARS,
+    SENSITIVE_QA_REFUSAL,
+    SENSITIVE_QA_TRACE_MARKER,
     acquire_daily_llm_question_slot,
     build_guarded_llm_query,
+    contains_secret_like_data,
     limit_answer_text,
 )
 from bot.services.qa_trigger import ShkoderQuestionFilter, TriggeredQuestion
@@ -255,7 +257,7 @@ def _escaped_text_with_budget(value: str, max_chars: int) -> str:
     return "…" if max_chars >= 1 else ""
 
 
-def _compact_author(user: object | None) -> str:
+def _compact_author_value(user: object | None) -> str:
     if user is None:
         return "—"
     first_name = getattr(user, "first_name", None)
@@ -265,19 +267,35 @@ def _compact_author(user: object | None) -> str:
         raw = str(first_name)
         if last_name:
             raw = f"{raw} {last_name}"
+        return raw
     elif username:
-        raw = f"@{username}"
-    else:
-        raw = "—"
-    return _escaped_text_with_budget(raw, 40)
+        return f"@{username}"
+    return "—"
+
+
+def _compact_author(user: object | None) -> str:
+    return _escaped_text_with_budget(_compact_author_value(user), 40)
 
 
 def _format_bounded_mention_response(
-    answer: AnswerWithCitations,
+    answer_text: str,
     bundle: EvidenceBundle,
     users_by_id: dict[int, object],
+    *,
+    sources_heading: str = "Источники:",
 ) -> str:
     """Render the entire mention answer, including sources, within 1200 chars."""
+
+    if contains_secret_like_data(answer_text) or any(
+        contains_secret_like_data(item.snippet)
+        or contains_secret_like_data(
+            _compact_author_value(
+                users_by_id.get(item.user_id) if item.user_id is not None else None
+            )
+        )
+        for item in bundle.items[:QA_EVIDENCE_LIMIT]
+    ):
+        return SENSITIVE_QA_REFUSAL
 
     source_lines: list[str] = []
     for idx, item in enumerate(bundle.items[:QA_EVIDENCE_LIMIT], start=1):
@@ -288,8 +306,11 @@ def _format_bounded_mention_response(
         snippet = _escaped_text_with_budget(item.snippet, 120)
         source_lines.append(f"[{idx}] {date_text} — {author}: {snippet}")
 
-    footer = "\n\n<b>Источники:</b>\n" + "\n".join(source_lines)
-    answer_budget = MAX_AI_ANSWER_CHARS - len(footer)
+    # ponytail: a fixed three-source footer avoids an HTML-aware truncator;
+    # add one only if Telegram formatting grows beyond this known-safe shape.
+    footer = f"<b>{html.escape(sources_heading)}</b>\n" + "\n".join(source_lines)
+    separator = "\n\n" if answer_text else ""
+    answer_budget = MAX_AI_ANSWER_CHARS - len(separator) - len(footer)
     if answer_budget < 1:
         # Defensive fallback for future footer changes.  Evidence identifiers
         # remain visible while untrusted snippets are omitted.
@@ -300,14 +321,27 @@ def _format_bounded_mention_response(
                 start=1,
             )
         ]
-        footer = "\n\n<b>Источники:</b>\n" + "\n".join(source_lines)
-        answer_budget = MAX_AI_ANSWER_CHARS - len(footer)
+        footer = f"<b>{html.escape(sources_heading)}</b>\n" + "\n".join(source_lines)
+        answer_budget = MAX_AI_ANSWER_CHARS - len(separator) - len(footer)
 
-    answer_text = _escaped_text_with_budget(answer.answer_text, answer_budget)
-    rendered = f"{answer_text}{footer}"
+    if answer_budget < 0:
+        raise ValueError("mention source footer exceeds configured limit")
+    bounded_answer = _escaped_text_with_budget(answer_text, answer_budget)
+    rendered = f"{bounded_answer}{separator}{footer}"
     if len(rendered) > MAX_AI_ANSWER_CHARS:
         raise ValueError("bounded mention response exceeds configured limit")
     return rendered
+
+
+async def _reply_to_mention(message: Message, text: str, **kwargs: Any) -> None:
+    """Apply the final secret/size fence shared by every mention reply."""
+
+    reply_text = text
+    if contains_secret_like_data(text) or contains_secret_like_data(html.unescape(text)):
+        reply_text = SENSITIVE_QA_REFUSAL
+    if len(reply_text) > MAX_AI_ANSWER_CHARS:
+        raise ValueError("mention reply exceeds configured limit")
+    await message.reply(reply_text, **kwargs)
 
 
 def _format_synth_card_footer(idx: int, item: EvidenceItem) -> str:
@@ -341,6 +375,25 @@ async def _write_trace(
         evidence_ids=evidence_ids,
         abstained=abstained,
         redact_query=redact_query,
+        source_chat_message_id=source_chat_message_id,
+    )
+
+
+async def _write_sensitive_trace(
+    session: AsyncSession,
+    *,
+    user_tg_id: int,
+    chat_id: int,
+    source_chat_message_id: int,
+) -> None:
+    await _write_trace(
+        session,
+        user_tg_id=user_tg_id,
+        chat_id=chat_id,
+        query=SENSITIVE_QA_TRACE_MARKER,
+        evidence_ids=[],
+        abstained=True,
+        redact_query=True,
         source_chat_message_id=source_chat_message_id,
     )
 
@@ -613,30 +666,52 @@ async def mention_question_handler(
 
     user = await UserRepo.get(session, sender.id)
     if user is None or not (user.is_member or user.is_admin):
-        await message.reply("Доступ только участникам сообщества.")
+        await _reply_to_mention(message, "Доступ только участникам сообщества.")
         return
 
     existing_trace = await QaTraceRepo.get_by_source_chat_message_id(
         session,
         persisted.chat_message.id,
     )
+    query = qa_question.query
+    query_redacted = False
+    raw_content = message.text if isinstance(message.text, str) else message.caption
+    if contains_secret_like_data(query) or (
+        isinstance(raw_content, str) and contains_secret_like_data(raw_content)
+    ):
+        await _reply_to_mention(message, SENSITIVE_QA_REFUSAL)
+        if existing_trace is None:
+            await _write_sensitive_trace(
+                session,
+                user_tg_id=sender.id,
+                chat_id=message.chat.id,
+                source_chat_message_id=persisted.chat_message.id,
+            )
+        return
     if existing_trace is not None:
         if existing_trace.llm_response_summary:
-            previous = _escaped_text_with_budget(
-                existing_trace.llm_response_summary,
-                MAX_AI_ANSWER_CHARS - 32,
-            )
-            await message.reply(
-                f"Уже отвечал на этот вопрос:\n\n{previous}",
-                parse_mode="HTML",
-            )
+            if contains_secret_like_data(existing_trace.llm_response_summary):
+                await _reply_to_mention(message, SENSITIVE_QA_REFUSAL)
+            else:
+                prefix = "Уже отвечал на этот вопрос:\n\n"
+                previous = _escaped_text_with_budget(
+                    existing_trace.llm_response_summary,
+                    MAX_AI_ANSWER_CHARS - len(prefix),
+                )
+                await _reply_to_mention(
+                    message,
+                    f"{prefix}{previous}",
+                    parse_mode="HTML",
+                )
         else:
-            await message.reply("Этот вопрос уже обработан.")
+            await _reply_to_mention(message, "Этот вопрос уже обработан.")
         return
 
-    query = qa_question.query
     if not query:
-        await message.reply("Напиши вопрос после упоминания Шкодера или в ответе ему.")
+        await _reply_to_mention(
+            message,
+            "Напиши вопрос после упоминания Шкодера или в ответе ему.",
+        )
         await _write_trace(
             session,
             user_tg_id=sender.id,
@@ -644,7 +719,7 @@ async def mention_question_handler(
             query="",
             evidence_ids=[],
             abstained=True,
-            redact_query=False,
+            redact_query=query_redacted,
             source_chat_message_id=persisted.chat_message.id,
         )
         return
@@ -652,7 +727,7 @@ async def mention_question_handler(
     # Conversational questions are AI-only.  The deterministic search service
     # remains an internal retrieval layer and is not exposed as a command.
     if not await FeatureFlagRepo.get(session, LLM_SYNTHESIS_FEATURE_FLAG):
-        await message.reply("AI-поиск по памяти сейчас недоступен.")
+        await _reply_to_mention(message, "AI-поиск по памяти сейчас недоступен.")
         await _write_trace(
             session,
             user_tg_id=sender.id,
@@ -660,7 +735,7 @@ async def mention_question_handler(
             query=query,
             evidence_ids=[],
             abstained=True,
-            redact_query=False,
+            redact_query=query_redacted,
             source_chat_message_id=persisted.chat_message.id,
         )
         return
@@ -669,11 +744,23 @@ async def mention_question_handler(
         session,
         query=query,
         chat_id=message.chat.id,
-        redact_query_in_audit=False,
+        redact_query_in_audit=query_redacted,
         limit=QA_EVIDENCE_LIMIT,
     )
+    if any(contains_secret_like_data(item.snippet) for item in result.bundle.items):
+        await _reply_to_mention(message, SENSITIVE_QA_REFUSAL)
+        await _write_sensitive_trace(
+            session,
+            user_tg_id=sender.id,
+            chat_id=message.chat.id,
+            source_chat_message_id=persisted.chat_message.id,
+        )
+        return
     if result.bundle.abstained or not result.bundle.evidence_ids:
-        await message.reply("Не нашёл достаточно подтверждений в памяти сообщества.")
+        await _reply_to_mention(
+            message,
+            "Не нашёл достаточно подтверждений в памяти сообщества.",
+        )
         await _write_trace(
             session,
             user_tg_id=sender.id,
@@ -681,28 +768,47 @@ async def mention_question_handler(
             query=query,
             evidence_ids=[],
             abstained=True,
-            redact_query=False,
+            redact_query=query_redacted,
             source_chat_message_id=persisted.chat_message.id,
         )
         return
 
     users_by_id: dict[int, object] = {}
+    sensitive_author = False
     for item in result.bundle.items:
         if item.user_id is None or item.user_id in users_by_id:
             continue
         author = await UserRepo.get(session, item.user_id)
         if author is not None:
+            if contains_secret_like_data(_compact_author_value(author)):
+                sensitive_author = True
+                break
             users_by_id[item.user_id] = author
+
+    if sensitive_author:
+        await _reply_to_mention(message, SENSITIVE_QA_REFUSAL)
+        await _write_sensitive_trace(
+            session,
+            user_tg_id=sender.id,
+            chat_id=message.chat.id,
+            source_chat_message_id=persisted.chat_message.id,
+        )
+        return
 
     quota = await acquire_daily_llm_question_slot(
         session,
         user_tg_id=sender.id,
     )
     if not quota.allowed:
-        deterministic_answer = _format_response(result.bundle, users_by_id)
-        await message.reply(
-            f"Лимит — {quota.limit} AI-вопроса в день. "
-            f"Показываю обычный поиск без AI.\n\n{deterministic_answer}",
+        deterministic_answer = _format_bounded_mention_response(
+            f"Лимит — {quota.limit} AI-вопроса в день. Показываю обычный поиск без AI.",
+            result.bundle,
+            users_by_id,
+            sources_heading="Найденные свидетельства:",
+        )
+        await _reply_to_mention(
+            message,
+            deterministic_answer,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -713,7 +819,7 @@ async def mention_question_handler(
             query=query,
             evidence_ids=result.bundle.evidence_ids,
             abstained=False,
-            redact_query=False,
+            redact_query=query_redacted,
             source_chat_message_id=persisted.chat_message.id,
         )
         return
@@ -726,7 +832,7 @@ async def mention_question_handler(
         query=query,
         evidence_ids=result.bundle.evidence_ids,
         abstained=False,
-        redact_query=False,
+        redact_query=query_redacted,
         source_chat_message_id=persisted.chat_message.id,
     )
     try:
@@ -752,43 +858,75 @@ async def mention_question_handler(
             extra={"qa_trace_id": trace.id, "chat_id": message.chat.id},
         )
         await session.commit()
-        await message.reply(
-            _format_response(result.bundle, users_by_id),
+        await _reply_to_mention(
+            message,
+            _format_bounded_mention_response(
+                "",
+                result.bundle,
+                users_by_id,
+                sources_heading="Найденные свидетельства:",
+            ),
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
         return
 
-    if isinstance(synth_result, AnswerWithCitations):
-        bounded_answer = limit_answer_text(synth_result.answer_text)
-        if bounded_answer:
-            bounded_result = replace(synth_result, answer_text=bounded_answer)
-            reply_text = _format_bounded_mention_response(
-                bounded_result,
-                result.bundle,
-                users_by_id,
-            )
-            response_summary: str | None = bounded_answer
-        else:
-            reply_text = _format_response(result.bundle, users_by_id)
-            response_summary = None
-    else:
-        reply_text = _format_response(result.bundle, users_by_id)
+    sensitive_gateway_refusal = not isinstance(
+        synth_result, AnswerWithCitations
+    ) and synth_result.reason in {"sensitive_input", "sensitive_output"}
+    if sensitive_gateway_refusal:
+        reply_text = SENSITIVE_QA_REFUSAL
         response_summary = None
+        response_redacted = True
+    elif isinstance(synth_result, AnswerWithCitations):
+        try:
+            bounded_answer = limit_answer_text(synth_result.answer_text)
+        except ValueError:
+            reply_text = SENSITIVE_QA_REFUSAL
+            response_summary = None
+            response_redacted = True
+        else:
+            if bounded_answer:
+                reply_text = _format_bounded_mention_response(
+                    bounded_answer,
+                    result.bundle,
+                    users_by_id,
+                )
+                response_summary = bounded_answer
+                response_redacted = bounded_answer != synth_result.answer_text
+            else:
+                reply_text = _format_bounded_mention_response(
+                    "",
+                    result.bundle,
+                    users_by_id,
+                    sources_heading="Найденные свидетельства:",
+                )
+                response_summary = None
+                response_redacted = bool(synth_result.answer_text)
+    else:
+        reply_text = _format_bounded_mention_response(
+            "",
+            result.bundle,
+            users_by_id,
+            sources_heading="Найденные свидетельства:",
+        )
+        response_summary = None
+        response_redacted = False
 
     await QaTraceRepo.update_llm_fields(
         session,
         qa_trace_id=trace.id,
         llm_call_id=synth_result.llm_call_id,
         llm_response_summary=response_summary,
-        llm_response_redacted=False,
+        llm_response_redacted=response_redacted,
         cost_usd=synth_result.cost_usd,
     )
     # Provider usage, cache, trace, and the per-user quota ledger must survive
     # an outbound Telegram failure.  The middleware may roll back after a send
     # exception, so make the paid/audited transaction durable first.
     await session.commit()
-    await message.reply(
+    await _reply_to_mention(
+        message,
         reply_text,
         parse_mode="HTML",
         disable_web_page_preview=True,

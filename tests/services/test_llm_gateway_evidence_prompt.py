@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from bot.services.evidence import EvidenceItem
 from bot.services.llm_gateway import (
     DEFAULT_PROMPT_TEMPLATE_VERSION,
@@ -62,6 +64,45 @@ def test_build_prompt_drops_items_outside_surviving_set():
     assert "private" not in prompt
     assert "allowed" in prompt
     assert "ALLOWED_CITATIONS: 22" in prompt
+
+
+@pytest.mark.parametrize(
+    ("query", "snippet"),
+    [
+        ("question " + "sk-" + "FAKEDEEPSEEK0123456789", "safe evidence"),
+        ("safe question", "cfat_" + "FAKECLOUDFLARE012345678901"),
+        (
+            "safe question",
+            "123456789" + ":FAKETELEGRAMBOT_TOKEN_0123456789",
+        ),
+        (
+            "safe question",
+            "DATABASE_" + "PASSWORD='Az9!FAKE.DB/0123456789'",
+        ),
+        (
+            "safe question",
+            "s\x00k-A1b2FAKECONTROL0123456789",
+        ),
+        (
+            "safe question",
+            "to\x00ken=Az9!FAKE_CONTROL_0123456789",
+        ),
+        (
+            "safe question",
+            "s\tk-A1b2FAKEGATEWAYCONTROL0123456789",
+        ),
+    ],
+)
+def test_build_prompt_refuses_secret_like_query_or_evidence(
+    query: str,
+    snippet: str,
+) -> None:
+    with pytest.raises(ValueError, match="sensitive"):
+        _build_prompt(
+            query,
+            (22,),
+            evidence_items=(_item(22, snippet),),
+        )
 
 
 def test_grounded_prompt_version_invalidates_pre_grounding_cache_keys():

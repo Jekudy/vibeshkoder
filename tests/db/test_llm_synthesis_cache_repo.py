@@ -163,9 +163,7 @@ async def test_invalidate_by_citation_returns_zero_when_no_match(db_session) -> 
         model="claude-haiku",
     )
 
-    rowcount = await SynthesisCacheRepo.invalidate_by_citation(
-        db_session, message_version_id=999
-    )
+    rowcount = await SynthesisCacheRepo.invalidate_by_citation(db_session, message_version_id=999)
 
     assert rowcount == 0
 
@@ -245,3 +243,20 @@ async def test_get_or_none_idempotent_multiple_calls(db_session) -> None:
     assert r1 is not None
     assert r2 is not None
     assert r1.id == r2.id
+
+
+async def test_delete_by_id_removes_exact_row_and_is_idempotent(db_session) -> None:
+    from bot.db.repos.llm_synthesis_cache import SynthesisCacheRepo
+
+    h = _input_hash()
+    row = await SynthesisCacheRepo.store(
+        db_session,
+        input_hash=h,
+        answer_text="unsafe cached answer",
+        citation_ids=[101],
+        model="deepseek-v4-flash",
+    )
+
+    assert await SynthesisCacheRepo.delete_by_id(db_session, cache_id=row.id) == 1
+    assert await SynthesisCacheRepo.get_or_none(db_session, input_hash=h) is None
+    assert await SynthesisCacheRepo.delete_by_id(db_session, cache_id=row.id) == 0
