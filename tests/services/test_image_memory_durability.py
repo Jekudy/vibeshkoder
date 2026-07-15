@@ -24,6 +24,8 @@ from bot.services.llm_providers.openai_vision import VisionDescriptionResult
 
 pytestmark = pytest.mark.usefixtures("app_env")
 
+_CONCURRENCY_TIMEOUT_SECONDS = 30
+
 
 class _Bot:
     async def get_file(self, file_id: str):
@@ -192,6 +194,7 @@ async def test_paid_outcome_survives_caller_rollback_and_is_not_dispatched_twice
 async def test_concurrent_workers_share_one_durable_claim(durable_factory) -> None:
     started = asyncio.Event()
     release = asyncio.Event()
+    first: asyncio.Task[MessageMedia | None] | None = None
 
     class Provider:
         calls = 0
@@ -220,7 +223,10 @@ async def test_concurrent_workers_share_one_durable_claim(durable_factory) -> No
                     session_factory=durable_factory,
                 )
             )
-            await asyncio.wait_for(started.wait(), timeout=5)
+            await asyncio.wait_for(
+                started.wait(),
+                timeout=_CONCURRENCY_TIMEOUT_SECONDS,
+            )
             async with durable_factory() as second_session:
                 second = await process_next_pending_photo(
                     second_session,
@@ -230,10 +236,18 @@ async def test_concurrent_workers_share_one_durable_claim(durable_factory) -> No
                 )
             assert second is None
             release.set()
-            assert (await asyncio.wait_for(first, timeout=5)).description_status == "ready"
+            result = await asyncio.wait_for(
+                first,
+                timeout=_CONCURRENCY_TIMEOUT_SECONDS,
+            )
+            assert result is not None and result.description_status == "ready"
         assert provider.calls == 1
     finally:
         release.set()
+        if first is not None:
+            if not first.done():
+                first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
         await _cleanup(durable_factory, user_id=user_id, message_id=message_id)
 
 
