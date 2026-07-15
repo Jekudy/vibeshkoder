@@ -66,6 +66,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.services.evidence import EvidenceBundle, EvidenceItem
 from bot.services.extraction_schema import (
     CandidateValidationError,
+    EXTRACTION_PROMPT_TEMPLATE_VERSION,
     MAX_EXTRACTION_INPUT_BYTES,
     serialize_untrusted_source_versions,
     validate_candidate_envelope,
@@ -2473,9 +2474,10 @@ class LiveWikiCompilerGateway:
 # ─── Phase 6 / T6-03 — extract_candidates gateway entry point ───────────────
 
 
-# Prompt template v0.1.0. Source content is JSONL-serialized below and explicitly
-# marked untrusted; it is never interpolated as prompt syntax.
-_EXTRACT_PROMPT_TEMPLATE_V0_1_0 = (
+# Extraction contract v0.1.1. The prompt body is unchanged from v0.1.0;
+# the semantic version bump lets completed runs be replayed under the stricter
+# parser that tolerates one provider-added JSON fence.
+_EXTRACT_PROMPT_TEMPLATE_V0_1_1 = (
     "Extract knowledge-card candidates from the following Telegram chat "
     "messages. Return a JSON array of objects with exact shape:\n"
     '  [{"candidate_json": {"topic_slug": str, "title": str, '
@@ -2509,22 +2511,34 @@ def _build_extraction_prompt(
         raise ValueError(f"extraction input exceeds {MAX_EXTRACTION_INPUT_BYTES} bytes")
     return (
         f"# template_version={prompt_template_version}\n"
-        + _EXTRACT_PROMPT_TEMPLATE_V0_1_0
+        + _EXTRACT_PROMPT_TEMPLATE_V0_1_1
         + messages_jsonl
         + "\n</UNTRUSTED_MESSAGES_JSONL>"
     )
 
 
+_EXTRACTION_JSON_FENCE_RE = re.compile(
+    r"\A```json\r?\n(?P<payload>.*?)\r?\n```\Z",
+    re.DOTALL,
+)
+
+
 def _parse_extraction_response(answer_text: str) -> list[dict[str, Any]]:
     """Parse the provider response into a list of candidate dicts.
+
+    Accept bare JSON or one whole-response, lowercase ``json`` markdown
+    fence. Any prose, extra payload, alternate fence, or loose syntax abstains.
 
     Returns ``[]`` for unparseable output. The gateway downgrades parse
     failures to abstention (no candidates) rather than raising — this
     keeps the SAVEPOINT in ``run_extraction_pass`` clean and lets the
     audit layer record ``error="no_valid_candidates"`` on the ledger row.
     """
+    stripped = answer_text.strip()
+    fenced = _EXTRACTION_JSON_FENCE_RE.fullmatch(stripped)
+    payload = fenced.group("payload") if fenced is not None else answer_text
     try:
-        parsed = json.loads(answer_text)
+        parsed = json.loads(payload)
     except (json.JSONDecodeError, ValueError):
         return []
     if not isinstance(parsed, list):
@@ -2541,7 +2555,7 @@ async def extract_candidates(
     session: AsyncSession,
     *,
     source_versions: list[dict[str, Any]],
-    prompt_template_version: str = "v0.1.0",
+    prompt_template_version: str = EXTRACTION_PROMPT_TEMPLATE_VERSION,
     ledger_repo: LedgerRepoProtocol,
     provider: LLMProvider,
     config: LLMGatewayConfig,
@@ -2822,7 +2836,7 @@ class LiveExtractCandidatesGateway:
         session: Any,
         *,
         source_versions: list[dict[str, Any]],
-        prompt_template_version: str = "v0.1.0",
+        prompt_template_version: str = EXTRACTION_PROMPT_TEMPLATE_VERSION,
     ) -> dict[str, Any]:
         return await extract_candidates(
             session,
