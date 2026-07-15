@@ -382,6 +382,88 @@ async def test_semantic_extraction_survives_caller_rollback_and_actor_change(
         )
 
 
+async def test_extraction_parser_version_bump_replays_once_then_stays_idempotent(
+    postgres_engine,
+) -> None:
+    """A completed v0.1.0 run cannot suppress v0.1.1, but v0.1.1 resumes itself."""
+    from bot.db.models import ExtractionRun
+    from bot.services.extractor import run_extraction_pass
+
+    factory = async_sessionmaker(postgres_engine, class_=AsyncSession, expire_on_commit=False)
+    actor_id, chat_id, other_chat_id = _unique_ids()
+    start = datetime(2010, 2, 3, tzinfo=timezone.utc)
+    provider_name = f"semantic-parser-version-{uuid.uuid4()}"
+    gateway = _FakeGateway(provider_name)
+    await _seed_actor_and_messages(
+        factory,
+        actor_id=actor_id,
+        messages=[(chat_id, 502, start + timedelta(minutes=1))],
+    )
+
+    try:
+        async with factory() as first_caller:
+            old = await run_extraction_pass(
+                first_caller,
+                window_start=start,
+                window_end=start + timedelta(hours=1),
+                gateway=gateway,
+                operator_user_id=actor_id,
+                source_chat_id=chat_id,
+                prompt_template_version="v0.1.0",
+                durable_session_factory=factory,
+            )
+
+        async with factory() as second_caller:
+            upgraded = await run_extraction_pass(
+                second_caller,
+                window_start=start,
+                window_end=start + timedelta(hours=1),
+                gateway=gateway,
+                operator_user_id=actor_id,
+                source_chat_id=chat_id,
+                durable_session_factory=factory,
+            )
+
+        async with factory() as third_caller:
+            repeated = await run_extraction_pass(
+                third_caller,
+                window_start=start,
+                window_end=start + timedelta(hours=1),
+                gateway=gateway,
+                operator_user_id=actor_id,
+                source_chat_id=chat_id,
+                durable_session_factory=factory,
+            )
+
+        assert old.run_status == upgraded.run_status == repeated.run_status == "completed"
+        assert upgraded.resumed is False
+        assert upgraded.extraction_run_id != old.extraction_run_id
+        assert repeated.resumed is True
+        assert repeated.extraction_run_id == upgraded.extraction_run_id
+        assert len(gateway.calls) == 2
+
+        async with factory() as verify:
+            runs = (
+                (
+                    await verify.execute(
+                        select(ExtractionRun)
+                        .where(ExtractionRun.source_chat_id == chat_id)
+                        .order_by(ExtractionRun.prompt_template_version)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert [run.prompt_template_version for run in runs] == ["v0.1.0", "v0.1.1"]
+    finally:
+        await _cleanup(
+            factory,
+            actor_id=actor_id,
+            chat_ids=(chat_id, other_chat_id),
+            provider_name=provider_name,
+        )
+
+
 async def test_semantic_extraction_concurrency_dispatches_provider_once(
     postgres_engine,
 ) -> None:

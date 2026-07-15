@@ -257,6 +257,50 @@ async def test_malformed_json_response_abstains_with_no_valid_candidates() -> No
     assert ledger.rows[-1].error == "no_valid_candidates"
 
 
+def test_parse_extraction_response_accepts_one_optional_json_fence() -> None:
+    """DeepSeek may wrap its otherwise valid JSON array in one markdown fence."""
+    from bot.services.llm_gateway import _parse_extraction_response
+
+    expected = [{"candidate_json": {"topic_slug": "one"}}]
+    payload = json.dumps(expected)
+
+    assert _parse_extraction_response(f"  ```json\r\n{payload}\r\n```  \n") == expected
+
+
+def test_parse_extraction_response_preserves_bare_json_contract() -> None:
+    """The existing bare-JSON provider contract remains unchanged."""
+    from bot.services.llm_gateway import _parse_extraction_response
+
+    expected = [{"candidate_json": {"topic_slug": "bare"}}]
+
+    assert _parse_extraction_response(f"\n{json.dumps(expected)}\t") == expected
+
+
+@pytest.mark.parametrize(
+    "answer_text",
+    [
+        "Provider explanation\n```json\n[]\n```",
+        "```json\n[]\n```\ntrailing prose",
+        "```json\n[]\n```\n[]",
+        "```json\n[]\n```\n```json\n[]\n```",
+        "```javascript\n[]\n```",
+        "```JSON\n[]\n```",
+        "```\n[]\n```",
+        "```json   \n[]\n```",
+        "```json []\n```",
+        "```json\n[]```",
+        "```json\n[]\n",
+    ],
+)
+def test_parse_extraction_response_rejects_noncanonical_fenced_output(
+    answer_text: str,
+) -> None:
+    """Fences are only a wrapper; prose, extra payloads, and loose syntax abstain."""
+    from bot.services.llm_gateway import _parse_extraction_response
+
+    assert _parse_extraction_response(answer_text) == []
+
+
 # ─── Tests: provider transient error ─────────────────────────────────────────
 
 

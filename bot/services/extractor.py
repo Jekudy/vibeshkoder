@@ -58,6 +58,7 @@ from bot.db.models import (
 from bot.db.repos.feature_flag import FeatureFlagRepo
 from bot.services.extraction_schema import (
     EXTRACTION_CANDIDATE_SCHEMA_VERSION,
+    EXTRACTION_PROMPT_TEMPLATE_VERSION,
     MAX_EXTRACTION_INPUT_BYTES,
     extraction_input_size_bytes,
     serialize_untrusted_source_versions,
@@ -156,7 +157,7 @@ class ExtractCandidatesGateway(Protocol):
         session: Any,
         *,
         source_versions: list[dict[str, Any]],
-        prompt_template_version: str = "v0.1.0",
+        prompt_template_version: str = EXTRACTION_PROMPT_TEMPLATE_VERSION,
     ) -> dict[str, Any]:
         """Return ``{"candidates": [...], "llm_usage_ledger_id": int | None}``.
 
@@ -1038,7 +1039,7 @@ async def run_extraction_pass(
     gateway: ExtractCandidatesGateway,
     operator_user_id: int | None = None,
     source_chat_id: int | None = None,
-    prompt_template_version: str = "v0.1.0",
+    prompt_template_version: str = EXTRACTION_PROMPT_TEMPLATE_VERSION,
     durable_session_factory: async_sessionmaker[AsyncSession] | None = None,
     selection_mode: str = "event_time",
     cursor_start_message_version_id: int | None = None,
