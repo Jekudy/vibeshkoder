@@ -15,6 +15,7 @@ Two failure modes:
   ``message_versions.is_redacted=TRUE``.
 * **source_memory_policy_not_normal** — ``chat_messages.memory_policy``
   is anything other than ``'normal'`` (non-normal policies all block).
+* **source_not_current** — the cited version was superseded by a Telegram edit.
 
 Canonical tombstone-key form: ``mv.content_hash``, NOT
 ``chat_messages.content_hash``. The live-persistence path leaves
@@ -58,6 +59,7 @@ _REVALIDATE_SQL = text(
             c.chat_id AS chat_id,
             c.message_id AS message_id,
             c.user_id AS user_id,
+            c.current_version_id = mv.id AS is_current,
             c.memory_policy AS memory_policy,
             c.is_redacted AS c_is_redacted
         FROM message_versions AS mv
@@ -85,6 +87,7 @@ _REVALIDATE_SQL = text(
     SELECT
         src.message_version_id AS mvid,
         (SELECT forget_event_id FROM tombstone_hit LIMIT 1) AS forget_event_id,
+        src.is_current AS is_current,
         src.mv_is_redacted AS mv_is_redacted,
         src.c_is_redacted AS c_is_redacted,
         src.memory_policy AS memory_policy
@@ -104,7 +107,7 @@ async def revalidate_sources(
         ``("blocked", {...})`` with payload fields:
             * ``failure_reason``: ``forget_tombstone_match`` |
               ``source_redacted`` | ``source_memory_policy_not_normal`` |
-              ``source_missing``.
+              ``source_not_current`` | ``source_missing``.
             * ``mvid``: the offending message_version_id.
             * ``forget_event_id`` (only on tombstone_match): the
               forget_events row id that fired the block.
@@ -131,6 +134,14 @@ async def revalidate_sources(
                     "failure_reason": "forget_tombstone_match",
                     "mvid": int(row.mvid),
                     "forget_event_id": int(row.forget_event_id),
+                },
+            )
+        if not row.is_current:
+            return (
+                "blocked",
+                {
+                    "failure_reason": "source_not_current",
+                    "mvid": int(row.mvid),
                 },
             )
         if row.c_is_redacted or row.mv_is_redacted:

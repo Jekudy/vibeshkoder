@@ -326,25 +326,18 @@ pytestmark = pytest.mark.asyncio(loop_scope="class")
 
 
 class TestWikiLeakage:
-    # ── L9a: offrecord source content must not appear in rendered wiki body ────
+    # ── Phase 13: legacy marker is a valid source ─────────────────────────────
 
-    async def test_l9a_offrecord_source_not_in_wiki_render(
+    async def test_l9a_legacy_marker_source_is_valid_in_wiki_render(
         self,
         eval_app_env: None,
         wiki_leakage_session: AsyncSession,
     ) -> None:
-        """L9a: wiki page body does NOT render content from an offrecord mvid.
-
-        Setup: message with #offrecord marker → memory_policy='offrecord'.
-        Wiki page cites that mvid directly via wiki_page_message_sources.
-        render_wiki_page() must suppress the citation token (member role)
-        and NOT include the message content in html_body.
-        """
+        """A source containing ``#offrecord`` stays normal and citable."""
         _ = eval_app_env
         session = wiki_leakage_session
         wiki_renderer = importlib.import_module("bot.services.wiki_renderer")
 
-        # Persist offrecord message.
         secret_text = _OFFRECORD_MARKER + " секретное содержание L9a"
         cm_id, mv_id = await _persist_message(
             session,
@@ -357,7 +350,6 @@ class TestWikiLeakage:
         admin_id = _BASE_USER_ID + 901
         await _create_user_for_admin(session, admin_id)
 
-        # Wiki page cites the offrecord mv.
         page_id = await _create_wiki_page(
             session,
             slug="l9a-test",
@@ -376,25 +368,14 @@ class TestWikiLeakage:
             body_markdown=f"Контент страницы [^mv:{mv_id}] конец.",
         )
 
-        # Hardened per Codex MEDIUM #4: explicit check that the offrecord secret
-        # text does NOT appear in the rendered body, AND no valid citation anchor
-        # is emitted for the offrecord mvid. The previous OR-form could pass even
-        # if secret_text leaked, as long as no "wiki-citation" marker was present.
+        # Source text is not copied into the page body, but the citation remains valid.
         secret_payload = "секретное содержание L9a"
-        assert secret_payload not in result.html_body, (
-            f"L9a: offrecord secret text leaked into html_body for mv_id={mv_id}"
-        )
-        citation_anchor = f'data-mv-id="{mv_id}"'
-        assert citation_anchor not in result.html_body, (
-            f"L9a: offrecord mv_id={mv_id} rendered as valid citation anchor"
-        )
-        # Citation must be suppressed (either in suppressed list OR page archived).
-        assert (
-            mv_id in result.suppressed_citations or result.page_archived
-        ), (
-            f"L9a: offrecord mv_id {mv_id} not suppressed; "
-            f"suppressed={result.suppressed_citations}, archived={result.page_archived}"
-        )
+        assert secret_payload not in result.html_body
+        citation_anchor = f'href="#mv-{mv_id}"'
+        assert citation_anchor in result.html_body
+        assert 'class="wiki-citation"' in result.html_body
+        assert mv_id not in result.suppressed_citations
+        assert result.page_archived is False
 
     # ── L9b: forget on card_source triggers page stale/archived ───────────────
 
@@ -424,9 +405,7 @@ class TestWikiLeakage:
         await _create_user_for_admin(session, admin_id)
 
         # Approved card cites the mv.
-        card_id = await _create_approved_card_with_source(
-            session, mv_id=mv_id, admin_id=admin_id
-        )
+        card_id = await _create_approved_card_with_source(session, mv_id=mv_id, admin_id=admin_id)
 
         # Wiki page cites the card.
         page_id = await _create_wiki_page(
@@ -449,7 +428,9 @@ class TestWikiLeakage:
 
         # Assert wiki page is now stale or archived.
         row = await session.execute(
-            text("SELECT page_status, public_enabled FROM wiki_pages WHERE id = CAST(:pid AS uuid)"),
+            text(
+                "SELECT page_status, public_enabled FROM wiki_pages WHERE id = CAST(:pid AS uuid)"
+            ),
             {"pid": page_id},
         )
         page_row = row.fetchone()
@@ -459,24 +440,18 @@ class TestWikiLeakage:
         )
         assert page_row.public_enabled is False, "L9b: public_enabled must be false after cascade"
 
-    # ── L9c: transitive forget through card → page must mask/stale ────────────
+    # ── Phase 13: legacy marker remains valid transitively through a card ─────
 
-    async def test_l9c_transitive_offrecord_stalens_page(
+    async def test_l9c_transitive_legacy_marker_keeps_page_live(
         self,
         eval_app_env: None,
         wiki_leakage_session: AsyncSession,
     ) -> None:
-        """L9c: wiki page cites an approved card whose card_source is offrecord.
-
-        The page MUST mask/stale even though the card's card_status is still
-        'approved'. The approved card status alone is insufficient.
-        render_wiki_page() must return page_archived=True or suppress the citation.
-        """
+        """An approved card sourced from marker-bearing normal text stays citable."""
         _ = eval_app_env
         session = wiki_leakage_session
         wiki_renderer = importlib.import_module("bot.services.wiki_renderer")
 
-        # Persist offrecord message that will be a card source.
         offrecord_text = _OFFRECORD_MARKER + " транзитивный источник L9c"
         cm_id, mv_id = await _persist_message(
             session,
@@ -488,10 +463,7 @@ class TestWikiLeakage:
         admin_id = _BASE_USER_ID + 903
         await _create_user_for_admin(session, admin_id)
 
-        # Approved card with the offrecord mv as its source.
-        card_id = await _create_approved_card_with_source(
-            session, mv_id=mv_id, admin_id=admin_id
-        )
+        card_id = await _create_approved_card_with_source(session, mv_id=mv_id, admin_id=admin_id)
 
         # Wiki page cites that card (transitive path).
         body_md = f"Страница транзитивно [^card:{card_id}]."
@@ -505,7 +477,6 @@ class TestWikiLeakage:
         )
         await _link_card_to_page(session, page_id=page_id, card_id=card_id)
 
-        # Render as member — card_source mv is offrecord → transitive_forget.
         result = await wiki_renderer.render_wiki_page(
             session,
             page_id=uuid.UUID(page_id),
@@ -513,12 +484,8 @@ class TestWikiLeakage:
             body_markdown=body_md,
         )
 
-        # Page must be archived (transitive_forget reason in governance) or
-        # html_body must be empty (no leak of offrecord-sourced content).
-        assert result.page_archived or result.html_body == "", (
-            f"L9c: offrecord transitive source leaked; page_archived={result.page_archived}, "
-            f"html_body length={len(result.html_body)}"
-        )
+        assert result.page_archived is False
+        assert result.html_body
 
     # ── L9d: message_hash tombstone forget invalidates wiki page ──────────────
 
@@ -579,7 +546,9 @@ class TestWikiLeakage:
 
         # Assert wiki page is now stale or archived.
         row = await session.execute(
-            text("SELECT page_status, public_enabled FROM wiki_pages WHERE id = CAST(:pid AS uuid)"),
+            text(
+                "SELECT page_status, public_enabled FROM wiki_pages WHERE id = CAST(:pid AS uuid)"
+            ),
             {"pid": page_id},
         )
         page_row = row.fetchone()
@@ -640,7 +609,9 @@ class TestWikiLeakage:
 
         # Assert wiki page is now stale or archived.
         row = await session.execute(
-            text("SELECT page_status, public_enabled FROM wiki_pages WHERE id = CAST(:pid AS uuid)"),
+            text(
+                "SELECT page_status, public_enabled FROM wiki_pages WHERE id = CAST(:pid AS uuid)"
+            ),
             {"pid": page_id},
         )
         page_row = row.fetchone()

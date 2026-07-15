@@ -1,8 +1,10 @@
 """Telegram digest publisher — T7-05 / Phase 7.
 
-Holds the digest row lock ACROSS ``bot.send_message`` in a single
-transaction (PHASE7_PLAN.md §5.F). This eliminates the race window where
-a forget cascade could see the row unlocked while Telegram is in-flight.
+Commits the ``posting`` state BEFORE ``bot.send_message``.  Telegram has no
+idempotency key, so this at-most-once boundary prevents an automatic retry
+from duplicating a digest after the send succeeded but the process crashed
+before recording the returned message id.  A stale ``posting`` row is treated
+as delivery-uncertain and requires explicit operator reconciliation.
 
 Status state machine:
     draft → posting → posted     (success)
@@ -25,6 +27,7 @@ from datetime import datetime, timezone
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Digest, DigestRun
@@ -33,6 +36,21 @@ from bot.services.digest_renderer import render_digest_html
 from bot.services.digests import DigestConfig
 
 logger = logging.getLogger(__name__)
+
+_LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+
+
+def _is_lock_not_available(exc: DBAPIError) -> bool:
+    """Return whether a DBAPI failure is PostgreSQL ``lock_not_available``.
+
+    SQLAlchemy's asyncpg adapter exposes the server code on ``exc.orig``;
+    psycopg-compatible adapters may expose the same value as ``pgcode``.
+    Matching the SQLSTATE keeps unrelated connection/query failures fail-fast.
+    """
+    return (
+        getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE_SQLSTATE
+        or getattr(exc.orig, "pgcode", None) == _LOCK_NOT_AVAILABLE_SQLSTATE
+    )
 
 
 class DigestPublisherInvalidState(Exception):
@@ -91,9 +109,7 @@ _PUBLISHER_TRIGGER_STATUSES: tuple[str, ...] = (
 )
 
 
-async def _digest_revalidate_citations(
-    session: AsyncSession, *, digest: Digest
-) -> bool:
+async def _digest_revalidate_citations(session: AsyncSession, *, digest: Digest) -> bool:
     """Defense-in-depth: re-check every citation source id is still visible.
 
     Returns True if all cited sources are clean, False if any failed
@@ -164,8 +180,8 @@ async def publish_digest(
 ) -> Digest:
     """Publish a digest to its destination chat.
 
-    Single long-lived transaction holding the row lock across send_message.
-    Caller MUST commit the session after this returns OR roll back on raise.
+    The function owns two durable transaction boundaries: ``posting`` before
+    outbound send, and ``posted``/``failed`` after the Telegram result.
     """
     if digest.status not in _PUBLISHER_TRIGGER_STATUSES:
         raise DigestPublisherInvalidState(
@@ -192,33 +208,70 @@ async def publish_digest(
         return digest
 
     # Set transaction-local timeout (covers 5s lock wait + ~20s Telegram + buffer).
-    await session.execute(
-        text("SELECT set_config('statement_timeout', '30s', true)")
-    )
+    await session.execute(text("SELECT set_config('statement_timeout', '30s', true)"))
 
     # Try FOR UPDATE NOWAIT with up to 3 backoff retries.
     locked = False
-    last_exc: Exception | None = None
+    last_exc: DBAPIError | None = None
     for attempt in range(3):
         try:
-            await session.execute(
-                text("SELECT id FROM digests WHERE id = :id FOR UPDATE NOWAIT"),
-                {"id": digest.id},
-            )
+            # PostgreSQL aborts the current transaction after a 55P03.  Keep
+            # each NOWAIT attempt inside a SAVEPOINT so the expected failure
+            # rolls back locally and the publisher's outer transaction stays
+            # usable for the next retry and the failure audit below.
+            async with session.begin_nested():
+                await session.execute(
+                    text("SELECT id FROM digests WHERE id = :id FOR UPDATE NOWAIT"),
+                    {"id": digest.id},
+                )
             locked = True
             break
-        except Exception as exc:
+        except DBAPIError as exc:
+            if not _is_lock_not_available(exc):
+                raise
             last_exc = exc
             await asyncio.sleep(0.1 * (2**attempt))
     if not locked:
-        # Fresh transaction guard: only update if still 'draft' (race-safe).
-        # Note: we're still inside the same session — for true fresh-tx,
-        # caller would need a separate session. For this implementation we
-        # update + log + raise; the scheduler wrapper rolls back outer tx.
         logger.warning(
             "publish_digest: lock acquisition exhausted (3 retries) digest_id=%s",
             digest.id,
         )
+        # The lock owner may have committed ``posting``/``posted`` while this
+        # publisher was backing off.  Transition to failure only if the row is
+        # still publishable; an unconditional ORM flush here would overwrite
+        # the concurrent winner after waiting for its row lock.
+        failure_result = await session.execute(
+            text(
+                "UPDATE digests "
+                "SET status='failed', error_text='publish_lock_timeout', updated_at=now() "
+                "WHERE id=:id AND status IN ('draft','approved_for_publish') "
+                "RETURNING id"
+            ),
+            {"id": digest.id},
+        )
+        if failure_result.scalar_one_or_none() is None:
+            current = (
+                await session.execute(
+                    text("SELECT status FROM digests WHERE id=:id"),
+                    {"id": digest.id},
+                )
+            ).scalar_one_or_none()
+            if current is None:
+                raise DigestPublisherInvalidState(
+                    digest_id=digest.id,
+                    current_status=None,
+                    reason="row_deleted_during_lock_timeout_transition",
+                )
+            raise DigestPublisherInvalidState(
+                digest_id=digest.id,
+                current_status=current,
+                reason=(
+                    "publish_lock_timeout transition requires status IN "
+                    "('draft','approved_for_publish'), "
+                    f"found {current!r}"
+                ),
+            )
+
         digest.status = "failed"
         digest.error_text = "publish_lock_timeout"
         session.add(
@@ -273,10 +326,7 @@ async def publish_digest(
         raise DigestPublisherInvalidState(
             digest_id=digest.id,
             current_status=current,
-            reason=(
-                "expected status IN ('draft','approved_for_publish'), "
-                f"found {current!r}"
-            ),
+            reason=(f"expected status IN ('draft','approved_for_publish'), found {current!r}"),
         )
 
     # Refresh ORM state to reflect the guarded UPDATE so subsequent code
@@ -319,6 +369,10 @@ async def publish_digest(
         digest_type=digest.type,
         window_end_utc=digest.window_end if digest.type == "weekly" else None,
     )
+    # At-most-once delivery boundary.  If the process dies after Telegram
+    # accepts the message, ``posting`` remains durable and no cron path sends
+    # the same digest again.  The stale reaper later marks it failed/uncertain.
+    await session.commit()
     try:
         sent = await bot.send_message(
             chat_id=digest_config.destination_chat_id,
@@ -339,6 +393,7 @@ async def publish_digest(
             )
         )
         await session.flush()
+        await session.commit()
         await notify_admins_digest_failure(
             bot, digest_id=digest.id, status="failed", error_text=str(exc)
         )
@@ -356,6 +411,7 @@ async def publish_digest(
             )
         )
         await session.flush()
+        await session.commit()
         await notify_admins_digest_failure(
             bot,
             digest_id=digest.id,
@@ -403,6 +459,7 @@ async def publish_digest(
     )
     await session.flush()
     await session.refresh(digest)
+    await session.commit()
     return digest
 
 

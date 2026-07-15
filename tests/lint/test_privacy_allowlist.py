@@ -1,10 +1,47 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "lint_privacy_check.sh"
+PRECOMMIT_SCRIPT = (
+    Path(__file__).resolve().parents[2] / "scripts" / "precommit-privacy-allowlist.sh"
+)
+
+PHASE13_COMPLETE_HISTORY_PATHS = (
+    "bot/middlewares/raw_update_persistence.py",
+    "bot/services/governance.py",
+    "bot/services/import_apply.py",
+    "bot/services/import_html_parser.py",
+    "bot/services/ingestion.py",
+    "bot/services/wiki_compiler.py",
+    "docs/ops/phase13-production-preflight-2026-07-14.md",
+    "tests/fixtures/qa_eval_cases.json",
+    "tests/handlers/test_chat_messages_helper_path.py",
+    "tests/handlers/test_chat_messages_redelivery_idempotent.py",
+    "tests/handlers/test_edited_message.py",
+    "tests/integration/test_offrecord_irreversibility.py",
+    "tests/integration/test_phase4_hotfix_e2e.py",
+    "tests/services/test_governance_stub.py",
+    "tests/services/test_human_memory_policy.py",
+    "tests/services/test_import_apply.py",
+    "tests/services/test_import_dry_run_stats.py",
+    "tests/services/test_import_html_apply.py",
+    "tests/services/test_import_parser.py",
+    "tests/services/test_llm_gateway_wiki.py",
+    "tests/services/test_message_persistence.py",
+)
+
+
+def phase13_complete_history_paths(script: Path) -> tuple[str, ...]:
+    text = script.read_text(encoding="utf-8")
+    start = text.index("# BEGIN PHASE13_COMPLETE_HISTORY_ALLOWLIST")
+    end = text.index("# END PHASE13_COMPLETE_HISTORY_ALLOWLIST")
+    block = text[start:end]
+    assert "=~" not in block, "Phase 13 allowlist must use exact paths, never regex/globs"
+    return tuple(re.findall(r'^\s*\[\[ "\$path" == "([^"]+)" \]\] && return 0$', block, re.M))
 
 
 def run_git(repo: Path, *args: str) -> None:
@@ -32,10 +69,44 @@ def run_lint(repo: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_precommit_lint(repo: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(PRECOMMIT_SCRIPT)],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def write_file(repo: Path, relative_path: str, content: str) -> None:
     path = repo / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def test_phase13_complete_history_allowlist_is_exact_and_synced() -> None:
+    """CI and advisory pre-commit use one path-exact Phase 13 exception set."""
+    assert phase13_complete_history_paths(SCRIPT) == PHASE13_COMPLETE_HISTORY_PATHS
+    assert phase13_complete_history_paths(PRECOMMIT_SCRIPT) == PHASE13_COMPLETE_HISTORY_PATHS
+
+
+def test_phase13_complete_history_paths_pass_ci_and_precommit(tmp_path: Path) -> None:
+    """Every intentional Phase 13 path is accepted by both canonical checks."""
+    init_repo(tmp_path)
+    commit_all(tmp_path)
+
+    marker = "#" + "off" + "record"
+    for relative_path in PHASE13_COMPLETE_HISTORY_PATHS:
+        write_file(tmp_path, relative_path, f"Phase 13 policy example: {marker}\n")
+
+    run_git(tmp_path, "add", ".")
+    precommit_result = run_precommit_lint(tmp_path)
+    assert precommit_result.returncode == 0, precommit_result.stdout + precommit_result.stderr
+
+    commit_all(tmp_path)
+    ci_result = run_lint(tmp_path)
+    assert ci_result.returncode == 0, ci_result.stdout + ci_result.stderr
 
 
 def test_empty_repo_passes(tmp_path: Path) -> None:
@@ -158,9 +229,7 @@ def test_narrowed_allowlist_only_permits_four_leakage_globs(tmp_path: Path) -> N
     result = run_lint(tmp_path)
 
     assert result.returncode == 1, (
-        "docs/ path with new marker should fail but passed:\n"
-        + result.stdout
-        + result.stderr
+        "docs/ path with new marker should fail but passed:\n" + result.stdout + result.stderr
     )
 
 

@@ -31,6 +31,7 @@ pytestmark = pytest.mark.usefixtures("app_env")
 # Helpers for building minimal export fixtures
 # ---------------------------------------------------------------------------
 
+
 def _make_export(chat_id: int, messages: list[dict]) -> dict:
     return {
         "name": "Test Chat",
@@ -70,6 +71,7 @@ def _rand_user_id() -> int:
 
 async def _ensure_user(session, tg_id: int) -> object:
     from bot.db.repos.user import UserRepo
+
     return await UserRepo.upsert(
         session,
         telegram_id=tg_id,
@@ -88,8 +90,10 @@ async def _create_chat_message(
     from datetime import datetime, timezone
 
     from bot.db.repos.message import MessageRepo
+    from bot.db.repos.message_version import MessageVersionRepo
+    from bot.services.content_hash import compute_content_hash
 
-    return await MessageRepo.save(
+    row = await MessageRepo.save(
         session,
         message_id=message_id,
         chat_id=chat_id,
@@ -98,11 +102,27 @@ async def _create_chat_message(
         date=datetime.now(tz=timezone.utc),
         raw_update_id=None,
     )
+    version = await MessageVersionRepo.insert_version(
+        session,
+        chat_message_id=row.id,
+        content_hash=compute_content_hash(
+            text="existing message",
+            caption=None,
+            message_kind="text",
+            entities=None,
+        ),
+        text="existing message",
+        normalized_text="existing message",
+    )
+    row.current_version_id = version.id
+    await session.flush()
+    return row
 
 
 # ---------------------------------------------------------------------------
 # 1. Backward compat: parse_export (sync, no DB) leaves db_* fields at defaults
 # ---------------------------------------------------------------------------
+
 
 def test_parse_export_db_fields_default_to_zero(tmp_path: Path) -> None:
     """parse_export() (no DB) must leave db_duplicate_count=0, db_duplicate_export_msg_ids=[],
@@ -123,6 +143,7 @@ def test_parse_export_db_fields_default_to_zero(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # 2. DB duplicate detection
 # ---------------------------------------------------------------------------
+
 
 async def test_db_duplicate_count_matches_colliding_ids(db_session, tmp_path: Path) -> None:
     """Pre-populate chat_messages with N rows; export contains M of those ids.
@@ -172,6 +193,42 @@ async def test_db_duplicate_count_zero_when_no_overlap(db_session, tmp_path: Pat
     assert report.db_duplicate_export_msg_ids == []
 
 
+async def test_db_existing_row_without_current_version_is_reported_for_restore(
+    db_session,
+    tmp_path: Path,
+) -> None:
+    """A legacy normalized row is not a safe duplicate: apply must restore its version."""
+    from datetime import datetime, timezone
+
+    from bot.db.repos.message import MessageRepo
+    from bot.services.import_dry_run import parse_export_with_db
+
+    chat_id = _rand_chat_id()
+    user_id = _rand_user_id()
+    await _ensure_user(db_session, user_id)
+    message_id = _rand_msg_id()
+    await MessageRepo.save(
+        db_session,
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text="legacy row",
+        date=datetime.now(tz=timezone.utc),
+        raw_update_id=None,
+    )
+
+    export = _make_export(chat_id, [_make_message(message_id)])
+    export_path = tmp_path / "export.json"
+    export_path.write_text(json.dumps(export), encoding="utf-8")
+
+    report = await parse_export_with_db(export_path, db_session, chat_id)
+
+    assert report.db_duplicate_count == 0
+    assert report.db_duplicate_export_msg_ids == []
+    assert report.db_rehydrate_count == 1
+    assert report.db_rehydrate_export_msg_ids == [message_id]
+
+
 async def test_db_duplicate_does_not_cross_chat_boundary(db_session, tmp_path: Path) -> None:
     """A message id in chat A must NOT be counted as duplicate when querying chat B."""
     from bot.services.import_dry_run import parse_export_with_db
@@ -198,6 +255,7 @@ async def test_db_duplicate_does_not_cross_chat_boundary(db_session, tmp_path: P
 # ---------------------------------------------------------------------------
 # 3. DB broken reply chain
 # ---------------------------------------------------------------------------
+
 
 async def test_db_broken_reply_count_when_target_missing(db_session, tmp_path: Path) -> None:
     """Export has a reply whose target is not in DB → db_broken_reply_count == 1."""
@@ -268,11 +326,12 @@ async def test_db_broken_reply_count_no_replies(db_session, tmp_path: Path) -> N
 # 4. CLI --with-db prints operator summary
 # ---------------------------------------------------------------------------
 
+
 async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -> None:
     """import_dry_run --with-db <path> prints the EXACT operator summary line.
 
-    Verifies the issue #99 spec verbatim:
-    "N duplicates would be skipped, M offrecord messages, K nomem, J broken reply chains."
+    Verifies the operator summary, including rows that the complete-history
+    import will restore instead of treating as duplicates.
 
     The DB session is mocked so no real connection is needed — we patch
     bot.db.engine.async_session to yield the test db_session.
@@ -281,7 +340,6 @@ async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -
     import sys
     from contextlib import asynccontextmanager
     from unittest.mock import patch
-
 
     chat_id = _rand_chat_id()
     user_id = _rand_user_id()
@@ -297,11 +355,14 @@ async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -
     missing_target = _rand_msg_id()
     reply_id = _rand_msg_id()
 
-    export = _make_export(chat_id, [
-        _make_message(existing_id),
-        _make_message(new_id),
-        _make_message(reply_id, reply_to=missing_target),
-    ])
+    export = _make_export(
+        chat_id,
+        [
+            _make_message(existing_id),
+            _make_message(new_id),
+            _make_message(reply_id, reply_to=missing_target),
+        ],
+    )
     f = tmp_path / "export.json"
     f.write_text(json.dumps(export), encoding="utf-8")
 
@@ -328,23 +389,26 @@ async def test_cli_with_db_prints_operator_summary(db_session, tmp_path: Path) -
 
     output = buf.getvalue().strip()
     assert rc == 0, f"Expected exit 0, got {rc}. Output: {output!r}"
-    # First line: exact format per issue #99 spec:
-    # "N duplicates would be skipped, M offrecord messages, K nomem, J broken reply chains."
+    # First line: exact complete-history dry-run summary.
     lines = output.splitlines()
-    expected_line1 = "1 duplicates would be skipped, 0 offrecord messages, 0 nomem, 1 broken reply chains."
+    expected_line1 = (
+        "1 duplicates would be skipped, 0 hidden/legacy rows would be restored, "
+        "0 offrecord messages, 0 nomem, 1 broken reply chains."
+    )
     assert lines[0] == expected_line1, (
         f"Expected exact first summary line:\n  {expected_line1!r}\nGot:\n  {lines[0]!r}"
     )
-    # Second line: tombstone summary (issue #100 extension). No tombstones in this test.
+    # Second line makes the complete-history policy explicit.
     assert len(lines) >= 2, f"Expected at least 2 output lines, got: {output!r}"
-    assert "Tombstone skip:" in lines[1], (
-        f"Expected 'Tombstone skip:' in second line, got: {lines[1]!r}"
-    )
+    assert lines[1] == (
+        "Complete history: legacy tombstones and policy markers do not skip messages."
+    ), f"Unexpected complete-history policy line: {lines[1]!r}"
 
 
 # ---------------------------------------------------------------------------
 # Fix 1: intra-export reply targets are NOT counted as broken
 # ---------------------------------------------------------------------------
+
 
 async def test_db_broken_reply_count_excludes_in_export_targets(db_session, tmp_path: Path) -> None:
     """Reply target present in same export but absent from DB is NOT counted as broken.
@@ -362,8 +426,8 @@ async def test_db_broken_reply_count_excludes_in_export_targets(db_session, tmp_
     msg_b_id = _rand_msg_id()
 
     messages = [
-        _make_message(msg_b_id),                       # target — in export, NOT in DB
-        _make_message(msg_a_id, reply_to=msg_b_id),    # source — reply to msg_b
+        _make_message(msg_b_id),  # target — in export, NOT in DB
+        _make_message(msg_a_id, reply_to=msg_b_id),  # source — reply to msg_b
     ]
     export = _make_export(chat_id, messages)
     f = tmp_path / "export.json"
@@ -381,7 +445,10 @@ async def test_db_broken_reply_count_excludes_in_export_targets(db_session, tmp_
 # Fix 2: multiplicity — count MESSAGES (not unique target ids)
 # ---------------------------------------------------------------------------
 
-async def test_db_broken_reply_count_counts_messages_not_unique_targets(db_session, tmp_path: Path) -> None:
+
+async def test_db_broken_reply_count_counts_messages_not_unique_targets(
+    db_session, tmp_path: Path
+) -> None:
     """Two messages that both reply to the same missing target → db_broken_reply_count == 2.
 
     The resolver deduplicates by target_id internally, but the count must be per-message

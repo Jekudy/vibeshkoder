@@ -106,9 +106,7 @@ async def test_list_pending_returns_pending_only(db_session) -> None:
     )
     await db_session.flush()
 
-    rows = await ExtractionCandidateRepo.list_pending(
-        db_session, limit=10, offset=0
-    )
+    rows = await ExtractionCandidateRepo.list_pending(db_session, limit=10, offset=0)
     ids = [r.id for r in rows]
     assert pending_id in ids
     assert approved_id not in ids
@@ -130,22 +128,21 @@ async def test_list_pending_orders_newest_first(db_session) -> None:
     # Force explicit timestamps so the ORDER BY can decide.
     from sqlalchemy import update
 
-    base = datetime.now(timezone.utc)
+    # Keep these rows above unrelated pending fixtures left by durability tests.
+    # The repository intentionally returns only the requested page, so using
+    # ordinary ``now()`` here makes this ordering assertion suite-order dependent.
+    base = datetime(2099, 1, 1, tzinfo=timezone.utc)
     await db_session.execute(
         update(ExtractionCandidate)
         .where(ExtractionCandidate.id == older)
         .values(created_at=base - timedelta(minutes=5))
     )
     await db_session.execute(
-        update(ExtractionCandidate)
-        .where(ExtractionCandidate.id == newer)
-        .values(created_at=base)
+        update(ExtractionCandidate).where(ExtractionCandidate.id == newer).values(created_at=base)
     )
     await db_session.flush()
 
-    rows = await ExtractionCandidateRepo.list_pending(
-        db_session, limit=10, offset=0
-    )
+    rows = await ExtractionCandidateRepo.list_pending(db_session, limit=10, offset=0)
     ids = [r.id for r in rows]
     # Newest first → newer appears before older.
     assert ids.index(newer) < ids.index(older)
@@ -159,12 +156,8 @@ async def test_list_pending_respects_limit_and_offset(db_session) -> None:
     for _ in range(5):
         ids.append(await _make_candidate(db_session, status="pending"))
 
-    page1 = await ExtractionCandidateRepo.list_pending(
-        db_session, limit=2, offset=0
-    )
-    page2 = await ExtractionCandidateRepo.list_pending(
-        db_session, limit=2, offset=2
-    )
+    page1 = await ExtractionCandidateRepo.list_pending(db_session, limit=2, offset=0)
+    page2 = await ExtractionCandidateRepo.list_pending(db_session, limit=2, offset=2)
 
     assert len(page1) == 2
     assert len(page2) == 2
@@ -192,9 +185,7 @@ async def test_get_by_id_for_update_returns_none_when_missing(db_session) -> Non
     """Returns None for a missing id (caller decides whether to error)."""
     from bot.db.repos.extraction_candidate import ExtractionCandidateRepo
 
-    row = await ExtractionCandidateRepo.get_by_id_for_update(
-        db_session, uuid.uuid4()
-    )
+    row = await ExtractionCandidateRepo.get_by_id_for_update(db_session, uuid.uuid4())
     assert row is None
 
 

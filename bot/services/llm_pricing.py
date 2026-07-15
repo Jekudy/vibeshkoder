@@ -38,6 +38,29 @@ MODEL_PRICING: dict[str, ModelPricing] = {
         input_per_million_tokens_usd=Decimal("0.15"),
         output_per_million_tokens_usd=Decimal("0.60"),
     ),
+    # DeepSeek official API pricing checked 2026-07-14. Cache-hit input is
+    # cheaper, but the ledger deliberately estimates every input token at the
+    # conservative cache-miss rate.
+    "deepseek-v4-flash": ModelPricing(
+        input_per_million_tokens_usd=Decimal("0.14"),
+        output_per_million_tokens_usd=Decimal("0.28"),
+    ),
+    "deepseek-v4-pro": ModelPricing(
+        input_per_million_tokens_usd=Decimal("0.435"),
+        output_per_million_tokens_usd=Decimal("0.87"),
+    ),
+    "gpt-5-mini": ModelPricing(
+        input_per_million_tokens_usd=Decimal("0.25"),
+        output_per_million_tokens_usd=Decimal("2.00"),
+    ),
+    "gpt-5.4-nano": ModelPricing(
+        input_per_million_tokens_usd=Decimal("0.20"),
+        output_per_million_tokens_usd=Decimal("1.25"),
+    ),
+    "gpt-5-nano": ModelPricing(
+        input_per_million_tokens_usd=Decimal("0.05"),
+        output_per_million_tokens_usd=Decimal("0.40"),
+    ),
 }
 
 
@@ -66,12 +89,8 @@ def estimate_cost(*, model: str, tokens_in: int, tokens_out: int) -> Decimal:
         this as a configuration / structural error.
     """
     pricing = MODEL_PRICING[model]
-    cost_in = (pricing.input_per_million_tokens_usd * Decimal(tokens_in)) / Decimal(
-        1_000_000
-    )
-    cost_out = (
-        pricing.output_per_million_tokens_usd * Decimal(tokens_out)
-    ) / Decimal(1_000_000)
+    cost_in = (pricing.input_per_million_tokens_usd * Decimal(tokens_in)) / Decimal(1_000_000)
+    cost_out = (pricing.output_per_million_tokens_usd * Decimal(tokens_out)) / Decimal(1_000_000)
     return (cost_in + cost_out).quantize(Decimal("0.000001"))
 
 

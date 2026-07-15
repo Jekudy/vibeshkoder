@@ -66,6 +66,7 @@ def _make_message(
         chat=SimpleNamespace(id=chat_id, type="supergroup"),
         from_user=SimpleNamespace(
             id=user_id,
+            is_bot=False,
             username=f"u{user_id}",
             first_name="Test",
             last_name=None,
@@ -160,9 +161,7 @@ def test_save_chat_message_advisory_lock_before_db_ops(app_env, monkeypatch) -> 
         f"TOCTOU RACE: first session.execute was NOT the advisory lock. "
         f"Got: {first_sql!r}. All SQL: {executed_sql}"
     )
-    assert "hashtext" in first_sql, (
-        f"Advisory lock SQL must use hashtext(). Got: {first_sql!r}"
-    )
+    assert "hashtext" in first_sql, f"Advisory lock SQL must use hashtext(). Got: {first_sql!r}"
 
     # Verify the lock key was correct by checking the params of the first call.
     first_call_args = session.execute.await_args_list[0]
@@ -230,9 +229,7 @@ def test_save_chat_message_offrecord_advisory_lock_before_db_ops(app_env, monkey
 # ─── Scenario 2: edited_message handler acquires advisory lock first ──────────
 
 
-def test_handle_edited_message_advisory_lock_before_find_chat_message(
-    app_env, monkeypatch
-) -> None:
+def test_handle_edited_message_advisory_lock_before_find_chat_message(app_env, monkeypatch) -> None:
     """The advisory lock must be acquired before _find_chat_message (SELECT FOR UPDATE).
 
     This verifies that T1-14's with_for_update() and #80's advisory lock cooperate:
@@ -335,7 +332,11 @@ def test_message_repo_save_legacy_select_uses_for_update(app_env) -> None:
     # Verify the SELECT statement has FOR UPDATE set.
     # SQLAlchemy's with_for_update() sets _for_update_arg on the select object.
     # We inspect the compiled SQL string for "FOR UPDATE" or check the internal flag.
-    compiled_sql = str(select_stmt.compile(dialect=__import__("sqlalchemy.dialects.postgresql", fromlist=["dialect"]).dialect()))
+    compiled_sql = str(
+        select_stmt.compile(
+            dialect=__import__("sqlalchemy.dialects.postgresql", fromlist=["dialect"]).dialect()
+        )
+    )
     assert "FOR UPDATE" in compiled_sql.upper(), (
         f"TOCTOU RACE: legacy DO NOTHING SELECT fallback does not use FOR UPDATE. "
         f"Compiled SQL: {compiled_sql!r}"

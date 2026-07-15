@@ -28,6 +28,7 @@ pytestmark = pytest.mark.usefixtures("app_env")
 # Helpers (mirror style from test_import_dry_run_stats.py)
 # ---------------------------------------------------------------------------
 
+
 def _make_export(chat_id: int, messages: list[dict]) -> dict:
     return {
         "name": "Test Chat",
@@ -63,6 +64,7 @@ def _rand_user_id() -> int:
 
 async def _ensure_user(session, tg_id: int) -> object:
     from bot.db.repos.user import UserRepo
+
     return await UserRepo.upsert(
         session,
         telegram_id=tg_id,
@@ -76,8 +78,10 @@ async def _create_chat_message(session, chat_id: int, message_id: int, user_id: 
     from datetime import datetime, timezone
 
     from bot.db.repos.message import MessageRepo
+    from bot.db.repos.message_version import MessageVersionRepo
+    from bot.services.content_hash import compute_content_hash
 
-    return await MessageRepo.save(
+    row = await MessageRepo.save(
         session,
         message_id=message_id,
         chat_id=chat_id,
@@ -86,6 +90,21 @@ async def _create_chat_message(session, chat_id: int, message_id: int, user_id: 
         date=datetime.now(tz=timezone.utc),
         raw_update_id=None,
     )
+    version = await MessageVersionRepo.insert_version(
+        session,
+        chat_message_id=row.id,
+        content_hash=compute_content_hash(
+            text="existing message",
+            caption=None,
+            message_kind="text",
+            entities=None,
+        ),
+        text="existing message",
+        normalized_text="existing message",
+    )
+    row.current_version_id = version.id
+    await session.flush()
+    return row
 
 
 async def _create_tombstone(session, *, tombstone_key: str) -> object:
@@ -105,6 +124,7 @@ async def _create_tombstone(session, *, tombstone_key: str) -> object:
 # 1. Offline mode: tombstone fields default to 0 / []
 # ---------------------------------------------------------------------------
 
+
 def test_parse_export_tombstone_fields_default_offline(tmp_path: Path) -> None:
     """parse_export() (no DB) must leave tombstone_skip_count=0 and
     tombstone_skip_export_msg_ids=[] — new fields present but empty in offline mode."""
@@ -121,12 +141,11 @@ def test_parse_export_tombstone_fields_default_offline(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. DB-aware: one export message matches a tombstone → count=1, id listed
+# 2. DB-aware: legacy tombstones are audit-only
 # ---------------------------------------------------------------------------
 
-async def test_tombstone_skip_count_matches_one_tombstone(db_session, tmp_path: Path) -> None:
-    """Insert tombstone keyed to message:{chat_id}:{msg_id}.
-    Export contains that msg_id → tombstone_skip_count=1, id in list."""
+
+async def test_legacy_tombstone_is_not_a_dry_run_skip(db_session, tmp_path: Path) -> None:
     from bot.services.import_dry_run import parse_export_with_db
 
     chat_id = _rand_chat_id()
@@ -145,13 +164,14 @@ async def test_tombstone_skip_count_matches_one_tombstone(db_session, tmp_path: 
 
     report = await parse_export_with_db(f, db_session, chat_id)
 
-    assert report.tombstone_skip_count == 1
-    assert report.tombstone_skip_export_msg_ids == [tombstoned_msg_id]
+    assert report.tombstone_skip_count == 0
+    assert report.tombstone_skip_export_msg_ids == []
 
 
 # ---------------------------------------------------------------------------
 # 3. DB-aware: no tombstone matches → count=0, list empty
 # ---------------------------------------------------------------------------
+
 
 async def test_tombstone_skip_count_zero_when_no_match(db_session, tmp_path: Path) -> None:
     """Export messages with NO matching tombstones → tombstone_skip_count=0."""
@@ -174,12 +194,11 @@ async def test_tombstone_skip_count_zero_when_no_match(db_session, tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
-# 4. Edge: message is BOTH a duplicate AND a tombstone → tombstone bucket wins
+# 4. Edge: a duplicate stays a duplicate despite a legacy tombstone
 # ---------------------------------------------------------------------------
 
-async def test_tombstone_wins_over_duplicate_bucket(db_session, tmp_path: Path) -> None:
-    """A message id that is both in chat_messages (duplicate) AND has a tombstone
-    must be counted under tombstone_skip_count, NOT under db_duplicate_count."""
+
+async def test_duplicate_stays_duplicate_with_legacy_tombstone(db_session, tmp_path: Path) -> None:
     from bot.services.import_dry_run import parse_export_with_db
 
     chat_id = _rand_chat_id()
@@ -202,23 +221,18 @@ async def test_tombstone_wins_over_duplicate_bucket(db_session, tmp_path: Path) 
 
     report = await parse_export_with_db(f, db_session, chat_id)
 
-    # Tombstone bucket wins
-    assert report.tombstone_skip_count == 1
-    assert report.tombstone_skip_export_msg_ids == [shared_msg_id]
-    # Duplicate count must NOT include the tombstoned id
-    assert report.db_duplicate_count == 0
-    assert shared_msg_id not in report.db_duplicate_export_msg_ids
+    assert report.tombstone_skip_count == 0
+    assert report.tombstone_skip_export_msg_ids == []
+    assert report.db_duplicate_count == 1
+    assert shared_msg_id in report.db_duplicate_export_msg_ids
 
 
 # ---------------------------------------------------------------------------
-# 5. CLI --with-db prints the new "Tombstone skip:" line
+# 5. CLI states the complete-history policy
 # ---------------------------------------------------------------------------
 
-async def test_cli_with_db_prints_tombstone_skip_line(db_session, tmp_path: Path) -> None:
-    """import_dry_run --with-db prints 'Tombstone skip: N messages match existing tombstones...'
 
-    Verifies that the new line appears directly after the existing duplicate summary line.
-    """
+async def test_cli_with_db_prints_complete_history_policy(db_session, tmp_path: Path) -> None:
     import argparse
     import io
     import sys
@@ -257,10 +271,5 @@ async def test_cli_with_db_prints_tombstone_skip_line(db_session, tmp_path: Path
 
     output = buf.getvalue()
     assert rc == 0, f"Expected exit 0, got {rc}. Output: {output!r}"
-    assert "Tombstone skip:" in output, (
-        f"Expected 'Tombstone skip:' line in output, got:\n{output!r}"
-    )
-    # The line should say 1 tombstone
-    assert "1 messages match existing tombstones" in output, (
-        f"Expected '1 messages match existing tombstones' in output, got:\n{output!r}"
-    )
+    assert "Complete history:" in output
+    assert "do not skip messages" in output

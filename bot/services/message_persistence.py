@@ -25,11 +25,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.locks import advisory_lock_chat_message
-from bot.db.models import ChatMessage
+from bot.db.models import ChatMessage, MessageVersion, OffrecordMark
 from bot.db.repos.message import MessageRepo
 from bot.db.repos.message_version import MessageVersionRepo
 from bot.db.repos.offrecord_mark import OffrecordMarkRepo
@@ -43,6 +43,124 @@ class PersistResult:
     chat_message: ChatMessage
     policy: str  # "normal" | "nomem" | "offrecord"
     is_offrecord_mark_created: bool
+
+
+async def rehydrate_message_from_import(
+    session: AsyncSession,
+    message: Any,
+    *,
+    chat_message_id: int,
+    raw_update_id: int,
+    raw_payload: dict[str, Any],
+    captured_at: datetime,
+) -> PersistResult:
+    """Restore a row hidden by the retired forget/offrecord policy.
+
+    Phase 13 switched to complete human history.  This explicit import-only
+    operation is intentionally allowed to undo the old sticky redaction ratchet;
+    normal live redeliveries still use :func:`persist_message_with_policy`.
+    """
+    await advisory_lock_chat_message(session, message.chat.id, message.message_id)
+    saved = (
+        await session.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.id == chat_message_id,
+                ChatMessage.chat_id == message.chat.id,
+                ChatMessage.message_id == message.message_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one()
+    if message.from_user is None:
+        raise ValueError("imported human message must have from_user")
+
+    normalized = extract_normalized_fields(message)
+    text_value = getattr(message, "text", None)
+    caption_value = normalized["caption"]
+    entities = extract_entities_unified(message)
+    entities_json = json.dumps(entities) if entities else None
+    content_hash = compute_content_hash(
+        text=text_value,
+        caption=caption_value,
+        message_kind=normalized["message_kind"],
+        entities=entities,
+    )
+    version = await MessageVersionRepo.insert_version(
+        session,
+        chat_message_id=saved.id,
+        content_hash=content_hash,
+        text=text_value,
+        caption=caption_value,
+        normalized_text=text_value,
+        entities_json=entities_json,
+        raw_update_id=raw_update_id,
+        is_redacted=False,
+        imported_final=True,
+        captured_at=captured_at,
+    )
+    # Redacted historical versions remain immutable audit rows. Migration 082
+    # permits one new active version with the same canonical content hash.
+    await session.execute(
+        update(ChatMessage)
+        .where(ChatMessage.id == saved.id)
+        .values(
+            user_id=message.from_user.id,
+            text=text_value,
+            caption=caption_value,
+            date=captured_at,
+            raw_json=raw_payload,
+            raw_update_id=raw_update_id,
+            reply_to_message_id=normalized["reply_to_message_id"],
+            message_thread_id=normalized["message_thread_id"],
+            message_kind=normalized["message_kind"],
+            current_version_id=version.id,
+            memory_policy="normal",
+            is_redacted=False,
+            content_hash=content_hash,
+            updated_at=func.now(),
+        )
+    )
+    await session.execute(
+        update(OffrecordMark)
+        .where(
+            OffrecordMark.chat_message_id == saved.id,
+            OffrecordMark.status == "active",
+        )
+        .values(status="revoked")
+    )
+    hashes = (
+        (
+            await session.execute(
+                select(MessageVersion.content_hash).where(
+                    MessageVersion.chat_message_id == saved.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    tombstone_keys = {
+        f"message:{saved.chat_id}:{saved.message_id}",
+        f"user:{saved.user_id}",
+        *(f"message_hash:{value}" for value in hashes),
+    }
+    from bot.db.models import ForgetEvent
+
+    await session.execute(
+        update(ForgetEvent)
+        .where(
+            ForgetEvent.tombstone_key.in_(sorted(tombstone_keys)),
+            ForgetEvent.status.in_(("pending", "processing", "completed")),
+        )
+        .values(
+            status="superseded",
+            updated_at=func.now(),
+        )
+    )
+    await session.flush()
+    await session.refresh(saved)
+    return PersistResult(saved, "normal", False)
 
 
 async def persist_message_with_policy(
@@ -197,9 +315,7 @@ async def persist_message_with_policy(
     # version pointer back to v1 (which would regress an already-edited message).
     if saved.current_version_id is None:
         await session.execute(
-            update(ChatMessage)
-            .where(ChatMessage.id == saved.id)
-            .values(current_version_id=v1.id)
+            update(ChatMessage).where(ChatMessage.id == saved.id).values(current_version_id=v1.id)
         )
         await session.flush()
         saved.current_version_id = v1.id

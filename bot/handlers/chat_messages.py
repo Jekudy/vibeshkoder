@@ -10,6 +10,7 @@ from bot.config import settings
 from bot.db.models import TelegramUpdate
 from bot.db.repos.user import UserRepo
 from bot.filters.chat_type import GroupChatFilter
+from bot.services.image_memory import enqueue_photo_memory
 from bot.services.message_persistence import persist_message_with_policy
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,12 @@ async def save_chat_message(
     if message.from_user is None:
         return
 
+    # The bot's own digest/Q&A/wiki posts are output, never source memory.  Skipping
+    # before UserRepo/persistence prevents feedback loops while raw transport audit can
+    # still be retained by the upstream middleware.
+    if message.from_user.is_bot:
+        return
+
     # Keep sender profile fresh for message attribution and admin lookups.
     await UserRepo.upsert(
         session,
@@ -48,6 +55,12 @@ async def save_chat_message(
         message,
         raw_update_id=raw_update.id if raw_update is not None else None,
     )
+    if message.photo:
+        await enqueue_photo_memory(
+            session,
+            message=message,
+            chat_message_id=result.chat_message.id,
+        )
 
     logger.debug(
         "chat_message saved: chat_id=%s message_id=%s policy=%s mark_created=%s",

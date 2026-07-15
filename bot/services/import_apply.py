@@ -1,30 +1,26 @@
 """Telegram Desktop import apply (T2-03 / issue #103, Stream Delta finale).
 
-Applies a Telegram Desktop single-chat export onto the live DB through the SAME
-governance + normalization path live ingestion uses (ADR-0007). The apply path
+Applies a Telegram Desktop single-chat export onto the live DB through the same
+normalization path live ingestion uses. The apply path
 synthesises ``telegram_updates`` rows (``update_id=NULL``, ``ingestion_run_id`` set)
 per imported message and routes content through ``persist_message_with_policy``
-(#89 helper). Direct writes to chat_messages bypassing the helper are forbidden.
+(#89 helper). New human rows may not bypass that helper; the exact-author legacy
+repair path only quarantines an existing normalized row and never creates one.
 
 Pipeline per export message (chronological order, in-chunk):
 
     1. Resume gate      — skip if ``export_msg_id <= last_processed_export_msg_id``.
-    2. Tombstone gate   — chunk-level ``batch_check_tombstones_by_message_key`` (#97).
-    3. Duplicate gate   — ``chat_messages`` or prior import audit row lookup.
+    2. Duplicate gate   — keep complete human history; legacy tombstones are audit-only.
     4. User resolution  — ``import_user_map.resolve_export_user`` (#93). Ghost users
                       are created with ``is_imported_only=True``.
-    5. Full tombstone   — ``check_tombstone`` with content_hash + ``user:{tg_id}`` before
-                      the synthetic raw insert.
-    6. Reply resolver   — ``import_reply_resolver`` priority order (same_run > prior_run
+    5. Reply resolver   — ``import_reply_resolver`` priority order (same_run > prior_run
                       > live > unresolved) (#98). Translates cm PK to message_id.
-    7. Synthetic raw    — Write a ``telegram_updates`` row with ``update_id=NULL`` and
+    6. Synthetic raw    — Write a ``telegram_updates`` row with ``update_id=NULL`` and
                       ``ingestion_run_id`` set. Audit row stays even when governance
                       rejects the content.
-    8. Governance       — ``governance.detect_policy`` runs after the synthetic audit row.
-                      ``offrecord`` keeps only that audit row and skips persistence.
-    9. Persist          — for non-offrecord outcomes, ``persist_message_with_policy`` (#89)
-                      writes ``chat_messages``.
-    10. Edit history    — ``MessageVersionRepo.insert_version(imported_final=True)`` per
+    7. Persist          — ``persist_message_with_policy`` writes new rows; the explicit
+                      import-only rehydrator restores rows hidden by retired policy.
+    8. Edit history     — ``MessageVersionRepo.insert_version(imported_final=True)`` per
                       #106. Skipped when persist returns a row whose ``raw_update_id``
                       is not the synthetic raw id (live overlap won).
     11. Checkpoint      — once per CHUNK, ``save_checkpoint`` deep-merges
@@ -39,8 +35,8 @@ Cross-stream contract:
 
 Hard invariants (verified by tests in tests/services/test_import_apply.py):
 - Idempotent: re-running on the same export produces zero net DB changes.
-- Tombstone gate runs BEFORE every write — confirmed via mock spy.
-- ``persist_message_with_policy`` is the SOLE writer to ``chat_messages``.
+- ``persist_message_with_policy`` is the sole creator of imported ``chat_messages``;
+  exact-author repair may only redact an existing row.
 - Synthetic ``telegram_updates.update_id`` is always NULL; ``ingestion_run_id``
   always matches the apply run.
 - ``message_versions.imported_final=TRUE`` for every imported version row.
@@ -54,6 +50,7 @@ Out of scope (next ticket — #104 logical rollback):
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -66,20 +63,22 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from bot.db.models import ChatMessage, IngestionRun, TelegramUpdate
+from bot.db.models import ChatMessage, IngestionRun, MessageVersion, TelegramUpdate
 from bot.db.repos.telegram_update import TelegramUpdateRepo
-from bot.services.content_hash import compute_content_hash
-from bot.services.governance import detect_policy
 from bot.services.import_checkpoint import save_checkpoint
 from bot.services.import_chunking import ChunkingConfig, acquire_advisory_lock
+from bot.services.import_author_exclusion import (
+    is_import_author_excluded,
+    normalize_import_author_name,
+    normalize_import_excluded_author_names,
+)
 from bot.services.import_parser import _classify_td_kind, _extract_text_string
 from bot.services.import_reply_resolver import resolve_reply_batch
-from bot.services.import_tombstone import (
-    batch_check_tombstones_by_message_key,
-    check_tombstone,
-)
 from bot.services.import_user_map import resolve_export_user
-from bot.services.message_persistence import persist_message_with_policy
+from bot.services.message_persistence import (
+    persist_message_with_policy,
+    rehydrate_message_from_import,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +116,9 @@ class ImportApplyReport:
     skipped_duplicate_count: int = 0
     """Message already present in chat_messages for this chat (idempotency hit)."""
 
+    rehydrated_count: int = 0
+    """Existing row restored from a retired redaction/forget policy."""
+
     skipped_tombstone_count: int = 0
     """Message blocked by forget_events tombstone."""
 
@@ -125,6 +127,15 @@ class ImportApplyReport:
 
     skipped_governance_count: int = 0
     """detect_policy returned offrecord — synthetic audit row kept, content not persisted."""
+
+    skipped_excluded_author_count: int = 0
+    """Explicit exact-match bot author — raw provenance kept, normalized rows omitted."""
+
+    excluded_author_names: list[str] = field(default_factory=list)
+    """Normalized exact author names configured for this import."""
+
+    excluded_author_message_counts: dict[str, int] = field(default_factory=dict)
+    """Per-author raw-only counts actually processed in this apply invocation."""
 
     skipped_resume_count: int = 0
     """Message id <= last_processed_export_msg_id — already applied in prior run."""
@@ -148,6 +159,16 @@ class ImportApplyReport:
     """Number of chunks committed (partial chunks rolled back on error)."""
 
 
+@dataclass(frozen=True)
+class _ExistingMessageState:
+    chat_message_id: int
+    memory_policy: str
+    is_redacted: bool
+    current_version_id: int | None
+    current_version_is_redacted: bool
+    is_live: bool
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 
@@ -158,6 +179,7 @@ async def run_apply(
     resume_point: int | None = None,
     chunking_config: ChunkingConfig,
     export_path: str | None = None,
+    excluded_author_names: frozenset[str] = frozenset(),
 ) -> ImportApplyReport:
     """Run the import apply path for the ingestion_run identified by ``ingestion_run_id``.
 
@@ -170,19 +192,28 @@ async def run_apply(
         resume_point: ``last_processed_export_msg_id`` from a prior partial run. ``None``
             for a fresh run. Messages with ``export_msg_id <= resume_point`` are skipped.
         chunking_config: Chunking + advisory-lock configuration loaded from env / CLI flag.
-        export_path: Override path to the export JSON. When ``None`` (production), the
+        export_path: Override path to the export JSON or HTML export directory. When
+            ``None`` (production), the
             path is read from ``IngestionRun.source_name``. The override exists for tests
             that want to point at a fixture without touching the run row's source_name.
+        excluded_author_names: Explicit author display names excluded at the normalized
+            boundary. Matching is exact after NFKC + whitespace collapse + casefold.
+            HTML imports require at least one name because HTML has no ``is_bot`` field.
 
     Returns:
         ImportApplyReport with counts and the final ``last_processed_export_msg_id``.
     """
+    normalized_excluded_author_names = normalize_import_excluded_author_names(excluded_author_names)
     report = ImportApplyReport(
         ingestion_run_id=ingestion_run_id,
         chat_id=0,  # populated below
         source_path="",  # populated below
         started_at=datetime.now(tz=timezone.utc),
         chunking_config=chunking_config,
+        excluded_author_names=sorted(normalized_excluded_author_names),
+        excluded_author_message_counts={
+            name: 0 for name in sorted(normalized_excluded_author_names)
+        },
     )
 
     async def _prepare_and_run(apply_session: AsyncSession) -> None:
@@ -199,8 +230,12 @@ async def run_apply(
                 "override provided — cannot locate export file"
             )
         path = Path(source_path).expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"export file not found: {path}")
+        if not path.is_file() and not path.is_dir():
+            raise FileNotFoundError(f"export path not found: {path}")
+        if (
+            path.is_dir() or path.suffix.lower() == ".html"
+        ) and not normalized_excluded_author_names:
+            raise ValueError("HTML import requires at least one exact excluded author name")
         report.source_path = str(path)
 
         await _run_apply_loop(
@@ -211,6 +246,7 @@ async def run_apply(
             chat_id=chat_id,
             resume_point=resume_point,
             chunking_config=chunking_config,
+            excluded_author_names=normalized_excluded_author_names,
         )
 
     try:
@@ -257,6 +293,7 @@ async def _run_apply_loop(
     chat_id: int,
     resume_point: int | None,
     chunking_config: ChunkingConfig,
+    excluded_author_names: frozenset[str],
 ) -> None:
     messages = list(_iter_export_messages(path))
     # Sort by id ascending so chunk boundaries are stable and resume semantics
@@ -276,23 +313,13 @@ async def _run_apply_loop(
     for chunk_start in range(0, len(messages), chunk_size):
         chunk = messages[chunk_start : chunk_start + chunk_size]
 
-        # Process chunk inside a single per-chunk transaction. Each message gets a
-        # SAVEPOINT so validation/mapping failures roll back only that message. The
-        # checkpoint is written inside the same outer transaction as the chunk data;
-        # one commit makes both visible atomically.
+        # Process the chunk inside one transaction. A message savepoint keeps the
+        # session usable long enough to record a structured error, but every message
+        # error aborts the entire chunk. This prevents a later successful message from
+        # advancing the checkpoint past missing history.
         chunk_snapshot = _snapshot_report(report)
         last_id_in_chunk: int | None = None
         try:
-            # Tombstone gate — one bulk SELECT per chunk (#97). Chunks containing only
-            # service messages still call this so the contract is uniform; it's a single
-            # query so the cost is negligible.
-            export_ids = [int(m["id"]) for m in chunk if isinstance(m.get("id"), int)]
-            tombstone_hits = await batch_check_tombstones_by_message_key(
-                session,
-                chat_id=chat_id,
-                export_msg_ids=export_ids,
-            )
-
             for msg in chunk:
                 try:
                     async with session.begin_nested():
@@ -301,8 +328,8 @@ async def _run_apply_loop(
                             msg=msg,
                             chat_id=chat_id,
                             ingestion_run_id=report.ingestion_run_id,
-                            tombstone_hits=tombstone_hits,
                             report=report,
+                            excluded_author_names=excluded_author_names,
                         )
                 except SQLAlchemyError:
                     logger.error(
@@ -316,8 +343,7 @@ async def _run_apply_loop(
                     raise
                 except (ValueError, RuntimeError) as exc:
                     _record_message_error(report, msg=msg, chat_id=chat_id, exc=exc)
-                    # Continue with next message — DO NOT advance last_id_in_chunk.
-                    advance = None
+                    raise
 
                 if advance is not None:
                     last_id_in_chunk = advance
@@ -338,11 +364,13 @@ async def _run_apply_loop(
                 await session.rollback()
             except SQLAlchemyError as rb_err:
                 logger.warning(
-                    "import_apply: rollback failed after chunk error "
-                    "(ingestion_run_id=%s, chunk_index=%s): %s",
-                    report.ingestion_run_id,
-                    chunk_index,
-                    rb_err,
+                    "import_apply: rollback failed after chunk error",
+                    extra={
+                        "ingestion_run_id": report.ingestion_run_id,
+                        "chunk_index": chunk_index,
+                        "error_class": type(rb_err).__name__,
+                        "error_taxonomy": "import_apply_chunk_rollback_failed",
+                    },
                 )
             _restore_report(report, chunk_snapshot)
             raise
@@ -362,11 +390,11 @@ async def _apply_one_message(
     msg: dict[str, Any],
     chat_id: int,
     ingestion_run_id: int,
-    tombstone_hits: set[int],
     report: ImportApplyReport,
+    excluded_author_names: frozenset[str],
 ) -> int | None:
     """Process one export message. Returns the export_msg_id once it has been ACKed
-    (applied / duplicate / governance-skipped / tombstone-skipped / overlap-skipped /
+    (applied / duplicate / rehydrated / overlap-skipped /
     service); returns ``None`` if the message had no usable id (skipped silently).
 
     Service messages produce no chat_messages row per the parser's contract (#94).
@@ -380,44 +408,60 @@ async def _apply_one_message(
     msg_id = msg_id_raw
 
     # Service messages: per #94 parser contract they are NOT user-authored. We do
-    # NOT call detect_policy on them and do NOT write a synthetic update for them
+    # do not write a synthetic update for them
     # (their structure carries no governance content). Bump the counter and ACK so
     # the checkpoint advances past them.
     if msg.get("type") == "service":
         report.skipped_service_count += 1
         return msg_id
 
-    # 1. Tombstone gate (#97) — message is in the chunk-level hit set.
-    if msg_id in tombstone_hits:
-        _record_tombstone_skip(report, msg_id)
+    # Explicit bot-author exclusion is a raw-only boundary. It must run before
+    # overlap/normalized duplicate checks, ghost-user creation, reply
+    # resolution, or any content persistence. It also repairs legacy imports made
+    # before the exact-author boundary existed: the old raw row is upgraded in
+    # place and any human-like normalized row is quarantined from derived memory.
+    display_name = msg.get("from") if isinstance(msg.get("from"), str) else None
+    if is_import_author_excluded(display_name, excluded_author_names):
+        raw_payload = _build_excluded_author_raw_payload(
+            msg,
+            chat_id=chat_id,
+            msg_id=msg_id,
+        )
+        changed = await _ensure_excluded_author_raw_only(
+            session,
+            chat_id=chat_id,
+            message_id=msg_id,
+            ingestion_run_id=ingestion_run_id,
+            raw_payload=raw_payload,
+        )
+        if changed:
+            assert isinstance(display_name, str)
+            normalized_author = normalize_import_author_name(display_name)
+            report.skipped_excluded_author_count += 1
+            report.excluded_author_message_counts[normalized_author] += 1
+        else:
+            report.skipped_duplicate_count += 1
         return msg_id
 
-    # 1b. Early live overlap check (§3.2 — must come BEFORE generic dup gate so live
-    # overlaps are classified correctly and skipped_overlap_count is bumped instead of
-    # skipped_duplicate_count).  No raw row yet — check without raw_update_id guard.
-    early_overlap = await _check_early_live_overlap(session, chat_id=chat_id, message_id=msg_id)
-    if early_overlap:
-        report.skipped_overlap_count += 1
-        return msg_id
-
-    # 2. Duplicate gate — chat_messages already has this (chat_id, message_id) from a
-    # prior import run (non-live row).
-    existing_cm_id = await _find_existing_chat_message_id(session, chat_id, msg_id)
-    if existing_cm_id is not None:
-        report.skipped_duplicate_count += 1
-        return msg_id
-
-    # Offrecord idempotency gate — offrecord messages keep only the synthetic audit
-    # telegram_updates row, so chat_messages cannot serve as their duplicate marker.
-    existing_import_update_id = await _find_existing_import_update_id(session, chat_id, msg_id)
-    if existing_import_update_id is not None:
-        report.skipped_duplicate_count += 1
+    # 1. Existing normal rows are idempotent.  Rows hidden by the retired
+    # governance policy deliberately continue through the import-only rehydrator.
+    existing = await _find_existing_chat_message_state(session, chat_id, msg_id)
+    needs_rehydrate = existing is not None and (
+        existing.memory_policy != "normal"
+        or existing.is_redacted
+        or existing.current_version_id is None
+        or existing.current_version_is_redacted
+    )
+    if existing is not None and not needs_rehydrate:
+        if existing.is_live:
+            report.skipped_overlap_count += 1
+        else:
+            report.skipped_duplicate_count += 1
         return msg_id
 
     # 3. User resolution (#93). Service-message ducks would set from_id=None;
     # user messages either have a "user<N>" or "channel<N>" string.
     from_id = msg.get("from_id")
-    display_name = msg.get("from") if isinstance(msg.get("from"), str) else None
     user_id = await resolve_export_user(
         session,
         from_id if isinstance(from_id, str) else None,
@@ -426,44 +470,17 @@ async def _apply_one_message(
     )
     if user_id is None:
         # No resolved user → cannot persist (chat_messages.user_id is NOT NULL).
-        # This indicates a malformed user message; bump error and continue.
-        report.error_count += 1
-        if len(report.error_export_msg_ids) < _ERROR_ID_CAP:
-            report.error_export_msg_ids.append(msg_id)
-        logger.error(
-            "import_apply: cannot resolve user for export_msg_id=%d (from_id=%r); skipping",
-            msg_id,
-            from_id,
+        # ACKing it would let the checkpoint advance past missing history.
+        raise ValueError(
+            f"cannot resolve user for export_msg_id={msg_id}: human message has no valid from_id"
         )
-        return msg_id
 
     # 4. Build kind + text/caption per parser semantics. Mirrors what the dry-run
     # parser counts so apply-side governance verdicts match dry-run preview.
     kind = _classify_td_kind(msg, warnings=None)
     text_value, caption_value = _extract_text_caption_for_kind(msg, kind)
 
-    # 5. Compute content hash (chv1) before the full tombstone check so message_hash
-    # tombstones are also honored. The new privacy-critical bit is user:{tg_id}.
-    text_entities = msg.get("text_entities") if isinstance(msg.get("text_entities"), list) else None
-    content_hash = compute_content_hash(
-        text=text_value,
-        caption=caption_value,
-        message_kind=kind,
-        entities=text_entities,
-    )
-
-    tombstone = await check_tombstone(
-        session,
-        chat_id=chat_id,
-        message_id=msg_id,
-        content_hash=content_hash,
-        user_tg_id=user_id,
-    )
-    if tombstone is not None:
-        _record_tombstone_skip(report, msg_id)
-        return msg_id
-
-    # 6. Reply resolution (#98). Read-only — no writes.
+    # 5. Reply resolution (#98). Read-only — no writes.
     reply_export_id_raw = msg.get("reply_to_message_id")
     reply_export_id: int | None = (
         reply_export_id_raw if isinstance(reply_export_id_raw, int) else None
@@ -496,7 +513,7 @@ async def _apply_one_message(
                 )
             )
 
-    # 7. Synthetic raw row — written FIRST and ALWAYS (even for offrecord), tagged
+    # 6. Synthetic raw row — full canonical payload, tagged
     # with ingestion_run_id so #104 rollback can locate it. update_id MUST be NULL.
     raw_payload = _build_raw_payload(msg, chat_id=chat_id, msg_id=msg_id)
     raw_row = await TelegramUpdateRepo.insert(
@@ -511,47 +528,7 @@ async def _apply_one_message(
         is_redacted=False,
     )
 
-    # 8. Governance gate. The synthetic row above is the audit trail. If the
-    # imported content is offrecord, do NOT call persist_message_with_policy and
-    # do NOT create chat_messages/message_versions rows.
-    #
-    # H1 fix: mirror message_persistence.py broadened-scan (Sprint #89 Commit 2).
-    # TD poll dict has a top-level "poll" key with "question". TD contact fields
-    # are NESTED under contact_information (not top-level) — confirmed by
-    # import_parser.py which uses msg.get("contact_information") as discriminator.
-    _poll_dict = msg.get("poll") if kind == "poll" else None
-    poll_question: str | None = None
-    if isinstance(_poll_dict, dict):
-        _q = _poll_dict.get("question")
-        if isinstance(_q, str) and _q:
-            poll_question = _q
-    contact_name: str | None = None
-    if kind == "contact":
-        _contact_info = msg.get("contact_information")
-        if isinstance(_contact_info, dict):
-            _first = _contact_info.get("first_name")
-            _last = _contact_info.get("last_name")
-            parts = [p for p in [_first, _last] if isinstance(p, str) and p]
-            if parts:
-                contact_name = " ".join(parts)
-    policy, _mark_payload = detect_policy(
-        text_value,
-        caption_value,
-        poll_question=poll_question,
-        contact_name=contact_name,
-    )
-    # 8b. Hotfix #164 H2 fix: do NOT short-circuit on offrecord. The helper handles
-    # offrecord internally (writes chat_messages with memory_policy='offrecord', creates
-    # OffrecordMark, creates redacted v1) — restoring import↔live audit symmetry per
-    # invariant #8 and closing risk-audit H2. Counter is retained for operator dashboards.
-    if policy == "offrecord":
-        raw_row.is_redacted = True
-        raw_row.redaction_reason = "offrecord"
-        await session.flush()
-        report.skipped_governance_count += 1
-        # IMPORTANT: do NOT return here. Continue to step 9.
-
-    # 9. Build the message duck.
+    # 7. Build the message duck.
     duck = _build_message_duck(
         msg=msg,
         chat_id=chat_id,
@@ -563,34 +540,49 @@ async def _apply_one_message(
         message_kind=kind,
     )
 
-    # 10. Explicit overlap pre-check BEFORE persist (hotfix #164 §3.2).
-    # If a LIVE chat_messages row already exists for (chat_id, message_id), the live
-    # row is authoritative — skip the helper entirely.
-    is_overlap = await _check_live_overlap_pre_persist(
+    # Close the read→insert race: a normal live row may appear after the initial
+    # state lookup but before our synthetic raw insert.
+    if existing is None and await _check_live_overlap_pre_persist(
         session,
         chat_id=chat_id,
         message_id=msg_id,
         current_import_raw_update_id=raw_row.id,
-    )
-    if is_overlap:
+    ):
         report.skipped_overlap_count += 1
         return msg_id
 
-    # 11. Single helper call — handles both normal AND offrecord paths uniformly.
-    # The helper is now the SOLE writer for (chat_messages, message_versions,
-    # current_version_id) triples — this closes CRITICAL 2, CRITICAL 3, and H2.
-    persist_result = await persist_message_with_policy(
-        session,
-        duck,
-        raw_update_id=raw_row.id,
-        source="import",
-        captured_at=duck.date,  # preserve export captured_at
-    )
-
-    # 12. Counter branching.
-    if persist_result.policy != "offrecord":
+    # 8. New rows follow the normal helper; legacy-hidden rows use the explicit
+    # complete-history rehydrator that is unavailable to live ingestion.
+    if needs_rehydrate:
+        assert existing is not None
+        persist_result = await rehydrate_message_from_import(
+            session,
+            duck,
+            chat_message_id=existing.chat_message_id,
+            raw_update_id=raw_row.id,
+            raw_payload=raw_payload,
+            captured_at=duck.date,
+        )
+        report.rehydrated_count += 1
+    else:
+        persist_result = await persist_message_with_policy(
+            session,
+            duck,
+            raw_update_id=raw_row.id,
+            source="import",
+            captured_at=duck.date,
+        )
         report.applied_count += 1
-    # offrecord case: skipped_governance_count was already bumped in step 8b.
+
+    if kind == "photo":
+        from bot.services.image_memory import record_missing_import_photo
+
+        await record_missing_import_photo(
+            session,
+            chat_message_id=persist_result.chat_message.id,
+            chat_id=chat_id,
+            message_id=msg_id,
+        )
 
     return msg_id
 
@@ -598,72 +590,19 @@ async def _apply_one_message(
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
 
-async def _check_early_live_overlap(
-    session: AsyncSession,
-    *,
-    chat_id: int,
-    message_id: int,
-) -> bool:
-    """Return True if a LIVE chat_messages row already exists for (chat_id, message_id).
-
-    Called BEFORE the generic duplicate gate and BEFORE the synthetic raw row is
-    created, so no ``current_import_raw_update_id`` exclusion is needed.  Live rows
-    are identified by: chat_messages.raw_update_id → telegram_updates row WHERE
-    update_id IS NOT NULL (live handler writes real Telegram update_id; import writes NULL).
-    """
-    stmt = (
-        select(ChatMessage.id)
-        .join(TelegramUpdate, TelegramUpdate.id == ChatMessage.raw_update_id)
-        .where(
-            ChatMessage.chat_id == chat_id,
-            ChatMessage.message_id == message_id,
-            TelegramUpdate.update_id.is_not(None),  # live, not synthetic-import
-        )
-        .limit(1)
-    )
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none() is not None
-
-
-async def _check_live_overlap_pre_persist(
-    session: AsyncSession,
-    *,
-    chat_id: int,
-    message_id: int,
-    current_import_raw_update_id: int,
-) -> bool:
-    """Return True if a LIVE chat_messages row already exists for (chat_id, message_id).
-
-    Live rows are identified by:
-      chat_messages.raw_update_id → telegram_updates row WHERE update_id IS NOT NULL.
-    Synthetic import raw rows (telegram_updates.update_id IS NULL) are NOT treated
-    as live overlaps; they are prior import runs and handled by the dup-check earlier.
-
-    Called BEFORE persist_message_with_policy so the live row is authoritative and
-    the import is skipped cleanly without creating a duplicate.
-    """
-    stmt = (
-        select(ChatMessage.id)
-        .join(TelegramUpdate, TelegramUpdate.id == ChatMessage.raw_update_id)
-        .where(
-            ChatMessage.chat_id == chat_id,
-            ChatMessage.message_id == message_id,
-            TelegramUpdate.update_id.is_not(None),  # live, not synthetic-import
-            ChatMessage.raw_update_id != current_import_raw_update_id,  # not us
-        )
-        .limit(1)
-    )
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none() is not None
-
-
 def _iter_export_messages(path: Path) -> Iterable[dict[str, Any]]:
-    """Yield message dicts from the export JSON.
+    """Yield canonical message dicts from JSON or Telegram HTML export.
 
     Reuses the parser's tolerant-reader contract: single-chat envelope, ``messages[]``
     list, malformed entries skipped silently. Full-account exports were already
     rejected at the dry-run gate; we re-validate the envelope shape defensively here.
     """
+    if path.is_dir() or path.suffix.lower() == ".html":
+        from bot.services.import_html_parser import iter_html_messages
+
+        yield from iter_html_messages(path)
+        return
+
     import json
 
     with path.open(encoding="utf-8") as fh:
@@ -696,8 +635,14 @@ def _extract_text_caption_for_kind(msg: dict, kind: str) -> tuple[str | None, st
 
     # Media-kind taxonomy from import_parser
     media_kinds = {
-        "photo", "video", "voice", "audio", "document", "sticker",
-        "animation", "video_note",
+        "photo",
+        "video",
+        "voice",
+        "audio",
+        "document",
+        "sticker",
+        "animation",
+        "video_note",
     }
     if kind in media_kinds:
         # TD text field is the caption for media messages
@@ -706,30 +651,29 @@ def _extract_text_caption_for_kind(msg: dict, kind: str) -> tuple[str | None, st
 
 
 def _build_raw_payload(msg: dict, *, chat_id: int, msg_id: int) -> dict:
-    """Build a minimal envelope to store in telegram_updates.raw_json.
+    """Preserve the complete canonical export payload for a human message."""
+    raw = copy.deepcopy(msg)
+    raw.setdefault("chat_id", chat_id)
+    raw.setdefault("message_id", msg_id)
+    return raw
 
-    Strips potentially-content-bearing fields that the parser would normally pass
-    through (text, text_entities, caption). The persisted row carries enough
-    metadata for #104 rollback (ids, timestamps) but no governance-relevant content
-    duplicated outside chat_messages. Content is owned by chat_messages /
-    message_versions through persist_message_with_policy.
 
-    The fully-original message dict is INTENTIONALLY not stored here. Per ADR-0003
-    the source-of-truth content lives in the chat_messages / message_versions rows
-    (which detect_policy filters); duplicating a copy in telegram_updates would
-    create a parallel offrecord-bypass channel.
+def _build_excluded_author_raw_payload(
+    msg: dict,
+    *,
+    chat_id: int,
+    msg_id: int,
+) -> dict:
+    """Preserve the complete canonical export payload for an exact excluded author.
+
+    Excluded bot output has no normalized ``chat_messages``/``message_versions`` row,
+    so the raw update is its sole archive and is explicitly labelled.
     """
-    # Allowlist of safe metadata fields. Anything not in the allowlist is dropped.
-    safe_keys = {
-        "id", "type", "date", "date_unixtime", "edited", "edited_unixtime",
-        "from_id", "reply_to_message_id", "media_type", "mime_type",
-        "forwarded_from", "duration_seconds", "width", "height", "actor_id",
-        "action",
-    }
-    minimal: dict[str, Any] = {k: v for k, v in msg.items() if k in safe_keys}
-    minimal.setdefault("chat_id", chat_id)
-    minimal.setdefault("message_id", msg_id)
-    return minimal
+    raw = copy.deepcopy(msg)
+    raw.setdefault("chat_id", chat_id)
+    raw.setdefault("message_id", msg_id)
+    raw["excluded_author"] = True
+    return raw
 
 
 def _build_message_duck(
@@ -762,10 +706,21 @@ def _build_message_duck(
     # picks the correct kind. The classifier looks at attribute presence (non-None);
     # we set the matching attr to a truthy sentinel.
     kind_attrs: dict[str, Any] = {
-        "photo": None, "video": None, "voice": None, "audio": None,
-        "document": None, "sticker": None, "animation": None, "video_note": None,
-        "location": None, "contact": None, "poll": None, "dice": None,
-        "forward_origin": None, "new_chat_members": None, "left_chat_member": None,
+        "photo": None,
+        "video": None,
+        "voice": None,
+        "audio": None,
+        "document": None,
+        "sticker": None,
+        "animation": None,
+        "video_note": None,
+        "location": None,
+        "contact": None,
+        "poll": None,
+        "dice": None,
+        "forward_origin": None,
+        "new_chat_members": None,
+        "left_chat_member": None,
         "pinned_message": None,
     }
     if message_kind in kind_attrs:
@@ -790,12 +745,22 @@ def _build_message_duck(
                 _poll_question = _q or None
         kind_attrs["poll"] = SimpleNamespace(_imported=True, question=_poll_question)
     if message_kind == "contact":
-        _contact_info = msg.get("contact_information") if isinstance(msg.get("contact_information"), dict) else None
-        _first = _contact_info.get("first_name") if _contact_info and isinstance(_contact_info.get("first_name"), str) else None
-        _last = _contact_info.get("last_name") if _contact_info and isinstance(_contact_info.get("last_name"), str) else None
-        kind_attrs["contact"] = SimpleNamespace(
-            _imported=True, first_name=_first, last_name=_last
+        _contact_info = (
+            msg.get("contact_information")
+            if isinstance(msg.get("contact_information"), dict)
+            else None
         )
+        _first = (
+            _contact_info.get("first_name")
+            if _contact_info and isinstance(_contact_info.get("first_name"), str)
+            else None
+        )
+        _last = (
+            _contact_info.get("last_name")
+            if _contact_info and isinstance(_contact_info.get("last_name"), str)
+            else None
+        )
+        kind_attrs["contact"] = SimpleNamespace(_imported=True, first_name=_first, last_name=_last)
 
     return SimpleNamespace(
         message_id=msg_id,
@@ -880,34 +845,168 @@ def _extract_chat_id_from_run(run: IngestionRun) -> int:
     return cid
 
 
-async def _find_existing_chat_message_id(
+async def _find_existing_chat_message_state(
     session: AsyncSession, chat_id: int, message_id: int
-) -> int | None:
-    """Return the chat_messages.id matching (chat_id, message_id), or None."""
+) -> _ExistingMessageState | None:
+    """Load enough state to distinguish idempotency, overlap and rehydration."""
     stmt = (
-        select(ChatMessage.id)
+        select(
+            ChatMessage.id,
+            ChatMessage.memory_policy,
+            ChatMessage.is_redacted,
+            ChatMessage.current_version_id,
+            MessageVersion.is_redacted,
+            TelegramUpdate.update_id,
+        )
+        .outerjoin(MessageVersion, MessageVersion.id == ChatMessage.current_version_id)
+        .outerjoin(TelegramUpdate, TelegramUpdate.id == ChatMessage.raw_update_id)
         .where(ChatMessage.chat_id == chat_id, ChatMessage.message_id == message_id)
         .limit(1)
     )
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none()
+    row = (await session.execute(stmt)).one_or_none()
+    if row is None:
+        return None
+    return _ExistingMessageState(
+        chat_message_id=int(row[0]),
+        memory_policy=str(row[1]),
+        is_redacted=bool(row[2]),
+        current_version_id=int(row[3]) if row[3] is not None else None,
+        current_version_is_redacted=bool(row[4]) if row[4] is not None else False,
+        is_live=row[5] is not None,
+    )
 
 
-async def _find_existing_import_update_id(
-    session: AsyncSession, chat_id: int, message_id: int
-) -> int | None:
-    """Return an existing import synthetic update id for offrecord idempotency."""
+async def _check_live_overlap_pre_persist(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    message_id: int,
+    current_import_raw_update_id: int,
+) -> bool:
     stmt = (
-        select(TelegramUpdate.id)
+        select(ChatMessage.id)
+        .join(TelegramUpdate, TelegramUpdate.id == ChatMessage.raw_update_id)
         .where(
-            TelegramUpdate.chat_id == chat_id,
-            TelegramUpdate.message_id == message_id,
-            TelegramUpdate.update_type == _IMPORT_UPDATE_TYPE,
+            ChatMessage.chat_id == chat_id,
+            ChatMessage.message_id == message_id,
+            TelegramUpdate.update_id.is_not(None),
+            ChatMessage.raw_update_id != current_import_raw_update_id,
         )
         .limit(1)
     )
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none()
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+
+async def _ensure_excluded_author_raw_only(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    message_id: int,
+    ingestion_run_id: int,
+    raw_payload: dict[str, Any],
+) -> bool:
+    """Enforce the exact-author raw-only boundary, including legacy repair.
+
+    Returns ``True`` when this import inserted/upgraded raw provenance or quarantined
+    normalized content. A fully canonical raw row with no eligible normalized content
+    returns ``False`` so repeated imports remain ordinary duplicates.
+    """
+    raw_row = (
+        await session.execute(
+            select(TelegramUpdate)
+            .where(
+                TelegramUpdate.chat_id == chat_id,
+                TelegramUpdate.message_id == message_id,
+                TelegramUpdate.update_type == _IMPORT_UPDATE_TYPE,
+            )
+            .order_by(TelegramUpdate.id)
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    changed = False
+    if raw_row is None:
+        await TelegramUpdateRepo.insert(
+            session,
+            update_type=_IMPORT_UPDATE_TYPE,
+            update_id=None,
+            raw_json=raw_payload,
+            raw_hash=None,
+            chat_id=chat_id,
+            message_id=message_id,
+            ingestion_run_id=ingestion_run_id,
+            is_redacted=False,
+        )
+        changed = True
+    elif (
+        raw_row.raw_json != raw_payload
+        or raw_row.raw_hash is not None
+        or raw_row.is_redacted
+        or raw_row.redaction_reason is not None
+    ):
+        raw_row.raw_json = copy.deepcopy(raw_payload)
+        raw_row.raw_hash = None
+        raw_row.is_redacted = False
+        raw_row.redaction_reason = None
+        changed = True
+
+    normalized_row = (
+        await session.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.chat_id == chat_id,
+                ChatMessage.message_id == message_id,
+            )
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if normalized_row is None:
+        return changed
+
+    versions = (
+        (
+            await session.execute(
+                select(MessageVersion)
+                .where(MessageVersion.chat_message_id == normalized_row.id)
+                .order_by(MessageVersion.version_seq)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    normalized_needs_quarantine = (
+        normalized_row.memory_policy != "forgotten"
+        or not normalized_row.is_redacted
+        or normalized_row.text is not None
+        or normalized_row.caption is not None
+        or normalized_row.raw_json is not None
+    )
+    versions_need_quarantine = any(
+        not version.is_redacted
+        or version.text is not None
+        or version.caption is not None
+        or version.normalized_text is not None
+        or version.entities_json is not None
+        for version in versions
+    )
+    if not normalized_needs_quarantine and not versions_need_quarantine:
+        return changed
+
+    normalized_row.memory_policy = "forgotten"
+    normalized_row.is_redacted = True
+    normalized_row.text = None
+    normalized_row.caption = None
+    normalized_row.raw_json = None
+    normalized_row.updated_at = datetime.now(tz=timezone.utc)
+    for version in versions:
+        version.is_redacted = True
+        version.text = None
+        version.caption = None
+        version.normalized_text = None
+        version.entities_json = None
+    return True
 
 
 async def _find_chat_message_message_id_by_raw_update_message_id(
@@ -940,12 +1039,6 @@ async def _find_chat_message_message_id_by_id(
     return result.scalar_one_or_none()
 
 
-def _record_tombstone_skip(report: ImportApplyReport, export_msg_id: int) -> None:
-    report.skipped_tombstone_count += 1
-    if len(report.tombstone_skip_export_msg_ids) < _ERROR_ID_CAP:
-        report.tombstone_skip_export_msg_ids.append(export_msg_id)
-
-
 def _record_message_error(
     report: ImportApplyReport,
     *,
@@ -953,7 +1046,7 @@ def _record_message_error(
     chat_id: int,
     exc: BaseException,
 ) -> None:
-    # Per-message envelope: log + bump error counters; chunk continues.
+    # Per-message envelope: capture context before the caller aborts the chunk.
     report.error_count += 1
     if len(report.error_export_msg_ids) < _ERROR_ID_CAP:
         msg_id = msg.get("id")
@@ -972,9 +1065,13 @@ def _record_message_error(
 
 _REPORT_SNAPSHOT_FIELDS = (
     "applied_count",
+    "rehydrated_count",
     "skipped_duplicate_count",
     "skipped_tombstone_count",
     "skipped_governance_count",
+    "skipped_excluded_author_count",
+    "excluded_author_names",
+    "excluded_author_message_counts",
     "skipped_resume_count",
     "skipped_service_count",
     "skipped_overlap_count",
@@ -990,13 +1087,25 @@ def _snapshot_report(report: ImportApplyReport) -> dict[str, Any]:
     snapshot: dict[str, Any] = {}
     for field_name in _REPORT_SNAPSHOT_FIELDS:
         value = getattr(report, field_name)
-        snapshot[field_name] = list(value) if isinstance(value, list) else value
+        if isinstance(value, list):
+            snapshot[field_name] = list(value)
+        elif isinstance(value, dict):
+            snapshot[field_name] = dict(value)
+        else:
+            snapshot[field_name] = value
     return snapshot
 
 
 def _restore_report(report: ImportApplyReport, snapshot: dict[str, Any]) -> None:
     for field_name, value in snapshot.items():
-        setattr(report, field_name, list(value) if isinstance(value, list) else value)
+        restored: Any
+        if isinstance(value, list):
+            restored = list(value)
+        elif isinstance(value, dict):
+            restored = dict(value)
+        else:
+            restored = value
+        setattr(report, field_name, restored)
 
 
 def _get_bound_async_engine(session: AsyncSession) -> AsyncEngine | None:
@@ -1005,14 +1114,3 @@ def _get_bound_async_engine(session: AsyncSession) -> AsyncEngine | None:
     if not isinstance(sync_bind, Engine):
         return None
     return AsyncEngine._retrieve_proxy_for_target(sync_bind)
-
-
-def _is_live_chat_message(cm: ChatMessage, *, synthetic_raw_update_id: int) -> bool:
-    """Decide whether the row was created by live ingestion (not import).
-
-    persist_message_with_policy returns the row resulting from the upsert:
-    - On a fresh insert, the row carries our raw_update_id and is import-owned.
-    - On a conflict (live row pre-existed), the row carries the original raw_update_id
-      from live ingestion. Compare against the synthetic raw row we just inserted.
-    """
-    return cm.raw_update_id != synthetic_raw_update_id

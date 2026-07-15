@@ -21,7 +21,7 @@ from __future__ import annotations
 import itertools
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -220,9 +220,7 @@ async def test_include_cards_false_omits_card_hits(db_session) -> None:
         source_version_ids=(msg.version_id,),
     )
 
-    hits = await search_messages(
-        db_session, "питон", chat_id=chat_id, include_cards=False
-    )
+    hits = await search_messages(db_session, "питон", chat_id=chat_id, include_cards=False)
 
     assert [h.source_type for h in hits] == ["message"]
     assert all(h.card_id is None for h in hits)
@@ -244,9 +242,7 @@ async def test_include_cards_true_returns_card_when_only_card_matches(db_session
         source_version_ids=(msg.version_id,),
     )
 
-    hits = await search_messages(
-        db_session, "диковина", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина", chat_id=chat_id, include_cards=True)
 
     assert len(hits) == 1
     assert hits[0].source_type == "card"
@@ -274,9 +270,7 @@ async def test_include_cards_true_merges_message_and_card_hits(db_session) -> No
         source_version_ids=(msg2.version_id,),
     )
 
-    hits = await search_messages(
-        db_session, "питон", chat_id=chat_id, include_cards=True, limit=10
-    )
+    hits = await search_messages(db_session, "питон", chat_id=chat_id, include_cards=True, limit=10)
 
     types = sorted(h.source_type for h in hits)
     assert "card" in types
@@ -292,9 +286,7 @@ async def test_draft_card_is_not_returned(db_session) -> None:
     from bot.services.search import search_messages
 
     chat_id = -100_604
-    msg = await _create_versioned_message(
-        db_session, chat_id=chat_id, text="ничего не найдём"
-    )
+    msg = await _create_versioned_message(db_session, chat_id=chat_id, text="ничего не найдём")
     await _create_approved_card(
         db_session,
         body_markdown="драфт-карточка уникальное диковина2",
@@ -302,9 +294,7 @@ async def test_draft_card_is_not_returned(db_session) -> None:
         card_status="draft",
     )
 
-    hits = await search_messages(
-        db_session, "диковина2", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина2", chat_id=chat_id, include_cards=True)
 
     assert [h.source_type for h in hits if h.source_type == "card"] == []
 
@@ -313,9 +303,7 @@ async def test_archived_card_is_not_returned(db_session) -> None:
     from bot.services.search import search_messages
 
     chat_id = -100_605
-    msg = await _create_versioned_message(
-        db_session, chat_id=chat_id, text="ничего не найдём"
-    )
+    msg = await _create_versioned_message(db_session, chat_id=chat_id, text="ничего не найдём")
     await _create_approved_card(
         db_session,
         body_markdown="archived карточка диковина3",
@@ -324,9 +312,7 @@ async def test_archived_card_is_not_returned(db_session) -> None:
         archived_reason="cascade",
     )
 
-    hits = await search_messages(
-        db_session, "диковина3", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина3", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
 
@@ -351,9 +337,7 @@ async def test_card_with_offrecord_source_excluded(db_session) -> None:
         source_version_ids=(msg.version_id,),
     )
 
-    hits = await search_messages(
-        db_session, "диковина4", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина4", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
 
@@ -374,9 +358,7 @@ async def test_card_with_redacted_chat_message_source_excluded(db_session) -> No
         source_version_ids=(msg.version_id,),
     )
 
-    hits = await search_messages(
-        db_session, "диковина5", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина5", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
 
@@ -397,11 +379,51 @@ async def test_card_with_redacted_message_version_source_excluded(db_session) ->
         source_version_ids=(msg.version_id,),
     )
 
-    hits = await search_messages(
-        db_session, "диковина6", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина6", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
+
+
+async def test_card_with_edited_away_source_excluded(db_session) -> None:
+    """Approved cards sourced from a non-current version fail closed."""
+    from bot.db.models import ChatMessage, MessageVersion
+    from bot.services.search import search_messages
+
+    chat_id = -100_608_1
+    msg = await _create_versioned_message(
+        db_session,
+        chat_id=chat_id,
+        text="старый источник",
+    )
+    await _create_approved_card(
+        db_session,
+        body_markdown="карточка со старой версией диковина-stale",
+        source_version_ids=(msg.version_id,),
+    )
+    replacement = MessageVersion(
+        chat_message_id=msg.chat_message_id,
+        version_seq=2,
+        text="новый источник",
+        caption=None,
+        normalized_text="новый источник",
+        content_hash=f"card-hash-{next(_hash_counter)}",
+        is_redacted=False,
+    )
+    db_session.add(replacement)
+    await db_session.flush()
+    chat_message = await db_session.get(ChatMessage, msg.chat_message_id)
+    assert chat_message is not None
+    chat_message.current_version_id = replacement.id
+    await db_session.flush()
+
+    hits = await search_messages(
+        db_session,
+        "диковина-stale",
+        chat_id=chat_id,
+        include_cards=True,
+    )
+
+    assert [hit for hit in hits if hit.source_type == "card"] == []
 
 
 async def test_card_with_completed_forget_event_on_one_source_excluded(db_session) -> None:
@@ -411,9 +433,7 @@ async def test_card_with_completed_forget_event_on_one_source_excluded(db_sessio
 
     chat_id = -100_609
     msgs = [
-        await _create_versioned_message(
-            db_session, chat_id=chat_id, text=f"источник {i}"
-        )
+        await _create_versioned_message(db_session, chat_id=chat_id, text=f"источник {i}")
         for i in range(3)
     ]
     await _create_approved_card(
@@ -429,9 +449,7 @@ async def test_card_with_completed_forget_event_on_one_source_excluded(db_sessio
         status="completed",
     )
 
-    hits = await search_messages(
-        db_session, "диковина7", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина7", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
 
@@ -440,9 +458,7 @@ async def test_card_with_pending_forget_event_on_one_source_excluded(db_session)
     from bot.services.search import search_messages
 
     chat_id = -100_610
-    msg = await _create_versioned_message(
-        db_session, chat_id=chat_id, text="pending-forget source"
-    )
+    msg = await _create_versioned_message(db_session, chat_id=chat_id, text="pending-forget source")
     await _create_approved_card(
         db_session,
         body_markdown="карточка pending диковина8",
@@ -455,9 +471,7 @@ async def test_card_with_pending_forget_event_on_one_source_excluded(db_session)
         status="pending",
     )
 
-    hits = await search_messages(
-        db_session, "диковина8", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина8", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
 
@@ -468,9 +482,7 @@ async def test_card_with_user_tombstone_excluded(db_session) -> None:
     from bot.services.search import search_messages
 
     chat_id = -100_611
-    msg = await _create_versioned_message(
-        db_session, chat_id=chat_id, text="user-tombstone source"
-    )
+    msg = await _create_versioned_message(db_session, chat_id=chat_id, text="user-tombstone source")
     await _create_approved_card(
         db_session,
         body_markdown="карточка user-tombstone диковина9",
@@ -484,9 +496,7 @@ async def test_card_with_user_tombstone_excluded(db_session) -> None:
         status="completed",
     )
 
-    hits = await search_messages(
-        db_session, "диковина9", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина9", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
 
@@ -495,9 +505,7 @@ async def test_card_with_content_hash_tombstone_excluded(db_session) -> None:
     from bot.services.search import search_messages
 
     chat_id = -100_612
-    msg = await _create_versioned_message(
-        db_session, chat_id=chat_id, text="hash-tombstone source"
-    )
+    msg = await _create_versioned_message(db_session, chat_id=chat_id, text="hash-tombstone source")
     await _create_approved_card(
         db_session,
         body_markdown="карточка hash диковина10",
@@ -511,9 +519,7 @@ async def test_card_with_content_hash_tombstone_excluded(db_session) -> None:
         status="completed",
     )
 
-    hits = await search_messages(
-        db_session, "диковина10", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина10", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
 
@@ -527,9 +533,7 @@ async def test_card_hit_ranks_above_equivalent_message_hit(db_session) -> None:
 
     chat_id = -100_613
     # Message with similar body — same query keyword present.
-    await _create_versioned_message(
-        db_session, chat_id=chat_id, text="одинаковая диковина11 здесь"
-    )
+    await _create_versioned_message(db_session, chat_id=chat_id, text="одинаковая диковина11 здесь")
     src = await _create_versioned_message(
         db_session,
         chat_id=chat_id,
@@ -557,9 +561,7 @@ async def test_message_hit_has_default_card_fields(db_session) -> None:
     from bot.services.search import search_messages
 
     chat_id = -100_614
-    await _create_versioned_message(
-        db_session, chat_id=chat_id, text="чистое сообщение"
-    )
+    await _create_versioned_message(db_session, chat_id=chat_id, text="чистое сообщение")
     hits = await search_messages(db_session, "чистое", chat_id=chat_id, include_cards=True)
 
     assert len(hits) == 1
@@ -574,9 +576,7 @@ async def test_card_hit_carries_source_mvid_tuple(db_session) -> None:
 
     chat_id = -100_615
     sources = [
-        await _create_versioned_message(
-            db_session, chat_id=chat_id, text=f"источник {i}"
-        )
+        await _create_versioned_message(db_session, chat_id=chat_id, text=f"источник {i}")
         for i in range(3)
     ]
     expected_mvids = tuple(s.version_id for s in sources)
@@ -586,9 +586,7 @@ async def test_card_hit_carries_source_mvid_tuple(db_session) -> None:
         source_version_ids=expected_mvids,
     )
 
-    hits = await search_messages(
-        db_session, "диковина12", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина12", chat_id=chat_id, include_cards=True)
 
     card_hits = [h for h in hits if h.source_type == "card"]
     assert len(card_hits) == 1
@@ -606,18 +604,14 @@ async def test_limit_clamps_merged_result(db_session) -> None:
     chat_id = -100_616
     sources = []
     for i in range(3):
-        m = await _create_versioned_message(
-            db_session, chat_id=chat_id, text=f"sourcemsg {i}"
-        )
+        m = await _create_versioned_message(db_session, chat_id=chat_id, text=f"sourcemsg {i}")
         sources.append(m)
         await _create_approved_card(
             db_session,
             body_markdown=f"карточка-{i} диковина13",
             source_version_ids=(m.version_id,),
         )
-    await _create_versioned_message(
-        db_session, chat_id=chat_id, text="ещё диковина13 сообщение"
-    )
+    await _create_versioned_message(db_session, chat_id=chat_id, text="ещё диковина13 сообщение")
 
     hits = await search_messages(
         db_session, "диковина13", chat_id=chat_id, include_cards=True, limit=2
@@ -634,9 +628,7 @@ async def test_include_cards_default_is_true_per_spec(db_session) -> None:
     from bot.services.search import search_messages
 
     chat_id = -100_617
-    msg = await _create_versioned_message(
-        db_session, chat_id=chat_id, text="нерелевантно"
-    )
+    msg = await _create_versioned_message(db_session, chat_id=chat_id, text="нерелевантно")
     await _create_approved_card(
         db_session,
         body_markdown="карточка default диковина14",
@@ -691,9 +683,7 @@ async def test_card_tombstone_message_hash_filters_live_only_content_hash(
         status="completed",
     )
 
-    hits = await search_messages(
-        db_session, "диковина20", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина20", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
 
@@ -745,9 +735,7 @@ async def test_card_with_partial_source_forget_no_cascade_yet(db_session) -> Non
         status="completed",
     )
 
-    hits = await search_messages(
-        db_session, "диковина21", chat_id=chat_id, include_cards=True
-    )
+    hits = await search_messages(db_session, "диковина21", chat_id=chat_id, include_cards=True)
 
     assert [h for h in hits if h.source_type == "card"] == []
 
@@ -782,54 +770,92 @@ def test_search_messages_sqlite_dialect_raises_when_include_cards_true() -> None
     fake_session.bind = fake_bind
 
     with pytest.raises(ValueError, match="include_cards=True.*PostgreSQL"):
-        asyncio.run(
-            search_messages(fake_session, "query", chat_id=-1, include_cards=True)
-        )
+        asyncio.run(search_messages(fake_session, "query", chat_id=-1, include_cards=True))
 
 
-# ─── H3: single-chat ingestion invariant (closes #279) ──────────────────────
+# ─── H3: end-to-end chat-scope contract (closes #279) ───────────────────────
 
 
-def test_extractor_eligible_sources_does_not_filter_by_chat_id_invariant() -> None:
-    """H3 (#279): documents the single-chat ingestion assumption.
-
-    ``_select_eligible_sources`` in ``bot/services/extractor.py`` does NOT
-    accept a ``chat_id`` parameter — all card sources can originate from ANY
-    chat with ``memory_policy='normal'``.  The search-side card branch in
-    ``_PHASE6_SQL`` trusts this upstream invariant: Phase 6 ingestion is
-    single-chat at the application boundary (``bot/handlers/chat_messages.py``
-    only forwards COMMUNITY_CHAT_ID to extraction).
-
-    This test asserts via source inspection that:
-    1. ``_select_eligible_sources`` signature has NO ``chat_id`` parameter.
-    2. The ``base_predicate`` SQL literal inside the function does NOT contain
-       a ``c.chat_id = :chat_id`` equality filter (only uses ``c.chat_id`` in
-       the tombstone key construction, not as a row filter).
-
-    If multi-chat ingestion is added later, this test will intentionally fail,
-    reminding the implementer to also add chat-scope to the card branch SQL.
-    See issue #279 for the two future-proofing options:
-      (a) EXISTS subquery on card_sources → chat_messages WHERE chat_id=:chat_id
-      (b) per-chat card tables.
-    """
-    import inspect
-    import re
-
+async def test_extractor_eligible_sources_are_scoped_to_source_chat_id(
+    db_session,
+) -> None:
+    """Extraction must never mix eligible source rows from another chat."""
     from bot.services import extractor
 
-    sig = inspect.signature(extractor._select_eligible_sources)
-    assert "chat_id" not in sig.parameters, (
-        "_select_eligible_sources gained a chat_id parameter — "
-        "if multi-chat ingestion landed, also update the card branch in "
-        "_PHASE6_SQL (see issue #279)."
+    requested_chat_id = -100_620
+    foreign_chat_id = -100_621
+    requested = await _create_versioned_message(
+        db_session,
+        chat_id=requested_chat_id,
+        text="локальный источник для экстракции",
+    )
+    foreign = await _create_versioned_message(
+        db_session,
+        chat_id=foreign_chat_id,
+        text="чужой источник для экстракции",
+    )
+    now = datetime.now(timezone.utc)
+
+    rows = await extractor._select_eligible_sources(
+        db_session,
+        window_start=now - timedelta(days=1),
+        window_end=now + timedelta(days=1),
+        source_chat_id=requested_chat_id,
+        force_include_chat_message_ids=None,
     )
 
-    src = inspect.getsource(extractor._select_eligible_sources)
-    # The tombstone key construction uses c.chat_id::text — that is allowed.
-    # What must NOT appear is a WHERE equality filter like "c.chat_id = :chat_id"
-    # or "c.chat_id = :param_chat_id" (whitespace-insensitive).
-    assert not re.search(r"c\.chat_id\s*=\s*:", src), (
-        "_select_eligible_sources now filters by c.chat_id = :param — "
-        "multi-chat ingestion has landed. Update _PHASE6_SQL card branch "
-        "to add EXISTS chat-scope filter (see issue #279)."
+    assert [row.message_version_id for row in rows] == [requested.version_id]
+    assert foreign.version_id not in {row.message_version_id for row in rows}
+
+
+async def test_card_search_is_chat_scoped_and_never_leaks_foreign_sources(
+    db_session,
+) -> None:
+    """Foreign and mixed-chat cards fail closed at the search boundary."""
+    from bot.services.search import search_messages
+
+    requested_chat_id = -100_622
+    foreign_chat_id = -100_623
+    requested = await _create_versioned_message(
+        db_session,
+        chat_id=requested_chat_id,
+        text="локальный источник карточки",
     )
+    foreign = await _create_versioned_message(
+        db_session,
+        chat_id=foreign_chat_id,
+        text="чужой источник карточки",
+    )
+    local_card = await _create_approved_card(
+        db_session,
+        body_markdown="локальная карточка межчатовыймаркер",
+        source_version_ids=(requested.version_id,),
+    )
+    foreign_card = await _create_approved_card(
+        db_session,
+        body_markdown="чужая карточка межчатовыймаркер",
+        source_version_ids=(foreign.version_id,),
+    )
+    mixed_card = await _create_approved_card(
+        db_session,
+        body_markdown="смешанная карточка межчатовыймаркер",
+        source_version_ids=(requested.version_id, foreign.version_id),
+    )
+
+    hits = await search_messages(
+        db_session,
+        "межчатовыймаркер",
+        chat_id=requested_chat_id,
+        include_cards=True,
+        limit=10,
+    )
+    card_hits = [hit for hit in hits if hit.source_type == "card"]
+
+    assert {hit.card_id for hit in card_hits} == {local_card.card_id}
+    assert all(hit.chat_id == requested_chat_id for hit in card_hits)
+    assert all(hit.card_source_message_version_ids == (requested.version_id,) for hit in card_hits)
+    assert foreign_card.card_id not in {hit.card_id for hit in card_hits}
+    assert mixed_card.card_id not in {hit.card_id for hit in card_hits}
+    assert foreign.version_id not in {
+        source_id for hit in card_hits for source_id in hit.card_source_message_version_ids
+    }

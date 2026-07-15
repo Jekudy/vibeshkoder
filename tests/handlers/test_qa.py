@@ -41,15 +41,31 @@ def _patch_persist(handler, monkeypatch) -> None:
     """Patch persist_message_with_policy and UserRepo.upsert for tests that use
     community-chat messages (the new §3.5 persist block runs for those)."""
     from bot.services.message_persistence import PersistResult
+
     fake_cm = SimpleNamespace(id=1, current_version_id=None)
     monkeypatch.setattr(
         handler,
         "persist_message_with_policy",
-        AsyncMock(return_value=PersistResult(
-            chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
-        )),
+        AsyncMock(
+            return_value=PersistResult(
+                chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
+            )
+        ),
     )
     monkeypatch.setattr(handler.UserRepo, "upsert", AsyncMock())
+
+
+def _flag_off_for_llm():
+    """Keep deterministic Q&A enabled while disabling paid synthesis."""
+
+    async def _impl(session, flag_key, *args, **kwargs):
+        if flag_key == "memory.qa.enabled":
+            return True
+        if flag_key == "memory.qa.llm_synthesis.enabled":
+            return False
+        return False
+
+    return _impl
 
 
 def _user(
@@ -108,9 +124,12 @@ async def test_flag_off_silent_return(monkeypatch) -> None:
     run_qa = AsyncMock()
     fake_cm = SimpleNamespace(id=1, current_version_id=None)
     from bot.services.message_persistence import PersistResult
-    persist_mock = AsyncMock(return_value=PersistResult(
-        chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
-    ))
+
+    persist_mock = AsyncMock(
+        return_value=PersistResult(
+            chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
+        )
+    )
 
     monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=False))
     monkeypatch.setattr(handler.QaTraceRepo, "create", trace_create)
@@ -139,9 +158,7 @@ async def test_dm_invocation_refuses_and_audits(monkeypatch) -> None:
 
     await handler.recall_handler(message, _command("память"), session)
 
-    message.reply.assert_awaited_once_with(
-        "Команда /recall работает только в community чате."
-    )
+    message.reply.assert_awaited_once_with("Команда /recall работает только в community чате.")
     trace_create.assert_awaited_once()
     assert trace_create.call_args.kwargs["query"] == "память"
     assert trace_create.call_args.kwargs["evidence_ids"] == []
@@ -203,7 +220,7 @@ async def test_member_with_results_renders_response(monkeypatch) -> None:
     run_qa = AsyncMock(return_value=_qa_result(abstained=False))
 
     _patch_persist(handler, monkeypatch)
-    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_off_for_llm())
     monkeypatch.setattr(
         handler.UserRepo,
         "get",
@@ -251,12 +268,12 @@ async def test_member_no_results_abstains(monkeypatch) -> None:
     assert trace_create.call_args.kwargs["abstained"] is True
 
 
-async def test_offrecord_query_not_echoed_and_audit_redacted(monkeypatch) -> None:
+async def test_legacy_offrecord_token_is_ordinary_audit_content(monkeypatch) -> None:
     handler = import_module("bot.handlers.qa")
     message = _message()
     session = AsyncMock()
     trace_create = AsyncMock()
-    run_qa = AsyncMock(return_value=_qa_result(abstained=True, query_redacted=True))
+    run_qa = AsyncMock(return_value=_qa_result(abstained=True, query_redacted=False))
     query = "секретный запрос #offrecord"
 
     _patch_persist(handler, monkeypatch)
@@ -267,12 +284,10 @@ async def test_offrecord_query_not_echoed_and_audit_redacted(monkeypatch) -> Non
 
     await handler.recall_handler(message, _command(query), session)
 
-    assert run_qa.call_args.kwargs["redact_query_in_audit"] is True
-    response = message.reply.call_args.args[0]
-    assert query not in response
+    assert run_qa.call_args.kwargs["redact_query_in_audit"] is False
     trace_create.assert_awaited_once()
     assert trace_create.call_args.kwargs["query"] == query
-    assert trace_create.call_args.kwargs["redact_query"] is True
+    assert trace_create.call_args.kwargs["redact_query"] is False
 
 
 async def test_audit_row_written_once_for_processed_invocation(monkeypatch) -> None:
@@ -298,6 +313,7 @@ async def test_audit_row_written_once_for_processed_invocation(monkeypatch) -> N
         "evidence_ids": [],
         "abstained": True,
         "redact_query": False,
+        "source_chat_message_id": None,
     }
 
 
@@ -319,9 +335,7 @@ async def test_recall_in_non_community_group_replies_and_audits(monkeypatch) -> 
     await handler.recall_handler(message, _command("что-то"), session)
 
     # New behavior: reply is always sent for non-community chats (not just private).
-    message.reply.assert_awaited_once_with(
-        "Команда /recall работает только в community чате."
-    )
+    message.reply.assert_awaited_once_with("Команда /recall работает только в community чате.")
     trace_create.assert_awaited_once()
     assert trace_create.call_args.kwargs["abstained"] is True
 
@@ -334,7 +348,9 @@ async def test_recall_in_non_community_group_handles_forbidden(monkeypatch) -> N
     handler = import_module("bot.handlers.qa")
     message = _message(chat_id=-9999999998, chat_type="supergroup")
     # Simulate bot lacking can_send_messages.
-    message.reply = AsyncMock(side_effect=TelegramForbiddenError(method=None, message="Forbidden: bot was kicked"))
+    message.reply = AsyncMock(
+        side_effect=TelegramForbiddenError(method=None, message="Forbidden: bot was kicked")
+    )
     session = AsyncMock()
     trace_create = AsyncMock()
 
@@ -366,6 +382,7 @@ async def test_recall_with_flag_off_still_persists_message(monkeypatch) -> None:
 
     persist_mock = AsyncMock()
     from bot.services.message_persistence import PersistResult
+
     persist_mock.return_value = PersistResult(
         chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
     )
@@ -410,9 +427,12 @@ async def test_recall_with_flag_off_creates_no_qa_trace(monkeypatch) -> None:
     fake_cm = SimpleNamespace(id=2, current_version_id=None)
 
     from bot.services.message_persistence import PersistResult
-    persist_mock = AsyncMock(return_value=PersistResult(
-        chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
-    ))
+
+    persist_mock = AsyncMock(
+        return_value=PersistResult(
+            chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
+        )
+    )
     trace_create = AsyncMock()
 
     monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=False))
@@ -435,9 +455,12 @@ async def test_recall_raw_update_id_threaded_via_param(monkeypatch) -> None:
     fake_cm = SimpleNamespace(id=3, current_version_id=None)
 
     from bot.services.message_persistence import PersistResult
-    persist_mock = AsyncMock(return_value=PersistResult(
-        chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
-    ))
+
+    persist_mock = AsyncMock(
+        return_value=PersistResult(
+            chat_message=fake_cm, policy="normal", is_offrecord_mark_created=False
+        )
+    )
 
     monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(return_value=False))
     monkeypatch.setattr(handler.UserRepo, "upsert", AsyncMock())

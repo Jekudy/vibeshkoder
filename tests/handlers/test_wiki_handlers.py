@@ -193,11 +193,17 @@ async def _get_page(session, *, page_id: uuid.UUID) -> object:
     from sqlalchemy import text
 
     return (
-        await session.execute(
-            text("SELECT public_enabled, robots_policy, page_status FROM wiki_pages WHERE id = :pid"),
-            {"pid": str(page_id)},
+        (
+            await session.execute(
+                text(
+                    "SELECT public_enabled, robots_policy, page_status FROM wiki_pages WHERE id = :pid"
+                ),
+                {"pid": str(page_id)},
+            )
         )
-    ).mappings().one()
+        .mappings()
+        .one()
+    )
 
 
 # ── tests ─────────────────────────────────────────────────────────────────────
@@ -279,6 +285,7 @@ async def test_publish_failed_governance_returns_summary(db_session) -> None:
     cm = await _make_chat_message(db_session, user_id=uid)
     # Patch memory_policy to offrecord directly via SQL
     from sqlalchemy import text as _text
+
     await db_session.execute(
         _text("UPDATE chat_messages SET memory_policy = 'offrecord' WHERE id = :cid"),
         {"cid": cm.id},
@@ -313,6 +320,8 @@ async def test_publish_success_inserts_log_and_flips_pe(db_session) -> None:
     uid = await _make_user(db_session)
     cm = await _make_chat_message(db_session, user_id=uid)
     mv_id = await _make_message_version(db_session, chat_message_id=cm.id)
+    cm.current_version_id = mv_id
+    await db_session.flush()
     await _link_mv(db_session, page_id=page_id, mv_id=mv_id)
 
     msg = _message(user_id=_ADMIN_ID, text=f"/wiki_publish {slug}")
@@ -339,6 +348,7 @@ async def test_republish_already_public_logs_prior_pe_true(db_session) -> None:
     the INSERT — code reads from the FOR UPDATE-locked row's actual value.
     """
     from sqlalchemy import text as _text
+
     handler = import_module("bot.handlers.wiki")
 
     await _ensure_admin_user(db_session)
@@ -346,6 +356,8 @@ async def test_republish_already_public_logs_prior_pe_true(db_session) -> None:
     uid = await _make_user(db_session)
     cm = await _make_chat_message(db_session, user_id=uid)
     mv_id = await _make_message_version(db_session, chat_message_id=cm.id)
+    cm.current_version_id = mv_id
+    await db_session.flush()
     await _link_mv(db_session, page_id=page_id, mv_id=mv_id)
 
     msg = _message(user_id=_ADMIN_ID, text=f"/wiki_publish {slug}")
@@ -444,12 +456,17 @@ async def test_unpublish_sets_noindex_and_logs_unpublish(db_session) -> None:
     assert await _pub_log_count(db_session, page_id=page_id) == 1
 
     from sqlalchemy import text as _text
+
     log = (
-        await db_session.execute(
-            _text("SELECT action FROM wiki_publication_log WHERE wiki_page_id = :pid"),
-            {"pid": str(page_id)},
+        (
+            await db_session.execute(
+                _text("SELECT action FROM wiki_publication_log WHERE wiki_page_id = :pid"),
+                {"pid": str(page_id)},
+            )
         )
-    ).mappings().one()
+        .mappings()
+        .one()
+    )
     assert log["action"] == "unpublish"
 
 
@@ -469,7 +486,9 @@ async def test_wiki_robots_index_refused_when_not_public(db_session) -> None:
 
     msg.answer.assert_awaited_once()
     replied = msg.answer.call_args[0][0]
-    assert "непубли" in replied.lower() or "public" in replied.lower() or "нельзя" in replied.lower()
+    assert (
+        "непубли" in replied.lower() or "public" in replied.lower() or "нельзя" in replied.lower()
+    )
 
     assert await _pub_log_count(db_session, page_id=page_id) == 0
     page = await _get_page(db_session, page_id=page_id)
@@ -498,12 +517,17 @@ async def test_wiki_robots_index_success_inserts_log(db_session) -> None:
     assert page["robots_policy"] == "index"
 
     from sqlalchemy import text as _text
+
     log = (
-        await db_session.execute(
-            _text("SELECT action FROM wiki_publication_log WHERE wiki_page_id = :pid"),
-            {"pid": str(page_id)},
+        (
+            await db_session.execute(
+                _text("SELECT action FROM wiki_publication_log WHERE wiki_page_id = :pid"),
+                {"pid": str(page_id)},
+            )
         )
-    ).mappings().one()
+        .mappings()
+        .one()
+    )
     assert log["action"] == "robots_index"
 
 
@@ -529,10 +553,15 @@ async def test_wiki_robots_noindex_always_succeeds(db_session) -> None:
     assert page["robots_policy"] == "noindex"
 
     from sqlalchemy import text as _text
+
     log = (
-        await db_session.execute(
-            _text("SELECT action FROM wiki_publication_log WHERE wiki_page_id = :pid"),
-            {"pid": str(page_id)},
+        (
+            await db_session.execute(
+                _text("SELECT action FROM wiki_publication_log WHERE wiki_page_id = :pid"),
+                {"pid": str(page_id)},
+            )
         )
-    ).mappings().one()
+        .mappings()
+        .one()
+    )
     assert log["action"] == "robots_noindex"

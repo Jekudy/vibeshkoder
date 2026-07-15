@@ -10,6 +10,35 @@ is_allowed_path() {
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_nomem.*\.jsonl$ ]] && return 0
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_forgotten.*\.jsonl$ ]] && return 0
   [[ "$path" =~ ^tests/fixtures/eval_seeds/leakage_redacted.*\.jsonl$ ]] && return 0
+
+  # BEGIN PHASE13_COMPLETE_HISTORY_ALLOWLIST
+  # Phase 13 deliberately retires legacy marker-based exclusion for human
+  # messages. These exact runtime, migration-acceptance, fixture, and test files
+  # either implement that complete-history boundary or verify repair of legacy
+  # normalized rows. Keep this list path-exact: adjacent files remain linted.
+  [[ "$path" == "bot/middlewares/raw_update_persistence.py" ]] && return 0
+  [[ "$path" == "bot/services/governance.py" ]] && return 0
+  [[ "$path" == "bot/services/import_apply.py" ]] && return 0
+  [[ "$path" == "bot/services/import_html_parser.py" ]] && return 0
+  [[ "$path" == "bot/services/ingestion.py" ]] && return 0
+  [[ "$path" == "bot/services/wiki_compiler.py" ]] && return 0
+  [[ "$path" == "docs/ops/phase13-production-preflight-2026-07-14.md" ]] && return 0
+  [[ "$path" == "tests/fixtures/qa_eval_cases.json" ]] && return 0
+  [[ "$path" == "tests/handlers/test_chat_messages_helper_path.py" ]] && return 0
+  [[ "$path" == "tests/handlers/test_chat_messages_redelivery_idempotent.py" ]] && return 0
+  [[ "$path" == "tests/handlers/test_edited_message.py" ]] && return 0
+  [[ "$path" == "tests/integration/test_offrecord_irreversibility.py" ]] && return 0
+  [[ "$path" == "tests/integration/test_phase4_hotfix_e2e.py" ]] && return 0
+  [[ "$path" == "tests/services/test_governance_stub.py" ]] && return 0
+  [[ "$path" == "tests/services/test_human_memory_policy.py" ]] && return 0
+  [[ "$path" == "tests/services/test_import_apply.py" ]] && return 0
+  [[ "$path" == "tests/services/test_import_dry_run_stats.py" ]] && return 0
+  [[ "$path" == "tests/services/test_import_html_apply.py" ]] && return 0
+  [[ "$path" == "tests/services/test_import_parser.py" ]] && return 0
+  [[ "$path" == "tests/services/test_llm_gateway_wiki.py" ]] && return 0
+  [[ "$path" == "tests/services/test_message_persistence.py" ]] && return 0
+  # END PHASE13_COMPLETE_HISTORY_ALLOWLIST
+
   # T6-03 design doc — describes privacy invariants by name; baseline-stable.
   [[ "$path" == "docs/memory-system/T6-03_design.md" ]] && return 0
 

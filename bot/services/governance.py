@@ -1,52 +1,24 @@
-"""Memory governance — deterministic policy detector + redactor (T1-12 + T1-13).
+"""Memory governance for the Phase 13 complete-history product contract.
 
-Replaces the T1-04 stub with the real ``detect_policy`` and ``redact_raw_for_offrecord``.
-Detection is deterministic (NO LLM) — token-match on ``#nomem`` and ``#offrecord`` in
-the message text and caption, case-insensitive.
+Every human community-chat message is persisted as ``normal`` memory.  Strings such as
+``#nomem`` and ``#offrecord`` are ordinary message content and do not create an opt-out.
 
-Policy semantics (per HANDOFF.md §10):
-
-- ``"normal"`` — store + use as memory.
-- ``"nomem"`` — store content but exclude from search / qa / extraction / catalog /
-  digest / wiki / graph. The DB row keeps the content; downstream consumers filter by
-  ``memory_policy``.
-- ``"offrecord"`` — content fields (``text``, ``caption``, ``entities``) MUST be redacted
-  before commit. The DB row keeps ids / timestamps / hash / policy marker. Downstream
-  consumers see the row but no content.
-
-If both tokens appear, ``"offrecord"`` takes precedence (stricter wins). The mark
-payload returned alongside the policy carries audit metadata for the
-``offrecord_marks`` row T1-13 inserts when policy != ``"normal"``.
+``redact_raw_for_offrecord`` remains available for historical rows and maintenance code
+that may need to sanitize an already-classified legacy payload.  The live/import policy
+detector no longer produces that classification.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Literal
 
 PolicyOutcome = Literal["normal", "nomem", "offrecord"]
-
-# Match #nomem / #offrecord as standalone hashtags. Case-insensitive. Negative
-# lookahead `(?!\w)` rejects #nomembership / #offrecordings; the leading anchor is left
-# implicit (start of string OR any non-word boundary), which Python's re handles via the
-# negative lookbehind below. Reading order: optional leading non-word, literal hashtag,
-# negative lookahead for trailing word char.
-_NOMEM_PATTERN = re.compile(r"(?i)(?<![\w])#nomem(?!\w)")
-_OFFRECORD_PATTERN = re.compile(r"(?i)(?<![\w])#offrecord(?!\w)")
-
-_DETECTED_BY = "deterministic_token_match_v1"
 
 # Version string for the governance filter.  Frozen into ButlerEvidenceContext
 # (T12-02) so the hash is stable across replays.  Bump if detect_policy logic
 # changes in a way that would produce different policy outcomes for the same
 # inputs (e.g. new patterns, new fields).
-GOVERNANCE_FILTER_VERSION = "phase12-v1"
-
-
-def _contains(pattern: re.Pattern[str], value: str | None) -> bool:
-    if not value:
-        return False
-    return bool(pattern.search(value))
+GOVERNANCE_FILTER_VERSION = "phase13-v1"
 
 
 def detect_policy(
@@ -58,57 +30,12 @@ def detect_policy(
     forward_text: str | None = None,
     forward_caption: str | None = None,
 ) -> tuple[PolicyOutcome, dict | None]:
-    """Run deterministic detection over text, caption, and optional extra fields.
+    """Return the single supported policy for all human message content.
 
-    Returns ``(policy, mark_payload)``:
-    - ``policy`` is one of ``"normal"`` / ``"nomem"`` / ``"offrecord"``.
-    - ``mark_payload`` is ``None`` for ``"normal"``; otherwise a dict with audit
-      metadata for the ``offrecord_marks`` row.
-
-    Detection rules (all fields scanned; offrecord > nomem):
-    - ``#offrecord`` in any of: text, caption, poll_question, contact_name,
-      forward_text, forward_caption → ``"offrecord"`` (takes precedence).
-    - Else ``#nomem`` in any of those fields → ``"nomem"``.
-    - Else → ``"normal"``.
-
-    Keyword-only args (``poll_question``, ``contact_name``, ``forward_text``,
-    ``forward_caption``) default to None for full backward compatibility — callers
-    that pass only ``(text, caption)`` positionally (e.g. import_parser.py,
-    ingestion.py) keep working unchanged.
-
-    Token matching is case-insensitive. Hashtags must stand alone — ``#nomembership``
-    and ``some#nomem`` do NOT match.
+    The full signature is retained so live ingestion and historical import adapters keep
+    one stable API.  Content is intentionally not inspected: opt-out tokens are ordinary
+    searchable text under the complete-history contract.
     """
-    # offrecord scan across all 6 fields
-    or_fields = {
-        "in_text": _contains(_OFFRECORD_PATTERN, text),
-        "in_caption": _contains(_OFFRECORD_PATTERN, caption),
-        "in_poll_question": _contains(_OFFRECORD_PATTERN, poll_question),
-        "in_contact_name": _contains(_OFFRECORD_PATTERN, contact_name),
-        "in_forward_text": _contains(_OFFRECORD_PATTERN, forward_text),
-        "in_forward_caption": _contains(_OFFRECORD_PATTERN, forward_caption),
-    }
-    if any(or_fields.values()):
-        return (
-            "offrecord",
-            {"detected_by": _DETECTED_BY, **or_fields},
-        )
-
-    # nomem scan across all 6 fields
-    nm_fields = {
-        "in_text": _contains(_NOMEM_PATTERN, text),
-        "in_caption": _contains(_NOMEM_PATTERN, caption),
-        "in_poll_question": _contains(_NOMEM_PATTERN, poll_question),
-        "in_contact_name": _contains(_NOMEM_PATTERN, contact_name),
-        "in_forward_text": _contains(_NOMEM_PATTERN, forward_text),
-        "in_forward_caption": _contains(_NOMEM_PATTERN, forward_caption),
-    }
-    if any(nm_fields.values()):
-        return (
-            "nomem",
-            {"detected_by": _DETECTED_BY, **nm_fields},
-        )
-
     return ("normal", None)
 
 

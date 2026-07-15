@@ -38,8 +38,10 @@ from bot.services.llm_gateway import (
     AnswerWithCitations,
     LLMGatewayConfig,
     synthesize_answer,
+    _build_prompt,
     _cache_input_hash,
     _normalize_query,
+    _prompt_hash,
 )
 from bot.services.llm_providers import (
     ProviderResult,
@@ -100,6 +102,7 @@ class FakeProvider:
 
 # ─── Config helper ───────────────────────────────────────────────────────────
 
+
 def _gateway_config(
     *,
     daily: Decimal = Decimal("5.00"),
@@ -116,6 +119,7 @@ def _gateway_config(
 
 # ─── DB seed helpers ─────────────────────────────────────────────────────────
 
+
 async def _seed_user(db_session, user_id: int) -> None:
     from bot.db.repos.user import UserRepo
 
@@ -126,7 +130,6 @@ async def _seed_user(db_session, user_id: int) -> None:
         first_name=f"LLMEval {user_id}",
         last_name=None,
     )
-
 
 
 async def _seed_message_version(
@@ -214,7 +217,9 @@ def _bundle_from_version(
     )
 
 
-def _empty_bundle(query: str = "тестовый запрос", chat_id: int = -1_009_000_000_001) -> EvidenceBundle:
+def _empty_bundle(
+    query: str = "тестовый запрос", chat_id: int = -1_009_000_000_001
+) -> EvidenceBundle:
     return EvidenceBundle.from_hits(query, chat_id, [])
 
 
@@ -427,13 +432,27 @@ async def test_eval_005_cache_hit(db_session) -> None:
 
     query = case["query"]
     cfg = _gateway_config()
+    bundle = _bundle_from_version(
+        version_id=version_id,
+        chat_message_id=cm_id,
+        user_id=99_005,
+        query=query,
+    )
 
-    # Compute the cache input hash with the actual version_id + config.
+    # Cache identity includes the prompt hash so mutable evidence snippets cannot
+    # reuse a stale answer under the same source id.
+    prompt_hash = _prompt_hash(
+        _build_prompt(
+            _normalize_query(query),
+            (version_id,),
+            evidence_items=list(bundle.items),
+        )
+    )
     input_hash = _cache_input_hash(
         query_normalized=_normalize_query(query),
         citation_ids=[version_id],
         model=cfg.model,
-        prompt_template_version=cfg.prompt_template_version,
+        prompt_template_version=f"{cfg.prompt_template_version}:{prompt_hash}",
     )
 
     preseed = case["preseed_cache"]
@@ -445,12 +464,6 @@ async def test_eval_005_cache_hit(db_session) -> None:
         model=cfg.model,
     )
 
-    bundle = _bundle_from_version(
-        version_id=version_id,
-        chat_message_id=cm_id,
-        user_id=99_005,
-        query=query,
-    )
     provider = FakeProvider()
 
     result = await synthesize_answer(
@@ -560,9 +573,7 @@ async def test_eval_007_forget_invalidated(db_session) -> None:
     from bot.db.models import ChatMessage
     from sqlalchemy import select
 
-    cm_result = await db_session.execute(
-        select(ChatMessage).where(ChatMessage.id == cm_id)
-    )
+    cm_result = await db_session.execute(select(ChatMessage).where(ChatMessage.id == cm_id))
     cm = cm_result.scalars().first()
     assert cm is not None
     tombstone_key = f"message:{cm.chat_id}:{cm.message_id}"
@@ -665,8 +676,13 @@ def test_fixture_json_is_valid_and_complete() -> None:
     assert len(cases) >= 6, f"contracts.md §9 requires ≥6 cases, got {len(cases)}"
 
     required_fields = {
-        "id", "description", "query", "evidence_message_version_ids",
-        "expected_outcome", "expected_citation_subset_of", "expected_cost_usd_max",
+        "id",
+        "description",
+        "query",
+        "evidence_message_version_ids",
+        "expected_outcome",
+        "expected_citation_subset_of",
+        "expected_cost_usd_max",
     }
     for case in cases:
         missing = required_fields - case.keys()

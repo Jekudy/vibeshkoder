@@ -20,8 +20,6 @@ from bot.handlers import (
     chat_messages,
     digest,
     edited_message,
-    forget_me,
-    forget_reply,
     forward_lookup,
     questionnaire,
     qa,
@@ -30,6 +28,9 @@ from bot.handlers import (
     wiki,
 )
 from bot.middlewares.db_session import DbSessionMiddleware
+from bot.middlewares.normalized_memory_persistence import (
+    NormalizedMemoryPersistenceMiddleware,
+)
 from bot.middlewares.raw_update_persistence import RawUpdatePersistenceMiddleware
 from bot.services.scheduler import start_scheduler, stop_scheduler
 
@@ -138,6 +139,14 @@ async def _init_db() -> None:
     logger.info("Database tables ensured")
 
 
+def _register_update_middlewares(dp: Dispatcher) -> None:
+    """Register persistence middleware in its required outer-to-inner order."""
+
+    dp.update.middleware(DbSessionMiddleware())
+    dp.update.middleware(RawUpdatePersistenceMiddleware())
+    dp.update.middleware(NormalizedMemoryPersistenceMiddleware())
+
+
 async def main() -> None:
     # Storage: Redis in prod, in-memory FSM in dev. The DB driver is postgres in both modes
     # (T0-02; see bot/db/engine.py).
@@ -162,12 +171,11 @@ async def main() -> None:
 
     # Register middleware on all update types.
     # DbSessionMiddleware is OUTERMOST so the session is open before raw persistence
-    # runs. RawUpdatePersistenceMiddleware (T1-04) persists the raw update inside the
-    # same DB transaction the handler will commit. The persistence path is gated by
-    # feature flag ``memory.ingestion.raw_updates.enabled`` (default OFF), so this
-    # change is a behavior-preserving wiring until operators enable the flag.
-    dp.update.middleware(DbSessionMiddleware())
-    dp.update.middleware(RawUpdatePersistenceMiddleware())
+    # runs. RawUpdatePersistenceMiddleware (T1-04) commits the source archive before
+    # normalized persistence and router dispatch, so a later handler rollback cannot
+    # delete it. The path is gated by feature flag
+    # ``memory.ingestion.raw_updates.enabled`` (default OFF).
+    _register_update_middlewares(dp)
 
     # Include routers (order matters — more specific first)
     dp.include_routers(
@@ -176,16 +184,14 @@ async def main() -> None:
         vouch.router,
         admin.router,
         admin_extract.router,  # T6-03: /admin_extract — Phase 6 backfill (private chat + admin gated)
-        admin_cards.router,    # T6-04/T6-05: /candidates /approve /reject /cards /card
-        admin_graph.router,    # T10-07: /graph_project_now /graph_stats /graph_query /graph_purge_now
-        digest.router,         # T7-06: /digest_now /digest_preview /digest_history
-        wiki.router,           # T9-06: /wiki_publish /wiki_unpublish /wiki_robots (admin-only)
-        butler.router,         # T12-05: /butler /butler_status /butler_cancel /butler_undo (DM-only, flag OFF)
+        admin_cards.router,  # T6-04/T6-05: /candidates /approve /reject /cards /card
+        admin_graph.router,  # T10-07: /graph_project_now /graph_stats /graph_query /graph_purge_now
+        digest.router,  # T7-06: /digest_now /digest_preview /digest_history
+        wiki.router,  # T9-06: /wiki_publish /wiki_unpublish /wiki_robots (admin-only)
+        butler.router,  # T12-05: /butler /butler_status /butler_cancel /butler_undo (DM-only, flag OFF)
         chat_events.router,
         edited_message.router,  # T1-14: edited_message handler (before chat_messages catch-all)
-        forget_me.router,  # T3-03: /forget_me command (DM or in-chat)
-        forget_reply.router,   # T3-02: /forget command handler (before chat_messages catch-all)
-        qa.router,  # T4-04: /recall q&a handler, runtime-gated by memory.qa.enabled
+        qa.router,  # Mention/reply Q&A only; runtime-gated by memory.qa.enabled
         forward_lookup.router,
         chat_messages.router,  # lowest priority — catches all group messages
     )

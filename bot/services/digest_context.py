@@ -171,8 +171,7 @@ async def build_digest_context(
     """
     if type not in ("daily", "weekly"):
         raise ValueError(
-            f"build_digest_context: unsupported type {type!r}; "
-            "expected 'daily' or 'weekly'"
+            f"build_digest_context: unsupported type {type!r}; expected 'daily' or 'weekly'"
         )
 
     cards_limit, raw_top_n, token_budget, min_threshold = _weekly_overrides(
@@ -204,16 +203,20 @@ async def build_digest_context(
         LIMIT :cards_limit
     """)
     card_rows = (
-        await session.execute(
-            cards_sql,
-            {
-                "source_chat_id": source_chat_id,
-                "ws": window_start,
-                "we": window_end,
-                "cards_limit": cards_limit,
-            },
+        (
+            await session.execute(
+                cards_sql,
+                {
+                    "source_chat_id": source_chat_id,
+                    "ws": window_start,
+                    "we": window_end,
+                    "cards_limit": cards_limit,
+                },
+            )
         )
-    ).mappings().all()
+        .mappings()
+        .all()
+    )
 
     cards: list[DigestContextCard] = []
     for row in card_rows:
@@ -236,11 +239,22 @@ async def build_digest_context(
                 mv.id AS message_version_id,
                 mv.chat_message_id,
                 u.first_name AS author_display,
-                mv.normalized_text AS text,
+                concat_ws(
+                    E'\n',
+                    mv.normalized_text,
+                    mv.caption,
+                    CASE
+                        WHEN mm.description_status = 'ready' THEN
+                            '[Описание изображения] ' || mm.description
+                            || E'\n[Источник изображения] ' || mm.source_message_url
+                        ELSE NULL
+                    END
+                ) AS text,
                 cm.date AS ts
             FROM message_versions mv
             JOIN chat_messages cm ON cm.id = mv.chat_message_id
             JOIN users u ON u.id = cm.user_id
+            LEFT JOIN message_media mm ON mm.chat_message_id = cm.id
             WHERE cm.chat_id = :source_chat_id
               AND cm.current_version_id = mv.id
               AND cm.date >= :ws
@@ -252,16 +266,20 @@ async def build_digest_context(
             LIMIT :top_n
         """)
         raw_rows = (
-            await session.execute(
-                raw_sql,
-                {
-                    "source_chat_id": source_chat_id,
-                    "ws": window_start,
-                    "we": window_end,
-                    "top_n": raw_top_n,
-                },
+            (
+                await session.execute(
+                    raw_sql,
+                    {
+                        "source_chat_id": source_chat_id,
+                        "ws": window_start,
+                        "we": window_end,
+                        "top_n": raw_top_n,
+                    },
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
 
         # Apply token budget — drop from tail.
         # `-1000` headroom mirrors Phase 7 behaviour: leaves room for the

@@ -19,18 +19,19 @@ PROMPT_VERSION = "digest-weekly-v0.1.0"
 # §5.F M1 — five canonical Russian section titles. The prompt instructs the
 # LLM to use only these; the caller emits a structured warning if a returned
 # section header carries an off-allowlist title (soft contract).
-SECTION_NAME_ALLOWLIST: frozenset[str] = frozenset({
-    "Объявления",
-    "Обсуждения",
-    "Знания и ресурсы",
-    "Встречи и события",
-    "Прочее",
-})
+SECTION_NAME_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "Объявления",
+        "Обсуждения",
+        "Знания и ресурсы",
+        "Встречи и события",
+        "Прочее",
+    }
+)
 
-SYSTEM_PROMPT = """You are writing an editorial WEEKLY digest for a private community chat.
-This will be reviewed by an admin before publishing — do not assume it
-will be sent verbatim. Write the best draft you can; the admin will
-approve or reject.
+SYSTEM_PROMPT = """You are writing an automatic WEEKLY digest for a private community chat.
+It will be published without manual approval, so include only facts supported
+by the provided evidence and make uncertainty explicit.
 
 Output format (strict):
   Line 1-4: TL;DR — 3-4 short sentences in Russian, prose. Cover the
@@ -78,16 +79,13 @@ def build_user_prompt(
     ]
     for c in cards:
         sids_csv = ", ".join(str(s) for s in c.card_source_ids)
-        lines.append(
-            f'  Card "{c.title}" (approved). Source ids you may cite: {sids_csv}'
-        )
+        lines.append(f'  Card "{c.title}" (approved). Source ids you may cite: {sids_csv}')
         lines.append(f"  Card body: {c.body_markdown}")
         lines.append("  ---")
     lines.append(f"Messages ({len(messages)}):")
     for m in messages:
         lines.append(
-            f"  [mv:{m.message_version_id}] {m.author_display},"
-            f" {m.ts.isoformat()}: {m.text}"
+            f"  [mv:{m.message_version_id}] {m.author_display}, {m.ts.isoformat()}: {m.text}"
         )
         lines.append("  ---")
     return "\n".join(lines)

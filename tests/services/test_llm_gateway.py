@@ -20,6 +20,7 @@ Test surface (≥30) covers all 7 pre-call invariants from PHASE5_PLAN.md §5.A:
 from __future__ import annotations
 
 import asyncio
+import logging
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -69,16 +70,11 @@ class LedgerRepoProtocol(Protocol):
         request_id: str | None,
         cache_hit: bool,
         error: str | None,
-    ) -> Any:
-        ...
+    ) -> Any: ...
 
-    async def daily_cost_usd(self, session: Any, *, day: Any) -> Decimal:
-        ...
+    async def daily_cost_usd(self, session: Any, *, day: Any) -> Decimal: ...
 
-    async def monthly_cost_usd(
-        self, session: Any, *, year: int, month: int
-    ) -> Decimal:
-        ...
+    async def monthly_cost_usd(self, session: Any, *, year: int, month: int) -> Decimal: ...
 
     async def update_placeholder(
         self,
@@ -92,13 +88,11 @@ class LedgerRepoProtocol(Protocol):
         request_id: str | None,
         latency_ms: int,
         error: str | None,
-    ) -> Any:
-        ...
+    ) -> Any: ...
 
 
 class SynthesisCacheRepoProtocol(Protocol):
-    async def get_or_none(self, session: Any, *, input_hash: str) -> Any | None:
-        ...
+    async def get_or_none(self, session: Any, *, input_hash: str) -> Any | None: ...
 
     async def store(
         self,
@@ -108,16 +102,11 @@ class SynthesisCacheRepoProtocol(Protocol):
         answer_text: str,
         citation_ids: list[int],
         model: str,
-    ) -> Any:
-        ...
+    ) -> Any: ...
 
-    async def bump_hit(self, session: Any, *, cache_id: int) -> None:
-        ...
+    async def bump_hit(self, session: Any, *, cache_id: int) -> None: ...
 
-    async def invalidate_by_citation(
-        self, session: Any, *, message_version_id: int
-    ) -> int:
-        ...
+    async def invalidate_by_citation(self, session: Any, *, message_version_id: int) -> int: ...
 
 
 @dataclass
@@ -189,9 +178,7 @@ class FakeLedgerRepo:
     async def daily_cost_usd(self, session: Any, *, day: Any) -> Decimal:
         return self.daily_cost
 
-    async def monthly_cost_usd(
-        self, session: Any, *, year: int, month: int
-    ) -> Decimal:
+    async def monthly_cost_usd(self, session: Any, *, year: int, month: int) -> Decimal:
         return self.monthly_cost
 
     async def update_placeholder(
@@ -274,16 +261,10 @@ class FakeCacheRepo:
                 row.hit_count += 1
                 return
 
-    async def invalidate_by_citation(
-        self, session: Any, *, message_version_id: int
-    ) -> int:
+    async def invalidate_by_citation(self, session: Any, *, message_version_id: int) -> int:
         self.invalidated_ids.append(message_version_id)
         before = len(self.rows)
-        self.rows = {
-            k: v
-            for k, v in self.rows.items()
-            if message_version_id not in v.citation_ids
-        }
+        self.rows = {k: v for k, v in self.rows.items() if message_version_id not in v.citation_ids}
         return before - len(self.rows)
 
 
@@ -504,9 +485,7 @@ def test_synthesis_result_alias_accepts_both_branches() -> None:
         cache_hit=False,
         llm_call_id=1,
     )
-    ab: SynthesisResult = Abstention(
-        reason="empty_bundle", cost_usd=Decimal("0"), llm_call_id=2
-    )
+    ab: SynthesisResult = Abstention(reason="empty_bundle", cost_usd=Decimal("0"), llm_call_id=2)
     assert isinstance(awc, AnswerWithCitations)
     assert isinstance(ab, Abstention)
 
@@ -519,9 +498,7 @@ def test_llm_gateway_config_is_frozen() -> None:
 
 def test_llm_budget_lock_id_is_deterministic_int64() -> None:
     """Lock id is sha256(b"llm_budget_guard")[:8] as signed int64."""
-    expected = int.from_bytes(
-        hashlib.sha256(b"llm_budget_guard").digest()[:8], "big", signed=True
-    )
+    expected = int.from_bytes(hashlib.sha256(b"llm_budget_guard").digest()[:8], "big", signed=True)
     assert LLM_BUDGET_LOCK_ID == expected
 
 
@@ -809,11 +786,19 @@ async def test_cache_hit_returns_cached_answer_no_provider_call() -> None:
     )
     # Pre-seed the cache with the input hash that the gateway will compute.
     cfg = _config()
-    expected_hash = hashlib.sha256(
-        ("q" + "|" + "100" + "|" + cfg.model + "|" + cfg.prompt_template_version).encode(
-            "utf-8"
-        )
-    ).hexdigest()
+    from bot.services.llm_gateway import _build_prompt, _cache_input_hash, _prompt_hash
+
+    prompt = _build_prompt(
+        "q",
+        (100,),
+        evidence_items=bundle.items,
+    )
+    expected_hash = _cache_input_hash(
+        query_normalized="q",
+        citation_ids=(100,),
+        model=cfg.model,
+        prompt_template_version=f"{cfg.prompt_template_version}:{_prompt_hash(prompt)}",
+    )
     await cache.store(
         session,
         input_hash=expected_hash,
@@ -984,12 +969,8 @@ async def test_budget_atomic_advisory_lock_invoked() -> None:
     assert any("pg_advisory_lock" in s for s in captured), captured
     assert any("pg_advisory_unlock" in s for s in captured), captured
     # Verify ordering: lock before unlock, both before provider dispatch.
-    lock_idx = next(
-        i for i, s in enumerate(captured) if "pg_advisory_lock" in s
-    )
-    unlock_idx = next(
-        i for i, s in enumerate(captured) if "pg_advisory_unlock" in s
-    )
+    lock_idx = next(i for i, s in enumerate(captured) if "pg_advisory_lock" in s)
+    unlock_idx = next(i for i, s in enumerate(captured) if "pg_advisory_unlock" in s)
     assert lock_idx < unlock_idx, (lock_idx, unlock_idx, captured)
     # Provider was called exactly once after the unlock.
     assert len(provider.calls) == 1
@@ -998,17 +979,13 @@ async def test_budget_atomic_advisory_lock_invoked() -> None:
 # ─── Tests: invariant 6 — provider error categorisation ─────────────────────
 
 
-@pytest.mark.parametrize(
-    "subtype", ["rate_limit", "timeout", "5xx", "connection_reset"]
-)
+@pytest.mark.parametrize("subtype", ["rate_limit", "timeout", "5xx", "connection_reset"])
 @pytest.mark.asyncio
 async def test_provider_transient_error_abstains(subtype: str) -> None:
     bundle = _make_bundle((100,))
     ledger = FakeLedgerRepo()
     cache = FakeCacheRepo()
-    provider = FakeProvider(
-        raise_exc=ProviderTransientError(subtype, message=f"{subtype} err")
-    )
+    provider = FakeProvider(raise_exc=ProviderTransientError(subtype, message=f"{subtype} err"))
     session = FakeSession(
         query_results=[
             [{"message_version_id": 100}],
@@ -1047,16 +1024,12 @@ async def test_provider_structural_error_abstains_and_emits_stop(
     def _fake_emit(name: str) -> None:
         emitted.append(name)
 
-    monkeypatch.setattr(
-        "bot.services.observability.emit_stop_signal", _fake_emit
-    )
+    monkeypatch.setattr("bot.services.observability.emit_stop_signal", _fake_emit)
 
     bundle = _make_bundle((100,))
     ledger = FakeLedgerRepo()
     cache = FakeCacheRepo()
-    provider = FakeProvider(
-        raise_exc=ProviderStructuralError(subtype, message=f"{subtype} err")
-    )
+    provider = FakeProvider(raise_exc=ProviderStructuralError(subtype, message=f"{subtype} err"))
     session = FakeSession(
         query_results=[
             [{"message_version_id": 100}],
@@ -1121,6 +1094,65 @@ async def test_provider_unknown_error_abstains_no_stop(
     assert res.reason == "provider_error"
     assert ledger.rows[-1].error == "provider_unknown:WeirdError"
     assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_qa_provider_failures_log_taxonomy_without_secret_or_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Structural and unknown QA failures never serialize provider exceptions."""
+
+    emitted: list[str] = []
+    monkeypatch.setattr(
+        "bot.services.observability.emit_stop_signal",
+        lambda name: emitted.append(name),
+    )
+    secret = "qa-gateway-secret-sentinel"
+    cases = [
+        (
+            ProviderStructuralError("auth", message=secret),
+            "ProviderStructuralError",
+            "auth",
+        ),
+        (
+            ProviderStructuralError("qa_gateway_secret_sentinel", message=secret),
+            "ProviderStructuralError",
+            "unknown",
+        ),
+        (RuntimeError(secret), "RuntimeError", "unknown"),
+    ]
+    caplog.set_level(logging.ERROR, logger="bot.services.llm_gateway")
+
+    for exc, expected_class, expected_subtype in cases:
+        bundle = _make_bundle((100,))
+        await synthesize_answer(
+            FakeSession(
+                query_results=[
+                    [{"message_version_id": 100}],
+                    [],
+                ]
+            ),  # type: ignore[arg-type]
+            bundle=bundle,
+            query="q",
+            config=_config(),
+            qa_trace_id=11,
+            ledger_repo=FakeLedgerRepo(),
+            cache_repo=FakeCacheRepo(),
+            provider=FakeProvider(raise_exc=exc),
+        )
+
+        record = caplog.records[-1]
+        assert record.getMessage() == "qa_llm_provider_failed"
+        assert record.error_class == expected_class
+        assert record.error_subtype == expected_subtype
+        assert record.exc_info is None
+
+    rendered = "\n".join(repr(record.__dict__) for record in caplog.records)
+    assert secret not in rendered
+    assert secret not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert emitted == ["llm_provider_structural", "llm_provider_structural"]
 
 
 # ─── Tests: invariant 7 — citation enforcement ──────────────────────────────
@@ -1273,9 +1305,7 @@ async def test_synthesize_answer_never_raises_on_provider_error() -> None:
     bundle = _make_bundle((100,))
     ledger = FakeLedgerRepo()
     cache = FakeCacheRepo()
-    provider = FakeProvider(
-        raise_exc=ProviderTransientError("rate_limit", message="overload")
-    )
+    provider = FakeProvider(raise_exc=ProviderTransientError("rate_limit", message="overload"))
     session = FakeSession(
         query_results=[
             [{"message_version_id": 100}],
@@ -1347,7 +1377,7 @@ async def test_concurrent_calls_under_budget_complete(
             query_results=[
                 [{"message_version_id": 100}],
                 [],
-                ]
+            ]
         )
         return await synthesize_answer(
             session,  # type: ignore[arg-type]
@@ -1539,9 +1569,7 @@ async def test_concurrent_cache_miss_only_one_dispatch() -> None:
     first_pipeline_done = False
 
     class _SerialisingSession(FakeSession):
-        async def execute(
-            self, *args: Any, **kwargs: Any
-        ) -> _SessionExecutor:
+        async def execute(self, *args: Any, **kwargs: Any) -> _SessionExecutor:
             stmt = args[0] if args else kwargs.get("statement")
             s = str(stmt) if stmt is not None else ""
             if "pg_advisory_lock" in s and "unlock" not in s:
@@ -1674,9 +1702,7 @@ def test_estimate_cost_unknown_model_returns_zero_emits_stop_signal(monkeypatch)
     from bot.services import observability
 
     emitted: list[str] = []
-    monkeypatch.setattr(
-        observability, "emit_stop_signal", lambda name: emitted.append(name)
-    )
+    monkeypatch.setattr(observability, "emit_stop_signal", lambda name: emitted.append(name))
 
     cfg = LLMGatewayConfig(
         provider="anthropic",
@@ -1732,11 +1758,26 @@ class _ExtractFakeLedger:
     monthly_cost: Decimal = Decimal("0")
     _next_id: int = 1
 
-    async def record(self, session: Any, *, qa_trace_id: Any, provider: str, model: str,
-                     prompt_hash: str, response_hash: Any, tokens_in: int, tokens_out: int,
-                     cost_usd: Decimal, latency_ms: int, request_id: Any, cache_hit: bool,
-                     error: Any, call_type: str = "unknown") -> Any:
+    async def record(
+        self,
+        session: Any,
+        *,
+        qa_trace_id: Any,
+        provider: str,
+        model: str,
+        prompt_hash: str,
+        response_hash: Any,
+        tokens_in: int,
+        tokens_out: int,
+        cost_usd: Decimal,
+        latency_ms: int,
+        request_id: Any,
+        cache_hit: bool,
+        error: Any,
+        call_type: str = "unknown",
+    ) -> Any:
         from dataclasses import make_dataclass
+
         Row = make_dataclass("Row", [("id", int), ("cost_usd", Decimal), ("call_type", str)])
         row = Row(id=self._next_id, cost_usd=cost_usd, call_type=call_type)
         self.rows.append(row)
@@ -1749,9 +1790,19 @@ class _ExtractFakeLedger:
     async def monthly_cost_usd(self, session: Any, *, year: int, month: int) -> Decimal:
         return self.monthly_cost
 
-    async def update_placeholder(self, session: Any, *, llm_call_id: int, cost_usd: Decimal,
-                                  response_hash: Any, tokens_in: int, tokens_out: int,
-                                  request_id: Any, latency_ms: int, error: Any) -> Any:
+    async def update_placeholder(
+        self,
+        session: Any,
+        *,
+        llm_call_id: int,
+        cost_usd: Decimal,
+        response_hash: Any,
+        tokens_in: int,
+        tokens_out: int,
+        request_id: Any,
+        latency_ms: int,
+        error: Any,
+    ) -> Any:
         for row in self.rows:
             if row.id == llm_call_id:
                 row.cost_usd = cost_usd

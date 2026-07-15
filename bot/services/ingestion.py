@@ -1,8 +1,8 @@
 """Live update ingestion (T1-04).
 
-Persists every aiogram ``Update`` into the raw archive (``telegram_updates``, T1-03)
-inside the same DB transaction that the handler will commit. Honors the ``#offrecord``
-ordering rule from ``docs/memory-system/AUTHORIZED_SCOPE.md``:
+Persists every aiogram ``Update`` into the raw archive (``telegram_updates``, T1-03).
+The raw middleware commits this write before downstream dispatch.  The service honors
+the ``#offrecord`` ordering rule from ``docs/memory-system/AUTHORIZED_SCOPE.md``:
 
     1. ``detect_policy()`` (stub today, real in T1-12) runs BEFORE commit.
     2. If policy == ``'offrecord'``, ``redact_raw_for_offrecord()`` strips content fields
@@ -119,8 +119,9 @@ async def record_update(
         - The persisted ``TelegramUpdate`` row when the raw-archive flag is ON.
         - ``None`` when the flag is OFF (no row written, no behavior change).
 
-    The function does NOT commit. Caller controls the transaction lifecycle (typically
-    ``DbSessionMiddleware`` commits on handler success / rolls back on exception).
+    The function does NOT commit. Caller controls the transaction lifecycle.  Live
+    middleware commits the returned row before dispatch; import callers retain their own
+    chunk transaction boundaries.
 
     Idempotency: live updates carry a non-null ``update_id``; repo's partial unique
     index makes ON CONFLICT DO NOTHING safe so retries (network replays, polling

@@ -5,7 +5,7 @@ Verifies the contract from the issue body:
   chat_messages).
 - Synthetic telegram_updates rows: update_id=NULL, ingestion_run_id set.
 - Idempotent apply: re-running on same export → zero net DB change.
-- Reply resolver wired (#98), tombstone gate (#97), rate limit / chunking (#102),
+- Reply resolver wired (#98), complete-history policy, rate limit / chunking (#102),
   checkpoint (#101).
 - ingestion_runs row tracks started_at / finished_at / stats_json on success.
 
@@ -208,9 +208,8 @@ async def test_apply_is_idempotent(db_session) -> None:
     # Synthetic telegram_updates for run2: zero (duplicate gate fires before insert).
     assert await _count_telegram_updates(db_session, run2) == 0
 
-    # Offrecord sub-case: edited_messages has one #offrecord message that creates only
-    # a synthetic audit row on the first run. The second run must treat that audit row
-    # as the duplicate marker and create zero new telegram_updates.
+    # Legacy policy-looking markers are ordinary text. All five messages are stored,
+    # and the second run remains idempotent.
     edited_run1 = await _create_apply_run(
         db_session,
         source_path=str(EDITED_MESSAGES),
@@ -223,8 +222,8 @@ async def test_apply_is_idempotent(db_session) -> None:
         resume_point=None,
         chunking_config=_default_chunking(),
     )
-    assert edited_rep1.applied_count == 4
-    assert edited_rep1.skipped_governance_count == 1
+    assert edited_rep1.applied_count == 5
+    assert edited_rep1.skipped_governance_count == 0
 
     edited_counts_before_second = await db_session.execute(
         sa_text(
@@ -268,12 +267,11 @@ async def test_apply_is_idempotent(db_session) -> None:
     assert (cm_after, tu_after) == (cm_before, tu_before)
 
 
-# ─── Test 3: Tombstone gate ───────────────────────────────────────────────────
+# ─── Test 3: complete-history import ignores legacy tombstones ────────────────
 
 
-async def test_apply_tombstone_blocks_message(db_session) -> None:
-    """Pre-insert a forget_event for one export message id. Apply must skip that
-    message (skipped_tombstone_count == 1) and persist must NOT be called for it."""
+async def test_apply_legacy_message_tombstone_does_not_block_history(db_session) -> None:
+    """Legacy forget rows are audit-only and cannot remove exported history."""
     from bot.db.repos.forget_event import ForgetEventRepo
     from bot.services.import_apply import run_apply
 
@@ -298,8 +296,7 @@ async def test_apply_tombstone_blocks_message(db_session) -> None:
         source_hash="hash_tombstone_block",
     )
 
-    # Spy on persist_message_with_policy so we can assert it was NOT called for the
-    # blocked id. We don't replace it — we wrap to keep behaviour identical.
+    # Spy without replacing behaviour.
     import bot.services.import_apply as apply_mod
 
     original_persist = apply_mod.persist_message_with_policy
@@ -317,25 +314,20 @@ async def test_apply_tombstone_blocks_message(db_session) -> None:
             chunking_config=_default_chunking(),
         )
 
-    assert report.skipped_tombstone_count == 1
-    assert report.applied_count == 4  # 5 user msgs minus 1 tombstoned
-    assert blocked_msg_id not in persisted_msg_ids, (
-        f"persist_message_with_policy must NOT be called for tombstoned id {blocked_msg_id}"
-    )
+    assert report.skipped_tombstone_count == 0
+    assert report.applied_count == 5
+    assert blocked_msg_id in persisted_msg_ids
 
-    # Tombstoned message did NOT land in chat_messages
+    # The historical message is present despite the obsolete tombstone.
     blocked = await db_session.execute(
-        sa_text(
-            "SELECT COUNT(*) FROM chat_messages WHERE chat_id = :cid AND message_id = :mid"
-        ),
+        sa_text("SELECT COUNT(*) FROM chat_messages WHERE chat_id = :cid AND message_id = :mid"),
         {"cid": chat_id, "mid": blocked_msg_id},
     )
-    assert int(blocked.scalar_one()) == 0
+    assert int(blocked.scalar_one()) == 1
 
 
-async def test_apply_user_tombstone_blocks_all_sender_messages(db_session) -> None:
-    """A user:{tg_id} tombstone must block every resolved sender message before
-    synthetic telegram_updates or chat_messages rows are written."""
+async def test_apply_legacy_user_tombstone_does_not_block_history(db_session) -> None:
+    """A legacy user tombstone is audit-only under complete-history policy."""
     from bot.db.repos.forget_event import ForgetEventRepo
     from bot.services.import_apply import run_apply
 
@@ -367,17 +359,14 @@ async def test_apply_user_tombstone_blocks_all_sender_messages(db_session) -> No
         chunking_config=_default_chunking(),
     )
 
-    assert report.skipped_tombstone_count == 3
-    assert report.tombstone_skip_export_msg_ids == blocked_msg_ids
+    assert report.skipped_tombstone_count == 0
+    assert report.tombstone_skip_export_msg_ids == []
 
     blocked_cm = await db_session.execute(
-        sa_text(
-            "SELECT COUNT(*) FROM chat_messages "
-            "WHERE chat_id = :cid AND user_id = :uid"
-        ),
+        sa_text("SELECT COUNT(*) FROM chat_messages WHERE chat_id = :cid AND user_id = :uid"),
         {"cid": chat_id, "uid": blocked_user_id},
     )
-    assert int(blocked_cm.scalar_one()) == 0
+    assert int(blocked_cm.scalar_one()) == len(blocked_msg_ids)
 
     blocked_updates = await db_session.execute(
         sa_text(
@@ -386,21 +375,149 @@ async def test_apply_user_tombstone_blocks_all_sender_messages(db_session) -> No
         ),
         {"rid": run_id},
     )
-    assert int(blocked_updates.scalar_one()) == 0
+    assert int(blocked_updates.scalar_one()) == len(blocked_msg_ids)
+
+
+async def test_apply_rehydrates_previously_redacted_message(db_session) -> None:
+    """The export restores content hidden by the retired governance system."""
+    from datetime import datetime, timezone
+
+    from bot.db.models import ChatMessage, MessageVersion, User
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services.import_apply import run_apply
+
+    chat_id = -1001999999999
+    db_session.add(
+        User(
+            id=1000001,
+            username="legacy-redacted",
+            first_name="Legacy",
+            is_member=True,
+        )
+    )
+    await db_session.flush()
+    hidden = ChatMessage(
+        message_id=1001,
+        chat_id=chat_id,
+        user_id=1000001,
+        text=None,
+        caption=None,
+        date=datetime.now(timezone.utc),
+        memory_policy="forgotten",
+        is_redacted=True,
+    )
+    db_session.add(hidden)
+    await db_session.flush()
+    hidden_version = MessageVersion(
+        chat_message_id=hidden.id,
+        version_seq=1,
+        text=None,
+        caption=None,
+        normalized_text=None,
+        entities_json=None,
+        content_hash="legacy-redacted-1001",
+        is_redacted=True,
+    )
+    db_session.add(hidden_version)
+    await db_session.flush()
+    hidden.current_version_id = hidden_version.id
+    await db_session.flush()
+    for target_type, target_id, key in (
+        ("message", "1001", f"message:{chat_id}:1001"),
+        ("message_hash", "legacy-redacted-1001", "message_hash:legacy-redacted-1001"),
+        ("user", "1000001", "user:1000001"),
+    ):
+        await ForgetEventRepo.create(
+            db_session,
+            target_type=target_type,
+            target_id=target_id,
+            actor_user_id=None,
+            authorized_by="system",
+            tombstone_key=key,
+        )
+    await db_session.flush()
+
+    run_id = await _create_apply_run(
+        db_session,
+        source_path=str(SMALL_CHAT),
+        chat_id=chat_id,
+        source_hash="hash_rehydrate_complete_history",
+    )
+    report = await run_apply(
+        db_session,
+        ingestion_run_id=run_id,
+        resume_point=None,
+        chunking_config=_default_chunking(),
+    )
+
+    assert report.applied_count == 4
+    assert report.rehydrated_count == 1
+    restored = (
+        await db_session.execute(
+            sa_text(
+                "SELECT cm.memory_policy, cm.is_redacted, cm.text, "
+                "mv.is_redacted AS mv_is_redacted, mv.text AS mv_text "
+                "FROM chat_messages cm JOIN message_versions mv "
+                "ON mv.id = cm.current_version_id "
+                "WHERE cm.chat_id=:cid AND cm.message_id=1001"
+            ),
+            {"cid": chat_id},
+        )
+    ).one()
+    assert restored.memory_policy == "normal"
+    assert restored.is_redacted is False
+    assert restored.mv_is_redacted is False
+    assert restored.text == "Hello everyone! Glad to be here."
+    assert restored.mv_text == "Hello everyone! Glad to be here."
+    versions = (
+        await db_session.execute(
+            sa_text(
+                "SELECT version_seq, is_redacted, text FROM message_versions "
+                "WHERE chat_message_id=:cmid ORDER BY version_seq"
+            ),
+            {"cmid": hidden.id},
+        )
+    ).all()
+    assert [tuple(row) for row in versions] == [
+        (1, True, None),
+        (2, False, "Hello everyone! Glad to be here."),
+    ]
+    statuses = (
+        (
+            await db_session.execute(
+                sa_text(
+                    "SELECT status FROM forget_events "
+                    "WHERE tombstone_key IN (:message_key, :hash_key, :user_key) "
+                    "ORDER BY tombstone_key"
+                ),
+                {
+                    "message_key": f"message:{chat_id}:1001",
+                    "hash_key": "message_hash:legacy-redacted-1001",
+                    "user_key": "user:1000001",
+                },
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert statuses == ["superseded", "superseded", "superseded"]
+
+    from bot.services.search import search_messages
+
+    hits = await search_messages(
+        db_session,
+        "everyone",
+        chat_id=chat_id,
+        include_cards=False,
+    )
+    assert any(hit.message_id == 1001 for hit in hits)
 
 
 # ─── Test 4: Governance gate ──────────────────────────────────────────────────
 
 
-async def test_apply_governance_offrecord_creates_redacted_row_and_audit(db_session) -> None:
-    """Apply edited_messages.json which contains an #offrecord message (id 2004).
-
-    Hotfix #164 H2 fix: persist_message_with_policy IS now called for offrecord messages
-    (import path mirrors live path). The helper writes a chat_messages row with
-    memory_policy='offrecord' and is_redacted=True (content nulled), creates an
-    OffrecordMark, and inserts a redacted MessageVersion. skipped_governance_count is
-    bumped; applied_count is NOT bumped.
-    """
+async def test_apply_legacy_offrecord_marker_keeps_complete_history(db_session) -> None:
+    """Legacy #offrecord text is retained like every other human message."""
     from bot.services.import_apply import run_apply
 
     chat_id = -1001999999999
@@ -428,28 +545,25 @@ async def test_apply_governance_offrecord_creates_redacted_row_and_audit(db_sess
             chunking_config=_default_chunking(),
         )
 
-    # Fixture contains 5 user messages: one #nomem (2003) persists normally,
-    # one #offrecord (2004) is persisted as redacted (H2 fix).
-    assert report.applied_count == 4
-    assert report.skipped_governance_count == 1
-    # H2 fix: persist IS called for msg 2004 (helper handles offrecord internally)
+    assert report.applied_count == 5
+    assert report.skipped_governance_count == 0
     assert 2004 in persisted_msg_ids
 
-    # H2 fix: chat_messages row IS created with memory_policy='offrecord', is_redacted=True
+    # The marker stays visible in the complete-history row.
     offrecord_cm = await db_session.execute(
         sa_text(
-            "SELECT memory_policy, is_redacted, text FROM chat_messages "
+            "SELECT memory_policy, is_redacted, text, caption FROM chat_messages "
             "WHERE chat_id = :cid AND message_id = :mid"
         ),
         {"cid": chat_id, "mid": 2004},
     )
     cm_row = offrecord_cm.fetchone()
-    assert cm_row is not None, "H2: chat_messages row must exist for imported #offrecord"
-    assert cm_row[0] == "offrecord"
-    assert cm_row[1] is True
-    assert cm_row[2] is None  # text nulled
+    assert cm_row is not None
+    assert cm_row[0] == "normal"
+    assert cm_row[1] is False
+    assert "#offrecord" in (cm_row[2] or cm_row[3])
 
-    # Synthetic telegram_updates audit row remains and is marked redacted.
+    # The corresponding raw audit row is retained without redaction too.
     raw_row = await db_session.execute(
         sa_text(
             "SELECT update_id, ingestion_run_id, is_redacted, redaction_reason "
@@ -460,8 +574,8 @@ async def test_apply_governance_offrecord_creates_redacted_row_and_audit(db_sess
     update_id, raw_run_id, is_redacted, redaction_reason = raw_row.one()
     assert update_id is None
     assert raw_run_id == run_id
-    assert is_redacted is True
-    assert redaction_reason == "offrecord"
+    assert is_redacted is False
+    assert redaction_reason is None
 
 
 # ─── Test 5: Reply resolver wired ─────────────────────────────────────────────
@@ -728,18 +842,14 @@ async def test_apply_skips_version_when_live_row_wins_overlap_race(db_session) -
             source_hash="hash_overlap_race",
         )
 
-        async def _miss_duplicate_gate(session, chat_id_arg, message_id_arg):
+        async def _miss_initial_state(session, chat_id_arg, message_id_arg):
             assert chat_id_arg == chat_id
             assert message_id_arg == 9001
             return None
 
-        async def _miss_early_overlap(session, *, chat_id, message_id):
-            # Simulate that the live row appeared AFTER the early check (true race).
-            return False
-
-        with (
-            patch("bot.services.import_apply._find_existing_chat_message_id", new=_miss_duplicate_gate),
-            patch("bot.services.import_apply._check_early_live_overlap", new=_miss_early_overlap),
+        with patch(
+            "bot.services.import_apply._find_existing_chat_message_state",
+            new=_miss_initial_state,
         ):
             report = await run_apply(
                 db_session,
@@ -824,6 +934,7 @@ async def test_apply_advisory_lock_acquired(db_session) -> None:
 
     # Wrap the original context manager so we can record invocation but keep behaviour.
     import bot.services.import_apply as apply_mod
+
     original_lock = apply_mod.acquire_advisory_lock
     original_persist = apply_mod.persist_message_with_policy
 
@@ -840,8 +951,10 @@ async def test_apply_advisory_lock_acquired(db_session) -> None:
         persist_connection_ids.append(id(await session.connection()))
         return await original_persist(session, message, **kwargs)
 
-    with patch("bot.services.import_apply.acquire_advisory_lock", new=_spy_lock), \
-         patch("bot.services.import_apply.persist_message_with_policy", new=_spy_persist):
+    with (
+        patch("bot.services.import_apply.acquire_advisory_lock", new=_spy_lock),
+        patch("bot.services.import_apply.persist_message_with_policy", new=_spy_persist),
+    ):
         await run_apply(
             db_session,
             ingestion_run_id=run_id,
@@ -875,6 +988,7 @@ async def test_apply_chunking_advances_checkpoint(db_session) -> None:
     sleep_calls: list[float] = []
 
     import bot.services.import_apply as apply_mod
+
     original_chkpt = apply_mod.save_checkpoint
 
     async def _spy_chkpt(session, *, ingestion_run_id, last_processed_export_msg_id, chunk_index):
@@ -889,8 +1003,10 @@ async def test_apply_chunking_advances_checkpoint(db_session) -> None:
     async def _spy_sleep(seconds):
         sleep_calls.append(seconds)
 
-    with patch("bot.services.import_apply.save_checkpoint", new=_spy_chkpt), \
-         patch("bot.services.import_apply.asyncio.sleep", new=_spy_sleep):
+    with (
+        patch("bot.services.import_apply.save_checkpoint", new=_spy_chkpt),
+        patch("bot.services.import_apply.asyncio.sleep", new=_spy_sleep),
+    ):
         await run_apply(
             db_session,
             ingestion_run_id=run_id,
@@ -972,23 +1088,28 @@ async def test_apply_audit_trail_stats_json(db_session) -> None:
     assert stats.get("last_processed_export_msg_id") == 1006
 
 
-# ─── Test 12: Error envelope — bad message resilience ─────────────────────────
+# ─── Test 12: Error envelope — fail-fast chunk rollback ───────────────────────
 
 
-async def test_apply_resilient_to_bad_user_resolution(db_session) -> None:
-    """A message with from_id=None (malformed) should bump error_count and continue
-    with the rest of the chunk. A later validation RuntimeError rolls back only that
-    message's savepoint, including its synthetic telegram_updates row."""
+async def test_apply_bad_middle_message_rolls_back_whole_chunk_and_checkpoint(
+    db_session,
+    tmp_path: Path,
+) -> None:
+    """good/bad/good in one chunk must not checkpoint past the bad message."""
     from bot.services.import_apply import run_apply
 
-    # Build a tiny synthetic export with one good and one bad message.
+    # The first chunk establishes checkpoint 7003. The second is good/bad/good;
+    # the middle persist fails after its synthetic raw row has been inserted.
     bad_export = {
         "name": "Malformed Test Chat",
         "type": "private_supergroup",
         "id": -2002,
         "messages": [
+            {"id": 7001, "type": "service", "date": "2024-03-01T09:57:00"},
+            {"id": 7002, "type": "service", "date": "2024-03-01T09:58:00"},
+            {"id": 7003, "type": "service", "date": "2024-03-01T09:59:00"},
             {
-                "id": 7001,
+                "id": 7004,
                 "type": "message",
                 "date": "2024-03-01T10:00:00",
                 "date_unixtime": "1709287200",
@@ -998,80 +1119,127 @@ async def test_apply_resilient_to_bad_user_resolution(db_session) -> None:
                 "text_entities": [{"type": "plain", "text": "ok"}],
             },
             {
-                "id": 7002,
+                "id": 7005,
                 "type": "message",
                 "date": "2024-03-01T10:01:00",
                 "date_unixtime": "1709287260",
-                # Intentionally NO from_id — user resolution returns None,
-                # apply bumps error_count and continues.
-                "text": "no sender",
-                "text_entities": [{"type": "plain", "text": "no sender"}],
+                "from": "User Bad",
+                "from_id": "user2000002",
+                "text": "fail after raw insert",
+                "text_entities": [{"type": "plain", "text": "fail after raw insert"}],
             },
             {
-                "id": 7003,
+                "id": 7006,
                 "type": "message",
                 "date": "2024-03-01T10:02:00",
                 "date_unixtime": "1709287320",
                 "from": "User Later",
-                "from_id": "user2000002",
-                "text": "roll back my synthetic raw row",
-                "text_entities": [{"type": "plain", "text": "roll back my synthetic raw row"}],
+                "from_id": "user2000003",
+                "text": "must not be processed",
+                "text_entities": [{"type": "plain", "text": "must not be processed"}],
             },
         ],
     }
-    tmp = Path(__file__).parents[1] / "fixtures" / "td_export" / "_tmp_bad_export.json"
+    tmp = tmp_path / "good-bad-good.json"
     tmp.write_text(json.dumps(bad_export), encoding="utf-8")
-    try:
-        run_id = await _create_apply_run(
+    run_id = await _create_apply_run(
+        db_session,
+        source_path=str(tmp),
+        chat_id=-2002,
+        source_hash="hash_bad_middle_message",
+    )
+    import bot.services.import_apply as apply_mod
+
+    original_persist = apply_mod.persist_message_with_policy
+    original_save_checkpoint = apply_mod.save_checkpoint
+    attempted_message_ids: list[int] = []
+    checkpoint_message_ids: list[int] = []
+
+    async def _persist_or_raise(session, message, **kwargs):
+        attempted_message_ids.append(message.message_id)
+        if message.message_id == 7005:
+            raise RuntimeError("synthetic validation failure after raw insert")
+        return await original_persist(session, message, **kwargs)
+
+    async def _record_checkpoint(session, **kwargs):
+        checkpoint_message_ids.append(kwargs["last_processed_export_msg_id"])
+        return await original_save_checkpoint(session, **kwargs)
+
+    with (
+        patch("bot.services.import_apply.persist_message_with_policy", new=_persist_or_raise),
+        patch("bot.services.import_apply.save_checkpoint", new=_record_checkpoint),
+        pytest.raises(RuntimeError, match="synthetic validation failure after raw insert"),
+    ):
+        await run_apply(
             db_session,
-            source_path=str(tmp),
-            chat_id=-2002,
-            source_hash="hash_bad_export_resilient",
+            ingestion_run_id=run_id,
+            resume_point=None,
+            chunking_config=_default_chunking(chunk_size=3),
         )
-        import bot.services.import_apply as apply_mod
 
-        original_persist = apply_mod.persist_message_with_policy
+    assert attempted_message_ids == [7004, 7005]
+    assert checkpoint_message_ids == [7003]
+    assert await _count_chat_messages(db_session, -2002) == 0
+    assert await _count_telegram_updates(db_session, run_id) == 0
 
-        async def _persist_or_raise(session, message, **kwargs):
-            if message.message_id == 7003:
-                raise RuntimeError("synthetic validation failure after raw insert")
-            return await original_persist(session, message, **kwargs)
 
-        with patch("bot.services.import_apply.persist_message_with_policy", new=_persist_or_raise):
-            report = await run_apply(
-                db_session,
-                ingestion_run_id=run_id,
-                resume_point=None,
-                chunking_config=_default_chunking(),
-            )
+async def test_apply_unresolved_human_author_fails_without_ack(
+    db_session,
+    tmp_path: Path,
+) -> None:
+    """A human message without a resolvable sender is an error, never an ACK."""
+    from bot.services.import_apply import run_apply
 
-        assert report.applied_count == 1  # only the good message
-        assert report.error_count == 2
-        assert 7002 in report.error_export_msg_ids
-        assert 7003 in report.error_export_msg_ids
+    unresolved_export = {
+        "name": "Unresolved Author Test Chat",
+        "type": "private_supergroup",
+        "id": -2003,
+        "messages": [
+            {
+                "id": 7101,
+                "type": "message",
+                "date": "2024-03-01T10:00:00",
+                "date_unixtime": "1709287200",
+                "from": "Human Without Export ID",
+                "text": "must not be acknowledged",
+                "text_entities": [{"type": "plain", "text": "must not be acknowledged"}],
+            }
+        ],
+    }
+    tmp = tmp_path / "unresolved-author.json"
+    tmp.write_text(json.dumps(unresolved_export), encoding="utf-8")
+    run_id = await _create_apply_run(
+        db_session,
+        source_path=str(tmp),
+        chat_id=-2003,
+        source_hash="hash_unresolved_author_fail_fast",
+    )
 
-        raw_7003 = await db_session.execute(
-            sa_text(
-                "SELECT COUNT(*) FROM telegram_updates "
-                "WHERE ingestion_run_id = :rid AND message_id = 7003"
-            ),
-            {"rid": run_id},
+    with pytest.raises(ValueError, match="cannot resolve user") as exc_info:
+        await run_apply(
+            db_session,
+            ingestion_run_id=run_id,
+            resume_point=None,
+            chunking_config=_default_chunking(),
         )
-        assert int(raw_7003.scalar_one()) == 0
-    finally:
-        tmp.unlink(missing_ok=True)
+
+    report = exc_info.value.import_apply_report
+    assert report.last_processed_export_msg_id is None
+    assert await _count_chat_messages(db_session, -2003) == 0
+    raw_count = await db_session.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM telegram_updates WHERE chat_id = :chat_id AND message_id = 7101"
+        ),
+        {"chat_id": -2003},
+    )
+    assert int(raw_count.scalar_one()) == 0
 
 
 # ─── H1: poll.question and contact.name passed to detect_policy in import path ──
 
 
-async def test_apply_poll_with_offrecord_question_yields_offrecord_policy(db_session) -> None:
-    """H1 fix verification: TD-imported poll whose question contains #offrecord MUST
-    result in memory_policy='offrecord' (or the row being redacted/skipped).
-
-    Before the fix, import_apply called detect_policy(text, caption) without
-    poll_question, so #offrecord in a poll question was silently stored as 'normal'.
-    """
+async def test_apply_poll_with_legacy_offrecord_marker_is_stored(db_session) -> None:
+    """A marker in a poll question is ordinary retained content."""
     import json as _json
     from pathlib import Path as _Path
 
@@ -1127,17 +1295,9 @@ async def test_apply_poll_with_offrecord_question_yields_offrecord_policy(db_ses
             chunking_config=_default_chunking(),
         )
 
-        # The poll with #offrecord question must be skipped via governance path.
-        assert report.skipped_governance_count == 1, (
-            f"H1: expected governance skip for poll with #offrecord question; "
-            f"got skipped_governance_count={report.skipped_governance_count}, "
-            f"applied_count={report.applied_count}"
-        )
-        assert report.applied_count == 0
+        assert report.skipped_governance_count == 0
+        assert report.applied_count == 1
 
-        # H2 fix: offrecord messages now create a chat_messages row with
-        # memory_policy='offrecord' and is_redacted=True (import mirrors live path).
-        # Verify the row has offrecord policy, NOT normal policy.
         cm_row = await db_session.execute(
             sa_text(
                 "SELECT memory_policy, is_redacted FROM chat_messages "
@@ -1146,24 +1306,17 @@ async def test_apply_poll_with_offrecord_question_yields_offrecord_policy(db_ses
             {"cid": chat_id},
         )
         row = cm_row.fetchone()
-        assert row is not None, "H1+H2: chat_messages row must exist for offrecord poll (H2 fix)"
-        assert row[0] == "offrecord", f"H1: memory_policy must be offrecord; got {row[0]}"
-        assert row[1] is True, "H1: is_redacted must be True for offrecord row"
+        assert row is not None
+        assert row[0] == "normal"
+        assert row[1] is False
     finally:
         tmp.unlink(missing_ok=True)
 
 
-async def test_apply_contact_with_offrecord_in_first_name_yields_offrecord_policy(
+async def test_apply_contact_with_legacy_offrecord_marker_is_stored(
     db_session,
 ) -> None:
-    """H1 fix coverage: TD contact-shaped message with #offrecord in
-    contact_information.first_name must be detected as offrecord and skipped
-    (not persisted to chat_messages).
-
-    Before the fix, import_apply read msg["first_name"] / msg["last_name"] at
-    the top level — fields that do not exist in the real TD export format.  TD
-    nests them under contact_information: {"first_name": ..., "last_name": ...}.
-    """
+    """A marker in an imported contact name is ordinary retained content."""
     import json as _json
     from pathlib import Path as _Path
 
@@ -1194,12 +1347,7 @@ async def test_apply_contact_with_offrecord_in_first_name_yields_offrecord_polic
         ],
     }
 
-    tmp = (
-        _Path(__file__).parents[1]
-        / "fixtures"
-        / "td_export"
-        / "_tmp_contact_offrecord.json"
-    )
+    tmp = _Path(__file__).parents[1] / "fixtures" / "td_export" / "_tmp_contact_offrecord.json"
     tmp.write_text(_json.dumps(contact_export), encoding="utf-8")
     try:
         run_id = await _create_apply_run(
@@ -1225,17 +1373,9 @@ async def test_apply_contact_with_offrecord_in_first_name_yields_offrecord_polic
             chunking_config=_default_chunking(),
         )
 
-        # The contact with #offrecord in first_name must be skipped via governance.
-        assert report.skipped_governance_count == 1, (
-            f"H1: expected governance skip for contact with #offrecord in "
-            f"contact_information.first_name; "
-            f"got skipped_governance_count={report.skipped_governance_count}, "
-            f"applied_count={report.applied_count}"
-        )
-        assert report.applied_count == 0
+        assert report.skipped_governance_count == 0
+        assert report.applied_count == 1
 
-        # H2 fix: offrecord messages now create a chat_messages row with
-        # memory_policy='offrecord' and is_redacted=True (import mirrors live path).
         cm_row = await db_session.execute(
             sa_text(
                 "SELECT memory_policy, is_redacted FROM chat_messages "
@@ -1244,9 +1384,9 @@ async def test_apply_contact_with_offrecord_in_first_name_yields_offrecord_polic
             {"cid": chat_id},
         )
         row = cm_row.fetchone()
-        assert row is not None, "H1+H2: chat_messages row must exist for offrecord contact (H2 fix)"
-        assert row[0] == "offrecord", f"H1: memory_policy must be offrecord; got {row[0]}"
-        assert row[1] is True, "H1: is_redacted must be True for offrecord row"
+        assert row is not None
+        assert row[0] == "normal"
+        assert row[1] is False
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -1257,23 +1397,26 @@ async def test_apply_contact_with_offrecord_in_first_name_yields_offrecord_polic
 def _make_offrecord_export(chat_id: int, msg_id: int, text: str) -> str:
     """Build a minimal single-message TD export JSON string."""
     import json
-    return json.dumps({
-        "id": chat_id,
-        "name": "Test Chat",
-        "type": "public_supergroup",
-        "messages": [
-            {
-                "id": msg_id,
-                "type": "message",
-                "date": "2024-01-15T10:00:00",
-                "date_unixtime": "1705312800",
-                "from": "User One",
-                "from_id": "user1000001",
-                "text": text,
-                "text_entities": [{"type": "plain", "text": text}],
-            }
-        ],
-    })
+
+    return json.dumps(
+        {
+            "id": chat_id,
+            "name": "Test Chat",
+            "type": "public_supergroup",
+            "messages": [
+                {
+                    "id": msg_id,
+                    "type": "message",
+                    "date": "2024-01-15T10:00:00",
+                    "date_unixtime": "1705312800",
+                    "from": "User One",
+                    "from_id": "user1000001",
+                    "text": text,
+                    "text_entities": [{"type": "plain", "text": text}],
+                }
+            ],
+        }
+    )
 
 
 async def test_import_apply_sets_current_version_id(db_session) -> None:
@@ -1372,7 +1515,9 @@ async def test_import_apply_overlap_with_live_v1_skips_via_pre_check(db_session)
     user_id = 88_001
 
     # Pre-seed a live user + chat_message
-    await UserRepo.upsert(db_session, telegram_id=user_id, username="u88001", first_name="T", last_name=None)
+    await UserRepo.upsert(
+        db_session, telegram_id=user_id, username="u88001", first_name="T", last_name=None
+    )
 
     live_msg = SimpleNamespace(
         message_id=msg_id,
@@ -1382,33 +1527,51 @@ async def test_import_apply_overlap_with_live_v1_skips_via_pre_check(db_session)
         caption=None,
         date=datetime.now(timezone.utc),
         model_dump=MagicMock(return_value={"text": "hello world"}),
-        reply_to_message=None, message_thread_id=None,
-        photo=None, video=None, voice=None, audio=None, document=None,
-        sticker=None, animation=None, video_note=None, location=None,
-        contact=None, poll=None, dice=None, forward_origin=None,
-        new_chat_members=None, left_chat_member=None, pinned_message=None,
-        entities=None, caption_entities=None,
+        reply_to_message=None,
+        message_thread_id=None,
+        photo=None,
+        video=None,
+        voice=None,
+        audio=None,
+        document=None,
+        sticker=None,
+        animation=None,
+        video_note=None,
+        location=None,
+        contact=None,
+        poll=None,
+        dice=None,
+        forward_origin=None,
+        new_chat_members=None,
+        left_chat_member=None,
+        pinned_message=None,
+        entities=None,
+        caption_entities=None,
     )
     live_result = await persist_message_with_policy(db_session, live_msg, source="live")
     live_cm = live_result.chat_message
     assert live_cm.current_version_id is not None
 
     # Build a TD export for the same (chat_id, msg_id)
-    export_data = _json.dumps({
-        "id": chat_id,
-        "name": "Test",
-        "type": "public_supergroup",
-        "messages": [{
-            "id": msg_id,
-            "type": "message",
-            "date": "2024-01-15T10:00:00",
-            "date_unixtime": "1705312800",
-            "from": "User One",
-            "from_id": f"user{user_id}",
-            "text": "hello world\n",  # whitespace divergence
-            "text_entities": [{"type": "plain", "text": "hello world\n"}],
-        }],
-    })
+    export_data = _json.dumps(
+        {
+            "id": chat_id,
+            "name": "Test",
+            "type": "public_supergroup",
+            "messages": [
+                {
+                    "id": msg_id,
+                    "type": "message",
+                    "date": "2024-01-15T10:00:00",
+                    "date_unixtime": "1705312800",
+                    "from": "User One",
+                    "from_id": f"user{user_id}",
+                    "text": "hello world\n",  # whitespace divergence
+                    "text_entities": [{"type": "plain", "text": "hello world\n"}],
+                }
+            ],
+        }
+    )
 
     tmp = Path(tempfile.mktemp(suffix=".json"))
     try:
@@ -1417,7 +1580,10 @@ async def test_import_apply_overlap_with_live_v1_skips_via_pre_check(db_session)
             db_session, source_path=str(tmp), chat_id=chat_id, source_hash="hash_overlap_pre_check"
         )
         report = await run_apply(
-            db_session, ingestion_run_id=run_id, resume_point=None, chunking_config=_default_chunking()
+            db_session,
+            ingestion_run_id=run_id,
+            resume_point=None,
+            chunking_config=_default_chunking(),
         )
 
         # Either the dup-check or pre-check skips the import
@@ -1425,20 +1591,23 @@ async def test_import_apply_overlap_with_live_v1_skips_via_pre_check(db_session)
         assert total_skipped >= 1, f"Expected overlap skip; got {report}"
 
         # Only ONE version row for this chat_message (the live v1)
-        versions = (await db_session.execute(
-            select(MessageVersion).where(MessageVersion.chat_message_id == live_cm.id)
-        )).scalars().all()
+        versions = (
+            (
+                await db_session.execute(
+                    select(MessageVersion).where(MessageVersion.chat_message_id == live_cm.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(versions) == 1
         assert versions[0].imported_final is False  # live v1, not import
     finally:
         tmp.unlink(missing_ok=True)
 
 
-async def test_import_apply_offrecord_creates_chat_message_and_mark(db_session) -> None:
-    """Apply fixture with #offrecord text → chat_messages row, OffrecordMark, redacted v1.
-
-    Verifies Risk H2 fix: import #offrecord now delegates to helper (same as live path).
-    """
+async def test_import_apply_legacy_offrecord_marker_stays_visible(db_session) -> None:
+    """A historical #offrecord marker does not redact complete human history."""
     import tempfile
 
     from bot.services.import_apply import run_apply
@@ -1454,54 +1623,57 @@ async def test_import_apply_offrecord_creates_chat_message_and_mark(db_session) 
             db_session, source_path=str(tmp), chat_id=chat_id, source_hash="hash_offrecord_164"
         )
         report = await run_apply(
-            db_session, ingestion_run_id=run_id, resume_point=None, chunking_config=_default_chunking()
+            db_session,
+            ingestion_run_id=run_id,
+            resume_point=None,
+            chunking_config=_default_chunking(),
         )
 
-        # Governance counter is bumped (kept for operator dashboards)
-        assert report.skipped_governance_count == 1
-        # applied_count is NOT bumped for offrecord
-        assert report.applied_count == 0
+        assert report.skipped_governance_count == 0
+        assert report.applied_count == 1
 
-        # chat_messages row MUST now exist with memory_policy='offrecord'
+        # chat_messages keeps normal policy and visible text.
         cm_check = await db_session.execute(
             sa_text(
-                "SELECT memory_policy, is_redacted FROM chat_messages "
+                "SELECT memory_policy, is_redacted, text FROM chat_messages "
                 "WHERE chat_id = :cid AND message_id = :mid"
             ),
             {"cid": chat_id, "mid": msg_id},
         )
         row = cm_check.fetchone()
-        assert row is not None, "H2: chat_messages row must exist for imported #offrecord"
-        assert row[0] == "offrecord"
-        assert row[1] is True
+        assert row is not None
+        assert row[0] == "normal"
+        assert row[1] is False
+        assert row[2] == "secret #offrecord info"
 
-        # OffrecordMark must exist
+        # No legacy governance artifact is created.
         from bot.db.models import ChatMessage
         from sqlalchemy import select as sa_select
-        cm_obj = (await db_session.execute(
-            sa_select(ChatMessage).where(
-                ChatMessage.chat_id == chat_id,
-                ChatMessage.message_id == msg_id,
+
+        cm_obj = (
+            await db_session.execute(
+                sa_select(ChatMessage).where(
+                    ChatMessage.chat_id == chat_id,
+                    ChatMessage.message_id == msg_id,
+                )
             )
-        )).scalar_one()
+        ).scalar_one()
 
         mark_check = await db_session.execute(
             sa_text("SELECT COUNT(*) FROM offrecord_marks WHERE chat_message_id = :id"),
             {"id": cm_obj.id},
         )
-        assert int(mark_check.scalar_one()) >= 1, "H2: OffrecordMark must exist for imported offrecord"
+        assert int(mark_check.scalar_one()) == 0
 
-        # MessageVersion row must exist with is_redacted=True
+        # MessageVersion keeps the source text.
         mv_check = await db_session.execute(
-            sa_text(
-                "SELECT is_redacted, text FROM message_versions WHERE chat_message_id = :id"
-            ),
+            sa_text("SELECT is_redacted, text FROM message_versions WHERE chat_message_id = :id"),
             {"id": cm_obj.id},
         )
         mv_row = mv_check.fetchone()
-        assert mv_row is not None, "H2: MessageVersion must be created for imported offrecord"
-        assert mv_row[0] is True, "H2: MessageVersion must be redacted"
-        assert mv_row[1] is None, "H2: MessageVersion.text must be NULL for offrecord"
+        assert mv_row is not None
+        assert mv_row[0] is False
+        assert mv_row[1] == "secret #offrecord info"
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -1528,24 +1700,43 @@ async def test_import_apply_live_overlap_bumps_overlap_count_not_dup_count(db_se
     user_id = 99_001
 
     # Pre-seed live chat_message via real path (creates live raw_update row with update_id NOT NULL).
-    await UserRepo.upsert(db_session, telegram_id=user_id, username="u99001", first_name="Overlap", last_name=None)
+    await UserRepo.upsert(
+        db_session, telegram_id=user_id, username="u99001", first_name="Overlap", last_name=None
+    )
     live_duck = SimpleNamespace(
         message_id=msg_id,
         chat=SimpleNamespace(id=chat_id, type="supergroup"),
-        from_user=SimpleNamespace(id=user_id, username="u99001", first_name="Overlap", last_name=None),
+        from_user=SimpleNamespace(
+            id=user_id, username="u99001", first_name="Overlap", last_name=None
+        ),
         text="live message text",
         caption=None,
         date=datetime.now(timezone.utc),
         model_dump=MagicMock(return_value={"text": "live message text"}),
-        reply_to_message=None, message_thread_id=None,
-        photo=None, video=None, voice=None, audio=None, document=None,
-        sticker=None, animation=None, video_note=None, location=None,
-        contact=None, poll=None, dice=None, forward_origin=None,
-        new_chat_members=None, left_chat_member=None, pinned_message=None,
-        entities=None, caption_entities=None,
+        reply_to_message=None,
+        message_thread_id=None,
+        photo=None,
+        video=None,
+        voice=None,
+        audio=None,
+        document=None,
+        sticker=None,
+        animation=None,
+        video_note=None,
+        location=None,
+        contact=None,
+        poll=None,
+        dice=None,
+        forward_origin=None,
+        new_chat_members=None,
+        left_chat_member=None,
+        pinned_message=None,
+        entities=None,
+        caption_entities=None,
     )
     # seed a live telegram_updates row (update_id IS NOT NULL) to satisfy overlap check
     from bot.db.repos.telegram_update import TelegramUpdateRepo
+
     live_raw = await TelegramUpdateRepo.insert(
         db_session,
         update_type="message",
@@ -1557,26 +1748,33 @@ async def test_import_apply_live_overlap_bumps_overlap_count_not_dup_count(db_se
         ingestion_run_id=None,
         is_redacted=False,
     )
-    live_result = await persist_message_with_policy(db_session, live_duck, raw_update_id=live_raw.id, source="live")
+    live_result = await persist_message_with_policy(
+        db_session, live_duck, raw_update_id=live_raw.id, source="live"
+    )
     assert live_result.chat_message.current_version_id is not None
 
     # Build a TD export for the same (chat_id, msg_id)
     import json as _json
-    export_data = _json.dumps({
-        "id": chat_id,
-        "name": "Test",
-        "type": "public_supergroup",
-        "messages": [{
-            "id": msg_id,
-            "type": "message",
-            "date": "2024-01-15T10:00:00",
-            "date_unixtime": "1705312800",
-            "from": "Overlap User",
-            "from_id": f"user{user_id}",
-            "text": "live message text",
-            "text_entities": [{"type": "plain", "text": "live message text"}],
-        }],
-    })
+
+    export_data = _json.dumps(
+        {
+            "id": chat_id,
+            "name": "Test",
+            "type": "public_supergroup",
+            "messages": [
+                {
+                    "id": msg_id,
+                    "type": "message",
+                    "date": "2024-01-15T10:00:00",
+                    "date_unixtime": "1705312800",
+                    "from": "Overlap User",
+                    "from_id": f"user{user_id}",
+                    "text": "live message text",
+                    "text_entities": [{"type": "plain", "text": "live message text"}],
+                }
+            ],
+        }
+    )
 
     tmp = Path(tempfile.mktemp(suffix=".json"))
     try:
@@ -1585,7 +1783,10 @@ async def test_import_apply_live_overlap_bumps_overlap_count_not_dup_count(db_se
             db_session, source_path=str(tmp), chat_id=chat_id, source_hash="hash_live_overlap_h3"
         )
         report = await run_apply(
-            db_session, ingestion_run_id=run_id, resume_point=None, chunking_config=_default_chunking()
+            db_session,
+            ingestion_run_id=run_id,
+            resume_point=None,
+            chunking_config=_default_chunking(),
         )
 
         # §3.2: live overlap must bump skipped_overlap_count, NOT skipped_duplicate_count.
@@ -1605,17 +1806,97 @@ async def test_import_apply_idempotent_rerun(db_session) -> None:
 
     chat_id = -1001999999999
     run1 = await _create_apply_run(
-        db_session, source_path=str(SMALL_CHAT), chat_id=chat_id, source_hash="hash_idempotent_164_r1"
+        db_session,
+        source_path=str(SMALL_CHAT),
+        chat_id=chat_id,
+        source_hash="hash_idempotent_164_r1",
     )
-    await run_apply(db_session, ingestion_run_id=run1, resume_point=None, chunking_config=_default_chunking())
+    await run_apply(
+        db_session, ingestion_run_id=run1, resume_point=None, chunking_config=_default_chunking()
+    )
 
     count_after_first = await _count_chat_messages(db_session, chat_id)
 
     run2 = await _create_apply_run(
-        db_session, source_path=str(SMALL_CHAT), chat_id=chat_id, source_hash="hash_idempotent_164_r2"
+        db_session,
+        source_path=str(SMALL_CHAT),
+        chat_id=chat_id,
+        source_hash="hash_idempotent_164_r2",
     )
-    report2 = await run_apply(db_session, ingestion_run_id=run2, resume_point=None, chunking_config=_default_chunking())
+    report2 = await run_apply(
+        db_session, ingestion_run_id=run2, resume_point=None, chunking_config=_default_chunking()
+    )
 
     count_after_second = await _count_chat_messages(db_session, chat_id)
-    assert count_after_second == count_after_first, "Idempotency: second run must not add new chat_messages rows"
+    assert count_after_second == count_after_first, (
+        "Idempotency: second run must not add new chat_messages rows"
+    )
     assert report2.applied_count == 0
+
+
+async def test_chunk_rollback_log_does_not_expose_exception_message(
+    monkeypatch,
+    caplog,
+) -> None:
+    """Rollback diagnostics retain class/taxonomy without logging driver payloads."""
+    import logging
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from bot.services import import_apply
+
+    sentinel = "sentinel-secret-import-rollback"
+
+    @asynccontextmanager
+    async def _nested_transaction():
+        yield
+
+    class _FailingRollbackSession:
+        def begin_nested(self):
+            return _nested_transaction()
+
+        async def rollback(self) -> None:
+            raise SQLAlchemyError(sentinel)
+
+    report = import_apply.ImportApplyReport(
+        ingestion_run_id=9001,
+        chat_id=-1009001,
+        source_path="/tmp/unused.json",
+        started_at=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        import_apply,
+        "_iter_export_messages",
+        lambda _path: iter([{"id": 1, "type": "message"}]),
+    )
+    monkeypatch.setattr(
+        import_apply,
+        "_apply_one_message",
+        AsyncMock(side_effect=ValueError("safe primary failure")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="bot.services.import_apply"):
+        with pytest.raises(ValueError, match="safe primary failure"):
+            await import_apply._run_apply_loop(
+                _FailingRollbackSession(),
+                report=report,
+                run_row=SimpleNamespace(),
+                path=Path("/tmp/unused.json"),
+                chat_id=report.chat_id,
+                resume_point=None,
+                chunking_config=_default_chunking(chunk_size=1),
+                excluded_author_names=frozenset(),
+            )
+
+    assert sentinel not in caplog.text
+    rollback_record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "error_taxonomy", None) == "import_apply_chunk_rollback_failed"
+    )
+    assert rollback_record.error_class == "SQLAlchemyError"
+    assert rollback_record.exc_info is None

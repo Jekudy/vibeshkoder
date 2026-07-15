@@ -45,7 +45,9 @@ LLM_PROVIDER_PREFIXES: tuple[str, ...] = (
 ALLOWED_LLM_IMPORT_FILES: frozenset[str] = frozenset(
     [
         "bot/services/llm_providers/anthropic.py",
+        "bot/services/llm_providers/deepseek.py",
         "bot/services/llm_providers/openai.py",
+        "bot/services/llm_providers/openai_vision.py",
     ]
 )
 
@@ -128,9 +130,12 @@ def test_i2_no_llm_provider_in_runtime_dependencies() -> None:
             in_dependencies = True
             in_optional = False
             continue
-        if line.startswith("[project.optional-dependencies]") or line.startswith(
-            "[tool."
-        ) or line.startswith("[build-system]") or line == "":
+        if (
+            line.startswith("[project.optional-dependencies]")
+            or line.startswith("[tool.")
+            or line.startswith("[build-system]")
+            or line == ""
+        ):
             if line.startswith("[project.optional-dependencies]"):
                 in_optional = True
             else:
@@ -144,8 +149,18 @@ def test_i2_no_llm_provider_in_runtime_dependencies() -> None:
 
         if in_dependencies:
             stripped = line.strip(" \t,\"'")
-            head = stripped.split("[", 1)[0].split("=", 1)[0].split(">", 1)[0].split("<", 1)[0].split("~", 1)[0].split("!", 1)[0].strip()
-            if head and head.replace("-", "_").lower() in {p.replace("-", "_").lower() for p in LLM_PROVIDER_PREFIXES}:
+            head = (
+                stripped.split("[", 1)[0]
+                .split("=", 1)[0]
+                .split(">", 1)[0]
+                .split("<", 1)[0]
+                .split("~", 1)[0]
+                .split("!", 1)[0]
+                .strip()
+            )
+            if head and head.replace("-", "_").lower() in {
+                p.replace("-", "_").lower() for p in LLM_PROVIDER_PREFIXES
+            }:
                 forbidden_runtime_hits.append(stripped)
 
     assert not forbidden_runtime_hits, (
@@ -251,7 +266,9 @@ def test_no_llm_provider_urls_outside_gateway() -> None:
         [
             "bot/services/llm_gateway.py",
             "bot/services/llm_providers/anthropic.py",
+            "bot/services/llm_providers/deepseek.py",
             "bot/services/llm_providers/openai.py",
+            "bot/services/llm_providers/openai_vision.py",
         ]
     )
 
@@ -264,10 +281,7 @@ def test_no_llm_provider_urls_outside_gateway() -> None:
 
     prod_matches = _scan_files_for_hostnames(production_paths, LLM_PROVIDER_HOSTNAMES)
 
-    violations = [
-        f"{_relative_to_repo(path)}:hostname {host!r}"
-        for path, host in prod_matches
-    ]
+    violations = [f"{_relative_to_repo(path)}:hostname {host!r}" for path, host in prod_matches]
     assert not violations, (
         "invariant 2 URL-level violation (I4b) — LLM provider hostname in "
         "bot/, web/, or ops/ outside the allow-list:\n" + "\n".join(violations)
@@ -279,9 +293,7 @@ def test_no_llm_provider_urls_outside_gateway() -> None:
         f"honeypot fixture missing at {honeypot_path} — "
         "create tests/fixtures/honeypot_llm_url.py with '# api.openai.com'"
     )
-    honeypot_matches = _scan_files_for_hostnames(
-        [honeypot_path], LLM_PROVIDER_HOSTNAMES
-    )
+    honeypot_matches = _scan_files_for_hostnames([honeypot_path], LLM_PROVIDER_HOSTNAMES)
     assert len(honeypot_matches) >= 1, (
         "honeypot fixture was not detected by _scan_files_for_hostnames — "
         "the scanner is broken or the fixture no longer contains a known LLM hostname"
@@ -289,21 +301,17 @@ def test_no_llm_provider_urls_outside_gateway() -> None:
 
 
 def test_i3_allow_list_contract_documented() -> None:
-    """I3: allow-list contains exactly the Phase 5 provider boundary files.
-
-    Updated 2026-05-11 when T5-01 (Phase 5 LLM gateway) shipped. The two
-    provider files (anthropic.py + openai.py) are the ONLY files allowed to
-    import LLM SDK packages; llm_gateway.py itself stays SDK-import-free
-    (verified by grep + by the I1 test).
-    """
+    """I3: allow-list contains exactly the audited provider boundary files."""
     assert ALLOWED_LLM_IMPORT_FILES == frozenset(
         [
             "bot/services/llm_providers/anthropic.py",
+            "bot/services/llm_providers/deepseek.py",
             "bot/services/llm_providers/openai.py",
+            "bot/services/llm_providers/openai_vision.py",
         ]
     ), (
-        "ALLOWED_LLM_IMPORT_FILES contract drift — Phase 5 boundary is "
-        "bot/services/llm_providers/{anthropic,openai}.py. If a new provider "
+        "ALLOWED_LLM_IMPORT_FILES contract drift — the audited boundary is "
+        "bot/services/llm_providers/*.py. If a new provider "
         "is added, extend the allow-list AND re-confirm gateway invariant #2."
     )
 
@@ -367,9 +375,7 @@ def assert_no_forbidden_imports_per_path(
     violations: list[str] = []
     empty_globs: list[str] = []
     for glob_pattern, forbidden in forbidden_map.items():
-        matched = sorted(
-            p for p in REPO_ROOT.glob(glob_pattern) if "__pycache__" not in p.parts
-        )
+        matched = sorted(p for p in REPO_ROOT.glob(glob_pattern) if "__pycache__" not in p.parts)
         if not matched:
             empty_globs.append(glob_pattern)
             continue
@@ -392,7 +398,9 @@ def assert_no_forbidden_imports_per_path(
 _BUTLER_FORBIDDEN_IMPORTS: dict[str, frozenset[str]] = {
     "bot/services/butler*.py": frozenset({"anthropic", "openai", "bot.services.graph_query"}),
     "bot/handlers/butler.py": frozenset({"anthropic", "openai", "bot.services.graph_query"}),
-    "bot/services/butler_tools/*.py": frozenset({"anthropic", "openai", "bot.services.graph_query"}),
+    "bot/services/butler_tools/*.py": frozenset(
+        {"anthropic", "openai", "bot.services.graph_query"}
+    ),
 }
 
 

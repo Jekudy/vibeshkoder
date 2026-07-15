@@ -29,6 +29,7 @@ from typing import Literal
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.config import settings
 from bot.db.models import Digest, DigestRun
 from bot.services.digest_context import DigestConfig as _DigestCtxConfig
 from bot.services.digest_context import build_digest_context
@@ -47,6 +48,11 @@ from bot.services.llm_providers import LLMProvider
 logger = logging.getLogger(__name__)
 
 DIGEST_LOCK_NAMESPACE = "phase7:digest_idempotency"
+
+_QUIET_WINDOW_BODY = {
+    "daily": "За прошедший день новых обсуждений не было.",
+    "weekly": "За прошедшую неделю новых обсуждений не было.",
+}
 
 
 @dataclass(frozen=True)
@@ -98,25 +104,32 @@ class DigestConfig:
         )
 
 
-class ConfigurationError(Exception):
-    """Digest configuration invariant violated."""
-
-
 def load_digest_config() -> DigestConfig:
-    src = int(os.environ.get("DIGEST_SOURCE_CHAT_ID", "0"))
-    dest_env = os.environ.get("DIGEST_DESTINATION_CHAT_ID")
-    dst = int(dest_env) if dest_env else None
-    if src and dst is not None and src == dst:
-        raise ConfigurationError(
-            f"DIGEST_SOURCE_CHAT_ID ({src}) must not equal "
-            "DIGEST_DESTINATION_CHAT_ID — digest would post into the same "
-            "chat it summarizes (echo loop)."
+    def required_chat_id(name: str) -> int:
+        raw_value = os.environ.get(name)
+        if raw_value is None or not raw_value.strip():
+            raise ValueError(f"{name} is required")
+        try:
+            chat_id = int(raw_value)
+        except ValueError:
+            raise ValueError(f"{name} must be a negative Telegram chat id") from None
+        if chat_id >= 0:
+            raise ValueError(f"{name} must be a negative Telegram chat id")
+        return chat_id
+
+    src = required_chat_id("DIGEST_SOURCE_CHAT_ID")
+    dst = required_chat_id("DIGEST_DESTINATION_CHAT_ID")
+    if src != dst:
+        raise ValueError(
+            "DIGEST_SOURCE_CHAT_ID and DIGEST_DESTINATION_CHAT_ID must identify the same chat"
+        )
+    if src != settings.COMMUNITY_CHAT_ID:
+        raise ValueError(
+            "DIGEST_SOURCE_CHAT_ID and DIGEST_DESTINATION_CHAT_ID must both equal COMMUNITY_CHAT_ID"
         )
     return DigestConfig(
         daily_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_DAILY_USD_CEILING", "1.00")),
-        monthly_cost_ceiling_usd=Decimal(
-            os.environ.get("DIGEST_MONTHLY_USD_CEILING", "10.00")
-        ),
+        monthly_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_MONTHLY_USD_CEILING", "10.00")),
         source_chat_id=src,
         destination_chat_id=dst,
         hour_msk=int(os.environ.get("DIGEST_HOUR_MSK", "9")),
@@ -124,21 +137,13 @@ def load_digest_config() -> DigestConfig:
         raw_message_top_n=int(os.environ.get("DIGEST_RAW_MESSAGE_TOP_N", "15")),
         token_budget_input=int(os.environ.get("DIGEST_TOKEN_BUDGET_INPUT", "8000")),
         # Phase 8 weekly knobs — independent of daily.
-        weekly_cost_ceiling_usd=Decimal(
-            os.environ.get("DIGEST_WEEKLY_USD_CEILING", "5.00")
-        ),
+        weekly_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_WEEKLY_USD_CEILING", "5.00")),
         weekly_monthly_cost_ceiling_usd=Decimal(
             os.environ.get("DIGEST_WEEKLY_MONTHLY_USD_CEILING", "20.00")
         ),
-        weekly_token_budget_input=int(
-            os.environ.get("DIGEST_WEEKLY_TOKEN_BUDGET", "24000")
-        ),
-        weekly_min_cards_threshold=int(
-            os.environ.get("DIGEST_WEEKLY_MIN_CARDS_THRESHOLD", "8")
-        ),
-        weekly_raw_message_top_n=int(
-            os.environ.get("DIGEST_WEEKLY_RAW_MESSAGE_TOP_N", "60")
-        ),
+        weekly_token_budget_input=int(os.environ.get("DIGEST_WEEKLY_TOKEN_BUDGET", "24000")),
+        weekly_min_cards_threshold=int(os.environ.get("DIGEST_WEEKLY_MIN_CARDS_THRESHOLD", "8")),
+        weekly_raw_message_top_n=int(os.environ.get("DIGEST_WEEKLY_RAW_MESSAGE_TOP_N", "60")),
     )
 
 
@@ -179,9 +184,7 @@ async def _cost_ceiling_breached(
           AND d.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
         """
     )
-    daily = (
-        await session.execute(sql_daily, {"type": type})
-    ).scalar_one_or_none() or Decimal("0")
+    daily = (await session.execute(sql_daily, {"type": type})).scalar_one_or_none() or Decimal("0")
     if Decimal(str(daily)) >= daily_ceiling:
         return True
     sql_monthly = text(
@@ -193,9 +196,9 @@ async def _cost_ceiling_breached(
           AND d.created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
         """
     )
-    monthly = (
-        await session.execute(sql_monthly, {"type": type})
-    ).scalar_one_or_none() or Decimal("0")
+    monthly = (await session.execute(sql_monthly, {"type": type})).scalar_one_or_none() or Decimal(
+        "0"
+    )
     if Decimal(str(monthly)) >= monthly_ceiling:
         return True
     return False
@@ -242,11 +245,8 @@ async def run_digest(
     """Orchestrate a digest run. Always returns a Digest row.
 
     Type widening (Phase 8 / T8-02 — PHASE8_PLAN.md §5.B): now accepts
-    ``type='weekly'``. The auto-pipeline terminal state for weekly is
-    ``status='draft'``; the transition to ``awaiting_review`` happens in
-    ``digest_weekly_job`` after this function returns (T8-04 / T8-05
-    territory). This keeps ``run_digest`` type-agnostic in its terminal
-    contract.
+    ``type='weekly'``. Both digest types leave this function as ``draft``;
+    their scheduler jobs publish that draft automatically.
 
     Cost ceiling routes via ``_cost_ceiling_breached(type=type)`` (H6
     type filter) so daily and weekly buckets are INDEPENDENT.
@@ -343,10 +343,12 @@ async def run_digest(
         await session.flush()
         return digest
 
-    # Step 6 — empty window short-circuit.
+    # Step 6 — a scheduled digest is still delivered for a quiet window.
+    # This path is deterministic and spends no LLM tokens.
     if not ctx.cards and not ctx.messages:
-        digest.status = "skipped"
-        run.status = "skipped"
+        digest.body_markdown = _QUIET_WINDOW_BODY[type]
+        digest.status = "draft"
+        run.status = "finished"
         run.finished_at = datetime.now(timezone.utc)
         await session.flush()
         return digest
@@ -411,5 +413,3 @@ async def run_digest(
     run.finished_at = datetime.now(timezone.utc)
     await session.flush()
     return digest
-
-

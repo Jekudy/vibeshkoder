@@ -150,9 +150,221 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     Migration 076: T12-06-fix C2 — butler_tool_invocations.posted_message_id.
     Migration 077: T12-07 — butler_undo_invocations table + status widened with 'undone'.
     Migration 078: T12-07-fix C1 — butler_tool_invocations.inverse_op_payload column.
+    Migration 079: weekly digests publish automatically without admin attribution.
+    Migration 080: image memory storage and wiki/image ledger call types.
+    Migration 082: complete-history supersession and active-version uniqueness.
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "078"
+    assert current == "087"
+
+
+async def test_080_message_media_and_ledger_call_types(
+    migrated_database_url: str,
+) -> None:
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        columns = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='message_media'
+            ORDER BY ordinal_position
+            """
+        )
+        assert {row["column_name"] for row in columns} >= {
+            "id",
+            "chat_message_id",
+            "media_kind",
+            "telegram_file_id",
+            "telegram_file_unique_id",
+            "source_message_url",
+            "description",
+            "description_status",
+            "description_model",
+            "llm_usage_ledger_id",
+            "description_attempts",
+            "next_attempt_at",
+            "last_error_code",
+        }
+        for call_type in ("wiki_compilation", "image_description"):
+            await conn.execute(
+                """
+                INSERT INTO llm_usage_ledger (provider, model, call_type)
+                VALUES ('test', 'test', $1)
+                """,
+                call_type,
+            )
+    finally:
+        await conn.close()
+
+
+async def test_080_downgrade_fails_closed_when_message_media_exists(
+    temp_database_url: str,
+) -> None:
+    """A downgrade must not silently discard imported photo provenance."""
+    _run_alembic(temp_database_url, "upgrade", "080")
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(temp_database_url)))
+    try:
+        await conn.execute(
+            """
+            INSERT INTO users (id, username, first_name)
+            VALUES (980000000001, 'migration_080', 'Migration 080')
+            """
+        )
+        chat_message_id = await conn.fetchval(
+            """
+            INSERT INTO chat_messages (message_id, chat_id, user_id, text, date)
+            VALUES (980001, -100980001, 980000000001, 'photo provenance', now())
+            RETURNING id
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO message_media (
+                chat_message_id,
+                media_kind,
+                source_message_url,
+                description_status
+            )
+            VALUES ($1, 'photo', 'https://t.me/c/980001/980001', 'missing_source')
+            """,
+            chat_message_id,
+        )
+    finally:
+        await conn.close()
+
+    result = _run_alembic(temp_database_url, "downgrade", "079", check=False)
+
+    assert result.returncode != 0
+    assert "Cannot downgrade 080: message_media contains rollout data" in (
+        result.stdout + result.stderr
+    )
+    assert await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version") == "080"
+    assert await _fetch_value(temp_database_url, "SELECT count(*) FROM message_media") == 1
+
+
+@pytest.mark.parametrize("rollout_data", ["qa_source", "media_retry"])
+async def test_081_downgrade_fails_closed_when_reliability_data_exists(
+    temp_database_url: str,
+    rollout_data: str,
+) -> None:
+    _run_alembic(temp_database_url, "upgrade", "081")
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(temp_database_url)))
+    try:
+        await conn.execute(
+            """
+            INSERT INTO users (id, username, first_name)
+            VALUES (981000000001, 'migration_081', 'Migration 081')
+            """
+        )
+        chat_message_id = await conn.fetchval(
+            """
+            INSERT INTO chat_messages (message_id, chat_id, user_id, text, date)
+            VALUES (981001, -100981001, 981000000001, 'reliability', now())
+            RETURNING id
+            """
+        )
+        if rollout_data == "qa_source":
+            await conn.execute(
+                """
+                INSERT INTO qa_traces (
+                    user_tg_id, chat_id, source_chat_message_id
+                ) VALUES (981000000001, -100981001, $1)
+                """,
+                chat_message_id,
+            )
+            expected_error = "Cannot downgrade 081: qa_traces contains delivery idempotency data"
+            preserved_query = (
+                "SELECT count(*) FROM qa_traces WHERE source_chat_message_id IS NOT NULL"
+            )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO message_media (
+                    chat_message_id, media_kind, source_message_url,
+                    description_status, description_attempts,
+                    next_attempt_at, last_error_code
+                ) VALUES (
+                    $1, 'photo', 'https://t.me/c/981001/981001',
+                    'pending', 2, now(), 'rate_limited'
+                )
+                """,
+                chat_message_id,
+            )
+            expected_error = "Cannot downgrade 081: message_media contains retry metadata"
+            preserved_query = "SELECT count(*) FROM message_media WHERE description_attempts = 2"
+    finally:
+        await conn.close()
+
+    result = _run_alembic(temp_database_url, "downgrade", "080", check=False)
+    assert result.returncode != 0
+    assert expected_error in result.stdout + result.stderr
+    assert await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version") == "081"
+    assert await _fetch_value(temp_database_url, preserved_query) == 1
+
+
+async def test_081_downgrade_succeeds_without_reliability_values(
+    temp_database_url: str,
+) -> None:
+    _run_alembic(temp_database_url, "upgrade", "081")
+    _run_alembic(temp_database_url, "downgrade", "080")
+    assert await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version") == "080"
+
+
+@pytest.mark.parametrize(
+    ("seed_sql", "expected_error", "preserved_query"),
+    [
+        (
+            """
+            INSERT INTO knowledge_cards (
+                id, topic_slug, title, body_markdown, card_status
+            )
+            VALUES (gen_random_uuid(), 'migration-083', 'Title', 'Body', 'draft')
+            """,
+            "Cannot downgrade 083: knowledge_cards.topic_slug contains rollout data",
+            "SELECT count(*) FROM knowledge_cards WHERE topic_slug = 'migration-083'",
+        ),
+        (
+            """
+            INSERT INTO extraction_runs (run_status, source_chat_id)
+            VALUES ('running', -100983001)
+            """,
+            "Cannot downgrade 083: extraction_runs.source_chat_id contains rollout data",
+            "SELECT count(*) FROM extraction_runs WHERE source_chat_id = -100983001",
+        ),
+    ],
+)
+async def test_083_downgrade_fails_closed_when_rollout_columns_contain_data(
+    temp_database_url: str,
+    seed_sql: str,
+    expected_error: str,
+    preserved_query: str,
+) -> None:
+    """Values that cannot exist on 082 must survive a rejected downgrade."""
+    _run_alembic(temp_database_url, "upgrade", "083")
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(temp_database_url)))
+    try:
+        await conn.execute(seed_sql)
+    finally:
+        await conn.close()
+
+    result = _run_alembic(temp_database_url, "downgrade", "082", check=False)
+
+    assert result.returncode != 0
+    assert expected_error in result.stdout + result.stderr
+    assert await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version") == "083"
+    assert await _fetch_value(temp_database_url, preserved_query) == 1
+
+
+async def test_083_downgrade_succeeds_without_rollout_column_values(
+    temp_database_url: str,
+) -> None:
+    """The fail-closed guard still permits rollback when no new values would be lost."""
+    _run_alembic(temp_database_url, "upgrade", "083")
+
+    _run_alembic(temp_database_url, "downgrade", "082")
+
+    assert await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version") == "082"
 
 
 # ─── Test: upgrade adds 4 review columns with correct types/nullability ──────
@@ -467,49 +679,50 @@ async def test_038_body_markdown_required_for_rejected_by_reaper(
 # ─── Test: approved_audit CHECK covers posting + posted statuses ─────────────
 
 
-async def test_038_approved_audit_check_covers_posting_and_posted(
+async def test_079_approved_audit_allows_automatic_weekly_publish(
     migrated_database_url: str,
 ) -> None:
-    """ck_digests_approved_audit rejects weekly 'posting'/'posted' rows missing audit cols.
-
-    The CHECK covers status IN ('approved_for_publish','posting','posted') for weekly
-    digests.  All three travel through the same approve→posting→posted pipeline with
-    the audit cols set at /digest_approve time and carried through unchanged.
-    """
+    """Automatic weekly posting/posted states need no admin attribution."""
     conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
     try:
-        # weekly posting with NULL published_by_admin_id → violates
-        with pytest.raises(asyncpg.exceptions.CheckViolationError):
-            await conn.execute(
-                """
-                INSERT INTO digests (
-                    type, window_start, window_end, status, citations, body_markdown,
-                    posting_started_at, published_by_admin_id, approved_at
-                )
-                VALUES (
-                    'weekly','2026-05-04 14:00:00+00','2026-05-11 14:00:00+00',
-                    'posting','[]'::jsonb,'body',
-                    '2026-05-11 09:00:00+00',
-                    NULL,
-                    '2026-05-11 09:00:00+00'
-                )
-                """
+        await conn.execute(
+            """
+            INSERT INTO digests (
+                type, window_start, window_end, status, citations, body_markdown,
+                posting_started_at, published_by_admin_id, approved_at
             )
-        # weekly posted with NULL approved_at → violates
+            VALUES (
+                'weekly','2026-05-04 14:00:00+00','2026-05-11 14:00:00+00',
+                'posting','[]'::jsonb,'body',
+                '2026-05-11 09:00:00+00', NULL, NULL
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO digests (
+                type, window_start, window_end, status, citations, body_markdown,
+                posted_at, posted_chat_id, posted_message_id,
+                published_by_admin_id, approved_at
+            )
+            VALUES (
+                'weekly','2026-05-04 15:00:00+00','2026-05-11 15:00:00+00',
+                'posted','[]'::jsonb,'body',
+                '2026-05-11 10:00:00+00', -1001234567890, 42,
+                NULL, NULL
+            )
+            """
+        )
+
         with pytest.raises(asyncpg.exceptions.CheckViolationError):
             await conn.execute(
                 """
                 INSERT INTO digests (
-                    type, window_start, window_end, status, citations, body_markdown,
-                    posted_at, posted_chat_id, posted_message_id,
-                    published_by_admin_id, approved_at
+                    type, window_start, window_end, status, citations, body_markdown
                 )
                 VALUES (
-                    'weekly','2026-05-04 15:00:00+00','2026-05-11 15:00:00+00',
-                    'posted','[]'::jsonb,'body',
-                    '2026-05-11 10:00:00+00', -1001234567890, 42,
-                    123456789,
-                    NULL
+                    'weekly','2026-05-04 16:00:00+00','2026-05-11 16:00:00+00',
+                    'approved_for_publish','[]'::jsonb,'body'
                 )
                 """
             )

@@ -172,6 +172,46 @@ async def test_get_by_hash_returns_none_for_missing(db_session) -> None:
     assert (await MessageVersionRepo.get_by_hash(db_session, msg_id, "nope")) is None
 
 
+async def test_get_by_hash_ignores_redacted_audit_and_insert_restores_active_version(
+    db_session,
+) -> None:
+    from bot.db.models import MessageVersion
+    from bot.db.repos.message_version import MessageVersionRepo
+
+    msg_id = await _make_chat_message(db_session)
+    redacted = MessageVersion(
+        chat_message_id=msg_id,
+        version_seq=1,
+        content_hash="restored-hash",
+        is_redacted=True,
+    )
+    db_session.add(redacted)
+    await db_session.flush()
+
+    assert await MessageVersionRepo.get_by_hash(db_session, msg_id, "restored-hash") is None
+
+    restored = await MessageVersionRepo.insert_version(
+        db_session,
+        chat_message_id=msg_id,
+        content_hash="restored-hash",
+        text="restored content",
+    )
+
+    assert restored.id != redacted.id
+    assert restored.version_seq == 2
+    assert restored.is_redacted is False
+    rows = (
+        (
+            await db_session.execute(
+                select(MessageVersion).where(MessageVersion.chat_message_id == msg_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [(row.version_seq, row.is_redacted) for row in rows] == [(1, True), (2, False)]
+
+
 # ─── current_version_id FK closure (T1-05 forward-ref → real FK) ──────────────────────────
 
 
@@ -290,18 +330,23 @@ def test_message_version_metadata_smoke(app_env) -> None:
     assert "fk_message_versions_chat_message_id" in fk_names
     assert "fk_message_versions_raw_update_id" in fk_names
 
-    index_names = {ix.name for ix in table.indexes}
+    indexes = {ix.name: ix for ix in table.indexes}
+    index_names = set(indexes)
     assert "ix_message_versions_content_hash" in index_names
     assert "ix_message_versions_captured_at" in index_names
     assert "ix_message_versions_chat_message_id" in index_names
+    assert "uq_message_versions_chat_message_content_hash_active" in index_names
+    active_hash_index = indexes["uq_message_versions_chat_message_content_hash_active"]
+    assert active_hash_index.unique is True
+    assert str(active_hash_index.dialect_options["postgresql"]["where"]) == ("is_redacted = false")
 
     # T1-05's forward-ref is now a real FK on chat_messages.current_version_id
     cm_table = models.Base.metadata.tables["chat_messages"]
     cm_fk_names = {fk.name for fk in cm_table.foreign_keys if fk.name}
     assert "fk_chat_messages_current_version_id" in cm_fk_names
 
-    # T2-81: UNIQUE (chat_message_id, content_hash) must exist as a DB-level constraint
-    assert "uq_message_versions_chat_message_content_hash" in constraint_names
+    # Phase 13: active versions remain unique while a redacted audit version may
+    # coexist with a restored version of the same canonical content.
 
 
 # ─── T2-81: concurrent-insert idempotency ─────────────────────────────────────────────────
@@ -405,7 +450,7 @@ async def test_insert_version_savepoint_branch_reselects_on_integrity_error(
     monkeypatch.setattr(MessageVersionRepo, "get_by_hash", staticmethod(fake_get_by_hash))
 
     # insert_version sees get_by_hash → None (lie), enters begin_nested, attempts INSERT,
-    # hits IntegrityError from uq_message_versions_chat_message_content_hash,
+    # hits IntegrityError from the active-version content-hash index,
     # rolls back the savepoint, then calls real get_by_hash → returns v1.
     result = await MessageVersionRepo.insert_version(
         db_session,

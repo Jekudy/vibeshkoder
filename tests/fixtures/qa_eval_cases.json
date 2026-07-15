@@ -320,7 +320,7 @@
     "notes": "Single text message imported via run_apply → searchable via /recall"
   },
   {
-    "id": "imp_002_offrecord_abstain",
+    "id": "imp_002_legacy_marker_searchable",
     "category": "import_path",
     "query": "приватно",
     "chat_id": -1001888888002,
@@ -345,8 +345,10 @@
         ]
       }
     ],
-    "expected_evidence_present": false,
-    "expected_chat_message_ids": [],
-    "notes": "Import message with #offrecord → /recall abstains (H2 fix validation)"
+    "expected_evidence_present": true,
+    "expected_chat_message_ids": [
+      9002
+    ],
+    "notes": "Phase 13: legacy #offrecord text is ordinary stored and searchable content"
   }
 ]

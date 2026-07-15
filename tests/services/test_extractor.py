@@ -10,7 +10,7 @@ Tests cover:
 * Tombstone exclusion: messages targeted by a ``forget_events`` row are skipped
   from the bundle (no leakage).
 * Empty window: zero candidates, run_status='completed', candidate_count=0.
-* Window bounds: only ``chat_messages.created_at`` within ``[window_start,
+* Window bounds: only Telegram event time ``chat_messages.date`` within ``[window_start,
   window_end)`` are considered.
 * Scheduler flag gating: scheduler tick reads the
   ``memory.extraction.scheduler.enabled`` flag and no-ops when off (default).
@@ -25,6 +25,7 @@ T6-02 ships a typed contract; T6-03 lands the concrete implementation under
 from __future__ import annotations
 
 import itertools
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -77,6 +78,7 @@ async def _make_chat_message(
     chat_id: int | None = None,
     user_id: int | None = None,
     when: datetime | None = None,
+    created_at: datetime | None = None,
     memory_policy: str = "normal",
     is_redacted: bool = False,
     text: str = "extraction source content",
@@ -107,6 +109,8 @@ async def _make_chat_message(
         chat_id = _next_chat_id()
     if when is None:
         when = datetime.now(timezone.utc)
+    if created_at is None:
+        created_at = when
     message_id = _next_msg_id()
 
     msg = ChatMessage(
@@ -115,7 +119,7 @@ async def _make_chat_message(
         user_id=user_id,
         text=text,
         date=when,
-        created_at=when,
+        created_at=created_at,
         memory_policy=memory_policy,
         is_redacted=is_redacted,
     )
@@ -129,26 +133,20 @@ async def _make_chat_message(
         normalized_text=text,
         entities_json={},
         content_hash=(
-            mv_content_hash
-            if mv_content_hash is not None
-            else f"h{_uuid_module.uuid4().hex[:16]}"
+            mv_content_hash if mv_content_hash is not None else f"h{_uuid_module.uuid4().hex[:16]}"
         ),
         is_redacted=version_is_redacted,
     )
     db_session.add(v)
     await db_session.flush()
     await db_session.execute(
-        sa_update(ChatMessage)
-        .where(ChatMessage.id == msg.id)
-        .values(current_version_id=v.id)
+        sa_update(ChatMessage).where(ChatMessage.id == msg.id).values(current_version_id=v.id)
     )
     await db_session.flush()
     return msg.id, v.id, chat_id, message_id
 
 
-async def _make_pending_forget_event(
-    db_session, *, target_type: str, target_id: int | str
-) -> int:
+async def _make_pending_forget_event(db_session, *, target_type: str, target_id: int | str) -> int:
     from bot.db.repos.forget_event import ForgetEventRepo
 
     ev = await ForgetEventRepo.create(
@@ -197,7 +195,11 @@ class FakeGateway:
 
     candidates_to_emit: list[dict[str, Any]]
     llm_usage_ledger_id: int | None = None
+    create_ledger: bool = True
     calls: list[dict[str, Any]] = None  # type: ignore[assignment]
+
+    extraction_provider = "test-fake"
+    extraction_model = "test-model"
 
     def __post_init__(self) -> None:
         if self.calls is None:
@@ -216,6 +218,20 @@ class FakeGateway:
                 "prompt_template_version": prompt_template_version,
             }
         )
+        if self.create_ledger:
+            from bot.db.models import LlmUsageLedger
+
+            ledger = LlmUsageLedger(
+                provider=self.extraction_provider,
+                model=self.extraction_model,
+                tokens_in=0,
+                tokens_out=0,
+            )
+            session.add(ledger)
+            await session.flush()
+            self.llm_usage_ledger_id = ledger.id
+        else:
+            self.llm_usage_ledger_id = None
         return {
             "candidates": list(self.candidates_to_emit),
             "llm_usage_ledger_id": self.llm_usage_ledger_id,
@@ -234,9 +250,7 @@ async def test_run_extraction_pass_writes_candidates_and_completed_run(
     window_start = datetime.now(timezone.utc) - timedelta(hours=1)
     window_end = datetime.now(timezone.utc) + timedelta(hours=1)
     when = window_start + timedelta(minutes=5)
-    cm_id, ver_id, chat_id, _ = await _make_chat_message(
-        db_session, when=when, text="alpha fact"
-    )
+    cm_id, ver_id, chat_id, _ = await _make_chat_message(db_session, when=when, text="alpha fact")
 
     # NOTE: Privacy invariant #4 — gateway-emitted candidates MUST be
     # paired with an llm_usage_ledger_id (see PHASE6_PLAN §8 and the
@@ -263,12 +277,10 @@ async def test_run_extraction_pass_writes_candidates_and_completed_run(
 
     assert result.run_status == "completed"
     assert result.candidate_count == 1
-    assert result.llm_usage_ledger_id == ledger_id
+    assert result.llm_usage_ledger_id == gw.llm_usage_ledger_id
     # Gateway was called exactly once.
     assert len(gw.calls) == 1
-    assert ver_id in [
-        sv["message_version_id"] for sv in gw.calls[0]["source_versions"]
-    ]
+    assert ver_id in [sv["message_version_id"] for sv in gw.calls[0]["source_versions"]]
 
     # ExtractionRun row exists with completed status.
     run_row = await db_session.get(ExtractionRun, result.extraction_run_id)
@@ -280,12 +292,16 @@ async def test_run_extraction_pass_writes_candidates_and_completed_run(
 
     # Candidate row exists, pending, with the staged source_message_version_id.
     cands = (
-        await db_session.execute(
-            select(ExtractionCandidate).where(
-                ExtractionCandidate.extraction_run_id == result.extraction_run_id
+        (
+            await db_session.execute(
+                select(ExtractionCandidate).where(
+                    ExtractionCandidate.extraction_run_id == result.extraction_run_id
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(cands) == 1
     assert cands[0].status == "pending"
     assert cands[0].source_message_version_ids == [ver_id]
@@ -366,12 +382,16 @@ async def test_run_extraction_pass_aborts_on_offrecord_source(db_session) -> Non
         assert run_row.run_status == "completed"
     else:
         cands = (
-            await db_session.execute(
-                select(ExtractionCandidate).where(
-                    ExtractionCandidate.extraction_run_id == result.extraction_run_id
+            (
+                await db_session.execute(
+                    select(ExtractionCandidate).where(
+                        ExtractionCandidate.extraction_run_id == result.extraction_run_id
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(cands) == 0
 
 
@@ -441,9 +461,7 @@ async def test_run_extraction_pass_excludes_messages_with_forget_tombstone(
     when = window_start + timedelta(minutes=5)
 
     # Normal message — included.
-    _, ver_normal, _, _ = await _make_chat_message(
-        db_session, when=when, text="alpha normal"
-    )
+    _, ver_normal, _, _ = await _make_chat_message(db_session, when=when, text="alpha normal")
     # Forgotten message — excluded.
     cm_tombstoned, ver_tombstoned, chat_id_f, msg_id_f = await _make_chat_message(
         db_session, when=when, text="DO_NOT_LEAK_TOMBSTONED"
@@ -481,9 +499,7 @@ async def test_run_extraction_pass_excludes_messages_with_forget_tombstone(
 
     assert result.run_status == "completed"
     forwarded_ids = [
-        sv["message_version_id"]
-        for call in gw.calls
-        for sv in call["source_versions"]
+        sv["message_version_id"] for call in gw.calls for sv in call["source_versions"]
     ]
     assert ver_tombstoned not in forwarded_ids
     for call in gw.calls:
@@ -554,9 +570,7 @@ async def test_run_extraction_pass_respects_window_bounds(db_session) -> None:
     )
 
     forwarded_ids = [
-        sv["message_version_id"]
-        for call in gw.calls
-        for sv in call["source_versions"]
+        sv["message_version_id"] for call in gw.calls for sv in call["source_versions"]
     ]
     assert ver_in in forwarded_ids
     assert ver_before not in forwarded_ids
@@ -564,6 +578,93 @@ async def test_run_extraction_pass_respects_window_bounds(db_session) -> None:
     for call in gw.calls:
         for sv in call["source_versions"]:
             assert "NOT_LEAK" not in (sv.get("text") or "")
+
+
+async def test_run_extraction_pass_excludes_other_chats(db_session) -> None:
+    from bot.db.models import ExtractionRun
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+    window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+    source_chat_id = -(7_000_000_000_000 + uuid.uuid4().int % 1_000_000_000_000)
+    other_chat_id = _next_chat_id()
+    _, source_mvid, _, _ = await _make_chat_message(
+        db_session,
+        chat_id=source_chat_id,
+        when=window_start + timedelta(minutes=10),
+        text="community source",
+    )
+    _, other_mvid, _, _ = await _make_chat_message(
+        db_session,
+        chat_id=other_chat_id,
+        when=window_start + timedelta(minutes=20),
+        text="PRIVATE_DM_MUST_NOT_LEAK",
+    )
+    ledger_id = await _make_llm_usage_ledger_row(db_session)
+    gateway = FakeGateway(candidates_to_emit=[], llm_usage_ledger_id=ledger_id)
+
+    result = await run_extraction_pass(
+        db_session,
+        window_start=window_start,
+        window_end=window_end,
+        gateway=gateway,
+        source_chat_id=source_chat_id,
+    )
+
+    forwarded = [
+        source["message_version_id"] for call in gateway.calls for source in call["source_versions"]
+    ]
+    assert source_mvid in forwarded
+    assert other_mvid not in forwarded
+    assert all(
+        "PRIVATE_DM_MUST_NOT_LEAK" not in (source.get("text") or "")
+        for call in gateway.calls
+        for source in call["source_versions"]
+    )
+    run = await db_session.get(ExtractionRun, result.extraction_run_id)
+    assert run is not None and run.source_chat_id == source_chat_id
+
+
+async def test_imported_message_uses_telegram_event_time_not_import_time(
+    db_session,
+) -> None:
+    from bot.services.extractor import run_extraction_pass
+
+    source_chat_id = _next_chat_id()
+    event_at = datetime(2025, 11, 15, 12, tzinfo=timezone.utc)
+    imported_at = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+    _, source_mvid, _, _ = await _make_chat_message(
+        db_session,
+        chat_id=source_chat_id,
+        when=event_at,
+        created_at=imported_at,
+        text="historical import event",
+    )
+    ledger_id = await _make_llm_usage_ledger_row(db_session)
+    historical_gateway = FakeGateway(candidates_to_emit=[], llm_usage_ledger_id=ledger_id)
+
+    await run_extraction_pass(
+        db_session,
+        window_start=event_at - timedelta(hours=1),
+        window_end=event_at + timedelta(hours=1),
+        gateway=historical_gateway,
+        source_chat_id=source_chat_id,
+    )
+    assert [
+        source["message_version_id"]
+        for call in historical_gateway.calls
+        for source in call["source_versions"]
+    ] == [source_mvid]
+
+    recent_gateway = FakeGateway(candidates_to_emit=[])
+    await run_extraction_pass(
+        db_session,
+        window_start=imported_at - timedelta(hours=1),
+        window_end=imported_at + timedelta(hours=1),
+        gateway=recent_gateway,
+        source_chat_id=source_chat_id,
+    )
+    assert recent_gateway.calls == []
 
 
 # ─── Test 6: scheduler flag — default OFF skips pass ─────────────────────────
@@ -597,9 +698,7 @@ async def test_extraction_scheduler_tick_flag_false_skips(db_session) -> None:
         extraction_scheduler_tick,
     )
 
-    await FeatureFlagRepo.set_enabled(
-        db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, False
-    )
+    await FeatureFlagRepo.set_enabled(db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, False)
     gw = FakeGateway(candidates_to_emit=[])
     result = await extraction_scheduler_tick(db_session, gateway=gw)
 
@@ -624,6 +723,9 @@ def test_extract_candidates_gateway_protocol_is_runtime_checkable() -> None:
     from bot.services.extractor import ExtractCandidatesGateway
 
     class _DuckGateway:
+        extraction_provider = "duck"
+        extraction_model = "duck-model"
+
         async def extract_candidates(
             self,
             session: Any,
@@ -745,9 +847,7 @@ async def test_extraction_scheduler_tick_skips_when_locked(db_session) -> None:
         extraction_scheduler_tick,
     )
 
-    await FeatureFlagRepo.set_enabled(
-        db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, True
-    )
+    await FeatureFlagRepo.set_enabled(db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, True)
 
     # Patch the scheduler-lock acquisition to simulate contention.
     original_try = ext_module._try_acquire_scheduler_lock
@@ -758,7 +858,9 @@ async def test_extraction_scheduler_tick_skips_when_locked(db_session) -> None:
     ext_module._try_acquire_scheduler_lock = fake_try_acquire  # type: ignore[assignment]
     try:
         gw = FakeGateway(candidates_to_emit=[])
-        result = await extraction_scheduler_tick(db_session, gateway=gw)
+        result = await extraction_scheduler_tick(
+            db_session, gateway=gw, source_chat_id=-1001234567890
+        )
     finally:
         ext_module._try_acquire_scheduler_lock = original_try  # type: ignore[assignment]
 
@@ -815,6 +917,9 @@ async def test_run_extraction_pass_records_failed_state_on_gateway_exception(
     class CrashingGateway:
         calls: list = None  # type: ignore[assignment]
 
+        extraction_provider = "crashing-test"
+        extraction_model = "crashing-model"
+
         def __post_init__(self) -> None:
             if self.calls is None:
                 self.calls = []
@@ -843,13 +948,17 @@ async def test_run_extraction_pass_records_failed_state_on_gateway_exception(
     # is captured durably. This requires SAVEPOINT-style isolation so
     # the failed UPDATE survives the gateway call's rollback.
     rows = (
-        await db_session.execute(
-            select(ExtractionRun).where(
-                ExtractionRun.ingestion_window_start == window_start,
-                ExtractionRun.ingestion_window_end == window_end,
+        (
+            await db_session.execute(
+                select(ExtractionRun).where(
+                    ExtractionRun.ingestion_window_start == window_start,
+                    ExtractionRun.ingestion_window_end == window_end,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(rows) >= 1
     failed = [r for r in rows if r.run_status == "failed"]
     assert len(failed) >= 1
@@ -966,6 +1075,7 @@ async def test_run_extraction_pass_fails_when_gateway_returns_null_ledger_id(
             }
         ],
         llm_usage_ledger_id=None,
+        create_ledger=False,
     )
 
     result = await run_extraction_pass(
@@ -985,12 +1095,16 @@ async def test_run_extraction_pass_fails_when_gateway_returns_null_ledger_id(
     # No candidates persisted — gateway output is discarded on audit
     # invariant violation.
     cands = (
-        await db_session.execute(
-            select(ExtractionCandidate).where(
-                ExtractionCandidate.extraction_run_id == result.extraction_run_id
+        (
+            await db_session.execute(
+                select(ExtractionCandidate).where(
+                    ExtractionCandidate.extraction_run_id == result.extraction_run_id
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert cands == []
 
 
@@ -1007,7 +1121,11 @@ async def test_run_extraction_pass_empty_bundle_skips_ledger_check(
     window_start = datetime(2000, 1, 1, tzinfo=timezone.utc)
     window_end = datetime(2000, 1, 2, tzinfo=timezone.utc)
 
-    gw = FakeGateway(candidates_to_emit=[], llm_usage_ledger_id=None)
+    gw = FakeGateway(
+        candidates_to_emit=[],
+        llm_usage_ledger_id=None,
+        create_ledger=False,
+    )
     result = await run_extraction_pass(
         db_session,
         window_start=window_start,
@@ -1037,14 +1155,12 @@ async def test_extraction_scheduler_tick_flag_true_runs_pass(db_session) -> None
     )
 
     # Enable flag — its updated_at is now phase_6_enabled_at.
-    await FeatureFlagRepo.set_enabled(
-        db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, True
-    )
+    await FeatureFlagRepo.set_enabled(db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, True)
 
     # Insert a message AFTER the flag was enabled (timestamp slightly past
     # phase_6_enabled_at so window_start <= created_at < window_end holds).
     when = datetime.now(timezone.utc)
-    _, ver_id, _, _ = await _make_chat_message(
+    _, ver_id, source_chat_id, _ = await _make_chat_message(
         db_session, when=when, text="post-enable msg"
     )
 
@@ -1065,6 +1181,7 @@ async def test_extraction_scheduler_tick_flag_true_runs_pass(db_session) -> None
         db_session,
         gateway=gw,
         now=when + timedelta(hours=1),
+        source_chat_id=source_chat_id,
     )
 
     assert result.skipped is False
@@ -1072,6 +1189,157 @@ async def test_extraction_scheduler_tick_flag_true_runs_pass(db_session) -> None
     assert result.extraction_result.run_status == "completed"
     # Gateway was invoked.
     assert len(gw.calls) >= 1
+
+
+async def test_extraction_scheduler_watermark_makes_two_ticks_non_overlapping(
+    db_session,
+) -> None:
+    """The second real PostgreSQL tick starts at the first successful end."""
+    from sqlalchemy import select, update
+
+    from bot.db.models import ExtractionRun, FeatureFlag
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+    from bot.services.extractor import (
+        MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG,
+        extraction_scheduler_tick,
+    )
+
+    enabled_at = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    first_end = enabled_at + timedelta(hours=1)
+    second_end = first_end + timedelta(hours=1)
+    source_chat_id = -(7_000_000_000_000 + uuid.uuid4().int % 1_000_000_000_000)
+
+    await FeatureFlagRepo.set_enabled(db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, True)
+    await db_session.execute(
+        update(FeatureFlag)
+        .where(FeatureFlag.flag_key == MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG)
+        .values(updated_at=enabled_at)
+    )
+
+    # Neither a failed scheduler run nor a successful manual run is a
+    # scheduler watermark.
+    db_session.add_all(
+        [
+            ExtractionRun(
+                ingestion_window_start=enabled_at,
+                ingestion_window_end=enabled_at + timedelta(minutes=30),
+                run_status="completed",
+                candidate_count=0,
+                operator_user_id=123,
+                source_chat_id=source_chat_id,
+            ),
+            ExtractionRun(
+                ingestion_window_start=enabled_at,
+                ingestion_window_end=enabled_at + timedelta(minutes=45),
+                run_status="failed",
+                candidate_count=0,
+                operator_user_id=None,
+                source_chat_id=source_chat_id,
+            ),
+            ExtractionRun(
+                ingestion_window_start=enabled_at,
+                ingestion_window_end=enabled_at + timedelta(minutes=50),
+                run_status="completed",
+                candidate_count=0,
+                operator_user_id=None,
+                source_chat_id=source_chat_id - 1,
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    await _make_chat_message(
+        db_session,
+        chat_id=source_chat_id,
+        when=enabled_at + timedelta(minutes=5),
+        text="first cursor source",
+    )
+
+    gateway = FakeGateway(candidates_to_emit=[])
+    first = await extraction_scheduler_tick(
+        db_session,
+        gateway=gateway,
+        now=first_end,
+        source_chat_id=source_chat_id,
+    )
+    await _make_chat_message(
+        db_session,
+        chat_id=source_chat_id,
+        when=enabled_at - timedelta(days=30),
+        text="late event-time insert",
+    )
+    second = await extraction_scheduler_tick(
+        db_session,
+        gateway=gateway,
+        now=second_end,
+        source_chat_id=source_chat_id,
+    )
+
+    assert first.extraction_result is not None
+    assert second.extraction_result is not None
+    first_run = await db_session.get(ExtractionRun, first.extraction_result.extraction_run_id)
+    second_run = await db_session.get(ExtractionRun, second.extraction_result.extraction_run_id)
+    assert first_run is not None and second_run is not None
+    assert (first_run.ingestion_window_start, first_run.ingestion_window_end) == (
+        enabled_at,
+        first_end,
+    )
+    assert (second_run.ingestion_window_start, second_run.ingestion_window_end) == (
+        first_end,
+        second_end,
+    )
+
+    completed_scheduler_windows = (
+        await db_session.execute(
+            select(
+                ExtractionRun.ingestion_window_start,
+                ExtractionRun.ingestion_window_end,
+            )
+            .where(
+                ExtractionRun.run_status == "completed",
+                ExtractionRun.operator_user_id.is_(None),
+                ExtractionRun.source_chat_id == source_chat_id,
+                ExtractionRun.ingestion_window_start >= enabled_at,
+            )
+            .order_by(ExtractionRun.ingestion_window_start)
+        )
+    ).all()
+    assert completed_scheduler_windows == [
+        (enabled_at, first_end),
+        (first_end, second_end),
+    ]
+
+
+async def test_extraction_input_size_cap_fails_before_gateway(db_session) -> None:
+    from bot.db.models import ExtractionRun
+    from bot.services.extraction_schema import MAX_EXTRACTION_INPUT_BYTES
+    from bot.services.extractor import run_extraction_pass
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+    window_end = datetime.now(timezone.utc) + timedelta(hours=1)
+    when = window_start + timedelta(minutes=5)
+    source_chat_id = _next_chat_id()
+    await _make_chat_message(
+        db_session,
+        chat_id=source_chat_id,
+        when=when,
+        text="x" * (MAX_EXTRACTION_INPUT_BYTES + 1),
+    )
+    gateway = FakeGateway(candidates_to_emit=[])
+
+    result = await run_extraction_pass(
+        db_session,
+        window_start=window_start,
+        window_end=window_end,
+        gateway=gateway,
+        source_chat_id=source_chat_id,
+    )
+
+    assert result.run_status == "failed"
+    assert result.failure_reason == "input_size_exceeded"
+    assert gateway.calls == []
+    run = await db_session.get(ExtractionRun, result.extraction_run_id)
+    assert run is not None and run.source_chat_id == source_chat_id
 
 
 # ─── Round 3 regression: tombstone via mv.content_hash for live-path messages ─
@@ -1096,9 +1364,7 @@ async def test_run_extraction_pass_excludes_live_message_via_mv_content_hash_tom
     when = window_start + timedelta(minutes=5)
 
     # Normal message — included.
-    _, ver_normal, _, _ = await _make_chat_message(
-        db_session, when=when, text="alpha normal"
-    )
+    _, ver_normal, _, _ = await _make_chat_message(db_session, when=when, text="alpha normal")
 
     # Live-path message: chat_messages.content_hash is NULL, mv.content_hash="X".
     mv_hash = "live_msg_sha_for_tombstone_test"
@@ -1141,9 +1407,7 @@ async def test_run_extraction_pass_excludes_live_message_via_mv_content_hash_tom
 
     assert result.run_status == "completed"
     forwarded_ids = [
-        sv["message_version_id"]
-        for call in gw.calls
-        for sv in call["source_versions"]
+        sv["message_version_id"] for call in gw.calls for sv in call["source_versions"]
     ]
     assert ver_live not in forwarded_ids
     for call in gw.calls:
@@ -1192,9 +1456,7 @@ async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
     when = datetime(2000, 6, 1, 12, tzinfo=timezone.utc)
 
     # ── Step 1: set up committed test data (user + chat_message + message_version) ──
-    setup_factory = async_sessionmaker(
-        postgres_engine, class_=AsyncSession, expire_on_commit=False
-    )
+    setup_factory = async_sessionmaker(postgres_engine, class_=AsyncSession, expire_on_commit=False)
 
     user_id = _next_user()
     chat_id = _next_chat_id()
@@ -1224,9 +1486,7 @@ async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
                 },
             )
             cm_row = await setup_s.execute(
-                text(
-                    "SELECT id FROM chat_messages WHERE message_id = :mid AND chat_id = :cid"
-                ),
+                text("SELECT id FROM chat_messages WHERE message_id = :mid AND chat_id = :cid"),
                 {"mid": message_id, "cid": chat_id},
             )
             cm_id = cm_row.scalar_one()
@@ -1247,9 +1507,7 @@ async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
             mv_id = mv_row.scalar_one()
 
             await setup_s.execute(
-                text(
-                    "UPDATE chat_messages SET current_version_id = :mv_id WHERE id = :cm_id"
-                ),
+                text("UPDATE chat_messages SET current_version_id = :mv_id WHERE id = :cm_id"),
                 {"mv_id": mv_id, "cm_id": cm_id},
             )
         # committed here
@@ -1258,6 +1516,9 @@ async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
     @dataclass
     class _CrashGw:
         calls: list = None  # type: ignore[assignment]
+
+        extraction_provider = "middleware-crash-test"
+        extraction_model = "middleware-crash-model"
 
         def __post_init__(self) -> None:
             if self.calls is None:
@@ -1307,9 +1568,7 @@ async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
                 {"ws": window_start, "we": window_end},
             )
             rows = rows_result.fetchall()
-            assert rows, (
-                "No extraction_runs row found — running-row was never committed durably"
-            )
+            assert rows, "No extraction_runs row found — running-row was never committed durably"
             statuses = {r[0] for r in rows}
             assert "failed" in statuses, (
                 f"Expected 'failed' audit row after gateway crash, got statuses={statuses}. "
@@ -1349,6 +1608,9 @@ async def test_run_extraction_pass_failed_status_survives_middleware_rollback(
 
 class _GatewayErrorFakeGateway:
     """FakeGateway that simulates a provider failure by returning gateway_error."""
+
+    extraction_provider = "gateway-error-test"
+    extraction_model = "gateway-error-model"
 
     def __init__(
         self,
@@ -1402,9 +1664,7 @@ async def test_run_extraction_pass_persists_gateway_error_on_provider_failure(
     when = datetime(2002, 7, 1, 12, tzinfo=timezone.utc)
 
     # ── Step 1: committed test data ──────────────────────────────────────────
-    setup_factory = async_sessionmaker(
-        postgres_engine, class_=AsyncSession, expire_on_commit=False
-    )
+    setup_factory = async_sessionmaker(postgres_engine, class_=AsyncSession, expire_on_commit=False)
 
     user_id = _next_user()
     chat_id = _next_chat_id()
@@ -1434,9 +1694,7 @@ async def test_run_extraction_pass_persists_gateway_error_on_provider_failure(
                 },
             )
             cm_row = await setup_s.execute(
-                sa_text(
-                    "SELECT id FROM chat_messages WHERE message_id = :mid AND chat_id = :cid"
-                ),
+                sa_text("SELECT id FROM chat_messages WHERE message_id = :mid AND chat_id = :cid"),
                 {"mid": message_id, "cid": chat_id},
             )
             cm_id = cm_row.scalar_one()
@@ -1451,17 +1709,13 @@ async def test_run_extraction_pass_persists_gateway_error_on_provider_failure(
                 {"cm_id": cm_id, "txt": "gateway-error-test-msg", "ch": content_hash},
             )
             mv_row = await setup_s.execute(
-                sa_text(
-                    "SELECT id FROM message_versions WHERE chat_message_id = :cm_id"
-                ),
+                sa_text("SELECT id FROM message_versions WHERE chat_message_id = :cm_id"),
                 {"cm_id": cm_id},
             )
             mv_id = mv_row.scalar_one()
 
             await setup_s.execute(
-                sa_text(
-                    "UPDATE chat_messages SET current_version_id = :mv_id WHERE id = :cm_id"
-                ),
+                sa_text("UPDATE chat_messages SET current_version_id = :mv_id WHERE id = :cm_id"),
                 {"mv_id": mv_id, "cm_id": cm_id},
             )
 
@@ -1520,9 +1774,7 @@ async def test_run_extraction_pass_persists_gateway_error_on_provider_failure(
             assert row[1] == "openai api 503", (
                 f"Expected gateway_error='openai api 503', got '{row[1]}'"
             )
-            assert row[2] == ledger_id, (
-                f"Expected llm_usage_ledger_id={ledger_id}, got {row[2]}"
-            )
+            assert row[2] == ledger_id, f"Expected llm_usage_ledger_id={ledger_id}, got {row[2]}"
     finally:
         async with verify_factory() as cleanup_s:
             async with cleanup_s.begin():
@@ -1534,9 +1786,7 @@ async def test_run_extraction_pass_persists_gateway_error_on_provider_failure(
                     {"ws": window_start, "we": window_end},
                 )
                 await cleanup_s.execute(
-                    sa_text(
-                        "DELETE FROM message_versions WHERE chat_message_id = :cm_id"
-                    ),
+                    sa_text("DELETE FROM message_versions WHERE chat_message_id = :cm_id"),
                     {"cm_id": cm_id},
                 )
                 await cleanup_s.execute(
@@ -1554,9 +1804,7 @@ async def test_run_extraction_pass_persists_gateway_error_on_provider_failure(
                 # Also clean up the user inserted by the test (ON CONFLICT DO NOTHING
                 # means no row if already present — safe to delete unconditionally here).
                 await cleanup_s.execute(
-                    sa_text(
-                        "DELETE FROM chat_messages WHERE chat_id = :cid AND message_id = :mid"
-                    ),
+                    sa_text("DELETE FROM chat_messages WHERE chat_id = :cid AND message_id = :mid"),
                     {"cid": chat_id, "mid": message_id},
                 )
 

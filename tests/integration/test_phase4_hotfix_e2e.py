@@ -99,15 +99,15 @@ def _build_td_export(*, chat_id: int, messages: list[dict]) -> str:
         "id": chat_id,
         "messages": messages,
     }
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, prefix="e2e_hotfix_"
-    )
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, prefix="e2e_hotfix_")
     json.dump(export, tmp)
     tmp.close()
     return tmp.name
 
 
-async def _create_import_run(db_session, *, source_path: str, chat_id: int, source_hash: str) -> int:
+async def _create_import_run(
+    db_session, *, source_path: str, chat_id: int, source_hash: str
+) -> int:
     from sqlalchemy import text as sa_text
 
     result = await db_session.execute(
@@ -166,7 +166,9 @@ async def test_live_message_then_recall_returns_hit(db_session) -> None:
         "persist_message_with_policy did not set current_version_id — CRITICAL 1 regression"
     )
 
-    qa_result = await run_qa(db_session, query="новости", chat_id=chat_id, redact_query_in_audit=False)
+    qa_result = await run_qa(
+        db_session, query="новости", chat_id=chat_id, redact_query_in_audit=False
+    )
 
     assert qa_result.bundle.abstained is False
     actual_msg_ids = [item.message_id for item in qa_result.bundle.items]
@@ -195,9 +197,7 @@ async def test_import_message_then_recall_returns_hit(db_session) -> None:
                 "from": "Import Test User",
                 "from_id": f"user{_next_user_id()}",
                 "text": "важное решение принято на встрече",
-                "text_entities": [
-                    {"type": "plain", "text": "важное решение принято на встрече"}
-                ],
+                "text_entities": [{"type": "plain", "text": "важное решение принято на встрече"}],
             }
         ],
     )
@@ -217,7 +217,9 @@ async def test_import_message_then_recall_returns_hit(db_session) -> None:
     assert report.error_count == 0
     assert report.applied_count == 1
 
-    qa_result = await run_qa(db_session, query="решение", chat_id=chat_id, redact_query_in_audit=False)
+    qa_result = await run_qa(
+        db_session, query="решение", chat_id=chat_id, redact_query_in_audit=False
+    )
 
     assert qa_result.bundle.abstained is False
     actual_msg_ids = [item.message_id for item in qa_result.bundle.items]
@@ -350,11 +352,11 @@ async def test_flag_off_recall_still_archives_message(db_session) -> None:
     assert cm.current_version_id is not None
 
 
-# ─── Scenario 6: Imported offrecord round-trip ───────────────────────────────
+# ─── Scenario 6: Imported legacy marker round-trip ──────────────────────────
 
 
-async def test_imported_offrecord_creates_redacted_row_and_abstains(db_session) -> None:
-    """Scenario 6: import #offrecord message → OffrecordMark + redacted v1; /recall abstains."""
+async def test_imported_legacy_marker_is_complete_and_searchable(db_session) -> None:
+    """Phase 13 imports ``#offrecord`` as ordinary complete-history content."""
     from bot.db.models import ChatMessage, OffrecordMark
     from bot.services.import_apply import run_apply
     from bot.services.qa import run_qa
@@ -396,7 +398,6 @@ async def test_imported_offrecord_creates_redacted_row_and_abstains(db_session) 
     )
     assert report.error_count == 0
 
-    # CRITICAL 3 + H2 fix: offrecord import creates chat_messages row with redacted content.
     cm_result = await db_session.execute(
         select(ChatMessage).where(
             ChatMessage.chat_id == chat_id,
@@ -404,23 +405,20 @@ async def test_imported_offrecord_creates_redacted_row_and_abstains(db_session) 
         )
     )
     cm = cm_result.scalar_one_or_none()
-    assert cm is not None, "chat_messages row must exist for imported offrecord message (H2 fix)"
-    assert cm.memory_policy == "offrecord"
-    assert cm.is_redacted is True
-    assert cm.text is None
-    assert cm.current_version_id is not None, "v1 must be set even for offrecord imports"
+    assert cm is not None
+    assert cm.memory_policy == "normal"
+    assert cm.is_redacted is False
+    assert cm.text == "#offrecord секретная информация"
+    assert cm.current_version_id is not None
 
-    # OffrecordMark must exist.
     mark_result = await db_session.execute(
         select(OffrecordMark).where(OffrecordMark.chat_message_id == cm.id)
     )
     mark = mark_result.scalar_one_or_none()
-    assert mark is not None, "OffrecordMark must be created for imported #offrecord message"
+    assert mark is None
 
-    # /recall must abstain on the offrecord content.
     qa_result = await run_qa(
         db_session, query="секретная", chat_id=chat_id, redact_query_in_audit=False
     )
-    assert qa_result.bundle.abstained is True, (
-        "Expected abstention for #offrecord imported message"
-    )
+    assert qa_result.bundle.abstained is False
+    assert cm.current_version_id in qa_result.bundle.evidence_ids

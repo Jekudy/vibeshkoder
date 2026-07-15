@@ -4,11 +4,10 @@ Covers:
 - ``digest_weekly_job``: flag-OFF strict no-op
 - ``digest_weekly_job``: ISO week window calc (last Mon 00:00 MSK → this Mon
   00:00 MSK, stored as UTC)
-- ``digest_weekly_job``: draft → ``transition_to_awaiting_review`` happy path
-- ``digest_weekly_job``: idempotency-return non-draft statuses do NOT trigger
-  the review transition
+- ``digest_weekly_job``: draft → automatic publication, without review
+- ``digest_weekly_job``: idempotency-return non-draft statuses do NOT publish
 - ``digest_weekly_job``: ``failed``/``cost_exceeded`` paths fire admin DM
-- ``digest_weekly_job``: registered as Mon 09:15 MSK cron with the H8 stagger
+- ``digest_weekly_job``: registered as Mon 09:00 MSK cron
 - ``digest_stale_review_reaper_job``: 48h DM marker append (M4 guarded UPDATE)
 - ``digest_stale_review_reaper_job``: 48h DM is idempotent (marker present →
   no-op)
@@ -88,9 +87,7 @@ async def test_digest_weekly_job_skipped_when_flag_off(db_session, monkeypatch):
 # ── digest_weekly_job: ISO week window ──────────────────────────────────────
 
 
-async def test_digest_weekly_job_window_is_iso_mon_to_mon_msk(
-    db_session, monkeypatch
-):
+async def test_digest_weekly_job_window_is_iso_mon_to_mon_msk(db_session, monkeypatch):
     """AC1 / §5.G: window_start = last Mon 00:00 MSK; window_end = this Mon
     00:00 MSK. Both must be passed to ``run_digest`` in UTC.
 
@@ -150,13 +147,10 @@ async def test_digest_weekly_job_window_is_iso_mon_to_mon_msk(
 # ── digest_weekly_job: draft → transition_to_awaiting_review ───────────────
 
 
-async def test_digest_weekly_job_transitions_draft_to_awaiting_review(
-    db_session, monkeypatch
-):
-    """Happy path: ``run_digest`` returns ``status='draft'`` →
-    ``transition_to_awaiting_review`` is called with the digest id, then
-    admin DM fires for ``weekly_awaiting_review``.
-    """
+async def test_digest_weekly_job_publishes_draft_without_review(db_session, monkeypatch):
+    """A fresh weekly draft is posted automatically to the source chat."""
+    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", "-1001234567890")
+    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", "-1001234567890")
     await _set_flag(db_session, "memory.digests.weekly.enabled", True)
     await db_session.flush()
 
@@ -169,45 +163,25 @@ async def test_digest_weekly_job_transitions_draft_to_awaiting_review(
     digest.status = "draft"
     digest.error_text = None
 
-    monkeypatch.setattr(
-        "bot.services.digests.run_digest", AsyncMock(return_value=digest)
-    )
+    monkeypatch.setattr("bot.services.digests.run_digest", AsyncMock(return_value=digest))
 
-    transition_mock = AsyncMock()
-    notify_mock = AsyncMock()
-
-    # Provide a fake digest_review module so the import-guard inside the job
-    # body finds the symbol. T8-04 is a parallel sprint; this test pretends
-    # the module is already merged.
-    import sys
-    import types
-
-    fake_review = types.ModuleType("bot.services.digest_review")
-    fake_review.transition_to_awaiting_review = transition_mock
-    monkeypatch.setitem(sys.modules, "bot.services.digest_review", fake_review)
+    publish_mock = AsyncMock()
 
     monkeypatch.setattr(
-        "bot.services.digest_admin_notify.notify_admins_digest_failure",
-        notify_mock,
+        "bot.services.digest_publisher.publish_digest",
+        publish_mock,
     )
 
     fake_bot = MagicMock()
     await scheduler_mod.digest_weekly_job(fake_bot)
 
-    assert transition_mock.await_count == 1, (
-        f"transition_to_awaiting_review must be called exactly once; got {transition_mock.await_count}"
+    publish_mock.assert_awaited_once()
+    call_kwargs = publish_mock.await_args.kwargs
+    assert call_kwargs["bot"] is fake_bot
+    assert call_kwargs["digest"] is digest
+    assert call_kwargs["digest_config"].source_chat_id == (
+        call_kwargs["digest_config"].destination_chat_id
     )
-    call_kwargs = transition_mock.await_args.kwargs
-    assert call_kwargs["digest_id"] == 4242
-
-    # Admin DM should have been dispatched with the weekly_awaiting_review tag.
-    assert notify_mock.await_count == 1, (
-        "admin DM must fire for weekly_awaiting_review handoff"
-    )
-    notify_kwargs = notify_mock.await_args.kwargs
-    assert notify_kwargs["digest_id"] == 4242
-    assert notify_kwargs["status"] == "awaiting_review"
-    assert notify_kwargs["error_text"] == "weekly_awaiting_review"
 
 
 # ── digest_weekly_job: idempotency-return non-draft statuses ───────────────
@@ -217,12 +191,11 @@ async def test_digest_weekly_job_transitions_draft_to_awaiting_review(
     "existing_status",
     ["awaiting_review", "approved_for_publish", "posting", "posted"],
 )
-async def test_digest_weekly_job_skips_transition_on_non_draft_status(
+async def test_digest_weekly_job_skips_publish_on_non_draft_status(
     db_session, monkeypatch, existing_status
 ):
     """H4 cron status-aware match block: when ``run_digest`` returns an
-    EXISTING row in an advanced status, ``transition_to_awaiting_review``
-    is NOT called (a prior cycle / admin already advanced the state).
+    EXISTING row in an advanced status, it is not posted a second time.
     """
     await _set_flag(db_session, "memory.digests.weekly.enabled", True)
     await db_session.flush()
@@ -235,23 +208,16 @@ async def test_digest_weekly_job_skips_transition_on_non_draft_status(
     digest.id = 555
     digest.status = existing_status
 
-    monkeypatch.setattr(
-        "bot.services.digests.run_digest", AsyncMock(return_value=digest)
-    )
+    monkeypatch.setattr("bot.services.digests.run_digest", AsyncMock(return_value=digest))
 
-    transition_mock = AsyncMock()
-    import sys
-    import types
-
-    fake_review = types.ModuleType("bot.services.digest_review")
-    fake_review.transition_to_awaiting_review = transition_mock
-    monkeypatch.setitem(sys.modules, "bot.services.digest_review", fake_review)
+    publish_mock = AsyncMock()
+    monkeypatch.setattr("bot.services.digest_publisher.publish_digest", publish_mock)
 
     fake_bot = MagicMock()
     await scheduler_mod.digest_weekly_job(fake_bot)
 
-    assert transition_mock.await_count == 0, (
-        f"transition_to_awaiting_review must NOT be called for status={existing_status!r}"
+    assert publish_mock.await_count == 0, (
+        f"publish_digest must NOT be called for status={existing_status!r}"
     )
 
 
@@ -259,9 +225,7 @@ async def test_digest_weekly_job_skips_transition_on_non_draft_status(
 
 
 @pytest.mark.parametrize("error_status", ["failed", "cost_exceeded"])
-async def test_digest_weekly_job_admin_dm_on_error_status(
-    db_session, monkeypatch, error_status
-):
+async def test_digest_weekly_job_admin_dm_on_error_status(db_session, monkeypatch, error_status):
     """H4: ``failed`` / ``cost_exceeded`` paths route to
     ``notify_admins_digest_failure`` so the admin sees the error explicitly.
     """
@@ -277,9 +241,7 @@ async def test_digest_weekly_job_admin_dm_on_error_status(
     digest.status = error_status
     digest.error_text = "weekly_test_error"
 
-    monkeypatch.setattr(
-        "bot.services.digests.run_digest", AsyncMock(return_value=digest)
-    )
+    monkeypatch.setattr("bot.services.digests.run_digest", AsyncMock(return_value=digest))
 
     notify_mock = AsyncMock()
     monkeypatch.setattr(
@@ -301,13 +263,12 @@ async def test_digest_weekly_job_admin_dm_on_error_status(
 # ── digest_weekly_job: APScheduler cron registration ────────────────────────
 
 
-async def test_digest_weekly_job_registered_at_mon_09_15_msk():
-    """AC1 + H8 stagger: weekly cron registered at Mon 09:15 MSK.
+async def test_digest_weekly_job_registered_at_mon_09_00_msk():
+    """Weekly cron is registered at Monday 09:00 MSK.
 
     Inspects the APScheduler registration via ``get_job``. The trigger is
     a ``CronTrigger`` with fields ``day_of_week='mon'``, ``hour=9``,
-    ``minute=15``, ``timezone=Europe/Moscow``. Distinct from the daily
-    cron (every day, hour=9, minute=0).
+    ``minute=0``, ``timezone=Europe/Moscow``.
     """
     from bot.services import scheduler as scheduler_mod
 
@@ -338,7 +299,7 @@ async def test_digest_weekly_job_registered_at_mon_09_15_msk():
         hour = fields_by_name["hour"]
         assert "9" in str(hour), f"hour field={hour!r}"
         minute = fields_by_name["minute"]
-        assert "15" in str(minute), f"minute field={minute!r}"
+        assert "0" in str(minute), f"minute field={minute!r}"
     finally:
         scheduler_mod.scheduler.start = real_start  # type: ignore[assignment]
         for jid in (
@@ -417,9 +378,7 @@ async def test_digest_stale_review_reaper_48h_dm_and_marker(db_session, monkeypa
     )
 
 
-async def test_digest_stale_review_reaper_48h_skips_if_already_notified(
-    db_session, monkeypatch
-):
+async def test_digest_stale_review_reaper_48h_skips_if_already_notified(db_session, monkeypatch):
     """AC7 idempotency: a row already marked ``[48h_notified]`` is NOT
     re-DM'd on the next reaper tick.
     """

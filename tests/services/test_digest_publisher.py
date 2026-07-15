@@ -148,9 +148,7 @@ async def test_publisher_skipped_no_destination(db_session):
     bot_mock = MagicMock()
     bot_mock.send_message = AsyncMock()
 
-    result = await publish_digest(
-        db_session, bot=bot_mock, digest=digest, digest_config=cfg
-    )
+    result = await publish_digest(db_session, bot=bot_mock, digest=digest, digest_config=cfg)
     assert result.status == "skipped_no_destination"
     bot_mock.send_message.assert_not_called()
 
@@ -181,12 +179,288 @@ async def test_publisher_rejects_non_draft_status(db_session):
     cfg = DigestConfig(destination_chat_id=-42)
     bot_mock = MagicMock()
     with pytest.raises(DigestPublisherInvalidState):
+        await publish_digest(db_session, bot=bot_mock, digest=digest, digest_config=cfg)
+
+
+async def test_publisher_nowait_contention_keeps_outer_transaction_usable(
+    postgres_engine,
+    monkeypatch,
+):
+    """A real 55P03 must roll back only its savepoint, not the outer transaction.
+
+    The lock holder is released only after the third failed NOWAIT attempt.  The
+    publisher must then be able to flush its ``publish_lock_timeout`` audit and
+    execute another statement in the same outer transaction.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from bot.db.models import Digest
+    from bot.services import digest_publisher as publisher_module
+    from bot.services.digest_publisher import publish_digest
+    from bot.services.digests import DigestConfig
+
+    session_factory = async_sessionmaker(
+        bind=postgres_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    now = datetime.now(timezone.utc)
+
+    async with session_factory() as setup_session:
+        digest = Digest(
+            type="daily",
+            window_start=now - timedelta(days=1),
+            window_end=now,
+            body_markdown="TL;DR.\n\n- Lock contention regression.",
+            citations=[],
+            status="draft",
+        )
+        setup_session.add(digest)
+        await setup_session.commit()
+        digest_id = digest.id
+
+    try:
+        async with session_factory() as lock_session, session_factory() as publish_session:
+            await lock_session.execute(
+                text("SELECT id FROM digests WHERE id=:id FOR UPDATE"),
+                {"id": digest_id},
+            )
+            publish_digest_row = await publish_session.get(Digest, digest_id)
+            assert publish_digest_row is not None
+
+            sleep_calls = 0
+
+            async def release_lock_after_last_retry(_delay: float) -> None:
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls == 3:
+                    await lock_session.rollback()
+
+            monkeypatch.setattr(
+                publisher_module.asyncio,
+                "sleep",
+                release_lock_after_last_retry,
+            )
+            notify_mock = AsyncMock()
+            monkeypatch.setattr(
+                publisher_module,
+                "notify_admins_digest_failure",
+                notify_mock,
+            )
+            bot_mock = MagicMock()
+            bot_mock.send_message = AsyncMock()
+
+            result = await publish_digest(
+                publish_session,
+                bot=bot_mock,
+                digest=publish_digest_row,
+                digest_config=DigestConfig(destination_chat_id=-1001234567890),
+            )
+
+            assert sleep_calls == 3
+            assert result.status == "failed"
+            assert result.error_text == "publish_lock_timeout"
+            assert (await publish_session.execute(text("SELECT 1"))).scalar_one() == 1
+            notify_mock.assert_awaited_once()
+            bot_mock.send_message.assert_not_awaited()
+            await publish_session.rollback()
+    finally:
+        async with session_factory() as cleanup_session:
+            await cleanup_session.execute(
+                text("DELETE FROM digest_runs WHERE digest_id=:id"),
+                {"id": digest_id},
+            )
+            await cleanup_session.execute(
+                text("DELETE FROM digests WHERE id=:id"),
+                {"id": digest_id},
+            )
+            await cleanup_session.commit()
+
+
+@pytest.mark.parametrize("winner_status", ["posting", "posted"])
+async def test_publisher_lock_exhaustion_does_not_overwrite_concurrent_winner(
+    postgres_engine,
+    monkeypatch,
+    winner_status,
+):
+    """A loser must not replace a concurrently committed winner with ``failed``."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from bot.db.models import Digest
+    from bot.services import digest_publisher as publisher_module
+    from bot.services.digest_publisher import (
+        DigestPublisherInvalidState,
+        publish_digest,
+    )
+    from bot.services.digests import DigestConfig
+
+    session_factory = async_sessionmaker(
+        bind=postgres_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    now = datetime.now(timezone.utc)
+    async with session_factory() as setup_session:
+        digest = Digest(
+            type="daily",
+            window_start=now - timedelta(days=1),
+            window_end=now,
+            body_markdown="TL;DR.\n\n- Concurrent winner regression.",
+            citations=[],
+            status="draft",
+        )
+        setup_session.add(digest)
+        await setup_session.commit()
+        digest_id = digest.id
+
+    try:
+        async with session_factory() as lock_session, session_factory() as publish_session:
+            if winner_status == "posting":
+                await lock_session.execute(
+                    text(
+                        "UPDATE digests SET status='posting', posting_started_at=now() WHERE id=:id"
+                    ),
+                    {"id": digest_id},
+                )
+            else:
+                await lock_session.execute(
+                    text(
+                        "UPDATE digests SET status='posted', posted_chat_id=-10042, "
+                        "posted_message_id=4242, posted_at=now() WHERE id=:id"
+                    ),
+                    {"id": digest_id},
+                )
+
+            stale_digest = await publish_session.get(Digest, digest_id)
+            assert stale_digest is not None
+            assert stale_digest.status == "draft"
+            sleep_calls = 0
+
+            async def commit_winner_after_last_retry(_delay: float) -> None:
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls == 3:
+                    await lock_session.commit()
+
+            monkeypatch.setattr(
+                publisher_module.asyncio,
+                "sleep",
+                commit_winner_after_last_retry,
+            )
+            notify_mock = AsyncMock()
+            monkeypatch.setattr(
+                publisher_module,
+                "notify_admins_digest_failure",
+                notify_mock,
+            )
+            bot_mock = MagicMock()
+            bot_mock.send_message = AsyncMock()
+
+            with pytest.raises(DigestPublisherInvalidState) as exc_info:
+                await publish_digest(
+                    publish_session,
+                    bot=bot_mock,
+                    digest=stale_digest,
+                    digest_config=DigestConfig(destination_chat_id=-1001234567890),
+                )
+
+            assert sleep_calls == 3
+            assert exc_info.value.digest_id == digest_id
+            assert exc_info.value.current_status == winner_status
+            notify_mock.assert_not_awaited()
+            bot_mock.send_message.assert_not_awaited()
+            await publish_session.rollback()
+
+        async with session_factory() as verify_session:
+            winner = (
+                await verify_session.execute(
+                    text("SELECT status, error_text FROM digests WHERE id=:id"),
+                    {"id": digest_id},
+                )
+            ).one()
+            assert tuple(winner) == (winner_status, None)
+            failed_runs = (
+                await verify_session.execute(
+                    text(
+                        "SELECT count(*) FROM digest_runs WHERE digest_id=:id AND status='failed'"
+                    ),
+                    {"id": digest_id},
+                )
+            ).scalar_one()
+            assert failed_runs == 0
+    finally:
+        async with session_factory() as cleanup_session:
+            await cleanup_session.execute(
+                text("DELETE FROM digest_runs WHERE digest_id=:id"),
+                {"id": digest_id},
+            )
+            await cleanup_session.execute(
+                text("DELETE FROM digests WHERE id=:id"),
+                {"id": digest_id},
+            )
+            await cleanup_session.commit()
+
+
+async def test_publisher_nowait_retry_does_not_mask_other_db_failures(
+    db_session,
+    monkeypatch,
+):
+    """Only SQLSTATE 55P03 is retryable; unrelated DB failures fail fast."""
+    from sqlalchemy.exc import DBAPIError
+
+    from bot.db.models import Digest
+    from bot.services import digest_publisher as publisher_module
+    from bot.services.digest_publisher import publish_digest
+    from bot.services.digests import DigestConfig
+
+    digest = Digest(
+        type="daily",
+        window_start=datetime.now(timezone.utc) - timedelta(days=1),
+        window_end=datetime.now(timezone.utc),
+        body_markdown="TL;DR.\n\n- Unexpected database error.",
+        citations=[],
+        status="draft",
+    )
+    db_session.add(digest)
+    await db_session.flush()
+
+    class ConnectionFailure(Exception):
+        sqlstate = "08006"
+
+    expected_error = DBAPIError(
+        "SELECT ... FOR UPDATE NOWAIT",
+        {"id": digest.id},
+        ConnectionFailure("connection failure"),
+        False,
+    )
+    real_execute = db_session.execute
+
+    async def execute_with_unexpected_lock_error(statement, parameters=None, **kwargs):
+        if "FOR UPDATE NOWAIT" in str(statement):
+            raise expected_error
+        return await real_execute(statement, parameters, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", execute_with_unexpected_lock_error)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(publisher_module.asyncio, "sleep", sleep_mock)
+    bot_mock = MagicMock()
+    bot_mock.send_message = AsyncMock()
+
+    with pytest.raises(DBAPIError) as exc_info:
         await publish_digest(
-            db_session, bot=bot_mock, digest=digest, digest_config=cfg
+            db_session,
+            bot=bot_mock,
+            digest=digest,
+            digest_config=DigestConfig(destination_chat_id=-1001234567890),
         )
 
+    assert exc_info.value is expected_error
+    sleep_mock.assert_not_awaited()
+    bot_mock.send_message.assert_not_awaited()
+    assert (await real_execute(text("SELECT 1"))).scalar_one() == 1
 
-async def test_publisher_happy_path_with_clean_citations(db_session):
+
+async def test_publisher_happy_path_with_clean_citations(db_session, monkeypatch):
     """Insert real message+version + card+source, citations point to them,
     publisher transitions draft→posting→posted."""
     from bot.db.models import (
@@ -242,19 +516,31 @@ async def test_publisher_happy_path_with_clean_citations(db_session):
     await db_session.flush()
 
     cfg = DigestConfig(destination_chat_id=-1001234567890)
+    events: list[str] = []
+    real_commit = db_session.commit
+
+    async def tracked_commit():
+        events.append("commit")
+        await real_commit()
+
+    monkeypatch.setattr(db_session, "commit", tracked_commit)
     bot_mock = MagicMock()
     bot_mock.send_message = AsyncMock()
     sent_msg = MagicMock()
     sent_msg.message_id = 777
-    bot_mock.send_message.return_value = sent_msg
 
-    result = await publish_digest(
-        db_session, bot=bot_mock, digest=digest, digest_config=cfg
-    )
+    async def send_message(**kwargs):
+        events.append("send")
+        return sent_msg
+
+    bot_mock.send_message.side_effect = send_message
+
+    result = await publish_digest(db_session, bot=bot_mock, digest=digest, digest_config=cfg)
     assert result.status == "posted", f"got status={result.status} err={result.error_text}"
     assert result.posted_message_id == 777
     assert result.posted_chat_id == cfg.destination_chat_id
     bot_mock.send_message.assert_awaited_once()
+    assert events == ["commit", "send", "commit"]
 
 
 async def test_redactor_masks_affected_bullet(db_session):
@@ -286,10 +572,16 @@ async def test_redactor_masks_affected_bullet(db_session):
     )
 
     # Re-fetch
-    row = (await db_session.execute(
-        text("SELECT body_markdown, citations, status FROM digests WHERE id = :id"),
-        {"id": did},
-    )).mappings().one()
+    row = (
+        (
+            await db_session.execute(
+                text("SELECT body_markdown, citations, status FROM digests WHERE id = :id"),
+                {"id": did},
+            )
+        )
+        .mappings()
+        .one()
+    )
     assert row["status"] == "redacted"
     assert "[REDACTED — забыто]" in row["body_markdown"]
     assert "First" not in row["body_markdown"]
@@ -367,10 +659,16 @@ async def test_idempotency_path_returns_session_attached_digest(db_session):
     # Also verify that mutating the returned object does persist to the DB.
     idempotency_digest.status = "posting"
     await db_session.flush()
-    row = (await db_session.execute(
-        __import__("sqlalchemy").text("SELECT status FROM digests WHERE id = :id"),
-        {"id": pre_id},
-    )).mappings().one()
+    row = (
+        (
+            await db_session.execute(
+                __import__("sqlalchemy").text("SELECT status FROM digests WHERE id = :id"),
+                {"id": pre_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
     assert row["status"] == "posting", (
         f"Mutation on idempotency-returned digest must persist, got {row['status']!r}"
     )
@@ -468,10 +766,16 @@ async def test_cascade_worker_with_bot_calls_edit_message_text(db_session):
     )
 
     # Verify the digest was also properly redacted in the DB
-    row = (await db_session.execute(
-        __import__("sqlalchemy").text("SELECT status FROM digests WHERE id = :id"),
-        {"id": did},
-    )).mappings().one()
+    row = (
+        (
+            await db_session.execute(
+                __import__("sqlalchemy").text("SELECT status FROM digests WHERE id = :id"),
+                {"id": did},
+            )
+        )
+        .mappings()
+        .one()
+    )
     assert row["status"] in ("redacted", "redacted_edit_failed"), (
         f"Digest must be redacted after cascade, got status={row['status']!r}"
     )
@@ -550,13 +854,17 @@ async def test_cascade_digests_layer_redacts_via_cascade_worker(db_session):
     # the body contains the REDACTED marker.
     await run_cascade_worker_once(db_session, batch_size=10)
 
-    row = (await db_session.execute(
-        text("SELECT status, body_markdown FROM digests WHERE id = :id"),
-        {"id": did},
-    )).mappings().one()
-    assert row["status"] in ("redacted", "redacted_edit_failed"), (
-        f"got status={row['status']}"
+    row = (
+        (
+            await db_session.execute(
+                text("SELECT status, body_markdown FROM digests WHERE id = :id"),
+                {"id": did},
+            )
+        )
+        .mappings()
+        .one()
     )
+    assert row["status"] in ("redacted", "redacted_edit_failed"), f"got status={row['status']}"
     assert "[REDACTED — забыто]" in row["body_markdown"]
 
 
@@ -592,17 +900,11 @@ async def test_redactor_widens_to_review_states(db_session, review_status):
         status=review_status,
         # ck_digests_approved_audit needs published_by_admin_id + approved_at
         # for weekly approved_for_publish / posting / posted statuses.
-        published_by_admin_id=(
-            42 if review_status == "approved_for_publish" else None
-        ),
+        published_by_admin_id=(42 if review_status == "approved_for_publish" else None),
         approved_at=(
-            datetime.now(timezone.utc)
-            if review_status == "approved_for_publish"
-            else None
+            datetime.now(timezone.utc) if review_status == "approved_for_publish" else None
         ),
-        review_notes=(
-            "test reject" if review_status == "rejected_by_admin" else None
-        ),
+        review_notes=("test reject" if review_status == "rejected_by_admin" else None),
     )
     db_session.add(digest)
     await db_session.flush()
@@ -616,10 +918,16 @@ async def test_redactor_widens_to_review_states(db_session, review_status):
         bot=None,
     )
 
-    row = (await db_session.execute(
-        text("SELECT status, body_markdown FROM digests WHERE id = :id"),
-        {"id": did},
-    )).mappings().one()
+    row = (
+        (
+            await db_session.execute(
+                text("SELECT status, body_markdown FROM digests WHERE id = :id"),
+                {"id": did},
+            )
+        )
+        .mappings()
+        .one()
+    )
     assert row["status"] == "redacted", (
         f"redactor failed to mask {review_status!r} row: status stayed {row['status']!r} — "
         f"silent privacy regression"
@@ -642,9 +950,7 @@ async def test_redactor_awaiting_review_notifies_admin(db_session, monkeypatch):
     async def _spy(bot, *, digest_id, status, error_text):
         captured.append((digest_id, status, error_text))
 
-    monkeypatch.setattr(
-        "bot.services.digest_redactor.notify_admins_digest_failure", _spy
-    )
+    monkeypatch.setattr("bot.services.digest_redactor.notify_admins_digest_failure", _spy)
 
     digest = Digest(
         type="weekly",
@@ -710,9 +1016,11 @@ async def test_redactor_skips_terminal_no_body_states(db_session, terminal_statu
         bot=None,
     )
 
-    row = (await db_session.execute(
-        text("SELECT status FROM digests WHERE id = :id"), {"id": did}
-    )).mappings().one()
+    row = (
+        (await db_session.execute(text("SELECT status FROM digests WHERE id = :id"), {"id": did}))
+        .mappings()
+        .one()
+    )
     assert row["status"] == terminal_status
 
 
@@ -784,12 +1092,9 @@ async def test_publisher_accepts_approved_for_publish(db_session):
     sent_msg.message_id = 778
     bot_mock.send_message.return_value = sent_msg
 
-    result = await publish_digest(
-        db_session, bot=bot_mock, digest=digest, digest_config=cfg
-    )
+    result = await publish_digest(db_session, bot=bot_mock, digest=digest, digest_config=cfg)
     assert result.status == "posted", (
-        f"publisher rejected approved_for_publish: status={result.status} "
-        f"err={result.error_text}"
+        f"publisher rejected approved_for_publish: status={result.status} err={result.error_text}"
     )
     assert result.posted_message_id == 778
 
@@ -821,9 +1126,7 @@ async def test_publisher_invalid_state_has_structured_fields(db_session):
     cfg = DigestConfig(destination_chat_id=-42)
     bot_mock = MagicMock()
     with pytest.raises(DigestPublisherInvalidState) as exc_info:
-        await publish_digest(
-            db_session, bot=bot_mock, digest=digest, digest_config=cfg
-        )
+        await publish_digest(db_session, bot=bot_mock, digest=digest, digest_config=cfg)
     assert exc_info.value.digest_id == digest.id
     assert exc_info.value.current_status == "posted"
     assert "draft" in exc_info.value.reason
@@ -864,9 +1167,7 @@ async def test_publisher_classifier_row_deleted_distinguishes_from_wrong_state(
 
     # Race: row DELETEd before publish runs (operator manual cleanup or
     # --regenerate racing).
-    await db_session.execute(
-        text("DELETE FROM digests WHERE id=:id"), {"id": did}
-    )
+    await db_session.execute(text("DELETE FROM digests WHERE id=:id"), {"id": did})
     await db_session.flush()
 
     # The Python `digest` object still has status='draft' in memory so the
@@ -877,9 +1178,7 @@ async def test_publisher_classifier_row_deleted_distinguishes_from_wrong_state(
     bot_mock = MagicMock()
     bot_mock.send_message = AsyncMock()
     with pytest.raises(DigestPublisherInvalidState) as exc_info:
-        await publish_digest(
-            db_session, bot=bot_mock, digest=digest, digest_config=cfg
-        )
+        await publish_digest(db_session, bot=bot_mock, digest=digest, digest_config=cfg)
     assert exc_info.value.digest_id == did
     assert exc_info.value.current_status is None
     assert "row_deleted_during_transition" in exc_info.value.reason
@@ -915,10 +1214,7 @@ async def test_publisher_classifier_wrong_state_after_guard_miss(db_session):
     # UPDATE — but the Python `digest` object still says 'draft' so the
     # trigger guard passes.
     await db_session.execute(
-        text(
-            "UPDATE digests SET status='redacted', updated_at=now() "
-            "WHERE id=:id"
-        ),
+        text("UPDATE digests SET status='redacted', updated_at=now() WHERE id=:id"),
         {"id": did},
     )
     await db_session.flush()
@@ -927,9 +1223,7 @@ async def test_publisher_classifier_wrong_state_after_guard_miss(db_session):
     bot_mock = MagicMock()
     bot_mock.send_message = AsyncMock()
     with pytest.raises(DigestPublisherInvalidState) as exc_info:
-        await publish_digest(
-            db_session, bot=bot_mock, digest=digest, digest_config=cfg
-        )
+        await publish_digest(db_session, bot=bot_mock, digest=digest, digest_config=cfg)
     assert exc_info.value.digest_id == did
     assert exc_info.value.current_status == "redacted"
     assert "expected status IN" in exc_info.value.reason
@@ -1011,10 +1305,16 @@ async def test_cascade_digests_scans_review_states(db_session):
 
     await run_cascade_worker_once(db_session, batch_size=10)
 
-    row = (await db_session.execute(
-        text("SELECT status, body_markdown FROM digests WHERE id=:id"),
-        {"id": did},
-    )).mappings().one()
+    row = (
+        (
+            await db_session.execute(
+                text("SELECT status, body_markdown FROM digests WHERE id=:id"),
+                {"id": did},
+            )
+        )
+        .mappings()
+        .one()
+    )
     assert row["status"] in ("redacted", "redacted_edit_failed"), (
         f"awaiting_review digest must be redacted by cascade — privacy "
         f"regression: got status={row['status']!r}"

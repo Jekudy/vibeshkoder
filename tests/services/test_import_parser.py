@@ -22,19 +22,23 @@ REPLIES_WITH_MEDIA = FIXTURE_DIR / "replies_with_media.json"
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _parse(path: Path):
     from bot.services.import_parser import parse_export
+
     return parse_export(path)
 
 
 def _report_as_dict(path: Path) -> dict:
     from dataclasses import asdict
+
     return asdict(_parse(path))
 
 
 # ---------------------------------------------------------------------------
 # 1. small_chat basic counts
 # ---------------------------------------------------------------------------
+
 
 def test_parse_small_chat_returns_report():
     report = _parse(SMALL_CHAT)
@@ -50,32 +54,33 @@ def test_parse_small_chat_returns_report():
 # 2. distinct users
 # ---------------------------------------------------------------------------
 
+
 def test_parse_small_chat_distinct_users():
     report = _parse(SMALL_CHAT)
     # user1000001, user1000002, user1000003 — 3 distinct user from_id values
     assert report.distinct_users == 3
-    assert sorted(report.distinct_export_user_ids) == [
-        "user1000001", "user1000002", "user1000003"
-    ]
+    assert sorted(report.distinct_export_user_ids) == ["user1000001", "user1000002", "user1000003"]
 
 
 # ---------------------------------------------------------------------------
 # 3. message_kind_counts
 # ---------------------------------------------------------------------------
 
+
 def test_parse_small_chat_kind_counts():
     report = _parse(SMALL_CHAT)
     counts = report.message_kind_counts
-    assert counts.get("text", 0) >= 1    # id 1001, 1004
-    assert counts.get("photo", 0) >= 1   # id 1002
-    assert counts.get("voice", 0) >= 1   # id 1003
-    assert counts.get("forward", 0) >= 1 # id 1005
-    assert counts.get("service", 0) == 1 # id 1006
+    assert counts.get("text", 0) >= 1  # id 1001, 1004
+    assert counts.get("photo", 0) >= 1  # id 1002
+    assert counts.get("voice", 0) >= 1  # id 1003
+    assert counts.get("forward", 0) >= 1  # id 1005
+    assert counts.get("service", 0) == 1  # id 1006
 
 
 # ---------------------------------------------------------------------------
 # 4. date range
 # ---------------------------------------------------------------------------
+
 
 def test_parse_small_chat_date_range():
     report = _parse(SMALL_CHAT)
@@ -92,6 +97,7 @@ def test_parse_small_chat_date_range():
 # 5. reply count
 # ---------------------------------------------------------------------------
 
+
 def test_parse_small_chat_reply_count():
     report = _parse(SMALL_CHAT)
     # id 1004 replies to 1001 (non-dangling)
@@ -103,6 +109,7 @@ def test_parse_small_chat_reply_count():
 # 6. no duplicates
 # ---------------------------------------------------------------------------
 
+
 def test_parse_small_chat_no_duplicates():
     report = _parse(SMALL_CHAT)
     assert report.duplicate_export_msg_ids == []
@@ -111,6 +118,7 @@ def test_parse_small_chat_no_duplicates():
 # ---------------------------------------------------------------------------
 # 7. no policy markers in small_chat
 # ---------------------------------------------------------------------------
+
 
 def test_parse_small_chat_no_policy_markers():
     report = _parse(SMALL_CHAT)
@@ -122,6 +130,7 @@ def test_parse_small_chat_no_policy_markers():
 # 8. edited_messages edit count
 # ---------------------------------------------------------------------------
 
+
 def test_parse_edited_messages_counts_edits():
     report = _parse(EDITED_MESSAGES)
     # id 2001 and id 2002 both have `edited` field
@@ -132,15 +141,17 @@ def test_parse_edited_messages_counts_edits():
 # 9. edited_messages policy counts
 # ---------------------------------------------------------------------------
 
-def test_parse_edited_messages_counts_policy():
+
+def test_parse_edited_messages_ignores_legacy_policy_markers():
     report = _parse(EDITED_MESSAGES)
-    assert report.policy_marker_counts["nomem"] >= 1    # id 2003 has #nomem
-    assert report.policy_marker_counts["offrecord"] >= 1  # id 2004 has #offrecord
+    # Phase 13 keeps the complete human history.  Legacy markers are plain text.
+    assert report.policy_marker_counts == {"normal": 5, "nomem": 0, "offrecord": 0}
 
 
 # ---------------------------------------------------------------------------
 # 10. replies_with_media dangling reply
 # ---------------------------------------------------------------------------
+
 
 def test_parse_replies_with_media_dangling_reply():
     report = _parse(REPLIES_WITH_MEDIA)
@@ -152,6 +163,7 @@ def test_parse_replies_with_media_dangling_reply():
 # 11. anonymous channel messages
 # ---------------------------------------------------------------------------
 
+
 def test_parse_replies_anonymous_channel():
     report = _parse(REPLIES_WITH_MEDIA)
     # id 3006 has from_id="channel1000050"
@@ -162,8 +174,10 @@ def test_parse_replies_anonymous_channel():
 # 12. no content in report
 # ---------------------------------------------------------------------------
 
+
 def test_parse_returns_no_content_in_report():
     from dataclasses import asdict
+
     report = _parse(SMALL_CHAT)
     payload = asdict(report)
     # Convert datetimes to strings for serialisation
@@ -182,6 +196,7 @@ def test_parse_returns_no_content_in_report():
 # 13. invalid JSON raises
 # ---------------------------------------------------------------------------
 
+
 def test_parse_invalid_json_raises(tmp_path: Path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not valid json", encoding="utf-8")
@@ -192,6 +207,7 @@ def test_parse_invalid_json_raises(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # 14. missing messages array raises
 # ---------------------------------------------------------------------------
+
 
 def test_parse_missing_messages_array_raises(tmp_path: Path):
     f = tmp_path / "no_messages.json"
@@ -204,6 +220,7 @@ def test_parse_missing_messages_array_raises(tmp_path: Path):
 # 15. full account export raises
 # ---------------------------------------------------------------------------
 
+
 def test_parse_full_account_export_raises(tmp_path: Path):
     f = tmp_path / "full_export.json"
     f.write_text(json.dumps({"chats": [{"name": "Chat", "messages": []}]}), encoding="utf-8")
@@ -215,6 +232,7 @@ def test_parse_full_account_export_raises(tmp_path: Path):
 # 16. missing file raises FileNotFoundError
 # ---------------------------------------------------------------------------
 
+
 def test_parse_missing_file_raises():
     with pytest.raises(FileNotFoundError):
         _parse(Path("/nonexistent/path/export.json"))
@@ -223,6 +241,7 @@ def test_parse_missing_file_raises():
 # ---------------------------------------------------------------------------
 # 17. mixed-array text message parses without crash
 # ---------------------------------------------------------------------------
+
 
 def test_parse_mixed_array_text_handled():
     report = _parse(SMALL_CHAT)
@@ -236,8 +255,10 @@ def test_parse_mixed_array_text_handled():
 # 18. helper unit tests: _extract_text_string
 # ---------------------------------------------------------------------------
 
+
 def test_extract_text_string_handles_string():
     from bot.services.import_parser import _extract_text_string
+
     assert _extract_text_string("hello") == "hello"
     assert _extract_text_string("") == ""
     assert _extract_text_string(None) == ""
@@ -245,6 +266,7 @@ def test_extract_text_string_handles_string():
 
 def test_extract_text_string_handles_mixed_array():
     from bot.services.import_parser import _extract_text_string
+
     mixed = [
         "Interesting article: ",
         {"type": "text_link", "text": "read more", "href": "https://example.com"},
@@ -257,6 +279,7 @@ def test_extract_text_string_handles_mixed_array():
 # ---------------------------------------------------------------------------
 # 19. _classify_td_kind priority
 # ---------------------------------------------------------------------------
+
 
 def test_classify_td_kind_priority():
     from bot.services.import_parser import _classify_td_kind
@@ -278,12 +301,14 @@ def test_classify_td_kind_priority():
 # 20. governance detect_policy called for each user message
 # ---------------------------------------------------------------------------
 
+
 def test_governance_called_per_message():
     from bot.services.import_parser import parse_export
 
-    with patch("bot.services.import_parser.detect_policy", wraps=__import__(
-        "bot.services.governance", fromlist=["detect_policy"]
-    ).detect_policy) as mock_dp:
+    with patch(
+        "bot.services.import_parser.detect_policy",
+        wraps=__import__("bot.services.governance", fromlist=["detect_policy"]).detect_policy,
+    ) as mock_dp:
         report = parse_export(SMALL_CHAT)
         # Must be called for each user message (5), NOT for service messages
         assert mock_dp.call_count == report.user_messages
@@ -293,8 +318,9 @@ def test_governance_called_per_message():
 # 21. Fix 1 — text_entities fallback for governance when text is empty
 # ---------------------------------------------------------------------------
 
-def test_text_entities_fallback_detects_nomem_policy(tmp_path: Path):
-    """When text='' but text_entities contains #nomem, governance must fire."""
+
+def test_text_entities_nomem_marker_is_plain_text(tmp_path: Path):
+    """Legacy policy-looking entities do not remove data from complete history."""
     export = {
         "id": -100111,
         "name": "Test",
@@ -318,20 +344,25 @@ def test_text_entities_fallback_detects_nomem_policy(tmp_path: Path):
     f = tmp_path / "entities_only.json"
     f.write_text(json.dumps(export), encoding="utf-8")
     from bot.services.import_parser import parse_export
+
     report = parse_export(f)
-    assert report.policy_marker_counts["nomem"] == 1
+    assert report.policy_marker_counts == {"normal": 1, "nomem": 0, "offrecord": 0}
 
 
 # ---------------------------------------------------------------------------
 # 22. Fix 2 — _extract_text_string tolerant about malformed array elements
 # ---------------------------------------------------------------------------
 
+
 def test_extract_text_string_tolerant_mixed_array():
     """Must not crash on non-str/non-dict items; coerce ints, skip None text, recurse lists."""
     from bot.services.import_parser import _extract_text_string
+
     # 'a' → kept, 5 → coerced to '5', {type:x, text:None} → skip (None text),
     # {type:y} → no text key → skip, ['nested', 'list'] → recurse to 'nestedlist'
-    result = _extract_text_string(["a", 5, {"type": "x", "text": None}, {"type": "y"}, ["nested", "list"]])
+    result = _extract_text_string(
+        ["a", 5, {"type": "x", "text": None}, {"type": "y"}, ["nested", "list"]]
+    )
     assert result == "a5nestedlist"
 
 
@@ -339,11 +370,15 @@ def test_extract_text_string_tolerant_mixed_array():
 # 23. Fix 3 — _classify_td_kind returns 'unknown' + warning for unknown media_type
 # ---------------------------------------------------------------------------
 
+
 def test_classify_td_kind_unknown_media_type_emits_warning():
     """Unknown media_type → return 'unknown', append a warning string."""
     from bot.services.import_parser import _classify_td_kind
+
     warnings: list[str] = []
-    result = _classify_td_kind({"type": "message", "media_type": "unknown_xyz", "text": "hello"}, warnings=warnings)
+    result = _classify_td_kind(
+        {"type": "message", "media_type": "unknown_xyz", "text": "hello"}, warnings=warnings
+    )
     assert result == "unknown"
     assert any("unknown_xyz" in w for w in warnings)
 
@@ -351,6 +386,7 @@ def test_classify_td_kind_unknown_media_type_emits_warning():
 # ---------------------------------------------------------------------------
 # 24. Fix 5 — parse warning emitted for non-str from_id
 # ---------------------------------------------------------------------------
+
 
 def test_parse_warning_for_int_from_id(tmp_path: Path):
     """from_id=12345 (int) must emit a parse warning."""
@@ -373,5 +409,6 @@ def test_parse_warning_for_int_from_id(tmp_path: Path):
     f = tmp_path / "int_from_id.json"
     f.write_text(json.dumps(export), encoding="utf-8")
     from bot.services.import_parser import parse_export
+
     report = parse_export(f)
     assert any("from_id" in w for w in report.parse_warnings)

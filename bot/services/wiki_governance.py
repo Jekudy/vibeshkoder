@@ -15,7 +15,7 @@ matching is done inside the SQL via `forget_events.tombstone_key` prefix
 comparison — matching the project-wide read-side convention used in
 search.py / extractor.py / llm_gateway.py / governance_revalidation.py.
 
-Invalid conditions checked (7 total):
+Invalid conditions checked:
 1. card_status != 'approved'        → reason "archived"
 2. message_version.is_redacted      → reason "redacted"
 3. chat_messages.memory_policy = 'offrecord' or 'forgotten'
@@ -31,6 +31,10 @@ Invalid conditions checked (7 total):
    (surfaced on the card citation, not on the underlying mv)
 8. card cited but card_sources_count = 0 (all sources have been deleted)
                                     → reason "transitive_forget"
+9. message_version is not the chat_message current version
+                                    → reason "non_current"
+10. source belongs to a different explicit chat scope
+                                    → reason "wrong_chat"
 
 Join chain used: message_versions.chat_message_id → chat_messages.id
 (NOT message_versions.message_id — that column does not exist on the table).
@@ -121,7 +125,10 @@ SELECT
     a.source_kind,
     a.card_id,
     mv.is_redacted          AS mv_is_redacted,
+    cm.is_redacted          AS cm_is_redacted,
     cm.memory_policy        AS cm_memory_policy,
+    cm.current_version_id = mv.id AS mv_is_current,
+    cm.chat_id              AS source_chat_id,
     EXISTS (
         SELECT 1 FROM forget_events fe
         WHERE fe.status IN ('pending','processing','completed')
@@ -157,7 +164,8 @@ class SourceCheckResult:
         reasons:         Mapping from "card:<uuid>" or "mvid:<id>" to a short
                          reason string: "archived", "redacted", "offrecord",
                          "forgotten", "tombstone:message_hash", "tombstone:user",
-                         "transitive_forget" (covers both "card with no clean
+                         "non_current", "wrong_chat", "transitive_forget"
+                         (covers both "card with no clean
                          transitive source remaining" AND "card with zero
                          card_sources rows left after cascade").
     """
@@ -187,6 +195,7 @@ async def validate_sources(
     session: AsyncSession,
     *,
     page_id: uuid.UUID | int,
+    source_chat_id: int | None = None,
 ) -> SourceCheckResult:
     """Validate all sources cited by a wiki page.
 
@@ -211,6 +220,12 @@ async def validate_sources(
     if isinstance(page_id, int):
         # Accept UUID.int for test convenience — convert back to UUID
         page_id = uuid.UUID(int=page_id)
+    if source_chat_id is not None and (
+        isinstance(source_chat_id, bool)
+        or not isinstance(source_chat_id, int)
+        or source_chat_id == 0
+    ):
+        raise ValueError("source_chat_id must be a non-zero integer")
 
     page_id_str = str(page_id)
 
@@ -220,17 +235,13 @@ async def validate_sources(
 
     # ── Step 0: page must exist ───────────────────────────────────────────────
     page_exists = (
-        await session.execute(
-            text(_PAGE_EXISTS_QUERY_SQL), {"page_id": page_id_str}
-        )
+        await session.execute(text(_PAGE_EXISTS_QUERY_SQL), {"page_id": page_id_str})
     ).scalar()
     if not page_exists:
         raise WikiPageNotFoundError(f"wiki_page {page_id} does not exist")
 
     # ── Step 1: fetch card statuses + card_sources counts ─────────────────────
-    card_rows = (
-        await session.execute(text(_CARDS_QUERY_SQL), {"page_id": page_id_str})
-    ).fetchall()
+    card_rows = (await session.execute(text(_CARDS_QUERY_SQL), {"page_id": page_id_str})).fetchall()
 
     # card_id → (status, cs_count)
     card_info: dict[uuid.UUID, tuple[str, int]] = {}
@@ -248,13 +259,17 @@ async def validate_sources(
     # Each row carries per-mv tombstone-active booleans evaluated in-SQL via
     # forget_events.tombstone_key prefix matching (not target_id).
     mv_rows = (
-        await session.execute(text(BATCHED_QUERY_SQL), {"page_id": page_id_str})
+        await session.execute(
+            text(BATCHED_QUERY_SQL),
+            {"page_id": page_id_str},
+        )
     ).fetchall()
 
     # ── Step 3: evaluate each mv row ─────────────────────────────────────────
     # Track which transitive card ids have ANY valid source remaining.
     transitive_card_ids: set[uuid.UUID] = set()
     card_has_clean_source: dict[uuid.UUID, bool] = {}
+    card_invalid_reason: dict[uuid.UUID, str] = {}
 
     for row in mv_rows:
         mv_id = int(row.mv_id)
@@ -269,7 +284,10 @@ async def validate_sources(
 
         mv_reason = _classify_mv(
             mv_is_redacted=bool(row.mv_is_redacted),
+            cm_is_redacted=bool(row.cm_is_redacted),
             cm_memory_policy=str(row.cm_memory_policy),
+            mv_is_current=bool(row.mv_is_current),
+            wrong_chat=(source_chat_id is not None and int(row.source_chat_id) != source_chat_id),
             fe_msg_active=bool(row.fe_msg_active),
             fe_hash_active=bool(row.fe_hash_active),
             fe_user_active=bool(row.fe_user_active),
@@ -284,6 +302,8 @@ async def validate_sources(
                 if mv_id not in invalid_mvids:
                     invalid_mvids.append(mv_id)
                     reasons[f"mvid:{mv_id}"] = mv_reason
+            elif card_id is not None:
+                card_invalid_reason.setdefault(card_id, mv_reason)
             # For transitive: do NOT flag the mv directly; flag the card instead
             # (handled below after we know all sources)
 
@@ -291,10 +311,11 @@ async def validate_sources(
     for cid in transitive_card_ids:
         if cid in {c for c in invalid_card_ids}:
             continue
-        if not card_has_clean_source.get(cid, False):
+        strict_reason = card_invalid_reason.get(cid) if source_chat_id is not None else None
+        if strict_reason is not None or not card_has_clean_source.get(cid, False):
             if cid not in invalid_card_ids:
                 invalid_card_ids.append(cid)
-                reasons[f"card:{cid}"] = "transitive_forget"
+                reasons[f"card:{cid}"] = strict_reason or "transitive_forget"
 
     # ── Step 5: flag cards whose card_sources_count = 0 (no rows reachable) ──
     # Read the count from the cards query result — no extra round-trip.
@@ -305,7 +326,10 @@ async def validate_sources(
             invalid_card_ids.append(cid)
             reasons[f"card:{cid}"] = "transitive_forget"
 
-    valid = not invalid_card_ids and not invalid_mvids
+    if source_chat_id is not None and not card_rows and not mv_rows:
+        reasons["page"] = "sources_missing"
+
+    valid = not invalid_card_ids and not invalid_mvids and "page" not in reasons
 
     return SourceCheckResult(
         valid=valid,
@@ -321,20 +345,29 @@ async def validate_sources(
 def _classify_mv(
     *,
     mv_is_redacted: bool,
+    cm_is_redacted: bool,
     cm_memory_policy: str,
+    mv_is_current: bool,
+    wrong_chat: bool,
     fe_msg_active: bool,
     fe_hash_active: bool,
     fe_user_active: bool,
 ) -> str | None:
     """Return the first invalid reason for this mv, or None if clean.
 
-    Priority order: redacted → offrecord → forgotten (message) →
-    tombstone:message_hash → tombstone:user.
+    Priority order: wrong_chat → non_current → redacted → offrecord →
+    forgotten (message) → tombstone:message_hash → tombstone:user.
 
     All tombstone booleans come from the BATCHED_QUERY_SQL EXISTS clauses,
     which match against forget_events.tombstone_key prefix (not target_id).
     """
-    if mv_is_redacted:
+    if wrong_chat:
+        return "wrong_chat"
+
+    if not mv_is_current:
+        return "non_current"
+
+    if mv_is_redacted or cm_is_redacted:
         return "redacted"
 
     if cm_memory_policy in ("offrecord", "forgotten"):

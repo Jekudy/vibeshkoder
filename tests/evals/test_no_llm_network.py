@@ -65,9 +65,7 @@ def test_guard_positive_async_non_llm_call_is_allowed(httpx_llm_guard: None) -> 
     """
 
     async def _make_call() -> httpx.Response:
-        transport = httpx.MockTransport(
-            handler=lambda request: httpx.Response(200)
-        )
+        transport = httpx.MockTransport(handler=lambda request: httpx.Response(200))
         async with httpx.AsyncClient(transport=transport) as client:
             return await client.get("https://example.com/api")
 
@@ -123,6 +121,14 @@ def test_guard_negative_google_gemini_hostname_is_detected() -> None:
     with httpx.Client(event_hooks={"request": [hook]}) as client:
         with pytest.raises(LLMNetworkCallDetected, match="generativelanguage.googleapis.com"):
             client.get("https://generativelanguage.googleapis.com/v1beta/models")
+
+
+def test_guard_negative_deepseek_hostname_is_detected() -> None:
+    """The configured low-cost text provider remains behind the gateway in evals."""
+    hook = make_llm_guard_hook()
+    with httpx.Client(event_hooks={"request": [hook]}) as client:
+        with pytest.raises(LLMNetworkCallDetected, match="api.deepseek.com"):
+            client.post("https://api.deepseek.com/chat/completions", json={})
 
 
 def test_guard_fixture_noop_without_eval_env(monkeypatch: pytest.MonkeyPatch) -> None:
