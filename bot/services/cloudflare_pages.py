@@ -12,12 +12,14 @@ import hashlib
 import ipaddress
 import os
 import re
+import shutil
 import subprocess
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal, Protocol, TypeAlias
 from urllib.parse import urlsplit
 
@@ -202,8 +204,9 @@ async def publish_static_generation(
 
     A session-level advisory lock serializes deployments to the same project and
     branch.  Historical success is only an optimization hint: the current live
-    generation marker must still match before an upload can be skipped.  The tree
-    audit is the final operation before spawning the pinned Wrangler process.
+    generation marker must still match before an upload can be skipped.  Both
+    canonical and disposable deploy trees are audited before spawning Wrangler;
+    the disposable tree is audited again before smoke verification.
     """
 
     if not _MANIFEST_RE.fullmatch(expected_manifest_sha256):
@@ -211,6 +214,7 @@ async def publish_static_generation(
     resolved_config = config or load_cloudflare_pages_config()
     resolved_engine = db_engine or _default_engine()
     resolved_smoke_check = smoke_check or _public_smoke_check
+    resolved_forbidden_origins = tuple(forbidden_origins)
     identity = {
         "manifest_sha256": expected_manifest_sha256,
         "project": resolved_config.project,
@@ -239,7 +243,7 @@ async def publish_static_generation(
             try:
                 actual_manifest_sha256 = audit_static_tree(
                     resolved_generation,
-                    forbidden_origins=forbidden_origins,
+                    forbidden_origins=resolved_forbidden_origins,
                 )
             except (StaticExportError, OSError) as exc:
                 audit_id = await _begin_attempt(connection, identity)
@@ -274,6 +278,7 @@ async def publish_static_generation(
 
             audit_id = await _begin_attempt(connection, identity)
             process: _Process | None = None
+            wrangler_workdir: TemporaryDirectory[str] | None = None
             try:
                 try:
                     _validate_pinned_runtime()
@@ -286,12 +291,26 @@ async def publish_static_generation(
                     )
                     raise CloudflarePagesPublishError("runtime_missing", audit_id) from None
 
+                await _audit_attempt_tree(
+                    connection,
+                    audit_id=audit_id,
+                    root=resolved_generation,
+                    expected_manifest_sha256=expected_manifest_sha256,
+                    forbidden_origins=resolved_forbidden_origins,
+                )
+
                 try:
-                    actual_manifest_sha256 = audit_static_tree(
-                        resolved_generation,
-                        forbidden_origins=forbidden_origins,
+                    wrangler_workdir = TemporaryDirectory(
+                        prefix=".wrangler-",
+                        dir=resolved_generation.parent,
                     )
-                except (StaticExportError, OSError) as exc:
+                    wrangler_cwd = Path(wrangler_workdir.name).resolve(strict=True)
+                    deploy_copy = shutil.copytree(
+                        resolved_generation,
+                        wrangler_cwd / "site",
+                        symlinks=True,
+                    )
+                except OSError as exc:
                     await _mark_failed(
                         connection,
                         audit_id=audit_id,
@@ -299,14 +318,14 @@ async def publish_static_generation(
                         error_class=_safe_error_class(exc),
                     )
                     raise CloudflarePagesPublishError("static_audit_failed", audit_id) from None
-                if actual_manifest_sha256 != expected_manifest_sha256:
-                    await _mark_failed(
-                        connection,
-                        audit_id=audit_id,
-                        error_code="static_manifest_mismatch",
-                        error_class="StaticManifestMismatch",
-                    )
-                    raise CloudflarePagesPublishError("static_manifest_mismatch", audit_id)
+
+                await _audit_attempt_tree(
+                    connection,
+                    audit_id=audit_id,
+                    root=deploy_copy,
+                    expected_manifest_sha256=expected_manifest_sha256,
+                    forbidden_origins=resolved_forbidden_origins,
+                )
 
                 try:
                     process = await process_exec(
@@ -314,11 +333,11 @@ async def publish_static_generation(
                         str(_WRANGLER_SCRIPT),
                         "pages",
                         "deploy",
-                        ".",
+                        str(deploy_copy),
                         f"--project-name={resolved_config.project}",
                         f"--branch={resolved_config.branch}",
                         "--no-bundle",
-                        cwd=resolved_generation,
+                        cwd=wrangler_cwd,
                         env={
                             "CLOUDFLARE_API_TOKEN": resolved_config.api_token,
                             "CLOUDFLARE_ACCOUNT_ID": resolved_config.account_id,
@@ -362,6 +381,14 @@ async def publish_static_generation(
                         error_class="ProcessExitNonZero",
                     )
                     raise CloudflarePagesPublishError("process_exit_nonzero", audit_id)
+
+                await _audit_attempt_tree(
+                    connection,
+                    audit_id=audit_id,
+                    root=deploy_copy,
+                    expected_manifest_sha256=expected_manifest_sha256,
+                    forbidden_origins=resolved_forbidden_origins,
+                )
 
                 try:
                     smoke_passed = await asyncio.wait_for(
@@ -412,12 +439,46 @@ async def publish_static_generation(
                 )
                 await asyncio.shield(cleanup_task)
                 raise
+            finally:
+                if wrangler_workdir is not None:
+                    wrangler_workdir.cleanup()
 
 
 def _default_engine() -> AsyncEngine:
     from bot.db.engine import engine
 
     return engine
+
+
+async def _audit_attempt_tree(
+    connection: AsyncConnection,
+    *,
+    audit_id: int,
+    root: Path,
+    expected_manifest_sha256: str,
+    forbidden_origins: Iterable[str],
+) -> None:
+    try:
+        actual_manifest_sha256 = audit_static_tree(
+            root,
+            forbidden_origins=forbidden_origins,
+        )
+    except (StaticExportError, OSError) as exc:
+        await _mark_failed(
+            connection,
+            audit_id=audit_id,
+            error_code="static_audit_failed",
+            error_class=_safe_error_class(exc),
+        )
+        raise CloudflarePagesPublishError("static_audit_failed", audit_id) from None
+    if actual_manifest_sha256 != expected_manifest_sha256:
+        await _mark_failed(
+            connection,
+            audit_id=audit_id,
+            error_code="static_manifest_mismatch",
+            error_class="StaticManifestMismatch",
+        )
+        raise CloudflarePagesPublishError("static_manifest_mismatch", audit_id)
 
 
 def _require_nonempty_secret(value: str, *, name: str) -> None:
