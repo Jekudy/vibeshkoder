@@ -53,6 +53,60 @@ def test_q3_saves_normalized_username_and_advances(app_env, monkeypatch) -> None
     )
 
 
+def test_referral_input_is_normalized_and_published_in_intro(app_env, monkeypatch) -> None:
+    questionnaire = import_module("bot.handlers.questionnaire")
+    session = AsyncMock()
+    persisted_answers: list[SimpleNamespace] = []
+
+    async def save_answer(_session, **kwargs) -> None:
+        persisted_answers.append(
+            SimpleNamespace(
+                question_index=kwargs["question_index"],
+                answer_text=kwargs["answer_text"],
+            )
+        )
+
+    save_answer_mock = AsyncMock(side_effect=save_answer)
+    get_answers_mock = AsyncMock(side_effect=lambda *_args, **_kwargs: persisted_answers)
+    monkeypatch.setattr(questionnaire.QuestionnaireRepo, "save_answer", save_answer_mock)
+    monkeypatch.setattr(questionnaire.QuestionnaireRepo, "get_answers", get_answers_mock)
+    monkeypatch.setattr(questionnaire.UserRepo, "get", AsyncMock(return_value=None))
+    monkeypatch.setattr(questionnaire.ApplicationRepo, "update_status", AsyncMock())
+
+    state = _q3_state(questionnaire)
+    asyncio.run(questionnaire.handle_answer(_message("t.me/Nick_Name"), state, session))
+
+    save_answer_mock.assert_awaited_once()
+    assert [answer.answer_text for answer in persisted_answers] == ["@nick_name"]
+
+    callback = SimpleNamespace(
+        from_user=SimpleNamespace(
+            id=111,
+            first_name="Applicant",
+            username="applicant",
+        ),
+        message=SimpleNamespace(edit_text=AsyncMock()),
+        bot=SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=333))),
+        answer=AsyncMock(),
+    )
+    callback_data = SimpleNamespace(action="yes")
+
+    asyncio.run(
+        questionnaire.handle_confirm(
+            callback,
+            callback_data,
+            state,
+            session,
+        )
+    )
+
+    get_answers_mock.assert_awaited_once_with(session, 111, application_id=222)
+    callback.bot.send_message.assert_awaited_once()
+    published_text = callback.bot.send_message.await_args.kwargs["text"]
+
+    assert "🔗 Откуда узнал: @nick_name" in published_text.splitlines()
+
+
 def test_invalid_q3_answer_fails_fast_without_advancing(app_env, monkeypatch) -> None:
     questionnaire = import_module("bot.handlers.questionnaire")
     texts = import_module("bot.texts")
