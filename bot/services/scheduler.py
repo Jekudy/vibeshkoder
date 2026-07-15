@@ -430,6 +430,7 @@ async def wiki_automation_job() -> None:
             provider=resolve_provider(
                 gateway_config.provider,
                 deepseek_max_tokens=DEEPSEEK_WIKI_MAX_TOKENS,
+                deepseek_json_output=True,
             ),
         )
         topics_seen = 0

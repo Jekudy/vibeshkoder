@@ -1131,6 +1131,7 @@ def resolve_provider(
     provider_name: str,
     *,
     deepseek_max_tokens: int | None = None,
+    deepseek_json_output: bool = False,
 ) -> LLMProvider:
     """Instantiate Anthropic or OpenAI provider per config.
 
@@ -1154,7 +1155,8 @@ def resolve_provider(
         return DeepSeekProvider(
             max_tokens=(
                 DEFAULT_DEEPSEEK_MAX_TOKENS if deepseek_max_tokens is None else deepseek_max_tokens
-            )
+            ),
+            json_output=deepseek_json_output,
         )
     raise ValueError(f"unknown provider: {provider_name}")
 

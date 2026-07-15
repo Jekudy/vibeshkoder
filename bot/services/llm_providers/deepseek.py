@@ -31,12 +31,16 @@ class DeepSeekProvider:
         api_key: str | None = None,
         client: httpx.AsyncClient | None = None,
         max_tokens: int = DEFAULT_DEEPSEEK_MAX_TOKENS,
+        json_output: bool = False,
     ) -> None:
         if type(max_tokens) is not int or not 1 <= max_tokens <= MAX_DEEPSEEK_OUTPUT_TOKENS:
             raise ValueError(f"max_tokens must be between 1 and {MAX_DEEPSEEK_OUTPUT_TOKENS}")
+        if type(json_output) is not bool:
+            raise ValueError("json_output must be a boolean")
         self._api_key = api_key
         self._client = client
         self._max_tokens = max_tokens
+        self._json_output = json_output
 
     async def call(self, *, prompt: str, model: str) -> ProviderResult:
         api_key = self._api_key
@@ -54,17 +58,20 @@ class DeepSeekProvider:
             timeout=httpx.Timeout(60.0, connect=10.0),
         )
         started = time.monotonic()
+        request_payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "thinking": {"type": "disabled"},
+            "max_tokens": self._max_tokens,
+            "stream": False,
+        }
+        if self._json_output:
+            request_payload["response_format"] = {"type": "json_object"}
         try:
             response = await client.post(
                 "/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "thinking": {"type": "disabled"},
-                    "max_tokens": self._max_tokens,
-                    "stream": False,
-                },
+                json=request_payload,
             )
         except httpx.TimeoutException as exc:
             raise ProviderTransientError("timeout", message="DeepSeek request timed out") from exc
