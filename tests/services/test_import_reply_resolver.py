@@ -34,6 +34,7 @@ pytestmark = pytest.mark.usefixtures("app_env")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _rand_chat_id() -> int:
     """Negative chat id in the range Telegram uses for groups."""
     return -random.randint(100_000_000, 199_999_999)
@@ -232,8 +233,8 @@ async def test_prior_run_excludes_newer_runs(db_session) -> None:
     """prior_run must select strictly older runs (started_at < current_run.started_at).
 
     Setup: runs at t=1 (oldest), t=2 (current), t=3 (newest).
-    Message exists only in run-1 and run-3.
-    Resolving from run-2 should pick run-1 (older), NOT run-3 (newer).
+    Run-1 owns the canonical raw; run-3 refreshes it without taking ownership.
+    Resolving from run-2 must therefore select run-1 as the prior run.
 
     Uses explicit started_at values because PostgreSQL `now()` is transaction-stable —
     multiple inserts inside a single test transaction would otherwise share the same
@@ -273,9 +274,22 @@ async def test_prior_run_excludes_newer_runs(db_session) -> None:
     db_session.add_all([run1, run2, run3])
     await db_session.flush()
 
-    # Place the message in run1 and run3 (NOT in run2 which is "current")
-    _, cm_run1 = await _create_imported_message(db_session, chat_id, export_msg_id, run1.id, user_id)
-    _, cm_run3 = await _create_imported_message(db_session, chat_id, export_msg_id, run3.id, user_id)
+    # The canonical raw row is first created by run1. A later run3 refresh keeps
+    # run1 ownership instead of creating an ambiguous second source row.
+    raw_run1, cm_run1 = await _create_imported_message(
+        db_session, chat_id, export_msg_id, run1.id, user_id
+    )
+    from bot.db.repos.telegram_update import TelegramUpdateRepo
+
+    refreshed = await TelegramUpdateRepo.upsert_import_message(
+        db_session,
+        raw_json={"refreshed_by": "run3"},
+        chat_id=chat_id,
+        message_id=export_msg_id,
+        ingestion_run_id=run3.id,
+    )
+    assert refreshed.id == raw_run1.id
+    assert refreshed.ingestion_run_id == run1.id
 
     # Resolving from run2: prior should be run1 (older), not run3 (newer)
     result = await resolve_reply(
@@ -286,11 +300,7 @@ async def test_prior_run_excludes_newer_runs(db_session) -> None:
     )
 
     assert result.resolved_via == "prior_run"
-    # Must resolve to run1's chat_message, not run3's
-    assert result.chat_message_id == cm_run1.id, (
-        f"Expected cm_run1.id={cm_run1.id}, got {result.chat_message_id} "
-        f"(cm_run3.id={cm_run3.id} would indicate a newer run was selected)"
-    )
+    assert result.chat_message_id == cm_run1.id
 
 
 # ---------------------------------------------------------------------------
@@ -545,12 +555,22 @@ def test_aggregate_resolutions() -> None:
     )
 
     resolutions: dict = {
-        1: ReplyResolution(export_msg_id=1, chat_message_id=10, resolved_via="same_run", chain_depth=0),
-        2: ReplyResolution(export_msg_id=2, chat_message_id=20, resolved_via="same_run", chain_depth=0),
-        3: ReplyResolution(export_msg_id=3, chat_message_id=30, resolved_via="prior_run", chain_depth=1),
+        1: ReplyResolution(
+            export_msg_id=1, chat_message_id=10, resolved_via="same_run", chain_depth=0
+        ),
+        2: ReplyResolution(
+            export_msg_id=2, chat_message_id=20, resolved_via="same_run", chain_depth=0
+        ),
+        3: ReplyResolution(
+            export_msg_id=3, chat_message_id=30, resolved_via="prior_run", chain_depth=1
+        ),
         4: ReplyResolution(export_msg_id=4, chat_message_id=40, resolved_via="live", chain_depth=0),
-        5: ReplyResolution(export_msg_id=5, chat_message_id=None, resolved_via="unresolved", chain_depth=0),
-        6: ReplyResolution(export_msg_id=6, chat_message_id=None, resolved_via="unresolved", chain_depth=0),
+        5: ReplyResolution(
+            export_msg_id=5, chat_message_id=None, resolved_via="unresolved", chain_depth=0
+        ),
+        6: ReplyResolution(
+            export_msg_id=6, chat_message_id=None, resolved_via="unresolved", chain_depth=0
+        ),
     }
 
     stats = aggregate_resolutions(resolutions)

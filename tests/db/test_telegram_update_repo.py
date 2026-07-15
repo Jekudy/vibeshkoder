@@ -79,9 +79,7 @@ async def test_insert_duplicate_update_id_returns_existing_no_duplicate(db_sessi
 
 
 async def test_insert_without_update_id_creates_independent_rows(db_session) -> None:
-    """Synthetic import updates (NULL update_id) bypass the partial unique index. Two
-    inserts produce two rows; the importer is responsible for its own dedup via raw_hash
-    + ingestion_run_id."""
+    """Different synthetic import source identities remain independent rows."""
     from bot.db.repos.telegram_update import TelegramUpdateRepo
 
     chat_id = _random_chat_id()

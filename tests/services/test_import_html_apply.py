@@ -124,6 +124,127 @@ async def test_html_apply_is_idempotent_and_persists_media_provenance(db_session
     assert int(count_result.scalar_one()) == 5
 
 
+async def test_html_reimport_repairs_missing_photo_media_without_duplicate_message(
+    db_session,
+) -> None:
+    from bot.services.import_apply import run_apply
+
+    first_run = await _create_run(db_session, "html_photo_repair_first")
+    first = await run_apply(
+        db_session,
+        ingestion_run_id=first_run,
+        resume_point=None,
+        chunking_config=_chunking(),
+        excluded_author_names=frozenset({"shkoder"}),
+    )
+    assert first.applied_count == 5
+
+    chat_message_id = int(
+        (
+            await db_session.execute(
+                sa_text("SELECT id FROM chat_messages WHERE chat_id=:chat_id AND message_id=102"),
+                {"chat_id": CHAT_ID},
+            )
+        ).scalar_one()
+    )
+    original_raw_update_id = int(
+        (
+            await db_session.execute(
+                sa_text("SELECT raw_update_id FROM chat_messages WHERE id=:chat_message_id"),
+                {"chat_message_id": chat_message_id},
+            )
+        ).scalar_one()
+    )
+    deleted = await db_session.execute(
+        sa_text("DELETE FROM message_media WHERE chat_message_id=:chat_message_id"),
+        {"chat_message_id": chat_message_id},
+    )
+    assert deleted.rowcount == 1
+    deleted_raw = await db_session.execute(
+        sa_text("DELETE FROM telegram_updates WHERE id=:raw_update_id"),
+        {"raw_update_id": original_raw_update_id},
+    )
+    assert deleted_raw.rowcount == 1
+
+    second_run = await _create_run(db_session, "html_photo_repair_second")
+    second = await run_apply(
+        db_session,
+        ingestion_run_id=second_run,
+        resume_point=None,
+        chunking_config=_chunking(),
+        excluded_author_names=frozenset({"shkoder"}),
+    )
+
+    assert second.applied_count == 0
+    assert second.skipped_duplicate_count == 5
+    chat_message_count = await db_session.execute(
+        sa_text("SELECT COUNT(*) FROM chat_messages WHERE chat_id=:chat_id AND message_id=102"),
+        {"chat_id": CHAT_ID},
+    )
+    assert int(chat_message_count.scalar_one()) == 1
+
+    media = (
+        await db_session.execute(
+            sa_text(
+                "SELECT chat_message_id, source_message_url, description_status, last_error_code "
+                "FROM message_media WHERE chat_message_id=:chat_message_id"
+            ),
+            {"chat_message_id": chat_message_id},
+        )
+    ).one()
+    assert media.chat_message_id == chat_message_id
+    assert media.source_message_url == "https://t.me/c/1234567890/102"
+    assert media.description_status == "missing_source"
+    assert media.last_error_code == "historical_export_no_file"
+
+    third_run = await _create_run(db_session, "html_photo_repair_third")
+    third = await run_apply(
+        db_session,
+        ingestion_run_id=third_run,
+        resume_point=None,
+        chunking_config=_chunking(),
+        excluded_author_names=frozenset({"shkoder"}),
+    )
+    assert third.applied_count == 0
+    assert third.skipped_duplicate_count == 5
+
+    raw_state = (
+        await db_session.execute(
+            sa_text(
+                "SELECT cm.raw_update_id, COUNT(tu.id) AS raw_count, "
+                "MIN(tu.ingestion_run_id) AS raw_run_id "
+                "FROM chat_messages cm "
+                "LEFT JOIN telegram_updates tu "
+                "ON tu.chat_id=cm.chat_id AND tu.message_id=cm.message_id "
+                "AND tu.update_type='import_message' AND tu.update_id IS NULL "
+                "WHERE cm.id=:chat_message_id "
+                "GROUP BY cm.raw_update_id"
+            ),
+            {"chat_message_id": chat_message_id},
+        )
+    ).one()
+    assert raw_state.raw_update_id is None
+    assert int(raw_state.raw_count) == 1
+    assert int(raw_state.raw_run_id) == second_run
+
+    from bot.services.import_rollback import rollback_ingestion_run
+
+    rollback = await rollback_ingestion_run(db_session, second_run)
+    assert rollback.telegram_updates_deleted == 1
+    assert rollback.chat_messages_deleted == 0
+    preserved = (
+        await db_session.execute(
+            sa_text(
+                "SELECT COUNT(*) FROM chat_messages cm "
+                "JOIN message_media mm ON mm.chat_message_id=cm.id "
+                "WHERE cm.id=:chat_message_id"
+            ),
+            {"chat_message_id": chat_message_id},
+        )
+    ).scalar_one()
+    assert int(preserved) == 1
+
+
 async def test_html_apply_excludes_exact_bot_author_but_keeps_raw_provenance(
     db_session,
 ) -> None:

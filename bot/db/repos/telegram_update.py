@@ -13,6 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import TelegramUpdate
 
+_IMPORT_MESSAGE_INDEX_PREDICATE = (
+    "update_id IS NULL "
+    "AND update_type = 'import_message' "
+    "AND chat_id IS NOT NULL "
+    "AND message_id IS NOT NULL"
+)
+
 
 class TelegramUpdateRepo:
     @staticmethod
@@ -34,7 +41,9 @@ class TelegramUpdateRepo:
         duplicate insert (same ``update_id``) returns the existing row instead of raising.
         The conflict path is keyed by the partial unique index
         ``ix_telegram_updates_update_id`` (created in migration 005), so it fires only when
-        ``update_id`` is set — synthetic import rows (NULL ``update_id``) always insert.
+        ``update_id`` is set. Canonical ``import_message`` callers must use
+        :meth:`upsert_import_message`; this generic NULL-``update_id`` path does not
+        resolve source-identity conflicts.
 
         Flushes; does not commit. Caller controls the transaction lifecycle.
         """
@@ -74,7 +83,7 @@ class TelegramUpdateRepo:
             )
             return existing.scalar_one()
 
-        # No update_id (synthetic import) — always insert.
+        # No update_id (generic synthetic row) — direct insert.
         row = TelegramUpdate(
             update_type=update_type,
             raw_json=raw_json,
@@ -86,6 +95,46 @@ class TelegramUpdateRepo:
             redaction_reason=redaction_reason,
         )
         session.add(row)
+        await session.flush()
+        return row
+
+    @staticmethod
+    async def upsert_import_message(
+        session: AsyncSession,
+        *,
+        raw_json: dict,
+        chat_id: int,
+        message_id: int,
+        ingestion_run_id: int,
+    ) -> TelegramUpdate:
+        """Atomically create or refresh one canonical synthetic import raw row.
+
+        Conflict updates deliberately preserve the original ``ingestion_run_id``.
+        Moving ownership to a later duplicate run could make its rollback delete a
+        raw row referenced by a normalized message created by the original run.
+        """
+        insert_stmt = pg_insert(TelegramUpdate).values(
+            update_type="import_message",
+            update_id=None,
+            raw_json=raw_json,
+            raw_hash=None,
+            chat_id=chat_id,
+            message_id=message_id,
+            ingestion_run_id=ingestion_run_id,
+            is_redacted=False,
+            redaction_reason=None,
+        )
+        statement = insert_stmt.on_conflict_do_update(
+            index_elements=["update_type", "chat_id", "message_id"],
+            index_where=text(_IMPORT_MESSAGE_INDEX_PREDICATE),
+            set_={
+                "raw_json": insert_stmt.excluded.raw_json,
+                "raw_hash": None,
+                "is_redacted": False,
+                "redaction_reason": None,
+            },
+        ).returning(TelegramUpdate)
+        row = (await session.execute(statement)).scalar_one()
         await session.flush()
         return row
 

@@ -155,7 +155,7 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     Migration 082: complete-history supersession and active-version uniqueness.
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "087"
+    assert current == "088"
 
 
 async def test_080_message_media_and_ledger_call_types(

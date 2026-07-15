@@ -58,7 +58,8 @@ async def rehydrate_message_from_import(
 
     Phase 13 switched to complete human history.  This explicit import-only
     operation is intentionally allowed to undo the old sticky redaction ratchet;
-    normal live redeliveries still use :func:`persist_message_with_policy`.
+    normal live redeliveries still use :func:`persist_message_with_policy`. The
+    existing normalized row keeps its original raw-update ownership.
     """
     await advisory_lock_chat_message(session, message.chat.id, message.message_id)
     saved = (
@@ -110,7 +111,6 @@ async def rehydrate_message_from_import(
             caption=caption_value,
             date=captured_at,
             raw_json=raw_payload,
-            raw_update_id=raw_update_id,
             reply_to_message_id=normalized["reply_to_message_id"],
             message_thread_id=normalized["message_thread_id"],
             message_kind=normalized["message_kind"],

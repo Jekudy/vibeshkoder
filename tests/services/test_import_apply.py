@@ -456,7 +456,9 @@ async def test_apply_rehydrates_previously_redacted_message(db_session) -> None:
         await db_session.execute(
             sa_text(
                 "SELECT cm.memory_policy, cm.is_redacted, cm.text, "
-                "mv.is_redacted AS mv_is_redacted, mv.text AS mv_text "
+                "cm.raw_update_id, cm.current_version_id, "
+                "mv.is_redacted AS mv_is_redacted, mv.text AS mv_text, "
+                "mv.raw_update_id AS mv_raw_update_id "
                 "FROM chat_messages cm JOIN message_versions mv "
                 "ON mv.id = cm.current_version_id "
                 "WHERE cm.chat_id=:cid AND cm.message_id=1001"
@@ -469,6 +471,8 @@ async def test_apply_rehydrates_previously_redacted_message(db_session) -> None:
     assert restored.mv_is_redacted is False
     assert restored.text == "Hello everyone! Glad to be here."
     assert restored.mv_text == "Hello everyone! Glad to be here."
+    assert restored.raw_update_id is None
+    assert restored.mv_raw_update_id is not None
     versions = (
         await db_session.execute(
             sa_text(
@@ -511,6 +515,40 @@ async def test_apply_rehydrates_previously_redacted_message(db_session) -> None:
         include_cards=False,
     )
     assert any(hit.message_id == 1001 for hit in hits)
+
+    from bot.services.import_rollback import rollback_ingestion_run
+
+    rollback = await rollback_ingestion_run(db_session, run_id)
+    assert rollback.telegram_updates_deleted == 5
+    assert rollback.chat_messages_deleted == 4
+    assert rollback.message_versions_cascade_deleted == 4
+
+    preserved = (
+        await db_session.execute(
+            sa_text(
+                "SELECT cm.memory_policy, cm.is_redacted, cm.text, "
+                "cm.raw_update_id, cm.current_version_id, mv.raw_update_id AS mv_raw_update_id "
+                "FROM chat_messages cm JOIN message_versions mv "
+                "ON mv.id=cm.current_version_id WHERE cm.id=:chat_message_id"
+            ),
+            {"chat_message_id": hidden.id},
+        )
+    ).one()
+    assert preserved.memory_policy == "normal"
+    assert preserved.is_redacted is False
+    assert preserved.text == "Hello everyone! Glad to be here."
+    assert preserved.raw_update_id is None
+    assert preserved.current_version_id == restored.current_version_id
+    assert preserved.mv_raw_update_id is None
+
+    new_rows = await db_session.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE chat_id=:chat_id AND message_id IN (1002, 1003, 1004, 1005)"
+        ),
+        {"chat_id": chat_id},
+    )
+    assert int(new_rows.scalar_one()) == 0
 
 
 # ─── Test 4: Governance gate ──────────────────────────────────────────────────
@@ -764,10 +802,11 @@ async def test_apply_sets_imported_final(db_session) -> None:
 
 async def test_apply_skips_version_when_live_row_wins_overlap_race(db_session) -> None:
     """If a live row appears after the duplicate gate but before persist, the import
-    synthetic raw row remains but imported_final version insertion is skipped."""
+    synthetic raw row remains, photo provenance is repaired, and imported_final
+    version insertion is skipped."""
     from bot.services.import_apply import run_apply
 
-    chat_id = -4004
+    chat_id = -1004004
     await db_session.execute(
         sa_text(
             """
@@ -827,8 +866,9 @@ async def test_apply_skips_version_when_live_row_wins_overlap_race(db_session) -
                 "date_unixtime": "1709287200",
                 "from": "Live Race User",
                 "from_id": "user900001",
-                "text": "import lost",
-                "text_entities": [{"type": "plain", "text": "import lost"}],
+                "text": "import photo caption",
+                "text_entities": [{"type": "plain", "text": "import photo caption"}],
+                "photo": "photos/missing_overlap.jpg",
             }
         ],
     }
@@ -880,6 +920,19 @@ async def test_apply_skips_version_when_live_row_wins_overlap_race(db_session) -
         {"rid": run_id},
     )
     assert int(synthetic_updates.scalar_one()) == 1
+
+    media = (
+        await db_session.execute(
+            sa_text(
+                "SELECT source_message_url, description_status, last_error_code "
+                "FROM message_media WHERE chat_message_id=:cmid"
+            ),
+            {"cmid": live_cm_id},
+        )
+    ).one()
+    assert media.source_message_url == "https://t.me/c/4004/9001"
+    assert media.description_status == "missing_source"
+    assert media.last_error_code == "historical_export_no_file"
 
 
 # ─── Test 7: Checkpoint / resume from mid-chunk failure ───────────────────────
@@ -965,6 +1018,89 @@ async def test_apply_advisory_lock_acquired(db_session) -> None:
     assert len(lock_connection_ids) == 1
     assert persist_connection_ids
     assert set(persist_connection_ids) == {lock_connection_ids[0]}
+
+
+async def test_engine_bound_advisory_apply_commits_chunks_for_fresh_connection(
+    postgres_engine,
+) -> None:
+    """Production engine-bound path must commit beyond the lock connection context."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from bot.services.import_apply import run_apply
+
+    chat_id = -1008812345678
+    run_id: int | None = None
+    try:
+        async with AsyncSession(bind=postgres_engine, expire_on_commit=False) as setup_session:
+            run_id = await _create_apply_run(
+                setup_session,
+                source_path=str(SMALL_CHAT),
+                chat_id=chat_id,
+                source_hash="engine_bound_commit_regression",
+            )
+            await setup_session.commit()
+
+        async with AsyncSession(bind=postgres_engine, expire_on_commit=False) as apply_session:
+            report = await run_apply(
+                apply_session,
+                ingestion_run_id=run_id,
+                resume_point=None,
+                chunking_config=_default_chunking(advisory_lock=True),
+            )
+        assert report.applied_count == 5
+        assert report.last_processed_export_msg_id == 1006
+
+        async with postgres_engine.connect() as observer:
+            persisted = (
+                await observer.execute(
+                    sa_text(
+                        """
+                        SELECT
+                            (SELECT COUNT(*) FROM telegram_updates
+                              WHERE ingestion_run_id=:run_id),
+                            (SELECT COUNT(*) FROM chat_messages
+                              WHERE chat_id=:chat_id),
+                            (SELECT COUNT(*) FROM message_media mm
+                              JOIN chat_messages cm ON cm.id=mm.chat_message_id
+                              WHERE cm.chat_id=:chat_id),
+                            (SELECT stats_json ->> 'last_processed_export_msg_id'
+                               FROM ingestion_runs WHERE id=:run_id)
+                        """
+                    ),
+                    {"run_id": run_id, "chat_id": chat_id},
+                )
+            ).one()
+        assert tuple(persisted[:3]) == (5, 5, 1)
+        assert persisted[3] == "1006"
+    finally:
+        if run_id is not None:
+            async with postgres_engine.begin() as cleanup:
+                await cleanup.execute(
+                    sa_text(
+                        "UPDATE chat_messages SET current_version_id=NULL WHERE chat_id=:chat_id"
+                    ),
+                    {"chat_id": chat_id},
+                )
+                await cleanup.execute(
+                    sa_text("DELETE FROM chat_messages WHERE chat_id=:chat_id"),
+                    {"chat_id": chat_id},
+                )
+                await cleanup.execute(
+                    sa_text("DELETE FROM telegram_updates WHERE chat_id=:chat_id"),
+                    {"chat_id": chat_id},
+                )
+                await cleanup.execute(
+                    sa_text("DELETE FROM ingestion_runs WHERE id=:run_id"),
+                    {"run_id": run_id},
+                )
+                await cleanup.execute(
+                    sa_text(
+                        "DELETE FROM users WHERE id IN (1000001, 1000002, 1000003) "
+                        "AND is_imported_only IS TRUE "
+                        "AND NOT EXISTS ("
+                        "SELECT 1 FROM chat_messages WHERE chat_messages.user_id=users.id)"
+                    )
+                )
 
 
 # ─── Test 9: Chunking — checkpoint advances per chunk ─────────────────────────

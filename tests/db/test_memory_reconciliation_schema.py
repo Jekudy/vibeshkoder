@@ -1,4 +1,4 @@
-"""Migration 087 acceptance tests for explicit paid-call reconciliation."""
+"""Migration 087-088 acceptance tests for memory rollout reconciliation."""
 
 from __future__ import annotations
 
@@ -453,3 +453,76 @@ async def test_087_downgrade_fails_closed_for_each_rollout_audit_surface(
     failed = _alembic(temp_database_url, "downgrade", "086", check=False)
     assert failed.returncode != 0
     assert "Cannot downgrade 087" in (failed.stdout + failed.stderr)
+
+
+async def test_088_canonical_import_raw_is_unique_across_runs(
+    temp_database_url: str,
+) -> None:
+    _alembic(temp_database_url, "upgrade", "088")
+    connection = await asyncpg.connect(**_kwargs(make_url(temp_database_url)))
+    try:
+        first_run = await connection.fetchval(
+            "INSERT INTO ingestion_runs (run_type, status) "
+            "VALUES ('import', 'completed') RETURNING id"
+        )
+        second_run = await connection.fetchval(
+            "INSERT INTO ingestion_runs (run_type, status) "
+            "VALUES ('import', 'completed') RETURNING id"
+        )
+        first_raw = await connection.fetchval(
+            """
+            INSERT INTO telegram_updates (
+                update_type, update_id, raw_json, chat_id, message_id, ingestion_run_id
+            ) VALUES ('import_message', NULL, '{}', -10088001, 88001, $1)
+            RETURNING id
+            """,
+            first_run,
+        )
+        duplicate = await connection.fetchval(
+            """
+            INSERT INTO telegram_updates (
+                update_type, update_id, raw_json, chat_id, message_id, ingestion_run_id
+            ) VALUES ('import_message', NULL, '{"new":true}', -10088001, 88001, $1)
+            ON CONFLICT (update_type, chat_id, message_id)
+            WHERE update_id IS NULL
+              AND update_type = 'import_message'
+              AND chat_id IS NOT NULL
+              AND message_id IS NOT NULL
+            DO NOTHING
+            RETURNING id
+            """,
+            second_run,
+        )
+        assert first_raw is not None
+        assert duplicate is None
+        assert (
+            await connection.fetchval(
+                """
+                SELECT count(*) FROM telegram_updates
+                WHERE update_type='import_message'
+                  AND update_id IS NULL
+                  AND chat_id=-10088001
+                  AND message_id=88001
+                """
+            )
+            == 1
+        )
+
+        await connection.execute(
+            """
+            INSERT INTO telegram_updates (update_type, update_id, chat_id, message_id)
+            VALUES ('message', 8800101, -10088001, 88001),
+                   ('message', 8800102, -10088001, 88001)
+            """
+        )
+        assert (
+            await connection.fetchval(
+                """
+                SELECT count(*) FROM telegram_updates
+                WHERE update_type='message' AND chat_id=-10088001 AND message_id=88001
+                """
+            )
+            == 2
+        )
+    finally:
+        await connection.close()
