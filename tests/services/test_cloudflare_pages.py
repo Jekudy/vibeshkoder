@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 import uuid
 from collections.abc import AsyncIterator
@@ -28,7 +29,7 @@ from bot.services.cloudflare_pages import (
     load_cloudflare_pages_config,
     publish_static_generation,
 )
-from bot.services.wiki_static_export import StaticWikiPage, export_static_site
+from bot.services.wiki_static_export import StaticWikiPage, audit_static_tree, export_static_site
 from tests.conftest import DEFAULT_LOCAL_POSTGRES_URL
 
 
@@ -192,6 +193,13 @@ def _static_generation(
         site_title=site_title,
         publication_authorized=True,
     )
+
+
+def _tree_snapshot(root: Path) -> dict[str, bytes | None]:
+    return {
+        path.relative_to(root).as_posix(): None if path.is_dir() else path.read_bytes()
+        for path in root.rglob("*")
+    }
 
 
 class _FakeProcess:
@@ -409,7 +417,7 @@ async def test_process_failure_is_durable_and_never_captures_output(
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
     assert kwargs["shell"] is False
-    assert kwargs["cwd"] == generation.generation_dir
+    assert kwargs["cwd"] != generation.generation_dir
     assert kwargs["env"] == {
         "CLOUDFLARE_API_TOKEN": config.api_token,
         "CLOUDFLARE_ACCOUNT_ID": config.account_id,
@@ -420,6 +428,131 @@ async def test_process_failure_is_durable_and_never_captures_output(
     assert rows[0]["status"] == "failed"
     assert rows[0]["error_code"] == "process_exit_nonzero"
     assert "secret" not in repr(rows[0]).lower()
+
+
+async def test_wrangler_workdir_cannot_mutate_immutable_generation(
+    tmp_path: Path,
+    publisher_engine: AsyncEngine,
+    clean_audit_rows: None,
+    pinned_runtime: tuple[Path, Path],
+    config: CloudflarePagesConfig,
+) -> None:
+    generation = _static_generation(tmp_path)
+    resolved_generation = generation.generation_dir.resolve()
+    canonical_before = _tree_snapshot(resolved_generation)
+    process_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    async def wrangler_writes_cache(*args: object, **kwargs: object) -> _FakeProcess:
+        process_calls.append((args, kwargs))
+        cache_path = Path(kwargs["cwd"]) / ".wrangler" / "cache" / "pages.json"
+        cache_path.parent.mkdir(parents=True)
+        cache_path.write_text("{}\n", encoding="utf-8")
+        deploy_index = Path(args[4]) / "index.html"
+        deploy_index.write_bytes(deploy_index.read_bytes())
+        return _FakeProcess(returncode=0)
+
+    first = await publish_static_generation(
+        generation.generation_dir,
+        expected_manifest_sha256=generation.manifest_sha256,
+        config=config,
+        db_engine=publisher_engine,
+        process_exec=wrangler_writes_cache,
+        smoke_check=_smoke_ok,
+    )
+    second = await publish_static_generation(
+        generation.generation_dir,
+        expected_manifest_sha256=generation.manifest_sha256,
+        config=config,
+        db_engine=publisher_engine,
+        process_exec=wrangler_writes_cache,
+        smoke_check=_smoke_ok,
+    )
+
+    assert (first.status, second.status) == ("succeeded", "skipped")
+    assert len(process_calls) == 1
+    args, kwargs = process_calls[0]
+    deploy_copy = Path(args[4])
+    wrangler_workdir = Path(kwargs["cwd"])
+    assert deploy_copy.is_absolute()
+    assert deploy_copy != resolved_generation
+    assert str(resolved_generation) not in {str(arg) for arg in args}
+    assert wrangler_workdir.is_absolute()
+    assert deploy_copy.parent == wrangler_workdir
+    assert not wrangler_workdir.is_relative_to(resolved_generation)
+    assert not wrangler_workdir.exists()
+    assert not deploy_copy.exists()
+    assert not (resolved_generation / ".wrangler").exists()
+    assert _tree_snapshot(resolved_generation) == canonical_before
+    assert audit_static_tree(resolved_generation) == generation.manifest_sha256
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error", "expected_class"),
+    [
+        ("content", "static_audit_failed", "StaticExportSecurityError"),
+        ("extra-file", "static_audit_failed", "StaticExportSecurityError"),
+        ("valid-other-tree", "static_manifest_mismatch", "StaticManifestMismatch"),
+    ],
+)
+async def test_wrangler_target_mutation_fails_before_smoke_or_success(
+    tmp_path: Path,
+    publisher_engine: AsyncEngine,
+    clean_audit_rows: None,
+    pinned_runtime: tuple[Path, Path],
+    config: CloudflarePagesConfig,
+    mutation: str,
+    expected_error: str,
+    expected_class: str,
+) -> None:
+    generation = _static_generation(tmp_path)
+    other_generation = _static_generation(tmp_path / "other", site_title="Другая Wiki")
+    assert other_generation.manifest_sha256 != generation.manifest_sha256
+    resolved_generation = generation.generation_dir.resolve()
+    canonical_before = _tree_snapshot(resolved_generation)
+    temp_paths: list[Path] = []
+    smoke_calls = 0
+
+    async def mutate_deploy_target(*args: object, **kwargs: object) -> _FakeProcess:
+        deploy_copy = Path(args[4])
+        wrangler_workdir = Path(kwargs["cwd"])
+        temp_paths.extend((wrangler_workdir, deploy_copy))
+        cache_path = wrangler_workdir / ".wrangler" / "cache" / "pages.json"
+        cache_path.parent.mkdir(parents=True)
+        cache_path.write_text("{}\n", encoding="utf-8")
+        if mutation == "content":
+            target = deploy_copy / "index.html"
+            target.write_bytes(target.read_bytes() + b"\n")
+        elif mutation == "extra-file":
+            (deploy_copy / "unexpected.txt").write_text("mutated\n", encoding="utf-8")
+        else:
+            shutil.rmtree(deploy_copy)
+            shutil.copytree(other_generation.generation_dir, deploy_copy)
+        return _FakeProcess(returncode=0)
+
+    async def track_smoke(_url: str, _expected_payload: bytes) -> bool:
+        nonlocal smoke_calls
+        smoke_calls += 1
+        return True
+
+    with pytest.raises(CloudflarePagesPublishError) as raised:
+        await publish_static_generation(
+            generation.generation_dir,
+            expected_manifest_sha256=generation.manifest_sha256,
+            config=config,
+            db_engine=publisher_engine,
+            process_exec=mutate_deploy_target,
+            smoke_check=track_smoke,
+        )
+
+    assert raised.value.error_code == expected_error
+    assert smoke_calls == 0
+    assert all(not path.exists() for path in temp_paths)
+    assert _tree_snapshot(resolved_generation) == canonical_before
+    assert audit_static_tree(resolved_generation) == generation.manifest_sha256
+    rows = await _fetch_rows(publisher_engine)
+    assert [(row["status"], row["error_code"], row["error_class"]) for row in rows] == [
+        ("failed", expected_error, expected_class)
+    ]
 
 
 async def test_process_timeout_kills_once_without_retry(
