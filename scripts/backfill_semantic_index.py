@@ -151,11 +151,17 @@ def _load_shadow_cases(path: Path, *, max_queries: int) -> tuple[ShadowCase, ...
     return tuple(cases)
 
 
-def _document_identity(document: Any, *, model: str) -> tuple[str, str, str, int, str, str]:
+def _document_identity(
+    document: Any,
+    *,
+    model: str,
+) -> tuple[str, str, str, int, int, int, str, str]:
     return (
         str(document.source_type),
         str(document.source_id),
         str(document.source_revision),
+        int(document.chunk_index),
+        int(document.chunk_count),
         int(document.chat_id),
         str(document.content_hash),
         model,
@@ -168,13 +174,13 @@ async def _eligible_identities(
     chat_id: int | None,
     batch_size: int,
     model: str,
-) -> dict[tuple[str, str, str, int, str, str], tuple[int, ...]]:
+) -> dict[tuple[str, str, str, int, int, int, str, str], tuple[int, ...]]:
     from bot.services.semantic_index import (
         list_eligible_card_documents,
         list_eligible_message_documents,
     )
 
-    identities: dict[tuple[str, str, str, int, str, str], tuple[int, ...]] = {}
+    identities: dict[tuple[str, str, str, int, int, int, str, str], tuple[int, ...]] = {}
     message_cursor = 0
     while True:
         batch = await list_eligible_message_documents(
@@ -243,6 +249,8 @@ async def _coverage_report(
                 SELECT unit.source_type,
                        unit.source_id,
                        unit.source_revision,
+                       unit.chunk_index,
+                       unit.chunk_count,
                        unit.chat_id,
                        unit.content_hash,
                        unit.embedding_model,
@@ -267,13 +275,15 @@ async def _coverage_report(
         .all()
     )
 
-    active: dict[tuple[str, str, str, int, str, str], tuple[int, ...]] = {}
-    invalidated: dict[tuple[str, str, str, int, str, str], tuple[int, ...]] = {}
+    active: dict[tuple[str, str, str, int, int, int, str, str], tuple[int, ...]] = {}
+    invalidated: dict[tuple[str, str, str, int, int, int, str, str], tuple[int, ...]] = {}
     for row in rows:
         key = (
             str(row["source_type"]),
             str(row["source_id"]),
             str(row["source_revision"]),
+            int(row["chunk_index"]),
+            int(row["chunk_count"]),
             int(row["chat_id"]),
             str(row["content_hash"]),
             str(row["embedding_model"]),

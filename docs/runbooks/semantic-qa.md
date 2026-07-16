@@ -232,6 +232,12 @@ python -m scripts.backfill_semantic_index backfill \
 - `eligible > 0` для текущей непустой production history;
 - `eligible = indexed + skipped`.
 
+Источник длиннее provider limit не обрезается и не пропускается: backfill
+детерминированно создаёт последовательные chunks до 8000 символов с тем же
+`source_id`, полным provenance и проверяемыми `chunk_index/chunk_count`.
+Coverage считается по chunks; vector retrieval выбирает лучший chunk каждого
+источника и не позволяет одному длинному документу вытеснить остальные.
+
 Скопировать no-content report из контейнера в root-only operator storage. Не
 загружать его в публичный CI artifact: source IDs и chat IDs остаются
 внутренними идентификаторами сообщества.

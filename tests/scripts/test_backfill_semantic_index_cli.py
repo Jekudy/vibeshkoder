@@ -174,7 +174,7 @@ async def test_coverage_audit_rejects_missing_partial_or_reordered_provenance(
     monkeypatch,
     actual_sources,
 ) -> None:
-    identity = ("card", "card-id", "revision", -100404, "a" * 64, "model")
+    identity = ("card", "card-id", "revision", 0, 1, -100404, "a" * 64, "model")
     monkeypatch.setattr(
         cli,
         "_eligible_identities",
@@ -184,6 +184,8 @@ async def test_coverage_audit_rejects_missing_partial_or_reordered_provenance(
         "source_type": "card",
         "source_id": "card-id",
         "source_revision": "revision",
+        "chunk_index": 0,
+        "chunk_count": 1,
         "chat_id": -100404,
         "content_hash": "a" * 64,
         "embedding_model": "model",

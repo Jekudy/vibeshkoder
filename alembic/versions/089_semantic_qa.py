@@ -146,6 +146,8 @@ def upgrade() -> None:
         sa.Column("source_type", sa.String(length=32), nullable=False),
         sa.Column("source_id", sa.String(length=64), nullable=False),
         sa.Column("source_revision", sa.String(length=128), nullable=False),
+        sa.Column("chunk_index", sa.SmallInteger(), nullable=False, server_default="0"),
+        sa.Column("chunk_count", sa.SmallInteger(), nullable=False, server_default="1"),
         sa.Column("chat_id", sa.BigInteger(), nullable=False),
         sa.Column("content_hash", sa.String(length=128), nullable=False),
         sa.Column("embedding_provider", sa.String(length=64), nullable=False),
@@ -167,6 +169,10 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint("embedding_dimensions = 1536", name="ck_semantic_units_dimensions"),
         sa.CheckConstraint(
+            "chunk_index >= 0 AND chunk_count > 0 AND chunk_index < chunk_count",
+            name="ck_semantic_units_chunk_bounds",
+        ),
+        sa.CheckConstraint(
             "(invalidated_at IS NULL) = (invalidation_reason IS NULL)",
             name="ck_semantic_units_invalidation_pair",
         ),
@@ -181,6 +187,7 @@ def upgrade() -> None:
             "source_type",
             "source_id",
             "source_revision",
+            "chunk_index",
             "content_hash",
             "embedding_model",
             name="uq_semantic_units_identity",

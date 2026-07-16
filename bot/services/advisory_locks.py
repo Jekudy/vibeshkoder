@@ -7,7 +7,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
 
 def _engine_for_session(session: AsyncSession) -> AsyncEngine | None:
@@ -96,19 +97,27 @@ async def hold_session_advisory_locks(
         yield
         return
 
-    async with engine.connect() as connection:
-        async with connection.begin():
-            for lock_id in ordered:
-                await connection.execute(
-                    text("SELECT pg_advisory_xact_lock(:lock_id)"),
-                    {"lock_id": lock_id},
-                )
-            for lock_key in ordered_keys:
-                await connection.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
-                    {"lock_key": lock_key},
-                )
-            yield
+    # This lock connection must coexist with caller queries while the caller's
+    # session may already hold the sole application-pool slot. A short-lived
+    # NullPool engine prevents deterministic pool_size=1 deadlocks and makes
+    # lock capacity independent from request concurrency.
+    lock_engine = create_async_engine(engine.url, poolclass=NullPool)
+    try:
+        async with lock_engine.connect() as connection:
+            async with connection.begin():
+                for lock_id in ordered:
+                    await connection.execute(
+                        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                        {"lock_id": lock_id},
+                    )
+                for lock_key in ordered_keys:
+                    await connection.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                        {"lock_key": lock_key},
+                    )
+                yield
+    finally:
+        await lock_engine.dispose()
 
 
 __all__ = [

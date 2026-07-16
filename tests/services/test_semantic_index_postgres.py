@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Literal
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from bot.db.models import (
     CardSource,
@@ -1004,7 +1004,9 @@ async def test_embedding_dispatch_splits_batch_at_provider_character_cap(db_sess
 
 
 @pytest.mark.asyncio
-async def test_oversize_document_is_accounted_without_provider_dispatch(db_session) -> None:
+async def test_oversize_document_is_chunked_with_full_coverage(db_session) -> None:
+    from scripts.backfill_semantic_index import _coverage_report
+
     human = await _user(db_session, user_id=8_044_042_250, is_bot=False)
     await _message(
         db_session,
@@ -1022,10 +1024,113 @@ async def test_oversize_document_is_accounted_without_provider_dispatch(db_sessi
         provider=provider,
     )
 
-    assert (result.indexed, result.skipped) == (0, 1)
-    assert result.reason_counts == {"skipped:oversize": 1}
-    assert provider.calls == []
-    assert (await db_session.execute(select(SemanticRetrievalUnit.id))).scalar_one_or_none() is None
+    assert (result.indexed, result.skipped) == (2, 0)
+    assert result.reason_counts == {"indexed:new_embedding": 2}
+    assert [tuple(len(value) for value in call) for call in provider.calls] == [(8_000, 1)]
+    units = (
+        (
+            await db_session.execute(
+                select(SemanticRetrievalUnit).order_by(SemanticRetrievalUnit.chunk_index)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [(unit.chunk_index, unit.chunk_count) for unit in units] == [(0, 2), (1, 2)]
+    assert len({unit.llm_usage_ledger_id for unit in units}) == 1
+    coverage = await _coverage_report(
+        db_session,
+        chat_id=CHAT_ID,
+        model=CONFIG.model,
+        batch_size=100,
+    )
+    assert coverage["status"] == "pass"
+    assert coverage["eligible"] == 2
+    assert coverage["coverage_percent"] == 100.0
+    hits = await vector_search(
+        db_session,
+        query_embedding=VECTOR_X,
+        chat_id=CHAT_ID,
+        embedding_model=CONFIG.model,
+        limit=5,
+    )
+    assert len(hits) == 1
+    assert hits[0].message_version_id == documents[0].message_version_ids[0]
+
+
+@pytest.mark.asyncio
+async def test_partial_provider_batch_is_durable_and_retry_does_not_repay(db_session) -> None:
+    from bot.services.llm_providers import ProviderTransientError
+
+    human = await _user(db_session, user_id=8_044_042_260, is_bot=False)
+    for offset in range(17):
+        await _message(
+            db_session,
+            user_id=human.id,
+            message_id=4042260 + offset,
+            text=(chr(ord("a") + offset) * 3996) + f"{offset:04d}",
+        )
+    documents = await list_eligible_message_documents(db_session, chat_id=CHAT_ID, limit=100)
+
+    class FailSecondProvider(CountingEmbeddingProvider):
+        async def embed(self, *, inputs, model: str, dimensions: int) -> EmbeddingResult:
+            values = tuple(inputs)
+            self.calls.append(values)
+            if len(self.calls) == 2:
+                raise ProviderTransientError("timeout", message="second partition failed")
+            return EmbeddingResult(
+                vectors=tuple(VECTOR_X for _ in values),
+                tokens_in=sum(len(value) for value in values),
+                request_id="partial-first",
+                raw_latency_ms=1,
+            )
+
+    first_provider = FailSecondProvider()
+    with pytest.raises(ProviderTransientError) as raised:
+        await backfill_semantic_index(
+            db_session,
+            config=CONFIG,
+            provider=first_provider,
+            batch_size=100,
+            chat_id=CHAT_ID,
+        )
+    partial = raised.value.semantic_batch_result
+    assert (partial.indexed, partial.skipped) == (16, 0)
+    assert partial.reason_counts == {"indexed:new_embedding": 16}
+    assert [len(call) for call in first_provider.calls] == [16, 1]
+    failed_run = (
+        (
+            await db_session.execute(
+                select(SemanticIndexRun).order_by(SemanticIndexRun.id.desc()).limit(1)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert failed_run.status == "failed"
+    assert (failed_run.eligible_count, failed_run.indexed_count, failed_run.failed_count) == (
+        17,
+        16,
+        1,
+    )
+    first_units = (await db_session.execute(select(SemanticRetrievalUnit))).scalars().all()
+    assert len(first_units) == 16
+    assert len({unit.llm_usage_ledger_id for unit in first_units}) == 1
+
+    retry_provider = CountingEmbeddingProvider()
+    retry = await _index_batch(
+        db_session,
+        documents=documents,
+        config=CONFIG,
+        provider=retry_provider,
+    )
+
+    assert (retry.indexed, retry.skipped) == (1, 16)
+    assert [len(call) for call in retry_provider.calls] == [1]
+    assert retry_provider.calls[0] == (documents[-1].canonical_text,)
+    final_units = (await db_session.execute(select(SemanticRetrievalUnit))).scalars().all()
+    assert len(final_units) == 17
+    assert len({unit.llm_usage_ledger_id for unit in final_units}) == 2
 
 
 @pytest.mark.asyncio
@@ -1270,6 +1375,37 @@ async def test_cancelled_delivery_scope_releases_dedicated_xact_lock(postgres_en
                 return
 
     await asyncio.wait_for(reacquire(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_advisory_lock_scope_does_not_consume_application_pool_slot(
+    postgres_engine,
+) -> None:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from bot.services.advisory_locks import hold_session_advisory_locks
+
+    single_slot_engine = create_async_engine(
+        postgres_engine.url,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.2,
+    )
+    factory = async_sessionmaker(
+        single_slot_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    lock_id = 8_044_046_500 + (uuid.uuid4().int % 1_000_000)
+    try:
+        async with factory() as session:
+            # Pin the only application-pool connection before entering the lock
+            # scope. The lock connection must come from independent capacity.
+            await session.execute(text("SELECT 1"))
+            async with hold_session_advisory_locks(session, (lock_id,)):
+                assert (await session.execute(text("SELECT 1"))).scalar_one() == 1
+    finally:
+        await single_slot_engine.dispose()
 
 
 @pytest.mark.asyncio

@@ -283,10 +283,11 @@ _ELIGIBLE_CARDS_SQL = text(
 # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _VECTOR_CANDIDATES_SQL = text(
     f"""
+    WITH governed_candidates AS (
     SELECT unit.id,
            unit.source_type,
            unit.source_id,
-           1 - (unit.embedding <=> CAST(:embedding AS vector)) AS similarity
+           unit.embedding <=> CAST(:embedding AS vector) AS distance
     FROM semantic_retrieval_units unit
     WHERE unit.chat_id = :chat_id
       AND unit.embedding_model = :embedding_model
@@ -338,7 +339,21 @@ _VECTOR_CANDIDATES_SQL = text(
                 OR NOT ({_FORGET_EXCLUDES})
             )
       )
-    ORDER BY unit.embedding <=> CAST(:embedding AS vector), unit.id ASC
+    ), ranked_candidates AS (
+        SELECT governed_candidates.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY source_type, source_id
+                   ORDER BY distance ASC, id ASC
+               ) AS source_rank
+        FROM governed_candidates
+    )
+    SELECT id,
+           source_type,
+           source_id,
+           1 - distance AS similarity
+    FROM ranked_candidates
+    WHERE source_rank = 1
+    ORDER BY distance ASC, id ASC
     LIMIT :limit
     """
 )
@@ -505,6 +520,8 @@ class RetrievalDocument:
     canonical_text: str
     content_hash: str
     message_version_ids: tuple[int, ...]
+    chunk_index: int = 0
+    chunk_count: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,6 +530,8 @@ class _ExistingUnit:
     source_type: str
     source_id: str
     source_revision: str
+    chunk_index: int
+    chunk_count: int
     chat_id: int
     content_hash: str
     invalidated_at: datetime | None
@@ -554,6 +573,40 @@ def _content_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _chunk_retrieval_document(
+    *,
+    source_type: Literal["message", "card"],
+    source_id: str,
+    source_revision: str,
+    chat_id: int,
+    canonical_text: str,
+    message_version_ids: tuple[int, ...],
+) -> list[RetrievalDocument]:
+    """Split source text without truncation using stable character boundaries."""
+
+    chunks = tuple(
+        canonical_text[offset : offset + MAX_EMBEDDING_INPUT_CHARS]
+        for offset in range(0, len(canonical_text), MAX_EMBEDDING_INPUT_CHARS)
+    )
+    if not chunks:
+        raise ValueError("retrieval document canonical text must not be empty")
+    chunk_count = len(chunks)
+    return [
+        RetrievalDocument(
+            source_type=source_type,
+            source_id=source_id,
+            source_revision=source_revision,
+            chat_id=chat_id,
+            canonical_text=chunk,
+            content_hash=_content_hash(chunk),
+            message_version_ids=message_version_ids,
+            chunk_index=chunk_index,
+            chunk_count=chunk_count,
+        )
+        for chunk_index, chunk in enumerate(chunks)
+    ]
+
+
 def _vector_literal(vector: Sequence[float]) -> str:
     if len(vector) != 1536:
         raise ValueError("query embedding must contain 1536 values")
@@ -589,14 +642,13 @@ async def list_eligible_message_documents(
         canonical_text = str(row["canonical_text"]).strip()
         media_revision = row["media_revision"]
         revision = f"v{row['version_seq']}:media:{media_revision.isoformat() if media_revision else 'none'}"
-        documents.append(
-            RetrievalDocument(
+        documents.extend(
+            _chunk_retrieval_document(
                 source_type="message",
                 source_id=str(row["message_version_id"]),
                 source_revision=revision,
                 chat_id=int(row["chat_id"]),
                 canonical_text=canonical_text,
-                content_hash=_content_hash(canonical_text),
                 message_version_ids=(int(row["message_version_id"]),),
             )
         )
@@ -621,8 +673,8 @@ async def list_eligible_card_documents(
         canonical_text = str(row["canonical_text"]).strip()
         updated_at = row["updated_at"]
         approved_at = row["approved_at"]
-        documents.append(
-            RetrievalDocument(
+        documents.extend(
+            _chunk_retrieval_document(
                 source_type="card",
                 source_id=str(row["card_id"]),
                 source_revision=(
@@ -631,7 +683,6 @@ async def list_eligible_card_documents(
                 ),
                 chat_id=int(row["chat_id"]),
                 canonical_text=canonical_text,
-                content_hash=_content_hash(canonical_text),
                 message_version_ids=tuple(int(value) for value in row["message_version_ids"]),
             )
         )
@@ -653,6 +704,8 @@ async def _load_existing_units(
             SemanticRetrievalUnit.source_type,
             SemanticRetrievalUnit.source_id,
             SemanticRetrievalUnit.source_revision,
+            SemanticRetrievalUnit.chunk_index,
+            SemanticRetrievalUnit.chunk_count,
             SemanticRetrievalUnit.chat_id,
             SemanticRetrievalUnit.content_hash,
             SemanticRetrievalUnit.invalidated_at,
@@ -678,6 +731,8 @@ async def _load_existing_units(
             source_type=str(row.source_type),
             source_id=str(row.source_id),
             source_revision=str(row.source_revision),
+            chunk_index=int(row.chunk_index),
+            chunk_count=int(row.chunk_count),
             chat_id=int(row.chat_id),
             content_hash=str(row.content_hash),
             invalidated_at=row.invalidated_at,
@@ -711,6 +766,8 @@ async def _load_parent_message_units(
             SemanticRetrievalUnit.source_type,
             SemanticRetrievalUnit.source_id,
             SemanticRetrievalUnit.source_revision,
+            SemanticRetrievalUnit.chunk_index,
+            SemanticRetrievalUnit.chunk_count,
             SemanticRetrievalUnit.chat_id,
             SemanticRetrievalUnit.content_hash,
             SemanticRetrievalUnit.invalidated_at,
@@ -747,6 +804,8 @@ async def _load_parent_message_units(
             source_type=str(row["source_type"]),
             source_id=str(row["source_id"]),
             source_revision=str(row["source_revision"]),
+            chunk_index=int(row["chunk_index"]),
+            chunk_count=int(row["chunk_count"]),
             chat_id=int(row["chat_id"]),
             content_hash=str(row["content_hash"]),
             invalidated_at=row["invalidated_at"],
@@ -768,12 +827,17 @@ def _find_reusable_unit(
     candidates = units_by_source.get((document.source_type, document.source_id), ())
     for candidate in candidates:
         if (
-            candidate.source_revision == document.source_revision
+            candidate.chunk_index == document.chunk_index
+            and candidate.chunk_count == document.chunk_count
+            and candidate.source_revision == document.source_revision
             and candidate.content_hash == document.content_hash
         ):
             return candidate
     for candidate in candidates:
-        if candidate.content_hash == document.content_hash:
+        if (
+            candidate.chunk_index == document.chunk_index
+            and candidate.content_hash == document.content_hash
+        ):
             return candidate
     return None
 
@@ -789,7 +853,8 @@ def _find_parent_message_unit(
         (
             candidate
             for candidate in units_by_current_source.get(document.source_id, ())
-            if candidate.content_hash == document.content_hash
+            if candidate.chunk_index == document.chunk_index
+            and candidate.content_hash == document.content_hash
         ),
         None,
     )
@@ -946,7 +1011,11 @@ async def _invalidate_previous_documents(
                   AND unit.invalidated_at IS NULL
                   AND (
                       unit.source_revision <> :source_revision
-                      OR unit.content_hash <> :content_hash
+                      OR unit.chunk_count <> :chunk_count
+                      OR (
+                          unit.chunk_index = :chunk_index
+                          AND unit.content_hash <> :content_hash
+                      )
                   )
                   AND EXISTS (
                       SELECT 1
@@ -964,6 +1033,8 @@ async def _invalidate_previous_documents(
                 "invalidated_at": now,
                 "embedding_model": embedding_model,
                 "source_revision": document.source_revision,
+                "chunk_index": document.chunk_index,
+                "chunk_count": document.chunk_count,
                 "content_hash": document.content_hash,
                 "current_message_version_id": int(document.source_id),
             },
@@ -979,7 +1050,11 @@ async def _invalidate_previous_documents(
         )
         .where(
             (SemanticRetrievalUnit.source_revision != document.source_revision)
-            | (SemanticRetrievalUnit.content_hash != document.content_hash)
+            | (SemanticRetrievalUnit.chunk_count != document.chunk_count)
+            | (
+                (SemanticRetrievalUnit.chunk_index == document.chunk_index)
+                & (SemanticRetrievalUnit.content_hash != document.content_hash)
+            )
         )
         .values(invalidated_at=now, invalidation_reason="source_revised")
     )
@@ -1000,6 +1075,7 @@ async def _reuse_document(
     )
     if (
         unit.source_revision != document.source_revision
+        or unit.chunk_count != document.chunk_count
         or unit.chat_id != document.chat_id
         or unit.invalidated_at is not None
     ):
@@ -1008,6 +1084,7 @@ async def _reuse_document(
             .where(SemanticRetrievalUnit.id == unit.id)
             .values(
                 source_revision=document.source_revision,
+                chunk_count=document.chunk_count,
                 chat_id=document.chat_id,
                 invalidated_at=None,
                 invalidation_reason=None,
@@ -1054,6 +1131,8 @@ async def _store_document(
             source_type=document.source_type,
             source_id=document.source_id,
             source_revision=document.source_revision,
+            chunk_index=document.chunk_index,
+            chunk_count=document.chunk_count,
             chat_id=document.chat_id,
             content_hash=document.content_hash,
             embedding_provider=embedding_provider,
@@ -1084,76 +1163,23 @@ async def _store_document(
     return True
 
 
-async def _index_batch_locked(
+async def _persist_document_batch(
     session: AsyncSession,
     *,
     documents: Sequence[RetrievalDocument],
     config: EmbeddingGatewayConfig,
-    provider: Any | None,
-) -> _BatchResult:
+    embeddings: dict[RetrievalDocument, tuple[Sequence[float], int]],
+) -> Counter[str]:
+    """Persist one governed batch and classify every document."""
+
     batch = tuple(documents)
     if not batch:
-        return _BatchResult(indexed=0, skipped=0, reason_counts={})
-    # The batch may have been listed before this worker acquired the per-source
-    # locks. Re-read governance state before any provider call so a forget/edit
-    # transaction that won the lock can never leak stale text to OpenAI.
-    prevalidated_documents = await _revalidate_documents(session, documents=batch)
-    units_before_embedding = await _load_existing_units(
-        session,
-        documents=prevalidated_documents,
-        embedding_model=config.model,
-    )
-    parent_units_before_embedding = await _load_parent_message_units(
-        session,
-        documents=prevalidated_documents,
-        embedding_model=config.model,
-    )
-    reusable_before_embedding = {
-        document: unit
-        for document in prevalidated_documents
-        if (
-            unit := _find_reusable_unit(
-                document=document,
-                units_by_source=units_before_embedding,
-            )
-            or _find_parent_message_unit(
-                document=document,
-                units_by_current_source=parent_units_before_embedding,
-            )
-        )
-        is not None
-    }
-    missing = [
-        document for document in prevalidated_documents if document not in reusable_before_embedding
-    ]
-    oversized_documents = {
-        document for document in missing if len(document.canonical_text) > MAX_EMBEDDING_INPUT_CHARS
-    }
-    embeddable_documents = [document for document in missing if document not in oversized_documents]
-    vectors_by_document: dict[RetrievalDocument, tuple[Sequence[float], int]] = {}
-    for embedding_batch in _partition_embedding_documents(embeddable_documents):
-        embedding_result = await embed_texts(
-            session,
-            inputs=[document.canonical_text for document in embedding_batch],
-            config=config,
-            ledger_repo=LedgerRepo(),
-            provider=provider,
-        )
-        vectors_by_document.update(
-            {
-                document: (vector, embedding_result.llm_usage_ledger_id)
-                for document, vector in zip(
-                    embedding_batch,
-                    embedding_result.vectors,
-                    strict=True,
-                )
-            }
-        )
-    embedded_documents = set(embeddable_documents)
+        return Counter()
+    embedded_documents = set(embeddings)
 
     valid_documents = await _revalidate_documents(
         session,
-        documents=prevalidated_documents,
+        documents=batch,
     )
     if blocked_count := len(batch) - len(valid_documents):
         logger.info(
@@ -1217,6 +1243,7 @@ async def _index_batch_locked(
             existing_sources = sources_by_unit.get(reusable.id, ())
             unchanged = (
                 reusable.source_revision == document.source_revision
+                and reusable.chunk_count == document.chunk_count
                 and reusable.chat_id == document.chat_id
                 and reusable.invalidated_at is None
                 and existing_sources == document.message_version_ids
@@ -1249,13 +1276,9 @@ async def _index_batch_locked(
             )
             reasons["indexed:reused_embedding" if stored else "skipped:conflict"] += 1
             continue
-        if document in oversized_documents:
-            reasons["skipped:oversize"] += 1
-            continue
-        embedded = vectors_by_document.get(document)
+        embedded = embeddings.get(document)
         if embedded is None:
-            reasons["skipped:conflict"] += 1
-            continue
+            raise LookupError("governed semantic document lost its reusable embedding")
         vector, llm_usage_ledger_id = embedded
         if await _store_document(
             session,
@@ -1270,14 +1293,110 @@ async def _index_batch_locked(
             reasons["indexed:new_embedding"] += 1
         else:
             reasons["skipped:conflict"] += 1
+    return reasons
+
+
+def _batch_result_from_reasons(reasons: Counter[str]) -> _BatchResult:
     indexed = reasons["indexed:new_embedding"] + reasons["indexed:reused_embedding"]
     skipped = (
         reasons["skipped:unchanged"]
         + reasons["skipped:governance_race"]
         + reasons["skipped:conflict"]
-        + reasons["skipped:oversize"]
     )
     return _BatchResult(indexed=indexed, skipped=skipped, reason_counts=dict(reasons))
+
+
+async def _index_batch_locked(
+    session: AsyncSession,
+    *,
+    documents: Sequence[RetrievalDocument],
+    config: EmbeddingGatewayConfig,
+    provider: Any | None,
+) -> _BatchResult:
+    batch = tuple(documents)
+    if not batch:
+        return _BatchResult(indexed=0, skipped=0, reason_counts={})
+    # Re-read governance state before any provider call. The caller already
+    # holds every source/forget lock for the entire sequence of partitions.
+    prevalidated_documents = await _revalidate_documents(session, documents=batch)
+    prevalidated_set = set(prevalidated_documents)
+    reasons: Counter[str] = Counter()
+    if blocked_count := len(batch) - len(prevalidated_documents):
+        reasons["skipped:governance_race"] += blocked_count
+
+    units_before_embedding = await _load_existing_units(
+        session,
+        documents=prevalidated_documents,
+        embedding_model=config.model,
+    )
+    parent_units_before_embedding = await _load_parent_message_units(
+        session,
+        documents=prevalidated_documents,
+        embedding_model=config.model,
+    )
+    reusable_documents = [
+        document
+        for document in prevalidated_documents
+        if _find_reusable_unit(
+            document=document,
+            units_by_source=units_before_embedding,
+        )
+        is not None
+        or _find_parent_message_unit(
+            document=document,
+            units_by_current_source=parent_units_before_embedding,
+        )
+        is not None
+    ]
+    if reusable_documents:
+        reasons.update(
+            await _persist_document_batch(
+                session,
+                documents=reusable_documents,
+                config=config,
+                embeddings={},
+            )
+        )
+
+    missing_documents = [
+        document
+        for document in batch
+        if document in prevalidated_set and document not in reusable_documents
+    ]
+    try:
+        for embedding_batch in _partition_embedding_documents(missing_documents):
+            embedding_result = await embed_texts(
+                session,
+                inputs=[document.canonical_text for document in embedding_batch],
+                config=config,
+                ledger_repo=LedgerRepo(),
+                provider=provider,
+            )
+            embeddings = {
+                document: (vector, embedding_result.llm_usage_ledger_id)
+                for document, vector in zip(
+                    embedding_batch,
+                    embedding_result.vectors,
+                    strict=True,
+                )
+            }
+            partition_reasons = await _persist_document_batch(
+                session,
+                documents=embedding_batch,
+                config=config,
+                embeddings=embeddings,
+            )
+            # Make each paid partition discoverable by retries and forget
+            # cascade before the next independent provider call can fail.
+            await session.commit()
+            reasons.update(partition_reasons)
+    except Exception as exc:
+        # The outer run still needs exact accounting for partitions committed
+        # before any failure. Only no-content counters cross the boundary.
+        setattr(exc, "semantic_batch_result", _batch_result_from_reasons(reasons))
+        raise
+
+    return _batch_result_from_reasons(reasons)
 
 
 async def _index_batch(
@@ -1472,6 +1591,11 @@ async def backfill_semantic_index(
         ProviderTransientError,
         ValueError,
     ) as exc:
+        partial_batch = getattr(exc, "semantic_batch_result", None)
+        if isinstance(partial_batch, _BatchResult):
+            indexed += partial_batch.indexed
+            skipped += partial_batch.skipped
+            reasons.update(partial_batch.reason_counts)
         # Every eligible document must be accounted for as indexed, skipped,
         # or failed. A provider error aborts the whole current batch, not one
         # synthetic row in the audit report.
@@ -1500,6 +1624,30 @@ async def backfill_semantic_index(
         await session.commit()
         logger.error(
             "semantic_index_database_failed",
+            extra={"run_id": run_id, "error_class": type(exc).__name__},
+        )
+        raise
+    except Exception as exc:
+        # Module-reload test harnesses and future provider taxonomies can yield
+        # an exception class that is not one of the explicit gateway types.
+        # Preserve the same durable, no-content run audit before propagating it.
+        partial_batch = getattr(exc, "semantic_batch_result", None)
+        if isinstance(partial_batch, _BatchResult):
+            indexed += partial_batch.indexed
+            skipped += partial_batch.skipped
+            reasons.update(partial_batch.reason_counts)
+        failed = max(0, eligible - indexed - skipped)
+        reasons[f"failed:{type(exc).__name__}"] += max(1, failed)
+        run.status = "failed"
+        run.eligible_count = eligible
+        run.indexed_count = indexed
+        run.skipped_count = skipped
+        run.failed_count = failed
+        run.reason_counts = dict(reasons)
+        run.completed_at = datetime.now(timezone.utc)
+        await session.commit()
+        logger.error(
+            "semantic_index_unexpected_failed",
             extra={"run_id": run_id, "error_class": type(exc).__name__},
         )
         raise

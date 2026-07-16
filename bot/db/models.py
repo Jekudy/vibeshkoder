@@ -797,6 +797,10 @@ class SemanticRetrievalUnit(Base):
         CheckConstraint("source_type IN ('message','card')", name="ck_semantic_units_source_type"),
         CheckConstraint("embedding_dimensions = 1536", name="ck_semantic_units_dimensions"),
         CheckConstraint(
+            "chunk_index >= 0 AND chunk_count > 0 AND chunk_index < chunk_count",
+            name="ck_semantic_units_chunk_bounds",
+        ),
+        CheckConstraint(
             "(invalidated_at IS NULL) = (invalidation_reason IS NULL)",
             name="ck_semantic_units_invalidation_pair",
         ),
@@ -804,6 +808,7 @@ class SemanticRetrievalUnit(Base):
             "source_type",
             "source_id",
             "source_revision",
+            "chunk_index",
             "content_hash",
             "embedding_model",
             name="uq_semantic_units_identity",
@@ -816,6 +821,8 @@ class SemanticRetrievalUnit(Base):
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     source_id: Mapped[str] = mapped_column(String(64), nullable=False)
     source_revision: Mapped[str] = mapped_column(String(128), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
+    chunk_count: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     embedding_provider: Mapped[str] = mapped_column(String(64), nullable=False)
