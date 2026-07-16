@@ -38,11 +38,13 @@ jobs:
           trap 'docker rm --force shkoder-postgres-smoke >/dev/null 2>&1 || true' EXIT
           for _ in $(seq 1 30); do
             if docker exec shkoder-postgres-smoke \
-              pg_isready -U vibe -d vibe_gatekeeper >/dev/null; then
+              pg_isready -h 127.0.0.1 -U vibe -d vibe_gatekeeper >/dev/null; then
+              postgres_ready=true
               break
             fi
             sleep 1
           done
+          test "${postgres_ready:-false}" = "true"
           docker exec shkoder-postgres-smoke \
             psql -U vibe -d vibe_gatekeeper -v ON_ERROR_STOP=1 \
               -c 'CREATE EXTENSION vector;'
