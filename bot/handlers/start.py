@@ -51,6 +51,7 @@ async def cmd_start(
         username=tg_user.username,
         first_name=tg_user.first_name,
         last_name=tg_user.last_name,
+        is_bot=getattr(tg_user, "is_bot", None),
     )
 
     # Check for active application (filling / pending / privacy_block)
@@ -132,6 +133,7 @@ async def cmd_refresh(
         username=tg_user.username,
         first_name=tg_user.first_name,
         last_name=tg_user.last_name,
+        is_bot=getattr(tg_user, "is_bot", None),
     )
 
     if not user.is_member:

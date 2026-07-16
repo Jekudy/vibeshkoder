@@ -6,6 +6,7 @@ dependencies = [
     "aiogram>=3.25",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.30",
+    "pgvector>=0.4.1,<0.5",
     "alembic>=1.14",
     "pydantic-settings>=2.0",
     "gspread-asyncio>=2.0",

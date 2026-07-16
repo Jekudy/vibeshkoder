@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from html.parser import HTMLParser
 import re
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -38,6 +40,18 @@ FAKE_SECRET_FAMILIES = (
         id="named-assignment",
     ),
 )
+
+
+@pytest.fixture(autouse=True)
+def _mock_semantic_delivery_intent(monkeypatch, app_env):
+    """Handler tests isolate orchestration from the real PostgreSQL repo."""
+
+    handler = import_module("bot.handlers.qa")
+    marker = AsyncMock()
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "mark_delivery_started", marker)
+    return marker
+
+
 FAKE_HIGHLIGHT_SPLIT_SECRETS = (
     pytest.param(
         "<b>token</b>=Az9!FAKE_SECRET_0123456789",
@@ -145,15 +159,85 @@ def _qa_result(
     )
 
 
-def _flag_get(handler, *, qa: bool = True, llm: bool = True) -> AsyncMock:
-    async def get(_session, key: str) -> bool:
+def _flag_get(
+    handler,
+    *,
+    qa: bool = True,
+    llm: bool = True,
+    semantic: bool = False,
+) -> AsyncMock:
+    async def get(
+        _session,
+        key: str,
+        scope_type: str | None = None,
+        scope_id: str | None = None,
+    ) -> bool:
         if key == handler.QA_FEATURE_FLAG:
             return qa
         if key == handler.LLM_SYNTHESIS_FEATURE_FLAG:
             return llm
+        if key == handler.SEMANTIC_QA_FEATURE_FLAG:
+            return semantic if scope_type is None and scope_id is None else False
         raise AssertionError(f"unexpected flag: {key}")
 
     return AsyncMock(side_effect=get)
+
+
+def test_five_source_footer_retains_clickable_links_with_worst_case_text() -> None:
+    handler = import_module("bot.handlers.qa")
+    base = _qa_result(snippet="<>&" * 2_000).bundle
+    item = base.items[0]
+    bundle = replace(
+        base,
+        items=tuple(
+            replace(
+                item,
+                message_version_id=101 + index,
+                chat_message_id=10 + index,
+                message_id=77 + index,
+                user_id=2002 + index,
+            )
+            for index in range(5)
+        ),
+    )
+    users = {
+        2002 + index: SimpleNamespace(first_name="А" * 2_000, last_name="Б" * 2_000)
+        for index in range(5)
+    }
+
+    rendered = handler._format_bounded_mention_response("О" * 10_000, bundle, users)
+
+    _assert_bounded_valid_html(rendered)
+    assert rendered.count('<a href="https://t.me/c/1234567890/') == 5
+
+
+def test_semantic_trace_binding_flattens_card_provenance() -> None:
+    qa_service = import_module("bot.services.qa")
+    from bot.services.evidence import EvidenceBundle, EvidenceItem
+
+    now = datetime(2026, 7, 16, 12, tzinfo=timezone.utc)
+    card = EvidenceItem(
+        message_version_id=101,
+        chat_message_id=10,
+        chat_id=COMMUNITY_CHAT_ID,
+        message_id=77,
+        user_id=2002,
+        snippet="approved card",
+        ts_rank=0.9,
+        captured_at=now,
+        message_date=now,
+        source_type="card",
+        card_source_message_version_ids=(101, 102, 103),
+    )
+    message = replace(
+        card,
+        message_version_id=104,
+        source_type="message",
+        card_source_message_version_ids=(),
+    )
+    bundle = EvidenceBundle("q", COMMUNITY_CHAT_ID, (card, message), False, now)
+
+    assert qa_service._semantic_evidence_provenance_ids(bundle) == [101, 102, 103, 104]
 
 
 def _patch_common(handler, monkeypatch, *, member: bool = True) -> None:
@@ -942,7 +1026,8 @@ async def test_redelivered_question_does_not_consume_second_llm_slot(monkeypatch
     run_qa.assert_not_awaited()
     quota.assert_not_awaited()
     synthesize.assert_not_awaited()
-    assert message.reply.await_args.args[0] == handler.SENSITIVE_QA_REFUSAL
+    assert "сохранённый ответ повторно не показывается" in message.reply.await_args.args[0]
+    assert FAKE_OPENAI_KEY not in message.reply.await_args.args[0]
     assert "Уже сохранённый ответ" not in message.reply.call_args.args[0]
     assert FAKE_OPENAI_KEY not in message.reply.await_args.args[0]
     _assert_bounded_valid_html(message.reply.await_args.args[0])
@@ -987,3 +1072,1044 @@ async def test_redelivered_sensitive_query_is_refused_without_duplicate_trace(
     run_qa.assert_not_awaited()
     quota.assert_not_awaited()
     synthesize.assert_not_awaited()
+
+
+async def test_redelivered_semantic_answer_never_replays_stored_content(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    rendered = (
+        'Ответ [1]\n\n<b>Источники:</b>\n[1] <a href="https://t.me/c/1234567890/77">источник</a>'
+    )
+    _patch_common(handler, monkeypatch)
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", _flag_get(handler, semantic=True))
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "get_by_source_chat_message_id",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                llm_response_summary=f"{handler._SEMANTIC_REPLAY_HTML_PREFIX}{rendered}"
+            )
+        ),
+    )
+    semantic = AsyncMock()
+    monkeypatch.setattr(handler, "_semantic_mention_question", semantic)
+
+    await handler.mention_question_handler(message, _question(), session)
+
+    semantic.assert_not_awaited()
+    assert rendered not in message.reply.await_args.args[0]
+    assert "сохранённый ответ повторно не показывается" in message.reply.await_args.args[0]
+
+
+async def test_semantic_feature_routes_before_legacy_retrieval(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    semantic_handler = AsyncMock()
+    legacy = AsyncMock()
+
+    _patch_common(handler, monkeypatch)
+    monkeypatch.setattr(
+        handler.FeatureFlagRepo,
+        "get",
+        _flag_get(handler, semantic=True),
+    )
+    monkeypatch.setattr(handler, "_semantic_mention_question", semantic_handler)
+    monkeypatch.setattr(handler, "run_qa", legacy)
+
+    await handler.mention_question_handler(message, _question(), session)
+
+    semantic_handler.assert_awaited_once_with(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="что решили про память?",
+        query_redacted=False,
+    )
+    legacy.assert_not_awaited()
+
+
+async def test_semantic_user_scoped_flag_routes_when_global_is_off(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message(user_id=1001)
+    session = AsyncMock()
+    semantic_handler = AsyncMock()
+    legacy = AsyncMock()
+
+    async def flag_get(_session, key, scope_type=None, scope_id=None):
+        if key in (handler.QA_FEATURE_FLAG, handler.LLM_SYNTHESIS_FEATURE_FLAG):
+            return True
+        if key == handler.SEMANTIC_QA_FEATURE_FLAG:
+            return scope_type == "user" and scope_id == "1001"
+        raise AssertionError(key)
+
+    _patch_common(handler, monkeypatch)
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(side_effect=flag_get))
+    monkeypatch.setattr(handler, "_semantic_mention_question", semantic_handler)
+    monkeypatch.setattr(handler, "run_qa", legacy)
+
+    await handler.mention_question_handler(message, _question(), session)
+
+    semantic_handler.assert_awaited_once()
+    legacy.assert_not_awaited()
+    scoped_call = handler.FeatureFlagRepo.get.await_args_list[-1]
+    assert scoped_call.kwargs == {"scope_type": "user", "scope_id": "1001"}
+
+
+async def test_semantic_user_scoped_flag_does_not_enable_other_user(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message(user_id=1002)
+    session = AsyncMock()
+    semantic_handler = AsyncMock()
+    lexical = AsyncMock(return_value=_qa_result(abstained=True))
+
+    async def flag_get(_session, key, scope_type=None, scope_id=None):
+        if key in (handler.QA_FEATURE_FLAG, handler.LLM_SYNTHESIS_FEATURE_FLAG):
+            return True
+        if key == handler.SEMANTIC_QA_FEATURE_FLAG:
+            return scope_type == "user" and scope_id == "1001"
+        raise AssertionError(key)
+
+    _patch_common(handler, monkeypatch)
+    monkeypatch.setattr(handler.FeatureFlagRepo, "get", AsyncMock(side_effect=flag_get))
+    monkeypatch.setattr(handler, "_semantic_mention_question", semantic_handler)
+    monkeypatch.setattr(handler, "run_qa", lexical)
+    monkeypatch.setattr(handler, "_write_trace", AsyncMock())
+
+    await handler.mention_question_handler(message, _question(), session)
+
+    semantic_handler.assert_not_awaited()
+    lexical.assert_awaited_once()
+    assert "Не нашёл достаточно" in message.reply.await_args.args[0]
+
+
+async def test_semantic_third_question_calls_only_ordinary_search(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    semantic = AsyncMock()
+    synthesize = AsyncMock()
+    ordinary = _qa_result()
+
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=False,
+                attempt_id=3003,
+                used=2,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(handler, "run_semantic_qa", semantic)
+    monkeypatch.setattr(handler, "synthesize_answer", synthesize)
+    monkeypatch.setattr(
+        handler,
+        "_ordinary_search_result",
+        AsyncMock(return_value=ordinary),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_bundle_users",
+        AsyncMock(return_value=({}, False)),
+    )
+    monkeypatch.setattr(handler, "_write_trace", AsyncMock())
+    reply_ordinary = AsyncMock()
+    monkeypatch.setattr(
+        handler,
+        "_reply_with_governed_ordinary_search",
+        reply_ordinary,
+    )
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="что решили про память?",
+        query_redacted=False,
+    )
+
+    semantic.assert_not_awaited()
+    synthesize.assert_not_awaited()
+    reply_ordinary.assert_awaited_once()
+    assert "Embedding и AI-синтез не вызывались" in reply_ordinary.await_args.kwargs["notice"]
+
+
+async def test_semantic_empty_retrieval_consumes_abstention_slot(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    empty = _qa_result(abstained=True)
+    finalize = AsyncMock()
+
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                attempt_id=3004,
+                used=0,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler,
+        "run_semantic_qa",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                bundle=empty.bundle,
+                embedding_llm_call_id=4004,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "create",
+        AsyncMock(return_value=SimpleNamespace(id=5004)),
+    )
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "attach_trace", AsyncMock())
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="нет ответа",
+        query_redacted=False,
+    )
+
+    assert finalize.await_args.kwargs["outcome"] == "abstained"
+    assert finalize.await_args.kwargs["embedding_llm_call_id"] == 4004
+    assert "Не нашёл достаточно" in message.reply.await_args.args[0]
+
+
+async def test_semantic_trace_is_committed_before_embedding_dispatch(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    events: list[str] = []
+
+    async def commit() -> None:
+        events.append("commit")
+
+    async def create(*_args, **_kwargs):
+        events.append("trace")
+        return SimpleNamespace(id=5015)
+
+    async def attach(*_args, **_kwargs) -> None:
+        events.append("attach")
+
+    async def run(*_args, **_kwargs):
+        events.append("embedding")
+        return SimpleNamespace(
+            bundle=_qa_result(abstained=True).bundle,
+            embedding_llm_call_id=4015,
+        )
+
+    session.commit.side_effect = commit
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                replayed=False,
+                attempt_id=3015,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(handler.QaTraceRepo, "create", create)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "attach_trace", attach)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", AsyncMock())
+    monkeypatch.setattr(handler, "run_semantic_qa", run)
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="порядок",
+        query_redacted=False,
+    )
+
+    assert events[:5] == ["commit", "trace", "attach", "commit", "embedding"]
+
+
+async def test_semantic_embedding_failure_releases_slot(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    from bot.services.llm_providers import ProviderTransientError
+
+    message = _message()
+    session = AsyncMock()
+    failure = ProviderTransientError("timeout", message="provider timeout")
+    failure.llm_usage_ledger_id = 4005
+    finalize = AsyncMock()
+
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                attempt_id=3005,
+                used=0,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(handler, "run_semantic_qa", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(
+        handler,
+        "_ordinary_search_result",
+        AsyncMock(return_value=_qa_result()),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "create",
+        AsyncMock(return_value=SimpleNamespace(id=5005)),
+    )
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "attach_trace", AsyncMock())
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(
+        handler,
+        "_bundle_users",
+        AsyncMock(return_value=({}, False)),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_reply_with_governed_ordinary_search",
+        AsyncMock(),
+    )
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="техническая ошибка",
+        query_redacted=False,
+    )
+
+    assert finalize.await_args.kwargs["outcome"] == "technical_failure"
+    assert finalize.await_args.kwargs["embedding_llm_call_id"] == 4005
+
+
+async def test_semantic_answer_has_valid_link_and_consumes_slot(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    from bot.services.llm_gateway import AnswerWithCitations
+
+    message = _message()
+    session = AsyncMock()
+    semantic_result = _qa_result()
+    finalize = AsyncMock()
+    author = SimpleNamespace(first_name="Author", last_name=None, username="author")
+
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                attempt_id=3006,
+                used=0,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler,
+        "run_semantic_qa",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                bundle=semantic_result.bundle,
+                embedding_llm_call_id=4006,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_bundle_users",
+        AsyncMock(return_value=({2002: author}, False)),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "create",
+        AsyncMock(return_value=SimpleNamespace(id=5006)),
+    )
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "attach_trace", AsyncMock())
+    monkeypatch.setattr(handler.QaTraceRepo, "update_llm_fields", AsyncMock())
+    monkeypatch.setattr(
+        handler,
+        "filter_surviving_evidence",
+        AsyncMock(return_value=semantic_result.bundle),
+    )
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(
+        handler,
+        "_load_gateway_config",
+        Mock(
+            return_value=SimpleNamespace(
+                provider="deepseek",
+                model="deepseek-v4-flash",
+            )
+        ),
+    )
+    monkeypatch.setattr(handler, "_resolve_provider", Mock(return_value=object()))
+    monkeypatch.setattr(
+        handler,
+        "synthesize_answer",
+        AsyncMock(
+            return_value=AnswerWithCitations(
+                answer_text="Решение подтверждено [[mv:101]]",
+                citation_ids=(101,),
+                cost_usd=Decimal("0.001"),
+                cache_hit=False,
+                llm_call_id=6006,
+                surviving_evidence_ids=(101,),
+            )
+        ),
+    )
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="что решили",
+        query_redacted=False,
+    )
+
+    assert finalize.await_args.kwargs["outcome"] == "answered"
+    assert handler.synthesize_answer.await_args.kwargs["max_evidence_items"] == 5
+    assert handler.synthesize_answer.await_args.kwargs["durable_placeholder"] is True
+    assert handler.synthesize_answer.await_args.kwargs["revalidate_after_provider"] is True
+    handler.SemanticQuotaRepo.attach_trace.assert_awaited_once_with(
+        session,
+        attempt_id=3006,
+        qa_trace_id=5006,
+    )
+    reply = message.reply.await_args.args[0]
+    assert "Решение подтверждено [1]" in reply
+    assert 'href="https://t.me/c/1234567890/77"' in reply
+    assert "[[mv:" not in reply
+    stored_summary = handler.QaTraceRepo.update_llm_fields.await_args.kwargs["llm_response_summary"]
+    assert stored_summary.startswith(handler._SEMANTIC_REPLAY_HTML_PREFIX)
+    assert 'href="https://t.me/c/1234567890/77"' in stored_summary
+
+
+async def test_semantic_reserved_replay_never_dispatches_providers(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    semantic = AsyncMock()
+    synthesis = AsyncMock()
+
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=False,
+                replayed=True,
+                status="reserved",
+                outcome=None,
+                attempt_id=3010,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "get_by_source_chat_message_id",
+        AsyncMock(return_value=SimpleNamespace(llm_response_summary=None)),
+    )
+    monkeypatch.setattr(handler, "run_semantic_qa", semantic)
+    monkeypatch.setattr(handler, "synthesize_answer", synthesis)
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="повтор",
+        query_redacted=False,
+    )
+
+    semantic.assert_not_awaited()
+    synthesis.assert_not_awaited()
+    assert "уже обрабатывается" in message.reply.await_args.args[0]
+
+
+async def test_semantic_answer_replay_never_emits_stored_content(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    rendered = (
+        'Готово [1]\n\n<b>Источники:</b>\n[1] <a href="https://t.me/c/1234567890/77">источник</a>'
+    )
+
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=False,
+                replayed=True,
+                status="consumed",
+                outcome="answered",
+                attempt_id=3011,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "get_by_source_chat_message_id",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                llm_response_summary=f"{handler._SEMANTIC_REPLAY_HTML_PREFIX}{rendered}"
+            )
+        ),
+    )
+    semantic = AsyncMock()
+    synthesis = AsyncMock()
+    monkeypatch.setattr(handler, "run_semantic_qa", semantic)
+    monkeypatch.setattr(handler, "synthesize_answer", synthesis)
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="повтор",
+        query_redacted=False,
+    )
+
+    semantic.assert_not_awaited()
+    synthesis.assert_not_awaited()
+    assert rendered not in message.reply.await_args.args[0]
+    assert "провайдеры повторно не вызывались" in message.reply.await_args.args[0]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_outcome"),
+    [("all_filtered", "abstained"), ("budget_exceeded", "technical_failure")],
+)
+async def test_semantic_abstention_classifies_quota_outcome(
+    monkeypatch,
+    reason: str,
+    expected_outcome: str,
+) -> None:
+    handler = import_module("bot.handlers.qa")
+    from bot.services.llm_gateway import Abstention
+
+    message = _message()
+    session = AsyncMock()
+    finalize = AsyncMock()
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                replayed=False,
+                attempt_id=3012,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "create",
+        AsyncMock(return_value=SimpleNamespace(id=5012)),
+    )
+    monkeypatch.setattr(handler.QaTraceRepo, "update_llm_fields", AsyncMock())
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "attach_trace", AsyncMock())
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(
+        handler,
+        "run_semantic_qa",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                bundle=_qa_result().bundle,
+                embedding_llm_call_id=4012,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_load_gateway_config",
+        Mock(return_value=SimpleNamespace(provider="deepseek", model="deepseek-v4-flash")),
+    )
+    monkeypatch.setattr(handler, "_resolve_provider", Mock(return_value=object()))
+    monkeypatch.setattr(
+        handler,
+        "synthesize_answer",
+        AsyncMock(
+            return_value=Abstention(
+                reason=reason,
+                cost_usd=Decimal("0"),
+                llm_call_id=6012,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_reply_after_technical_release",
+        AsyncMock(),
+    )
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="классификация",
+        query_redacted=False,
+    )
+
+    assert finalize.await_args.kwargs["outcome"] == expected_outcome
+
+
+async def test_semantic_render_revalidation_change_abstains_without_leak(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    from bot.services.llm_gateway import AnswerWithCitations
+
+    message = _message()
+    session = AsyncMock()
+    original = _qa_result(snippet="PRIVATE-FORGOTTEN-SNIPPET")
+    empty = _qa_result(abstained=True)
+    finalize = AsyncMock()
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                replayed=False,
+                attempt_id=3013,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "create",
+        AsyncMock(return_value=SimpleNamespace(id=5013)),
+    )
+    monkeypatch.setattr(handler.QaTraceRepo, "update_retrieval_fields", AsyncMock())
+    monkeypatch.setattr(handler.QaTraceRepo, "update_llm_fields", AsyncMock())
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "attach_trace", AsyncMock())
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(
+        handler,
+        "run_semantic_qa",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                bundle=original.bundle,
+                embedding_llm_call_id=4013,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_load_gateway_config",
+        Mock(return_value=SimpleNamespace(provider="deepseek", model="deepseek-v4-flash")),
+    )
+    monkeypatch.setattr(handler, "_resolve_provider", Mock(return_value=object()))
+    monkeypatch.setattr(
+        handler,
+        "synthesize_answer",
+        AsyncMock(
+            return_value=AnswerWithCitations(
+                answer_text="Ответ [[mv:101]]",
+                citation_ids=(101,),
+                cost_usd=Decimal("0.001"),
+                cache_hit=False,
+                llm_call_id=6013,
+                surviving_evidence_ids=(101,),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler,
+        "filter_surviving_evidence",
+        AsyncMock(return_value=empty.bundle),
+    )
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="гонка forget",
+        query_redacted=False,
+    )
+
+    assert finalize.await_args.kwargs["outcome"] == "abstained"
+    reply = message.reply.await_args.args[0]
+    assert "PRIVATE-FORGOTTEN-SNIPPET" not in reply
+    assert "Не нашёл достаточно" in reply
+
+
+async def test_semantic_technical_release_precedes_failing_ordinary_fallback(
+    monkeypatch,
+) -> None:
+    handler = import_module("bot.handlers.qa")
+    from sqlalchemy.exc import SQLAlchemyError
+    from bot.services.llm_providers import ProviderTransientError
+
+    message = _message()
+    session = AsyncMock()
+    events: list[str] = []
+    failure = ProviderTransientError("timeout", message="provider timeout")
+    failure.llm_usage_ledger_id = 4014
+
+    async def finalize(*_args, **_kwargs) -> None:
+        events.append("released")
+
+    async def fallback(*_args, **_kwargs):
+        events.append("fallback")
+        raise SQLAlchemyError("ordinary search failed")
+
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                replayed=False,
+                attempt_id=3014,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "create",
+        AsyncMock(return_value=SimpleNamespace(id=5014)),
+    )
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "attach_trace", AsyncMock())
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(handler, "run_semantic_qa", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(handler, "_ordinary_search_result", fallback)
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        query="ошибка fallback",
+        query_redacted=False,
+    )
+
+    assert events == ["released", "fallback"]
+    assert "Лимит не списан" in message.reply.await_args.args[0]
+
+
+async def test_semantic_quota_consumes_only_after_successful_delivery(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    session = AsyncMock()
+    message = _message()
+    events: list[str] = []
+
+    async def reply(*_args, **_kwargs) -> None:
+        events.append("delivered")
+
+    async def finalize(*_args, **kwargs) -> None:
+        events.append(f"finalized:{kwargs['outcome']}")
+
+    async def mark_delivery(*_args, **_kwargs) -> None:
+        events.append("delivery-intent")
+
+    monkeypatch.setattr(handler, "_reply_to_mention", reply)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "mark_delivery_started", mark_delivery)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+
+    await handler._deliver_and_consume_semantic_attempt(
+        message,
+        session,
+        attempt_id=31,
+        outcome="answered",
+        qa_trace_id=41,
+        embedding_llm_call_id=51,
+        synthesis_llm_call_id=61,
+        reply_text="answer",
+    )
+
+    assert events == ["delivery-intent", "delivered", "finalized:answered"]
+
+
+async def test_post_delivery_commit_failure_keeps_durable_delivery_intent(monkeypatch) -> None:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    handler = import_module("bot.handlers.qa")
+    session = AsyncMock()
+    message = _message()
+    commits = 0
+
+    async def commit() -> None:
+        nonlocal commits
+        commits += 1
+        if commits == 3:
+            raise SQLAlchemyError("post-delivery commit failed")
+
+    intent = AsyncMock()
+    finalize = AsyncMock()
+    reply = AsyncMock()
+    session.commit.side_effect = commit
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "mark_delivery_started", intent)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(handler, "_reply_to_mention", reply)
+
+    with pytest.raises(SQLAlchemyError, match="post-delivery"):
+        await handler._deliver_and_consume_semantic_attempt(
+            message,
+            session,
+            attempt_id=33,
+            outcome="answered",
+            qa_trace_id=43,
+            embedding_llm_call_id=53,
+            synthesis_llm_call_id=63,
+            reply_text="delivered answer",
+        )
+
+    intent.assert_awaited_once()
+    reply.assert_awaited_once()
+    finalize.assert_awaited_once()
+    assert commits == 3
+
+
+async def test_pre_delivery_intent_commit_failure_releases_slot(monkeypatch) -> None:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    handler = import_module("bot.handlers.qa")
+    session = AsyncMock()
+    message = _message()
+    commits = 0
+
+    async def commit() -> None:
+        nonlocal commits
+        commits += 1
+        if commits == 2:
+            raise SQLAlchemyError("intent commit failed")
+
+    intent = AsyncMock()
+    finalize = AsyncMock()
+    reply = AsyncMock()
+    clear = AsyncMock()
+    session.commit.side_effect = commit
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "mark_delivery_started", intent)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(handler.QaTraceRepo, "clear_undelivered_llm_summary", clear)
+    monkeypatch.setattr(handler, "_reply_to_mention", reply)
+
+    await handler._deliver_and_consume_semantic_attempt(
+        message,
+        session,
+        attempt_id=36,
+        outcome="answered",
+        qa_trace_id=46,
+        embedding_llm_call_id=56,
+        synthesis_llm_call_id=66,
+        reply_text="must not be sent",
+        clear_summary_on_failure=True,
+    )
+
+    intent.assert_awaited_once()
+    clear.assert_awaited_once_with(session, qa_trace_id=46)
+    assert finalize.await_args.kwargs == {
+        "attempt_id": 36,
+        "outcome": "technical_failure",
+        "qa_trace_id": 46,
+        "embedding_llm_call_id": 56,
+        "synthesis_llm_call_id": 66,
+    }
+    assert reply.await_count == 1
+    assert "лимит не списан" in reply.await_args.args[1]
+    assert commits == 3
+
+
+async def test_delivery_revalidation_database_failure_releases_slot(monkeypatch) -> None:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    handler = import_module("bot.handlers.qa")
+    session = AsyncMock()
+    message = _message()
+    bundle = _qa_result().bundle
+
+    @asynccontextmanager
+    async def locked(*_args, **_kwargs):
+        yield
+
+    finalize = AsyncMock()
+    intent = AsyncMock()
+    reply = AsyncMock()
+    monkeypatch.setattr(handler, "hold_evidence_delivery_locks", locked)
+    monkeypatch.setattr(
+        handler,
+        "filter_surviving_evidence",
+        AsyncMock(side_effect=SQLAlchemyError("revalidation failed")),
+    )
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "mark_delivery_started", intent)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(handler, "_reply_to_mention", reply)
+
+    await handler._deliver_and_consume_semantic_attempt(
+        message,
+        session,
+        attempt_id=37,
+        outcome="answered",
+        qa_trace_id=47,
+        embedding_llm_call_id=57,
+        synthesis_llm_call_id=67,
+        reply_text="must not be sent",
+        delivery_bundle=bundle,
+        expected_evidence_ids=tuple(bundle.evidence_ids),
+    )
+
+    intent.assert_not_awaited()
+    assert finalize.await_args.kwargs["outcome"] == "technical_failure"
+    assert finalize.await_args.kwargs["embedding_llm_call_id"] == 57
+    assert finalize.await_args.kwargs["synthesis_llm_call_id"] == 67
+    assert "лимит не списан" in reply.await_args.args[1]
+
+
+async def test_final_delivery_gate_blocks_invalidated_evidence(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    session = AsyncMock()
+    message = _message()
+    original = _qa_result().bundle
+    empty = _qa_result(abstained=True).bundle
+
+    @asynccontextmanager
+    async def unlocked(*_args, **_kwargs):
+        yield
+
+    invalidate = AsyncMock()
+    clear = AsyncMock()
+    reply = AsyncMock()
+    monkeypatch.setattr(handler, "hold_evidence_delivery_locks", unlocked)
+    monkeypatch.setattr(handler, "filter_surviving_evidence", AsyncMock(return_value=empty))
+    monkeypatch.setattr(handler.SynthesisCacheRepo, "invalidate_by_citation", invalidate)
+    monkeypatch.setattr(handler.QaTraceRepo, "clear_undelivered_llm_summary", clear)
+    monkeypatch.setattr(handler, "_reply_to_mention", reply)
+
+    with pytest.raises(handler.EvidenceInvalidatedBeforeDelivery):
+        await handler._deliver_and_consume_semantic_attempt(
+            message,
+            session,
+            attempt_id=34,
+            outcome="answered",
+            qa_trace_id=44,
+            embedding_llm_call_id=54,
+            synthesis_llm_call_id=64,
+            reply_text="must not leak",
+            clear_summary_on_failure=True,
+            delivery_bundle=original,
+            expected_evidence_ids=tuple(original.evidence_ids),
+        )
+
+    invalidate.assert_awaited()
+    clear.assert_awaited_once_with(session, qa_trace_id=44)
+    reply.assert_not_awaited()
+
+
+async def test_semantic_ambiguous_delivery_failure_consumes_and_preserves_summary(
+    monkeypatch,
+) -> None:
+    handler = import_module("bot.handlers.qa")
+    from aiogram.exceptions import TelegramNetworkError
+
+    session = AsyncMock()
+    message = _message()
+    finalize = AsyncMock()
+    clear = AsyncMock()
+    failure = TelegramNetworkError(method=object(), message="network down")
+    monkeypatch.setattr(handler, "_reply_to_mention", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(handler.QaTraceRepo, "clear_undelivered_llm_summary", clear)
+
+    with pytest.raises(TelegramNetworkError):
+        await handler._deliver_and_consume_semantic_attempt(
+            message,
+            session,
+            attempt_id=32,
+            outcome="answered",
+            qa_trace_id=42,
+            embedding_llm_call_id=52,
+            synthesis_llm_call_id=62,
+            reply_text="undelivered answer",
+            clear_summary_on_failure=True,
+        )
+
+    clear.assert_not_awaited()
+    assert finalize.await_args.kwargs["outcome"] == "answered"
+
+
+async def test_semantic_definitive_delivery_rejection_releases_and_clears_summary(
+    monkeypatch,
+) -> None:
+    handler = import_module("bot.handlers.qa")
+    from aiogram.exceptions import TelegramForbiddenError
+
+    session = AsyncMock()
+    message = _message()
+    finalize = AsyncMock()
+    clear = AsyncMock()
+    failure = TelegramForbiddenError(method=object(), message="bot blocked")
+    monkeypatch.setattr(handler, "_reply_to_mention", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(handler.QaTraceRepo, "clear_undelivered_llm_summary", clear)
+
+    with pytest.raises(TelegramForbiddenError):
+        await handler._deliver_and_consume_semantic_attempt(
+            message,
+            session,
+            attempt_id=35,
+            outcome="answered",
+            qa_trace_id=45,
+            embedding_llm_call_id=55,
+            synthesis_llm_call_id=65,
+            reply_text="definitively rejected answer",
+            clear_summary_on_failure=True,
+        )
+
+    clear.assert_awaited_once_with(session, qa_trace_id=45)
+    assert finalize.await_args.kwargs["outcome"] == "technical_failure"
+
+
+async def test_ordinary_delivery_gate_refuses_changed_evidence(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    session = AsyncMock()
+    message = _message()
+    original = _qa_result().bundle
+    empty = _qa_result(abstained=True).bundle
+
+    @asynccontextmanager
+    async def locked(*_args, **_kwargs):
+        yield
+
+    reply = AsyncMock()
+    monkeypatch.setattr(handler, "hold_evidence_delivery_locks", locked)
+    monkeypatch.setattr(handler, "filter_surviving_evidence", AsyncMock(return_value=empty))
+    monkeypatch.setattr(handler, "_reply_to_mention", reply)
+
+    await handler._reply_with_governed_ordinary_search(
+        message,
+        session,
+        bundle=original,
+        notice="Обычный поиск",
+    )
+
+    assert "Источники изменились" in reply.await_args.args[1]
+    assert "evidence" not in reply.await_args.args[1]

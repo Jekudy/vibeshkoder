@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import hashlib
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -30,13 +31,14 @@ from typing import Any, Protocol
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from bot.services.evidence import EvidenceBundle
+from bot.services.evidence import EvidenceBundle, EvidenceItem
 from bot.services.llm_gateway import (
     LLM_BUDGET_LOCK_ID,
     Abstention,
     AnswerWithCitations,
     LLMGatewayConfig,
     SynthesisResult,
+    _SOURCE_FILTER_SQL,
     _build_prompt,
     _cache_input_hash,
     _estimate_cost,
@@ -407,6 +409,7 @@ class FakeSession:
     query_results: list[list[dict[str, Any]]] = field(default_factory=list)
     nested_depth: int = 0
     nested_entries: int = 0
+    commits: int = 0
 
     def begin_nested(self) -> _FakeNestedTransaction:
         self.nested_entries += 1
@@ -421,6 +424,9 @@ class FakeSession:
         else:
             rows = []
         return _SessionExecutor(rows)
+
+    async def commit(self) -> None:
+        self.commits += 1
 
 
 # ─── Helper: build a non-empty bundle ────────────────────────────────────────
@@ -555,6 +561,21 @@ def test_llm_budget_lock_id_is_deterministic_int64() -> None:
     assert LLM_BUDGET_LOCK_ID == expected
 
 
+def test_source_filter_sql_revalidates_complete_semantic_governance() -> None:
+    sql = str(_SOURCE_FILTER_SQL)
+    for required in (
+        "cm.chat_id = :chat_id",
+        "cm.current_version_id = mv.id",
+        "author.is_bot = FALSE",
+        "cm.memory_policy = 'normal'",
+        "NOT IN ('voice', 'audio')",
+        "cm.is_redacted = FALSE",
+        "mv.is_redacted = FALSE",
+        "fe.status IN ('pending', 'processing', 'completed')",
+    ):
+        assert required in sql
+
+
 # ─── Tests: invariant 1 — empty bundle short-circuit ────────────────────────
 
 
@@ -653,6 +674,272 @@ async def test_source_filter_partial_keeps_subset() -> None:
     assert isinstance(res, AnswerWithCitations)
     assert res.citation_ids == (100,)
     assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_semantic_mode_sends_five_governed_evidence_items() -> None:
+    bundle = _make_bundle((100, 101, 102, 103, 104))
+    ledger = FakeLedgerRepo()
+    cache = FakeCacheRepo()
+    provider = FakeProvider(citation_ids=(100,))
+    session = FakeSession(
+        query_results=[
+            [{"message_version_id": value} for value in bundle.evidence_ids],
+            [],
+        ]
+    )
+
+    result = await synthesize_answer(
+        session,  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+        max_evidence_items=5,
+    )
+
+    assert isinstance(result, AnswerWithCitations)
+    assert result.surviving_evidence_ids == (100, 101, 102, 103, 104)
+    prompt = provider.calls[0]["prompt"]
+    assert all(f'"message_version_id": {value}' in prompt for value in bundle.evidence_ids)
+
+
+@pytest.mark.asyncio
+async def test_card_is_dropped_when_non_anchor_provenance_is_not_governed() -> None:
+    now = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+    card = EvidenceItem(
+        message_version_id=100,
+        chat_message_id=200,
+        chat_id=-1001,
+        message_id=300,
+        user_id=None,
+        snippet="approved card",
+        ts_rank=0.8,
+        captured_at=now,
+        message_date=now,
+        source_type="card",
+        card_id=uuid.uuid4(),
+        card_source_message_version_ids=(100, 101),
+    )
+    bundle = EvidenceBundle("q", -1001, (card,), False, now)
+    provider = FakeProvider(citation_ids=(100,))
+
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"card_id": str(card.card_id), "source_ids": [100, 101]}],
+                [{"message_version_id": 100}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=FakeLedgerRepo(),
+        cache_repo=FakeCacheRepo(),
+        provider=provider,
+        max_evidence_items=5,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "all_filtered"
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_approved_card_cache_binds_complete_current_provenance() -> None:
+    now = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+    card = EvidenceItem(
+        message_version_id=100,
+        chat_message_id=200,
+        chat_id=-1001,
+        message_id=300,
+        user_id=None,
+        snippet="approved card",
+        ts_rank=0.8,
+        captured_at=now,
+        message_date=now,
+        source_type="card",
+        card_id=uuid.uuid4(),
+        card_source_message_version_ids=(100, 101),
+    )
+    bundle = EvidenceBundle("q", -1001, (card,), False, now)
+    cache = FakeCacheRepo()
+
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"card_id": str(card.card_id), "source_ids": [100, 101]}],
+                [{"message_version_id": 100}, {"message_version_id": 101}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=FakeLedgerRepo(),
+        cache_repo=cache,
+        provider=FakeProvider(citation_ids=(100,)),
+        max_evidence_items=5,
+    )
+
+    assert isinstance(result, AnswerWithCitations)
+    assert result.citation_ids == (100,)
+    assert next(iter(cache.rows.values())).citation_ids == [100, 101]
+
+
+@pytest.mark.asyncio
+async def test_card_is_dropped_when_not_currently_approved() -> None:
+    now = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+    card = EvidenceItem(
+        message_version_id=100,
+        chat_message_id=200,
+        chat_id=-1001,
+        message_id=300,
+        user_id=None,
+        snippet="stale approved search hit",
+        ts_rank=0.8,
+        captured_at=now,
+        message_date=now,
+        source_type="card",
+        card_id=uuid.uuid4(),
+        card_source_message_version_ids=(100,),
+    )
+    provider = FakeProvider(citation_ids=(100,))
+
+    result = await synthesize_answer(
+        FakeSession(query_results=[[]]),  # type: ignore[arg-type]
+        bundle=EvidenceBundle("q", -1001, (card,), False, now),
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=FakeLedgerRepo(),
+        cache_repo=FakeCacheRepo(),
+        provider=provider,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "all_filtered"
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_message_and_card_anchor_is_prompted_once() -> None:
+    message_bundle = _make_bundle((100,))
+    item = message_bundle.items[0]
+    card = EvidenceItem(
+        message_version_id=100,
+        chat_message_id=201,
+        chat_id=-1001,
+        message_id=301,
+        user_id=None,
+        snippet="same anchor card",
+        ts_rank=0.7,
+        captured_at=item.captured_at,
+        message_date=item.message_date,
+        source_type="card",
+        card_id=uuid.uuid4(),
+        card_source_message_version_ids=(100, 101),
+    )
+    bundle = EvidenceBundle(
+        "q",
+        -1001,
+        (item, card),
+        False,
+        message_bundle.created_at,
+    )
+    provider = FakeProvider(citation_ids=(100,))
+
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"card_id": str(card.card_id), "source_ids": [100, 101]}],
+                [{"message_version_id": 100}, {"message_version_id": 101}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=FakeLedgerRepo(),
+        cache_repo=FakeCacheRepo(),
+        provider=provider,
+        max_evidence_items=5,
+    )
+
+    assert isinstance(result, AnswerWithCitations)
+    assert result.surviving_evidence_ids == (100,)
+    assert provider.calls[0]["prompt"].count('"message_version_id": 100') == 1
+
+
+@pytest.mark.asyncio
+async def test_post_provider_governance_change_abstains_before_cache() -> None:
+    bundle = _make_bundle((100,))
+    provider = FakeProvider(citation_ids=(100,))
+    cache = FakeCacheRepo()
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"message_version_id": 100}],
+                [],
+                [],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=FakeLedgerRepo(),
+        cache_repo=cache,
+        provider=provider,
+        revalidate_after_provider=True,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.reason == "all_filtered"
+    assert len(provider.calls) == 1
+    assert cache.rows == {}
+
+
+@pytest.mark.asyncio
+async def test_semantic_placeholder_is_committed_with_cost_before_provider() -> None:
+    bundle = _make_bundle((100,))
+    session = FakeSession(
+        query_results=[
+            [{"message_version_id": 100}],
+            [],
+        ]
+    )
+
+    class CommitCheckingProvider(FakeProvider):
+        async def call(self, *, prompt: str, model: str) -> ProviderResult:
+            assert session.commits == 1
+            assert ledger.rows[0].error == "reserved_in_flight"
+            return await super().call(prompt=prompt, model=model)
+
+    ledger = FakeLedgerRepo()
+    result = await synthesize_answer(
+        session,  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=FakeCacheRepo(),
+        provider=CommitCheckingProvider(citation_ids=(100,)),
+        durable_placeholder=True,
+    )
+
+    assert isinstance(result, AnswerWithCitations)
+    assert session.commits == 1
+    assert ledger.rows[0].cost_usd > 0
 
 
 @pytest.mark.parametrize("secret", FAKE_SECRET_FAMILIES)
@@ -1372,6 +1659,41 @@ async def test_budget_atomic_advisory_lock_invoked() -> None:
     assert len(provider.calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_durable_synthesis_uses_transaction_lock_and_commits_release() -> None:
+    captured: list[str] = []
+
+    class _CapturingSession(FakeSession):
+        async def execute(self, *args: Any, **kwargs: Any) -> _SessionExecutor:
+            statement = args[0] if args else kwargs.get("statement")
+            if statement is not None:
+                captured.append(str(statement))
+            return await super().execute(*args, **kwargs)
+
+    session = _CapturingSession(
+        query_results=[
+            [{"message_version_id": 100}],
+            [],
+        ]
+    )
+    result = await synthesize_answer(
+        session,  # type: ignore[arg-type]
+        bundle=_make_bundle((100,)),
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=FakeLedgerRepo(),
+        cache_repo=FakeCacheRepo(),
+        provider=FakeProvider(citation_ids=(100,)),
+        durable_placeholder=True,
+    )
+
+    assert isinstance(result, AnswerWithCitations)
+    assert any("pg_advisory_xact_lock" in sql for sql in captured)
+    assert not any("pg_advisory_unlock" in sql for sql in captured)
+    assert session.commits == 1
+
+
 # ─── Tests: invariant 6 — provider error categorisation ─────────────────────
 
 
@@ -1403,6 +1725,33 @@ async def test_provider_transient_error_abstains(subtype: str) -> None:
     assert isinstance(res, Abstention)
     assert res.reason == "provider_error"
     assert ledger.rows[-1].error == f"provider_transient:{subtype}"
+
+
+@pytest.mark.asyncio
+async def test_durable_timeout_keeps_conservative_cost_reservation() -> None:
+    ledger = FakeLedgerRepo()
+    result = await synthesize_answer(
+        FakeSession(
+            query_results=[
+                [{"message_version_id": 100}],
+                [],
+            ]
+        ),  # type: ignore[arg-type]
+        bundle=_make_bundle((100,)),
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=FakeCacheRepo(),
+        provider=FakeProvider(
+            raise_exc=ProviderTransientError("timeout", message="ambiguous timeout")
+        ),
+        durable_placeholder=True,
+    )
+
+    assert isinstance(result, Abstention)
+    assert result.cost_usd > 0
+    assert ledger.rows[-1].cost_usd == result.cost_usd
 
 
 @pytest.mark.asyncio
@@ -1659,6 +2008,8 @@ async def test_citation_hallucination_rejected() -> None:
     assert isinstance(res, Abstention)
     assert res.reason == "provider_error"
     assert ledger.rows[-1].error == "citation_hallucination"
+    assert res.cost_usd > 0
+    assert ledger.rows[-1].cost_usd == res.cost_usd
 
 
 @pytest.mark.asyncio
@@ -2151,6 +2502,8 @@ async def test_provider_empty_citations_aborts_synthesis() -> None:
     assert res.reason == "provider_error"
     # Ledger has the placeholder UPDATEd with the no-citations sentinel.
     assert ledger.rows[-1].error == "provider_returned_no_citations"
+    assert res.cost_usd > 0
+    assert ledger.rows[-1].cost_usd == res.cost_usd
     # No cache row was written — defends against forget invalidation
     # being unable to join on the empty array.
     assert len(cache.rows) == 0

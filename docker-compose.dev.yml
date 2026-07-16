@@ -13,7 +13,7 @@
 
 services:
   postgres-dev:
-    image: postgres:16
+    image: pgvector/pgvector:0.8.2-pg16-bookworm@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
     container_name: shkoder-postgres-dev
     environment:
       POSTGRES_USER: shkoder_dev

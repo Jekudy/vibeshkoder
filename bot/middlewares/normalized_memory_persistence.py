@@ -55,6 +55,7 @@ class NormalizedMemoryPersistenceMiddleware(BaseMiddleware):
             username=sender.username,
             first_name=sender.first_name,
             last_name=sender.last_name,
+            is_bot=getattr(sender, "is_bot", None),
         )
         raw_update = data.get("raw_update")
         result = await persist_message_with_policy(

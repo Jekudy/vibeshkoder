@@ -50,6 +50,7 @@ async def save_chat_message(
         username=message.from_user.username,
         first_name=message.from_user.first_name,
         last_name=message.from_user.last_name,
+        is_bot=getattr(message.from_user, "is_bot", None),
     )
 
     # Persist with policy detection (advisory lock + governance + mark creation).
