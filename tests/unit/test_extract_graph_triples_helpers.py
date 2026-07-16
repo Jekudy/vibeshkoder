@@ -115,7 +115,8 @@ async def test_resolve_entity_returns_unknown_sentinel_when_unresolvable() -> No
         source_card_id=None,
         source_mv_id=None,
     )
-    expected_suffix = hashlib.md5(label.encode()).hexdigest()[:8]
+    # This mirrors a non-cryptographic deterministic sentinel in production.
+    expected_suffix = hashlib.md5(label.encode()).hexdigest()[:8]  # nosemgrep: python.lang.security.insecure-hash-algorithms-md5.insecure-hash-algorithm-md5
     assert result == f"UNKNOWN_{expected_suffix}"
 
 

@@ -1,0 +1,59 @@
+name: PR Issue Gate
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  issues: read
+  pull-requests: read
+
+jobs:
+  require-open-issue:
+    name: Require open linked issue
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate GitHub closing references
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          closing_references="$(
+            gh pr view "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json closingIssuesReferences \
+              --jq '.closingIssuesReferences[]
+                | [.repository.owner.login, .repository.name, (.number | tostring)]
+                | @tsv'
+          )"
+
+          if [ -z "$closing_references" ]; then
+            echo "PR has no same-repository closing reference recognized by GitHub." >&2
+            echo "Add a body line such as: Closes #123" >&2
+            exit 1
+          fi
+
+          open_issue_found=false
+          same_repository_reference_found=false
+
+          while IFS=$'\t' read -r owner repository issue_number; do
+            if [ "$owner/$repository" != "$GITHUB_REPOSITORY" ]; then
+              continue
+            fi
+
+            same_repository_reference_found=true
+            state="$(gh issue view "$issue_number" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
+            if [ "$state" = "OPEN" ]; then
+              open_issue_found=true
+            fi
+          done <<< "$closing_references"
+
+          if [ "$same_repository_reference_found" != "true" ]; then
+            echo "PR only closes issues from other repositories." >&2
+            exit 1
+          fi
+
+          if [ "$open_issue_found" != "true" ]; then
+            echo "Every closing reference points to a closed issue. Link at least one open issue." >&2
+            exit 1
+          fi

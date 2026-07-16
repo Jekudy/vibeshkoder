@@ -7,6 +7,7 @@
 .superflow-state.json
 .par-evidence.json
 .worktrees/
+_bmad/config.user.toml
 .claude/agent-memory/
 .claude/worktrees/
 memory/

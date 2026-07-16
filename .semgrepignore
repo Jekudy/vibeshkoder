@@ -1,0 +1,4 @@
+# Installer-managed BMAD framework and generated IDE integrations.
+_bmad/
+.agents/skills/
+.claude/skills/

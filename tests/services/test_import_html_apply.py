@@ -441,7 +441,9 @@ async def test_all_authors_keep_full_raw_while_excluded_bot_is_raw_only(db_sessi
         ),
     ):
         count = await db_session.execute(
-            sa_text(f"SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+            # Identifiers come only from the hard-coded test matrix above;
+            # runtime values remain bound parameters.
+            sa_text(f"SELECT COUNT(*) FROM {table} WHERE {predicate}"),  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
             params,
         )
         normalized_counts[table] = int(count.scalar_one())

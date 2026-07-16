@@ -1,0 +1,5 @@
+[workflow]
+activation_steps_prepend = [
+  "Do not read or write sprint-status.yaml. Record action items as GitHub Issues during the mandatory handoff.",
+]
+on_complete = "Execute the mandatory handoff in file:{project-root}/_bmad/custom/github-issue-handoff.md before exiting."

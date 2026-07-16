@@ -309,6 +309,11 @@ main() {
   local -a files=()
   local file
   while IFS= read -r file; do
+    case "$file" in
+      _bmad/* | _bmad-output/* | .agents/skills/* | .claude/skills/*)
+        continue
+        ;;
+    esac
     files+=("$file")
   done < <(git ls-files)
 

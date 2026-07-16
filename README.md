@@ -10,6 +10,23 @@ The target deployment path for this project is:
 
 The VPS is not the source of truth anymore.
 
+## Development Workflow
+
+GitHub Issues is the only project tracker. Every change starts from an open issue and
+every PR closes one:
+
+`idea or research -> BMAD workflow -> GitHub Issue -> branch/worktree -> implementation -> PR`
+
+- Thinking work is complete only after its outcome creates or updates a GitHub Issue.
+- Do not create a branch, worktree, or implementation change before the issue exists.
+- PR descriptions must contain `Closes #<issue-number>` or an equivalent closing keyword.
+- BMAD artifacts and repository documents support an issue; they are not a parallel backlog.
+
+[BMAD BMM](https://docs.bmad-method.org/) is installed for Codex and Claude Code. Run
+`bmad-help` in a fresh task to choose the next workflow. For an established project,
+`bmad-quick-dev` fits small changes; major features should pass through analysis, PRD,
+architecture, and stories as needed.
+
 ## Local Development
 
 ### 1. Create env

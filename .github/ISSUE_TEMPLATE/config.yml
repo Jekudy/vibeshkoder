@@ -1,11 +1,1 @@
 blank_issues_enabled: false
-contact_links:
-  - name: Architecture Q&A
-    url: https://github.com/Jekudy/vibeshkoder/discussions/categories/architecture-q-a
-    about: Questions about the memory system architecture and design decisions.
-  - name: RFC / Design Proposals
-    url: https://github.com/Jekudy/vibeshkoder/discussions/categories/rfc
-    about: Propose and discuss design changes before opening a ticket.
-  - name: Show & Tell
-    url: https://github.com/Jekudy/vibeshkoder/discussions/categories/show-and-tell
-    about: Share progress, demos, and experiments.

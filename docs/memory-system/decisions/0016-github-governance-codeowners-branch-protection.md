@@ -8,6 +8,9 @@
 - **Author**: GPT-5.5 Pro / principal architect draft
 - **Reviewers**: @&lt;collaborator-handle&gt; (TODO: добавить при онбординге)
 
+> Process-routing note: the former Discussions → ADR → Issue sequence is superseded by
+> ADR-0019. CODEOWNERS and branch-protection decisions in this ADR remain accepted.
+
 ## Context
 
 Memory cycle вводит чувствительные зоны: governance, llm boundary, db migrations, import
@@ -117,4 +120,5 @@ required status check падает, merge заблокирован.
 - [GitHub Docs — About protected branches](https://docs.github.com/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)
 - [GitHub Docs — Available rules for rulesets](https://docs.github.com/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 - `.github/CODEOWNERS` — текущая схема
-- `docs/memory-system/README.md` — workflow Discussions/RFC → ADR → Issue → PR
+- ADR-0019 — GitHub Issues as the sole work ledger and BMAD handoff
+- `docs/memory-system/README.md` — current issue-first workflow

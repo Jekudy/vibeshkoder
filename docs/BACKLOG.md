@@ -2,6 +2,10 @@
 
 Deferred items from 4-agent review 2026-04-22. Not in F0 scope, revisit quarterly.
 
+This is a historical candidate list, not an executable backlog. GitHub Issues is the only
+canonical backlog. Before any item below is researched or implemented, create or update a
+GitHub Issue with current evidence, scope, acceptance criteria, and dependencies.
+
 ## Future Features (F1-F2)
 
 ### Content ingestion expansion

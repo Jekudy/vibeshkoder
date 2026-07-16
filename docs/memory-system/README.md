@@ -15,8 +15,9 @@ the migration from a pure community gatekeeper into a governed community memory.
 знакомства. Если ADR/ARCHITECTURE противоречат HANDOFF — побеждает HANDOFF (он canonical),
 а ADR/ARCHITECTURE правятся. Если правки в HANDOFF — обязательно обновить связанные ADR.
 
-Новые архитектурные решения, не вошедшие в исходный HANDOFF, оформляются как новые ADR
-в `decisions/` через RFC в GitHub Discussions → accept → ADR + связанный issue.
+Новые архитектурные решения, не вошедшие в исходный HANDOFF, начинаются с Discovery/RFC
+issue в GitHub Issues. После решения создаётся ADR в `decisions/` (если нужен) и отдельный
+implementation issue.
 
 ## Read order (15-minute onboarding first, details later)
 
@@ -36,6 +37,10 @@ If a previous spec disagrees with `HANDOFF.md`, `HANDOFF.md` wins. The legacy v0
 (`docs/superpowers/archive/2026-04-22-shkoderbot-memory-editor-design.SUPERSEDED.md`) is
 superseded — do not implement from it.
 
+This rule governs product and architecture content. GitHub Issues is the separate canonical
+source for work scope and status; this directory contains supporting specifications and
+derived status snapshots.
+
 ## Workflow
 
 - Branch: `feat/memory-foundation` in worktree `.worktrees/memory/`.
@@ -52,20 +57,23 @@ superseded — do not implement from it.
 ## Workflow для архитектурных решений
 
 ```
-Discussions/RFC → ADR → Issue → PR
+Discovery/RFC Issue → Decision → ADR (if needed) → Implementation Issue → PR
 ```
 
-1. Новое архитектурное предложение → GitHub Discussions, категория `RFC`.
-2. После accept → создаётся ADR в `decisions/`.
-3. ADR → создаётся implementation issue с link на ADR.
-4. Issue → PR с link на issue (PR template требует ADR-ссылку для sensitive paths).
+1. Новое архитектурное предложение фиксируется Discovery/RFC issue до реализации.
+2. В issue собираются evidence, варианты, рекомендация и итоговое решение.
+3. После accept создаётся ADR в `decisions/`, если решение влияет на архитектуру.
+4. Для реализации создаётся отдельный implementation issue со ссылкой на RFC/ADR.
+5. Implementation issue → PR с `Closes #N`.
 
-### Discussions vs Issues
+### Issue types
 
-- **Discussions / RFC** — new architecture, change to invariants, source-of-truth/governance changes, retention/privacy policy, llm/extraction policy, public wiki decision, graph/butler decision, schema strategy changes.
-- **Issues** — implementation tickets, bugs, small tactical changes, test failures, migration tasks after ADR accepted.
+- **Discovery / RFC Issue** — research, architecture, changes to invariants, governance,
+  retention/privacy, LLM policy, public surfaces, graph/butler, or schema strategy.
+- **Implementation Work Issue** — features, bugs, tactical changes, tests, migrations, docs,
+  and infrastructure after the decision is concrete.
 
-См. ADR-0016 (github governance) для деталей по CODEOWNERS, branch protection, ADR-link check.
+См. ADR-0016 для CODEOWNERS и branch protection; ADR-0019 — для issue-first процесса.
 
 ## Non-negotiable invariants (from HANDOFF.md §1)
 

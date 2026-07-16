@@ -106,7 +106,7 @@
 
 ---
 
-## Recommended Notion seeding (proposed)
+## Recommended GitHub Issue seeding (proposed)
 
 **Tier 1 — Must seed (10 issues, all P0/blocker-adjacent):**
 1. CRIT-06 (already exists, status: Todo) — operator security split
@@ -132,10 +132,10 @@
 
 ## Next steps
 
-1. **User decision:** confirm Tier 1 list. Each becomes a Notion SHK issue.
+1. **User decision:** confirm Tier 1 list. Each becomes a GitHub Issue.
 2. After seeding: schedule which Tier 1 to attack in Round 6 (probably HIGH-10, HIGH-12, MID-20 first — small, high-leverage).
 3. Tier 2 epics get one parent issue per epic.
-4. This document remains source of truth — Notion issues link back here.
+4. GitHub Issues are canonical for scope and status; this document remains supporting evidence.
 
 ---
 

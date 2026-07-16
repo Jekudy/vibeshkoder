@@ -1,71 +1,41 @@
-name: Implementation Ticket
-description: A concrete development task tied to the memory system cycle.
-title: "[T?-??] "
+name: Implementation Work
+description: Define a concrete unit of development before creating a branch or worktree.
+title: "[dev] "
 labels: []
 body:
   - type: dropdown
-    id: phase
+    id: work-type
     attributes:
-      label: Phase
-      description: Which phase does this ticket belong to?
+      label: Work Type
       options:
-        - "0 – Gatekeeper Stabilization"
-        - "1 – Source of Truth + Raw Archive"
-        - "2a – Import Dry-Run"
-        - "2b – Import Apply"
-        - "3 – Governance"
-        - "4 – Hybrid Search + Q&A"
-        - "5 – Events + Observations"
-        - "6 – Knowledge Cards + Admin Review"
-        - "7 – Daily Summaries"
-        - "8 – Weekly Digest"
-        - "9 – Wiki / Community Catalog"
-        - "10 – Graphiti / Neo4j Projection"
-        - "11 – shkoderbench / Evals Hardening"
-        - "12 – Future Butler (design only)"
+        - Feature
+        - Bug fix
+        - Refactor
+        - Infrastructure
+        - Documentation
+        - Test / quality
     validations:
       required: true
 
-  - type: dropdown
-    id: area
+  - type: textarea
+    id: problem
     attributes:
-      label: Area
-      description: Primary area affected.
-      options:
-        - "area:db"
-        - "area:ingestion"
-        - "area:governance"
-        - "area:search"
-        - "area:llm-gateway"
-        - "area:admin"
-        - "area:import"
-        - "area:evals"
-        - "area:infra"
-        - "area:docs"
-        - "area:other"
+      label: Problem
+      description: What concrete problem does this work solve, and why now?
     validations:
       required: true
 
-  - type: dropdown
-    id: size
+  - type: textarea
+    id: scope
     attributes:
-      label: Size
-      options:
-        - "S – a few hours"
-        - "M – ~1 day"
-        - "L – 2–3 days"
-        - "XL – 4+ days"
-    validations:
-      required: true
+      label: Scope
+      description: State what is included and excluded.
+      placeholder: |
+        Included:
+        - ...
 
-  - type: dropdown
-    id: priority
-    attributes:
-      label: Priority
-      options:
-        - "P0 – blocker"
-        - "P1 – high"
-        - "P2 – normal"
+        Excluded:
+        - ...
     validations:
       required: true
 
@@ -73,28 +43,43 @@ body:
     id: acceptance-criteria
     attributes:
       label: Acceptance Criteria
-      description: Objective, testable done-criteria. Bullet list preferred.
+      description: Objective, testable done-criteria.
       placeholder: |
         - [ ] ...
         - [ ] ...
     validations:
       required: true
 
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation Plan
+      description: Tests, checks, or evidence that will prove the acceptance criteria.
+    validations:
+      required: true
+
+  - type: input
+    id: source
+    attributes:
+      label: Source / Design Issue
+      description: Link the Discovery/RFC issue or ADR that produced this task, if any.
+      placeholder: "#123 or N/A"
+
   - type: input
     id: dependencies
     attributes:
       label: Dependencies
-      description: Issue numbers or PR links this ticket depends on (comma-separated). Leave blank if none.
-      placeholder: "#42, #57"
+      description: Issue numbers or PR links this work depends on. Use N/A if none.
+      placeholder: "#42, #57, or N/A"
+    validations:
+      required: true
 
   - type: checkboxes
-    id: scope-check
+    id: issue-first
     attributes:
-      label: AUTHORIZED_SCOPE.md check
-      description: Confirm this ticket is within the authorized scope for the selected phase.
+      label: Issue-first gate
       options:
-        - label: >
-            I have read `docs/memory-system/AUTHORIZED_SCOPE.md` and confirmed this work
-            is within the authorized scope (or is explicitly marked STRETCH/NO and I have
-            approval to proceed).
+        - label: No branch, worktree, or implementation change was created before this issue.
+          required: true
+        - label: The work is within `AUTHORIZED_SCOPE.md` when that document applies.
           required: true
