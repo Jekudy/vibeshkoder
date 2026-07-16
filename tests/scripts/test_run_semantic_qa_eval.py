@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
 import json
 import stat
 from pathlib import Path
@@ -10,6 +11,12 @@ from scripts import run_semantic_qa_eval as runner
 
 
 RELEASE_SHA = "a" * 40
+
+
+def _secret_query() -> str:
+    """Build a detector fixture without storing a credential-shaped literal."""
+
+    return "".join(("OPENAI_API_KEY=", "sk-", "proj-", "abcdefghijklmnop", "qrstuvwxyz012345"))
 
 
 def _rows(count: int = 50) -> list[dict[str, object]]:
@@ -71,6 +78,53 @@ def test_smoke_mode_is_explicit_and_requires_exactly_one_case(tmp_path: Path) ->
     assert len(cases) == 1
     with pytest.raises(ValueError, match="at least 50"):
         runner.load_private_cases(path, smoke=False)
+
+
+@pytest.mark.parametrize(
+    "unsafe_query",
+    [
+        "x" * 146,
+        pytest.param(_secret_query(), id="secret-like"),
+    ],
+)
+def test_private_input_rejects_queries_outside_production_guard_before_run(
+    tmp_path: Path,
+    unsafe_query: str,
+) -> None:
+    path = tmp_path / "unsafe.jsonl"
+    row = _rows()[0]
+    row["query"] = unsafe_query
+    _write(path, [row])
+
+    with pytest.raises(ValueError):
+        runner.load_private_cases(path, smoke=True)
+
+
+@pytest.mark.asyncio
+async def test_run_case_rechecks_query_before_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bot.services import llm_gateway
+    from bot.services.semantic_eval import SemanticEvalCase
+
+    embed = AsyncMock()
+    monkeypatch.setattr(llm_gateway, "embed_texts", embed)
+    case = runner.PrivateEvalCase(
+        label=SemanticEvalCase(
+            case_id="unsafe-direct-case",
+            category="privacy_governance",
+            expected_source_ids=(),
+            forbidden_source_ids=("message:1",),
+            expected_abstain=True,
+        ),
+        chat_id=-1001234567890,
+        query=_secret_query(),
+        exclude_chat_message_id=None,
+    )
+
+    with pytest.raises(ValueError):
+        await runner._run_case(case)
+    embed.assert_not_awaited()
 
 
 @pytest.mark.asyncio

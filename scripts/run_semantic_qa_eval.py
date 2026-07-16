@@ -38,6 +38,7 @@ from bot.services.llm_gateway import (
 )
 from bot.services.llm_providers import ProviderStructuralError, ProviderTransientError
 from bot.services.qa_guardrails import build_guarded_llm_query, contains_secret_like_data
+from bot.services.qa_trigger import MAX_USER_QUERY_CHARS
 from bot.services.semantic_eval import SemanticEvalCase
 from bot.services.semantic_index import HybridSearchResult, hybrid_search
 
@@ -68,6 +69,14 @@ class PrivateEvalCase:
     chat_id: int
     query: str
     exclude_chat_message_id: int | None
+
+
+def _guard_eval_query(query: str) -> str:
+    """Apply the production query boundary before any eval provider call."""
+
+    if len(query) > MAX_USER_QUERY_CHARS:
+        raise ValueError("private evaluation query exceeds the production query limit")
+    return build_guarded_llm_query(query)
 
 
 def _sha256_file(path: Path) -> str:
@@ -126,6 +135,7 @@ def load_private_cases(path: Path, *, smoke: bool) -> tuple[PrivateEvalCase, ...
             or len(query) > 256
         ):
             raise ValueError("query must be a non-empty trimmed string of at most 256 chars")
+        _guard_eval_query(query)
         exclude_id = row["exclude_chat_message_id"]
         if exclude_id is not None and (type(exclude_id) is not int or exclude_id < 1):
             raise ValueError("exclude_chat_message_id must be null or a positive integer")
@@ -219,6 +229,7 @@ def _sanitized_observation_row(review_row: dict[str, Any]) -> dict[str, Any]:
 async def _run_case(case: PrivateEvalCase) -> dict[str, Any]:
     from bot.db.engine import async_session
 
+    guarded_query = _guard_eval_query(case.query)
     started = time.monotonic()
     embedding_config = load_embedding_gateway_config()
     synthesis_config = load_gateway_config()
@@ -257,7 +268,7 @@ async def _run_case(case: PrivateEvalCase) -> dict[str, Any]:
             synth_result = await synthesize_answer(
                 session,
                 bundle=bundle,
-                query=build_guarded_llm_query(case.query),
+                query=guarded_query,
                 config=synthesis_config,
                 qa_trace_id=None,
                 ledger_repo=LedgerRepo(),
