@@ -1063,19 +1063,23 @@ async def _index_batch_locked(
     batch = tuple(documents)
     if not batch:
         return _BatchResult(indexed=0, skipped=0, reason_counts={})
+    # The batch may have been listed before this worker acquired the per-source
+    # locks. Re-read governance state before any provider call so a forget/edit
+    # transaction that won the lock can never leak stale text to OpenAI.
+    prevalidated_documents = await _revalidate_documents(session, documents=batch)
     units_before_embedding = await _load_existing_units(
         session,
-        documents=batch,
+        documents=prevalidated_documents,
         embedding_model=config.model,
     )
     parent_units_before_embedding = await _load_parent_message_units(
         session,
-        documents=batch,
+        documents=prevalidated_documents,
         embedding_model=config.model,
     )
     reusable_before_embedding = {
         document: unit
-        for document in batch
+        for document in prevalidated_documents
         if (
             unit := _find_reusable_unit(
                 document=document,
@@ -1088,7 +1092,9 @@ async def _index_batch_locked(
         )
         is not None
     }
-    missing = [document for document in batch if document not in reusable_before_embedding]
+    missing = [
+        document for document in prevalidated_documents if document not in reusable_before_embedding
+    ]
     embedding_result = None
     vectors_by_document: dict[RetrievalDocument, Sequence[float]] = {}
     if missing:
@@ -1102,7 +1108,10 @@ async def _index_batch_locked(
         vectors_by_document = dict(zip(missing, embedding_result.vectors, strict=True))
     embedded_documents = set(missing)
 
-    valid_documents = await _revalidate_documents(session, documents=batch)
+    valid_documents = await _revalidate_documents(
+        session,
+        documents=prevalidated_documents,
+    )
     if blocked_count := len(batch) - len(valid_documents):
         logger.info(
             "semantic_index_documents_skipped_governance",
