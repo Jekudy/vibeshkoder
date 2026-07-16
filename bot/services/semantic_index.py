@@ -32,6 +32,11 @@ from bot.services.llm_gateway import (
     embed_texts,
 )
 from bot.services.llm_providers import ProviderStructuralError, ProviderTransientError
+from bot.services.llm_providers.openai_embeddings import (
+    MAX_EMBEDDING_BATCH_CHARS,
+    MAX_EMBEDDING_BATCH_SIZE,
+    MAX_EMBEDDING_INPUT_CHARS,
+)
 from bot.services.search import SearchHit
 
 
@@ -790,6 +795,32 @@ def _find_parent_message_unit(
     )
 
 
+def _partition_embedding_documents(
+    documents: Sequence[RetrievalDocument],
+) -> tuple[tuple[RetrievalDocument, ...], ...]:
+    """Build provider-safe batches without changing or truncating source text."""
+
+    batches: list[tuple[RetrievalDocument, ...]] = []
+    current: list[RetrievalDocument] = []
+    current_chars = 0
+    for document in documents:
+        document_chars = len(document.canonical_text)
+        if document_chars > MAX_EMBEDDING_INPUT_CHARS:
+            raise ValueError("oversize embedding documents must be filtered before batching")
+        if current and (
+            len(current) >= MAX_EMBEDDING_BATCH_SIZE
+            or current_chars + document_chars > MAX_EMBEDDING_BATCH_CHARS
+        ):
+            batches.append(tuple(current))
+            current = []
+            current_chars = 0
+        current.append(document)
+        current_chars += document_chars
+    if current:
+        batches.append(tuple(current))
+    return tuple(batches)
+
+
 async def _acquire_document_locks(
     session: AsyncSession,
     *,
@@ -1095,18 +1126,30 @@ async def _index_batch_locked(
     missing = [
         document for document in prevalidated_documents if document not in reusable_before_embedding
     ]
-    embedding_result = None
-    vectors_by_document: dict[RetrievalDocument, Sequence[float]] = {}
-    if missing:
+    oversized_documents = {
+        document for document in missing if len(document.canonical_text) > MAX_EMBEDDING_INPUT_CHARS
+    }
+    embeddable_documents = [document for document in missing if document not in oversized_documents]
+    vectors_by_document: dict[RetrievalDocument, tuple[Sequence[float], int]] = {}
+    for embedding_batch in _partition_embedding_documents(embeddable_documents):
         embedding_result = await embed_texts(
             session,
-            inputs=[document.canonical_text for document in missing],
+            inputs=[document.canonical_text for document in embedding_batch],
             config=config,
             ledger_repo=LedgerRepo(),
             provider=provider,
         )
-        vectors_by_document = dict(zip(missing, embedding_result.vectors, strict=True))
-    embedded_documents = set(missing)
+        vectors_by_document.update(
+            {
+                document: (vector, embedding_result.llm_usage_ledger_id)
+                for document, vector in zip(
+                    embedding_batch,
+                    embedding_result.vectors,
+                    strict=True,
+                )
+            }
+        )
+    embedded_documents = set(embeddable_documents)
 
     valid_documents = await _revalidate_documents(
         session,
@@ -1206,15 +1249,20 @@ async def _index_batch_locked(
             )
             reasons["indexed:reused_embedding" if stored else "skipped:conflict"] += 1
             continue
-        if document not in vectors_by_document or embedding_result is None:
+        if document in oversized_documents:
+            reasons["skipped:oversize"] += 1
+            continue
+        embedded = vectors_by_document.get(document)
+        if embedded is None:
             reasons["skipped:conflict"] += 1
             continue
+        vector, llm_usage_ledger_id = embedded
         if await _store_document(
             session,
             document=document,
-            vector=vectors_by_document[document],
+            vector=vector,
             config=config,
-            llm_usage_ledger_id=embedding_result.llm_usage_ledger_id,
+            llm_usage_ledger_id=llm_usage_ledger_id,
             embedding_provider=EMBEDDING_PROVIDER,
             embedding_model_version=EMBEDDING_MODEL_VERSION,
             embedding_dimensions=config.dimensions,
@@ -1227,6 +1275,7 @@ async def _index_batch_locked(
         reasons["skipped:unchanged"]
         + reasons["skipped:governance_race"]
         + reasons["skipped:conflict"]
+        + reasons["skipped:oversize"]
     )
     return _BatchResult(indexed=indexed, skipped=skipped, reason_counts=dict(reasons))
 
@@ -1243,15 +1292,28 @@ async def _index_batch(
     batch = tuple(documents)
     if not batch:
         return _BatchResult(indexed=0, skipped=0, reason_counts={})
-    from bot.services.advisory_locks import hold_session_advisory_locks
+    from bot.services.advisory_locks import (
+        governed_message_lock_keys,
+        hold_session_advisory_locks,
+    )
     from bot.services.forget_cascade import _p6_mvid_advisory_lock_id
 
-    lock_ids = (
-        _p6_mvid_advisory_lock_id(message_version_id)
-        for document in batch
-        for message_version_id in document.message_version_ids
+    provenance_ids = tuple(
+        dict.fromkeys(
+            message_version_id
+            for document in batch
+            for message_version_id in document.message_version_ids
+        )
     )
-    async with hold_session_advisory_locks(session, lock_ids):
+    lock_ids = (
+        _p6_mvid_advisory_lock_id(message_version_id) for message_version_id in provenance_ids
+    )
+    lock_keys = await governed_message_lock_keys(session, provenance_ids)
+    async with hold_session_advisory_locks(
+        session,
+        lock_ids,
+        lock_keys=lock_keys,
+    ):
         result = await _index_batch_locked(
             session,
             documents=batch,

@@ -745,8 +745,7 @@ async def test_forget_that_wins_source_lock_blocks_stale_text_before_provider(
 ) -> None:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from bot.services.advisory_locks import hold_session_advisory_locks
-    from bot.services.forget_cascade import _p6_mvid_advisory_lock_id
+    from bot.db.repos.forget_event import ForgetEventRepo
 
     factory = async_sessionmaker(postgres_engine, class_=AsyncSession, expire_on_commit=False)
     suffix = uuid.uuid4().int % 1_000_000
@@ -771,32 +770,28 @@ async def test_forget_that_wins_source_lock_blocks_stale_text_before_provider(
                 chat_id=chat_id,
             )
             assert len(stale_documents) == 1
-            lock_id = _p6_mvid_advisory_lock_id(source.version.id)
 
             async with factory() as forget_session:
-                async with hold_session_advisory_locks(forget_session, (lock_id,)):
-                    forget_session.add(
-                        ForgetEvent(
-                            target_type="message",
-                            target_id=str(source.message.id),
-                            actor_user_id=human.id,
-                            authorized_by="self",
-                            tombstone_key=f"message:{chat_id}:{source.message.message_id}",
-                            status="pending",
-                        )
+                await ForgetEventRepo.create(
+                    forget_session,
+                    target_type="message",
+                    target_id=str(source.message.id),
+                    actor_user_id=human.id,
+                    authorized_by="self",
+                    tombstone_key=f"message:{chat_id}:{source.message.message_id}",
+                )
+                index_task = asyncio.create_task(
+                    _index_batch(
+                        index_session,
+                        documents=stale_documents,
+                        config=CONFIG,
+                        provider=provider,
                     )
-                    await forget_session.commit()
-                    index_task = asyncio.create_task(
-                        _index_batch(
-                            index_session,
-                            documents=stale_documents,
-                            config=CONFIG,
-                            provider=provider,
-                        )
-                    )
-                    await asyncio.sleep(0.1)
-                    assert index_task.done() is False
-                    assert provider.calls == []
+                )
+                await asyncio.sleep(0.1)
+                assert index_task.done() is False
+                assert provider.calls == []
+                await forget_session.commit()
 
             result = await asyncio.wait_for(index_task, timeout=2)
 
@@ -815,6 +810,116 @@ async def test_forget_that_wins_source_lock_blocks_stale_text_before_provider(
                 delete(ForgetEvent).where(ForgetEvent.target_id == str(source.message.id))
             )
             await cleanup.execute(delete(ChatMessage).where(ChatMessage.chat_id == chat_id))
+            await cleanup.execute(delete(User).where(User.id == user_id))
+            await cleanup.commit()
+
+
+@pytest.mark.asyncio
+async def test_provider_dispatch_holds_same_lock_as_pending_forget_creation(
+    postgres_engine,
+) -> None:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from bot.db.repos.forget_event import ForgetEventRepo
+
+    factory = async_sessionmaker(postgres_engine, class_=AsyncSession, expire_on_commit=False)
+    suffix = uuid.uuid4().int % 1_000_000
+    user_id = 8_044_042_215 + suffix
+    chat_id = -9_044_042_215 - suffix
+    provider_entered = asyncio.Event()
+    release_provider = asyncio.Event()
+    ledger_ids: set[int] = set()
+
+    class BarrierProvider(CountingEmbeddingProvider):
+        async def embed(self, *, inputs, model: str, dimensions: int) -> EmbeddingResult:
+            self.calls.append(tuple(inputs))
+            provider_entered.set()
+            await release_provider.wait()
+            return EmbeddingResult(
+                vectors=(VECTOR_X,),
+                tokens_in=sum(len(value) for value in inputs),
+                request_id="forget-lock-provider-dispatch",
+                raw_latency_ms=1,
+            )
+
+    provider = BarrierProvider()
+    try:
+        async with factory() as setup:
+            human = await _user(setup, user_id=user_id, is_bot=False)
+            source = await _message(
+                setup,
+                user_id=human.id,
+                message_id=4042215 + suffix,
+                text="provider dispatch owns the forget target lock",
+                chat_id=chat_id,
+            )
+            await setup.commit()
+
+        async with factory() as index_session:
+            documents = await list_eligible_message_documents(index_session, chat_id=chat_id)
+            index_task = asyncio.create_task(
+                _index_batch(
+                    index_session,
+                    documents=documents,
+                    config=CONFIG,
+                    provider=provider,
+                )
+            )
+            await asyncio.wait_for(provider_entered.wait(), timeout=2)
+
+            async def create_forget() -> None:
+                async with factory() as forget_session:
+                    await ForgetEventRepo.create(
+                        forget_session,
+                        target_type="message",
+                        target_id=str(source.message.id),
+                        actor_user_id=human.id,
+                        authorized_by="self",
+                        tombstone_key=f"message:{chat_id}:{source.message.message_id}",
+                    )
+                    await forget_session.commit()
+
+            forget_task = asyncio.create_task(create_forget())
+            await asyncio.sleep(0.1)
+            assert forget_task.done() is False
+            assert len(provider.calls) == 1
+            release_provider.set()
+            result, _ = await asyncio.gather(index_task, forget_task)
+
+        assert (result.indexed, result.skipped) == (1, 0)
+        async with factory() as verification:
+            units = (
+                (
+                    await verification.execute(
+                        select(SemanticRetrievalUnit).where(
+                            SemanticRetrievalUnit.chat_id == chat_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(units) == 1
+            ledger_ids = {unit.llm_usage_ledger_id for unit in units}
+            assert (
+                await verification.execute(
+                    select(ForgetEvent.id).where(ForgetEvent.target_id == str(source.message.id))
+                )
+            ).scalar_one() > 0
+    finally:
+        release_provider.set()
+        async with factory() as cleanup:
+            await cleanup.execute(
+                delete(SemanticRetrievalUnit).where(SemanticRetrievalUnit.chat_id == chat_id)
+            )
+            await cleanup.execute(
+                delete(ForgetEvent).where(ForgetEvent.target_id == str(source.message.id))
+            )
+            await cleanup.execute(delete(ChatMessage).where(ChatMessage.chat_id == chat_id))
+            if ledger_ids:
+                await cleanup.execute(
+                    delete(LlmUsageLedger).where(LlmUsageLedger.id.in_(ledger_ids))
+                )
             await cleanup.execute(delete(User).where(User.id == user_id))
             await cleanup.commit()
 
@@ -870,6 +975,57 @@ async def test_concurrent_winner_is_reported_as_conflict_not_unchanged(db_sessio
     assert result.reason_counts == {"skipped:conflict": 1}
     assert len(provider.calls) == 1
     assert len((await db_session.execute(select(SemanticRetrievalUnit.id))).scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_embedding_dispatch_splits_batch_at_provider_character_cap(db_session) -> None:
+    human = await _user(db_session, user_id=8_044_042_230, is_bot=False)
+    for offset in range(17):
+        await _message(
+            db_session,
+            user_id=human.id,
+            message_id=4042230 + offset,
+            text=(chr(ord("a") + offset) * 3996) + f"{offset:04d}",
+        )
+    documents = await list_eligible_message_documents(db_session, chat_id=CHAT_ID, limit=100)
+    provider = CountingEmbeddingProvider()
+
+    result = await _index_batch(
+        db_session,
+        documents=documents,
+        config=CONFIG,
+        provider=provider,
+    )
+
+    assert (result.indexed, result.skipped) == (17, 0)
+    assert [len(call) for call in provider.calls] == [16, 1]
+    assert all(sum(len(value) for value in call) <= 64_000 for call in provider.calls)
+    assert len((await db_session.execute(select(SemanticRetrievalUnit.id))).scalars().all()) == 17
+
+
+@pytest.mark.asyncio
+async def test_oversize_document_is_accounted_without_provider_dispatch(db_session) -> None:
+    human = await _user(db_session, user_id=8_044_042_250, is_bot=False)
+    await _message(
+        db_session,
+        user_id=human.id,
+        message_id=4042250,
+        text="x" * 8_001,
+    )
+    documents = await list_eligible_message_documents(db_session, chat_id=CHAT_ID)
+    provider = CountingEmbeddingProvider()
+
+    result = await _index_batch(
+        db_session,
+        documents=documents,
+        config=CONFIG,
+        provider=provider,
+    )
+
+    assert (result.indexed, result.skipped) == (0, 1)
+    assert result.reason_counts == {"skipped:oversize": 1}
+    assert provider.calls == []
+    assert (await db_session.execute(select(SemanticRetrievalUnit.id))).scalar_one_or_none() is None
 
 
 @pytest.mark.asyncio

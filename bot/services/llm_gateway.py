@@ -1339,38 +1339,14 @@ async def hold_evidence_delivery_locks(
 ) -> AsyncIterator[None]:
     """Serialize final presentation with forget/edit/card-governance writers."""
 
-    from bot.db.models import ChatMessage, MessageVersion
     from bot.services.advisory_locks import (
-        chat_message_advisory_key,
-        forget_target_advisory_key,
+        governed_message_lock_keys,
         hold_session_advisory_locks,
     )
     from bot.services.forget_cascade import _p6_mvid_advisory_lock_id
 
     provenance_ids = _bundle_provenance_ids(bundle.items)
-    metadata_result = await session.execute(
-        select(
-            MessageVersion.id,
-            MessageVersion.content_hash,
-            ChatMessage.id.label("chat_message_id"),
-            ChatMessage.user_id,
-            ChatMessage.chat_id,
-            ChatMessage.message_id,
-        )
-        .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
-        .where(MessageVersion.id.in_(provenance_ids))
-    )
-    lock_keys: set[str] = set()
-    for row in metadata_result:
-        lock_keys.update(
-            {
-                chat_message_advisory_key(int(row.chat_id), int(row.message_id)),
-                forget_target_advisory_key("message", str(row.chat_message_id)),
-                forget_target_advisory_key("message_hash", str(row.content_hash)),
-            }
-        )
-        if row.user_id is not None:
-            lock_keys.add(forget_target_advisory_key("user", str(row.user_id)))
+    lock_keys = await governed_message_lock_keys(session, provenance_ids)
     lock_ids = (_p6_mvid_advisory_lock_id(value) for value in provenance_ids)
     async with hold_session_advisory_locks(
         session,

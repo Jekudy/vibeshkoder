@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 
@@ -31,6 +31,42 @@ def forget_target_advisory_key(target_type: str, target_id: str) -> str:
     if target_type not in {"message", "user", "message_hash"}:
         raise ValueError(f"unsupported forget target lock type: {target_type}")
     return f"forget_target:{target_type}:{target_id}"
+
+
+async def governed_message_lock_keys(
+    session: AsyncSession,
+    message_version_ids: Iterable[int],
+) -> tuple[str, ...]:
+    """Return every writer lock key protecting governed message provenance."""
+
+    ids = tuple(sorted(set(message_version_ids)))
+    if not ids:
+        return ()
+    from bot.db.models import ChatMessage, MessageVersion
+
+    result = await session.execute(
+        select(
+            MessageVersion.content_hash,
+            ChatMessage.id.label("chat_message_id"),
+            ChatMessage.user_id,
+            ChatMessage.chat_id,
+            ChatMessage.message_id,
+        )
+        .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
+        .where(MessageVersion.id.in_(ids))
+    )
+    lock_keys: set[str] = set()
+    for row in result:
+        lock_keys.update(
+            {
+                chat_message_advisory_key(int(row.chat_id), int(row.message_id)),
+                forget_target_advisory_key("message", str(row.chat_message_id)),
+                forget_target_advisory_key("message_hash", str(row.content_hash)),
+            }
+        )
+        if row.user_id is not None:
+            lock_keys.add(forget_target_advisory_key("user", str(row.user_id)))
+    return tuple(sorted(lock_keys))
 
 
 @asynccontextmanager
@@ -78,6 +114,7 @@ async def hold_session_advisory_locks(
 __all__ = [
     "chat_message_advisory_key",
     "forget_target_advisory_key",
+    "governed_message_lock_keys",
     "hold_session_advisory_locks",
     "session_uses_postgresql",
 ]
