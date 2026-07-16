@@ -1,0 +1,5 @@
+[workflow]
+persistent_facts = [
+  "file:{project-root}/_bmad-output/project-context.md",
+]
+on_complete = "Execute the mandatory handoff in file:{project-root}/_bmad/custom/github-issue-handoff.md before exiting."

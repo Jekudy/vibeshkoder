@@ -3,7 +3,8 @@
 **Last updated:** 2026-04-27
 **Owner:** founder
 **Sprint:** CRIT-07 (Hard Review 2026-04-27)
-**Notion issue:** https://www.notion.so/34ff1cc3549b8179810cd4d489930295
+**Legacy Notion reference (historical only):** https://www.notion.so/34ff1cc3549b8179810cd4d489930295
+**Current tracking rule:** create or link a GitHub Issue before any follow-up work.
 
 ---
 

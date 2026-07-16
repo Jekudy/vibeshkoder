@@ -23,10 +23,25 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 
 ## Issue Tracker
 
-- This repo uses Notion via `nt` plugin (`/nt:issue`, `/nt:work`, `/nt:status`, ...)
-- Other projects use Linear via `ln` plugin
-- Do not mix: `nt` commands in non-shkoderbot repos will fail by design
-- To override in one-off scenarios: `export NT_TEAM=SHK`
+- GitHub Issues is the only canonical tracker for scope, backlog, and status.
+- Every research, brainstorming, design, architecture, planning, PRD, retrospective,
+  or course-correction session is complete only after it creates or updates a GitHub
+  Issue and links any supporting artifacts.
+- Do not create a branch or worktree, edit implementation files, or write code before
+  an open issue exists with problem, scope, acceptance criteria, and dependencies.
+- Verify supplied issues with `gh issue view <number>`. Branches, commits, and PRs must
+  reference the issue; PR bodies must include `Closes #<number>` or an equivalent
+  GitHub closing keyword.
+- Do not create or mirror project work in Discussions, Notion, Linear, or local backlog
+  files. BMAD outputs, ADRs, plans, charters, and status documents are supporting only.
+
+## BMAD
+
+- BMAD BMM is installed under `_bmad/`; generated skills live in `.agents/skills/`
+  and `.claude/skills/`.
+- Start an unfamiliar workflow with `bmad-help` in a fresh task. Use `bmad-quick-dev`
+  for small changes and the full analysis/planning flow for major changes.
+- Read `_bmad-output/project-context.md` before running a BMAD workflow.
 
 ## Current Migration Rule
 
@@ -484,7 +499,8 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
     `stats_json.original_run_id`, NO-content logging, live-row protection, tombstones not
     rolled back, and the Phase 4+ downstream-dependent TODO.
 
-Issue tracker for memory cycle: **GitHub Issues** (label `phase:0`, `phase:1`, etc.). The
-`nt` (Notion) plugin remains the tracker for non-memory work in this repo if any.
+Historical memory-cycle labels such as `phase:0` and `phase:1` remain valid, but GitHub
+Issues is the canonical tracker for all work in this repository. Local status documents
+are derived snapshots.
 
 <!-- updated-by-superflow:2026-05-27 -->

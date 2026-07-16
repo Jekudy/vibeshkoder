@@ -1,5 +1,5 @@
-name: RFC – Design Proposal
-description: Propose a design change or architectural decision for discussion before implementation.
+name: Discovery / RFC
+description: Capture the outcome of research, product thinking, or design before implementation.
 title: "[RFC] "
 labels: ["rfc"]
 body:
@@ -8,6 +8,14 @@ body:
     attributes:
       label: Problem Statement
       description: What problem are you solving? Why does it need solving now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and Context
+      description: What research, user signal, constraints, or existing behavior informed this proposal?
     validations:
       required: true
 
@@ -36,6 +44,15 @@ body:
       required: true
 
   - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome / Decision
+      description: Record the current conclusion. Update this issue when the decision changes.
+      placeholder: "Accepted, rejected, needs more evidence, or ready for an implementation issue."
+    validations:
+      required: true
+
+  - type: textarea
     id: open-questions
     attributes:
       label: Open Questions
@@ -49,3 +66,11 @@ body:
       label: Related ADR
       description: Link to an existing ADR in `docs/memory-system/decisions/` if applicable.
       placeholder: "docs/memory-system/decisions/ADR-0001-*.md or N/A"
+
+  - type: checkboxes
+    id: issue-first
+    attributes:
+      label: Issue-first gate
+      options:
+        - label: No implementation will start until a dedicated implementation issue exists.
+          required: true

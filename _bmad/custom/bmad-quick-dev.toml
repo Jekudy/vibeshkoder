@@ -1,0 +1,5 @@
+[workflow]
+activation_steps_prepend = [
+  "Execute file:{project-root}/_bmad/custom/github-development-gate.md before implementation.",
+]
+on_complete = "Execute the mandatory handoff in file:{project-root}/_bmad/custom/github-issue-handoff.md before exiting."

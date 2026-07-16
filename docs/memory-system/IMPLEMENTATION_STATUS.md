@@ -2,7 +2,8 @@
 
 **Last updated:** 2026-05-30 (T12-10 — Phase 12 CLOSED. Scheduler savepoint fix (HIGH FHR), ORM CHECK drift fix (MEDIUM), closure docs. Alembic head 078. Phase 11 binding 102/102. FHR APPROVE. Memory system 12-phase cycle COMPLETE.)
 **Active worktrees:** none (Phase 6 closed). Historical: `.worktrees/p6-w1-stream-b` (T6-02, closed); `.worktrees/orch-A` (Phase 5–6 planning); `.worktrees/orch-B` (Phase 9/10/12 planning); `.worktrees/orch-C` (Phase 11 planning); `.worktrees/p2-alpha/bravo/charlie/delta` (Phase 2 closed 2026-04-29); `.worktrees/p4-hotfix-164` (closed by PR #203).
-**Source of truth:** this file is updated after every PR merge into `main`.
+**Status snapshot:** GitHub Issues is the canonical source for scope and status. This derived
+file is updated after every PR merge into `main`.
 
 ---
 
@@ -721,4 +722,3 @@ sync→async cascade FLIP per RFC-001:415 conditional Neo4j approval).
 
 <!-- updated-by-superflow:2026-05-30 -->
 <!-- phase-a-cleanup:2026-05-22 -->
-

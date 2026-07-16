@@ -1,0 +1,5 @@
+[workflow]
+activation_steps_append = [
+  "Replace the remaining workflow with file:{project-root}/_bmad/custom/github-sprint-planning.md, then exit.",
+]
+on_complete = "Execute the mandatory handoff in file:{project-root}/_bmad/custom/github-issue-handoff.md before exiting."
