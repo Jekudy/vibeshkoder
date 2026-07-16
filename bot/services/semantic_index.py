@@ -46,6 +46,8 @@ RRF_K = 60
 
 _FORGET_EXCLUDES = forget_excludes_sql_fragment()
 
+# Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _REVALIDATE_PROVENANCE_SQL = text(
     f"""
     SELECT mv.id AS message_version_id,
@@ -78,6 +80,8 @@ _REVALIDATE_CARDS_SQL = text(
     """
 )
 
+# Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _RECONCILE_INELIGIBLE_SQL = text(
     f"""
     UPDATE semantic_retrieval_units AS unit
@@ -170,6 +174,8 @@ _RECONCILE_INELIGIBLE_SQL = text(
     """
 )
 
+# Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _ELIGIBLE_MESSAGES_SQL = text(
     f"""
     SELECT mv.id AS message_version_id,
@@ -215,6 +221,8 @@ _ELIGIBLE_MESSAGES_SQL = text(
     """
 )
 
+# Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _ELIGIBLE_CARDS_SQL = text(
     f"""
     SELECT kc.id AS card_id,
@@ -266,6 +274,8 @@ _ELIGIBLE_CARDS_SQL = text(
     """
 )
 
+# Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _VECTOR_CANDIDATES_SQL = text(
     f"""
     SELECT unit.id,
@@ -328,6 +338,8 @@ _VECTOR_CANDIDATES_SQL = text(
     """
 )
 
+# Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _MESSAGE_HIT_SQL = text(
     f"""
     SELECT mv.id AS message_version_id,
@@ -368,6 +380,8 @@ _MESSAGE_HIT_SQL = text(
     """
 )
 
+# Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _CARD_HIT_SQL = text(
     f"""
     SELECT kc.id AS card_id,

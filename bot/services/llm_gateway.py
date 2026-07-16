@@ -474,6 +474,8 @@ def _build_prompt(
 # ─── SQL fragments ──────────────────────────────────────────────────────────
 
 
+# Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _SOURCE_FILTER_SQL = text(
     f"""
     SELECT mv.id AS message_version_id

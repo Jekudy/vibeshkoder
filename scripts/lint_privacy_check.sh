@@ -216,6 +216,13 @@ is_allowed_path() {
   [[ "$path" == "tests/evals/test_graph_drift.py" ]] && return 0
   [[ "$path" == "tests/evals/test_graph_no_llm_in_rebuild.py" ]] && return 0
 
+  # Issue #404 semantic Q&A privacy enforcers and operator runbook. These files
+  # must name the forbidden-source/forget invariants they implement and verify;
+  # keep the allowlist path-exact so adjacent runtime files remain linted.
+  [[ "$path" == "docs/runbooks/semantic-qa.md" ]] && return 0
+  [[ "$path" == "tests/services/test_forget_cascade_semantic.py" ]] && return 0
+  [[ "$path" == "tests/services/test_semantic_index_postgres.py" ]] && return 0
+
   return 1
 }
 
