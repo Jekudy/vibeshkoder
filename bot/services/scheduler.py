@@ -389,7 +389,7 @@ async def run_semantic_index_tick() -> None:
         ProviderStructuralError,
         ProviderTransientError,
     )
-    from bot.services.semantic_index import backfill_semantic_index
+    from bot.services.semantic_index import EmbeddingClaimUnresolved, backfill_semantic_index
 
     try:
         async with async_session() as session:
@@ -402,6 +402,7 @@ async def run_semantic_index_tick() -> None:
                     chat_id=settings.COMMUNITY_CHAT_ID,
                 )
             except (
+                EmbeddingClaimUnresolved,
                 EmbeddingBudgetExceeded,
                 ProviderStructuralError,
                 ProviderTransientError,

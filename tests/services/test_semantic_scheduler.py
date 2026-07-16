@@ -60,6 +60,31 @@ async def test_semantic_index_tick_runs_idempotent_reconciliation(monkeypatch) -
     )
 
 
+async def test_semantic_index_tick_reports_unresolved_claim(monkeypatch, caplog) -> None:
+    scheduler = import_module("bot.services.scheduler")
+    feature_flags = import_module("bot.db.repos.feature_flag")
+    gateway = import_module("bot.services.llm_gateway")
+    semantic_index = import_module("bot.services.semantic_index")
+    session = AsyncMock()
+    backfill = AsyncMock(
+        side_effect=semantic_index.EmbeddingClaimUnresolved(unit_id=404, status="reserved")
+    )
+
+    monkeypatch.setattr(scheduler, "async_session", _session_context(session))
+    monkeypatch.setattr(feature_flags.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        gateway,
+        "load_embedding_gateway_config",
+        Mock(return_value=SimpleNamespace(model="text-embedding-3-small", dimensions=1536)),
+    )
+    monkeypatch.setattr(semantic_index, "backfill_semantic_index", backfill)
+
+    await scheduler.run_semantic_index_tick()
+
+    session.rollback.assert_awaited_once()
+    assert "semantic_index_tick_failed" in caplog.text
+
+
 def test_start_scheduler_registers_semantic_index_tick(monkeypatch) -> None:
     scheduler = import_module("bot.services.scheduler")
     jobs: list[tuple[object, str | None, dict[str, object]]] = []

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -229,18 +230,22 @@ async def _unit(
     vector: tuple[float, ...],
     ledger_id: int,
 ) -> SemanticRetrievalUnit:
+    chunk_text = source.version.normalized_text or source.version.text or ""
     unit = SemanticRetrievalUnit(
         source_type="message",
         source_id=str(source.version.id),
         source_revision="v1:media:none",
         chat_id=source.message.chat_id,
-        content_hash=source.version.content_hash,
+        content_hash=hashlib.sha256(chunk_text.encode()).hexdigest(),
         embedding_provider="openai",
         embedding_model="text-embedding-3-small",
         embedding_model_version="text-embedding-3-small",
         embedding_dimensions=1536,
+        embedding_status="completed",
+        chunk_text=chunk_text,
         embedding=list(vector),
         llm_usage_ledger_id=ledger_id,
+        indexed_at=datetime.now(timezone.utc),
     )
     session.add(unit)
     await session.flush()
@@ -736,7 +741,11 @@ async def test_pending_forget_created_during_embedding_prevents_unit_store(db_se
     assert (result.indexed, result.skipped) == (0, 1)
     assert result.reason_counts == {"skipped:governance_race": 1}
     assert len(provider.calls) == 1
-    assert (await db_session.execute(select(SemanticRetrievalUnit.id))).scalar_one_or_none() is None
+    claim = (await db_session.execute(select(SemanticRetrievalUnit))).scalars().one()
+    assert claim.embedding_status == "failed"
+    assert claim.embedding is None
+    assert claim.chunk_text is None
+    assert claim.invalidation_reason == "governance_race"
 
 
 @pytest.mark.asyncio
@@ -925,7 +934,9 @@ async def test_provider_dispatch_holds_same_lock_as_pending_forget_creation(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_winner_is_reported_as_conflict_not_unchanged(db_session) -> None:
+async def test_unresolved_exact_claim_blocks_provider_retry(db_session) -> None:
+    EmbeddingClaimUnresolved = _index_batch.__globals__["EmbeddingClaimUnresolved"]
+
     human = await _user(db_session, user_id=8_044_042_221, is_bot=False)
     source = await _message(
         db_session,
@@ -936,56 +947,55 @@ async def test_concurrent_winner_is_reported_as_conflict_not_unchanged(db_sessio
     document = (await list_eligible_message_documents(db_session, chat_id=CHAT_ID))[0]
     winner_ledger = await _ledger(db_session, suffix="winner")
 
-    class ConcurrentWinnerProvider(CountingEmbeddingProvider):
-        async def embed(self, *, inputs, model: str, dimensions: int) -> EmbeddingResult:
-            winner = SemanticRetrievalUnit(
-                source_type=document.source_type,
-                source_id=document.source_id,
-                source_revision=document.source_revision,
-                chat_id=document.chat_id,
-                content_hash=document.content_hash,
-                embedding_provider="openai",
-                embedding_model=model,
-                embedding_model_version="text-embedding-3-small",
-                embedding_dimensions=dimensions,
-                embedding=list(VECTOR_X),
-                llm_usage_ledger_id=winner_ledger.id,
-            )
-            db_session.add(winner)
-            await db_session.flush()
-            db_session.add(
-                SemanticRetrievalUnitSource(
-                    unit_id=winner.id,
-                    message_version_id=source.version.id,
-                    position=0,
-                )
-            )
-            await db_session.flush()
-            return await super().embed(inputs=inputs, model=model, dimensions=dimensions)
-
-    provider = ConcurrentWinnerProvider()
-    result = await _index_batch(
-        db_session,
-        documents=[document],
-        config=CONFIG,
-        provider=provider,
+    unresolved = SemanticRetrievalUnit(
+        source_type=document.source_type,
+        source_id=document.source_id,
+        source_revision=document.source_revision,
+        chat_id=document.chat_id,
+        content_hash=document.content_hash,
+        embedding_provider="openai",
+        embedding_model=CONFIG.model,
+        embedding_model_version="text-embedding-3-small",
+        embedding_dimensions=CONFIG.dimensions,
+        embedding_status="failed",
+        chunk_text=None,
+        embedding=None,
+        llm_usage_ledger_id=winner_ledger.id,
+        indexed_at=None,
     )
+    db_session.add(unresolved)
+    await db_session.flush()
+    db_session.add(
+        SemanticRetrievalUnitSource(
+            unit_id=unresolved.id,
+            message_version_id=source.version.id,
+            position=0,
+        )
+    )
+    await db_session.flush()
 
-    assert (result.indexed, result.skipped) == (0, 1)
-    assert result.reason_counts == {"skipped:conflict": 1}
-    assert len(provider.calls) == 1
+    provider = CountingEmbeddingProvider()
+    with pytest.raises(EmbeddingClaimUnresolved, match="operator resolution"):
+        await _index_batch(
+            db_session,
+            documents=[document],
+            config=CONFIG,
+            provider=provider,
+        )
+
+    assert provider.calls == []
     assert len((await db_session.execute(select(SemanticRetrievalUnit.id))).scalars().all()) == 1
 
 
 @pytest.mark.asyncio
 async def test_embedding_dispatch_splits_batch_at_provider_character_cap(db_session) -> None:
     human = await _user(db_session, user_id=8_044_042_230, is_bot=False)
-    for offset in range(17):
+    for offset in range(81):
         await _message(
             db_session,
             user_id=human.id,
             message_id=4042230 + offset,
-            text=(chr(ord("a") + offset) * 3996) + f"{offset:04d}",
+            text=f"{offset:04d}" + (chr(0x410 + (offset % 32)) * 796),
         )
     documents = await list_eligible_message_documents(db_session, chat_id=CHAT_ID, limit=100)
     provider = CountingEmbeddingProvider()
@@ -997,10 +1007,10 @@ async def test_embedding_dispatch_splits_batch_at_provider_character_cap(db_sess
         provider=provider,
     )
 
-    assert (result.indexed, result.skipped) == (17, 0)
-    assert [len(call) for call in provider.calls] == [16, 1]
+    assert (result.indexed, result.skipped) == (81, 0)
+    assert [len(call) for call in provider.calls] == [80, 1]
     assert all(sum(len(value) for value in call) <= 64_000 for call in provider.calls)
-    assert len((await db_session.execute(select(SemanticRetrievalUnit.id))).scalars().all()) == 17
+    assert len((await db_session.execute(select(SemanticRetrievalUnit.id))).scalars().all()) == 81
 
 
 @pytest.mark.asyncio
@@ -1008,11 +1018,12 @@ async def test_oversize_document_is_chunked_with_full_coverage(db_session) -> No
     from scripts.backfill_semantic_index import _coverage_report
 
     human = await _user(db_session, user_id=8_044_042_250, is_bot=False)
+    late_chunk = ("y" * 700) + "LATE-CHUNK-EVIDENCE"
     await _message(
         db_session,
         user_id=human.id,
         message_id=4042250,
-        text="x" * 8_001,
+        text=("early-prefix " + "x" * (800 - len("early-prefix "))) + late_chunk,
     )
     documents = await list_eligible_message_documents(db_session, chat_id=CHAT_ID)
     provider = CountingEmbeddingProvider()
@@ -1026,7 +1037,9 @@ async def test_oversize_document_is_chunked_with_full_coverage(db_session) -> No
 
     assert (result.indexed, result.skipped) == (2, 0)
     assert result.reason_counts == {"indexed:new_embedding": 2}
-    assert [tuple(len(value) for value in call) for call in provider.calls] == [(8_000, 1)]
+    assert [tuple(len(value) for value in call) for call in provider.calls] == [
+        (800, len(late_chunk))
+    ]
     units = (
         (
             await db_session.execute(
@@ -1049,26 +1062,201 @@ async def test_oversize_document_is_chunked_with_full_coverage(db_session) -> No
     assert coverage["coverage_percent"] == 100.0
     hits = await vector_search(
         db_session,
-        query_embedding=VECTOR_X,
+        query_embedding=VECTOR_Y,
         chat_id=CHAT_ID,
         embedding_model=CONFIG.model,
         limit=5,
     )
     assert len(hits) == 1
     assert hits[0].message_version_id == documents[0].message_version_ids[0]
+    assert hits[0].snippet == late_chunk
+    assert hits[0].snippet.index("LATE-CHUNK-EVIDENCE") > 400
 
 
 @pytest.mark.asyncio
-async def test_partial_provider_batch_is_durable_and_retry_does_not_repay(db_session) -> None:
-    from bot.services.llm_providers import ProviderTransientError
+async def test_whitespace_only_chunk_is_filtered_without_content_loss(db_session) -> None:
+    from scripts.backfill_semantic_index import _coverage_report
+
+    human = await _user(db_session, user_id=8_044_042_251, is_bot=False)
+    await _message(
+        db_session,
+        user_id=human.id,
+        message_id=4042251,
+        text=("a" * 800) + (" " * 800) + "b",
+    )
+    documents = await list_eligible_message_documents(db_session, chat_id=CHAT_ID)
+    provider = CountingEmbeddingProvider()
+
+    result = await _index_batch(
+        db_session,
+        documents=documents,
+        config=CONFIG,
+        provider=provider,
+    )
+
+    assert (result.indexed, result.skipped) == (2, 0)
+    assert [(document.chunk_index, document.chunk_count) for document in documents] == [
+        (0, 2),
+        (1, 2),
+    ]
+    assert provider.calls == [("a" * 800, "b")]
+    coverage = await _coverage_report(
+        db_session,
+        chat_id=CHAT_ID,
+        model=CONFIG.model,
+        batch_size=100,
+    )
+    assert coverage["status"] == "pass"
+    assert coverage["eligible"] == 2
+    assert coverage["unresolved_claims"] == 0
+
+
+@pytest.mark.asyncio
+async def test_card_vector_hit_hydrates_the_winning_late_chunk(db_session) -> None:
+    human = await _user(db_session, user_id=8_044_042_252, is_bot=False)
+    admin = await _user(db_session, user_id=8_044_042_253, is_bot=False, is_admin=True)
+    source = await _message(
+        db_session,
+        user_id=human.id,
+        message_id=4042252,
+        text="card provenance source",
+    )
+    card = await _approved_card(
+        db_session,
+        admin_id=admin.id,
+        source_ids=(source.version.id,),
+        title="early-card",
+    )
+    card.body_markdown = ("x" * 1_500) + " LATE-CARD-CHUNK"
+    await db_session.flush()
+    documents = await list_eligible_card_documents(db_session, chat_id=CHAT_ID)
+    assert len(documents) == 2
+    provider = CountingEmbeddingProvider()
+    await _index_batch(
+        db_session,
+        documents=documents,
+        config=CONFIG,
+        provider=provider,
+    )
+
+    hits = await vector_search(
+        db_session,
+        query_embedding=VECTOR_Y,
+        chat_id=CHAT_ID,
+        embedding_model=CONFIG.model,
+        limit=5,
+    )
+
+    assert len(hits) == 1
+    assert hits[0].card_id == card.id
+    assert hits[0].snippet == documents[1].canonical_text
+    assert "LATE-CARD-CHUNK" in hits[0].snippet
+    assert hits[0].snippet.index("LATE-CARD-CHUNK") > 400
+    assert hits[0].card_source_message_version_ids == (source.version.id,)
+
+
+@pytest.mark.asyncio
+async def test_vector_hydration_rejects_card_body_changed_after_embedding(db_session) -> None:
+    human = await _user(db_session, user_id=8_044_042_254, is_bot=False)
+    admin = await _user(db_session, user_id=8_044_042_255, is_bot=False, is_admin=True)
+    source = await _message(
+        db_session,
+        user_id=human.id,
+        message_id=4042254,
+        text="mutable card provenance",
+    )
+    card = await _approved_card(
+        db_session,
+        admin_id=admin.id,
+        source_ids=(source.version.id,),
+        title="Current card",
+    )
+    documents = await list_eligible_card_documents(db_session, chat_id=CHAT_ID)
+    await _index_batch(
+        db_session,
+        documents=documents,
+        config=CONFIG,
+        provider=CountingEmbeddingProvider(),
+    )
+
+    current_hits = await vector_search(
+        db_session,
+        query_embedding=VECTOR_X,
+        chat_id=CHAT_ID,
+        embedding_model=CONFIG.model,
+    )
+    assert len(current_hits) == 1
+    assert current_hits[0].snippet == documents[0].canonical_text
+
+    card.body_markdown = "replacement body that was never embedded"
+    await db_session.flush()
+
+    assert (
+        await vector_search(
+            db_session,
+            query_embedding=VECTOR_X,
+            chat_id=CHAT_ID,
+            embedding_model=CONFIG.model,
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_vector_hydration_rejects_media_description_changed_after_embedding(
+    db_session,
+) -> None:
+    human = await _user(db_session, user_id=8_044_042_256, is_bot=False)
+    source = await _message(
+        db_session,
+        user_id=human.id,
+        message_id=4042256,
+        text="message with mutable media description",
+    )
+    media = MessageMedia(
+        chat_message_id=source.message.id,
+        media_kind="photo",
+        source_message_url="https://t.me/c/404/2256",
+        description="original embedded visual description",
+        description_status="ready",
+        description_model="gpt-5-nano",
+    )
+    db_session.add(media)
+    await db_session.flush()
+    documents = await list_eligible_message_documents(db_session, chat_id=CHAT_ID)
+    await _index_batch(
+        db_session,
+        documents=documents,
+        config=CONFIG,
+        provider=CountingEmbeddingProvider(),
+    )
+
+    media.description = "replacement visual description that was never embedded"
+    await db_session.flush()
+
+    assert (
+        await vector_search(
+            db_session,
+            query_embedding=VECTOR_X,
+            chat_id=CHAT_ID,
+            embedding_model=CONFIG.model,
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_provider_batch_is_durable_and_retry_fails_closed(db_session) -> None:
+    ProviderTransientError = _index_batch.__globals__["ProviderTransientError"]
+    EmbeddingClaimUnresolved = _index_batch.__globals__["EmbeddingClaimUnresolved"]
 
     human = await _user(db_session, user_id=8_044_042_260, is_bot=False)
-    for offset in range(17):
+    for offset in range(81):
         await _message(
             db_session,
             user_id=human.id,
             message_id=4042260 + offset,
-            text=(chr(ord("a") + offset) * 3996) + f"{offset:04d}",
+            text=f"{offset:04d}" + (chr(0x410 + (offset % 32)) * 796),
         )
     documents = await list_eligible_message_documents(db_session, chat_id=CHAT_ID, limit=100)
 
@@ -1095,9 +1283,9 @@ async def test_partial_provider_batch_is_durable_and_retry_does_not_repay(db_ses
             chat_id=CHAT_ID,
         )
     partial = raised.value.semantic_batch_result
-    assert (partial.indexed, partial.skipped) == (16, 0)
-    assert partial.reason_counts == {"indexed:new_embedding": 16}
-    assert [len(call) for call in first_provider.calls] == [16, 1]
+    assert (partial.indexed, partial.skipped) == (80, 0)
+    assert partial.reason_counts == {"indexed:new_embedding": 80}
+    assert [len(call) for call in first_provider.calls] == [80, 1]
     failed_run = (
         (
             await db_session.execute(
@@ -1109,28 +1297,234 @@ async def test_partial_provider_batch_is_durable_and_retry_does_not_repay(db_ses
     )
     assert failed_run.status == "failed"
     assert (failed_run.eligible_count, failed_run.indexed_count, failed_run.failed_count) == (
-        17,
-        16,
+        81,
+        80,
         1,
     )
     first_units = (await db_session.execute(select(SemanticRetrievalUnit))).scalars().all()
-    assert len(first_units) == 16
-    assert len({unit.llm_usage_ledger_id for unit in first_units}) == 1
+    assert len(first_units) == 81
+    assert [unit.embedding_status for unit in first_units].count("completed") == 80
+    assert [unit.embedding_status for unit in first_units].count("failed") == 1
+    assert len({unit.llm_usage_ledger_id for unit in first_units}) == 2
 
     retry_provider = CountingEmbeddingProvider()
-    retry = await _index_batch(
-        db_session,
-        documents=documents,
-        config=CONFIG,
-        provider=retry_provider,
-    )
+    with pytest.raises(EmbeddingClaimUnresolved):
+        await _index_batch(
+            db_session,
+            documents=documents,
+            config=CONFIG,
+            provider=retry_provider,
+        )
 
-    assert (retry.indexed, retry.skipped) == (1, 16)
-    assert [len(call) for call in retry_provider.calls] == [1]
-    assert retry_provider.calls[0] == (documents[-1].canonical_text,)
+    assert retry_provider.calls == []
     final_units = (await db_session.execute(select(SemanticRetrievalUnit))).scalars().all()
-    assert len(final_units) == 17
+    assert len(final_units) == 81
     assert len({unit.llm_usage_ledger_id for unit in final_units}) == 2
+
+
+@pytest.mark.asyncio
+async def test_paid_result_terminal_failure_keeps_reserved_claim_and_blocks_repay(
+    postgres_engine,
+    monkeypatch,
+) -> None:
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    EmbeddingClaimUnresolved = _index_batch.__globals__["EmbeddingClaimUnresolved"]
+    _SemanticEmbeddingOutcomeRecorder = _index_batch.__globals__[
+        "_SemanticEmbeddingOutcomeRecorder"
+    ]
+
+    suffix = uuid.uuid4().int % 1_000_000
+    user_id = 8_044_042_270 + suffix
+    chat_id = -9_044_042_270 - suffix
+    factory = async_sessionmaker(postgres_engine, class_=AsyncSession, expire_on_commit=False)
+    original_complete = _SemanticEmbeddingOutcomeRecorder.complete
+
+    async def fail_terminal_commit(self, session, *, llm_usage_ledger_id, vectors):
+        raise OperationalError("forced terminal materialization failure", {}, RuntimeError())
+
+    monkeypatch.setattr(
+        _SemanticEmbeddingOutcomeRecorder,
+        "complete",
+        fail_terminal_commit,
+    )
+    first_provider = CountingEmbeddingProvider()
+    ledger_id: int | None = None
+    try:
+        async with factory() as session:
+            human = await _user(session, user_id=user_id, is_bot=False)
+            await _message(
+                session,
+                user_id=human.id,
+                message_id=4_042_270 + suffix,
+                text="paid result must never be dispatched twice",
+                chat_id=chat_id,
+            )
+            documents = await list_eligible_message_documents(session, chat_id=chat_id)
+            with pytest.raises(OperationalError):
+                await _index_batch(
+                    session,
+                    documents=documents,
+                    config=CONFIG,
+                    provider=first_provider,
+                )
+
+            assert len(first_provider.calls) == 1
+            claim = (
+                (
+                    await session.execute(
+                        select(SemanticRetrievalUnit).where(
+                            SemanticRetrievalUnit.chat_id == chat_id
+                        )
+                    )
+                )
+                .scalars()
+                .one()
+            )
+            assert claim.embedding_status == "reserved"
+            assert claim.embedding is None
+            assert claim.chunk_text is None
+            ledger_id = claim.llm_usage_ledger_id
+            ledger = await session.get(LlmUsageLedger, ledger_id)
+            assert ledger is not None
+            assert ledger.error == "reserved_in_flight"
+
+            monkeypatch.setattr(
+                _SemanticEmbeddingOutcomeRecorder,
+                "complete",
+                original_complete,
+            )
+            retry_provider = CountingEmbeddingProvider()
+            with pytest.raises(EmbeddingClaimUnresolved):
+                await _index_batch(
+                    session,
+                    documents=documents,
+                    config=CONFIG,
+                    provider=retry_provider,
+                )
+            assert retry_provider.calls == []
+    finally:
+        async with factory() as cleanup:
+            await cleanup.execute(
+                delete(SemanticRetrievalUnit).where(SemanticRetrievalUnit.chat_id == chat_id)
+            )
+            await cleanup.execute(delete(ChatMessage).where(ChatMessage.chat_id == chat_id))
+            if ledger_id is not None:
+                await cleanup.execute(delete(LlmUsageLedger).where(LlmUsageLedger.id == ledger_id))
+            await cleanup.execute(delete(User).where(User.id == user_id))
+            await cleanup.commit()
+
+
+@pytest.mark.asyncio
+async def test_sql_failure_preserves_committed_partition_accounting(
+    postgres_engine,
+    monkeypatch,
+) -> None:
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    _SemanticEmbeddingOutcomeRecorder = _index_batch.__globals__[
+        "_SemanticEmbeddingOutcomeRecorder"
+    ]
+
+    suffix = uuid.uuid4().int % 1_000_000
+    user_id = 8_044_042_800 + suffix
+    chat_id = -9_044_042_800 - suffix
+    factory = async_sessionmaker(postgres_engine, class_=AsyncSession, expire_on_commit=False)
+    original_complete = _SemanticEmbeddingOutcomeRecorder.complete
+    terminal_calls = 0
+
+    async def fail_second_terminal(self, session, *, llm_usage_ledger_id, vectors):
+        nonlocal terminal_calls
+        terminal_calls += 1
+        if terminal_calls == 2:
+            await session.execute(text("SELECT 1 / 0"))
+        await original_complete(
+            self,
+            session,
+            llm_usage_ledger_id=llm_usage_ledger_id,
+            vectors=vectors,
+        )
+
+    monkeypatch.setattr(
+        _SemanticEmbeddingOutcomeRecorder,
+        "complete",
+        fail_second_terminal,
+    )
+    provider = CountingEmbeddingProvider()
+    run_id: int | None = None
+    ledger_ids: set[int] = set()
+    try:
+        async with factory() as session:
+            human = await _user(session, user_id=user_id, is_bot=False)
+            for offset in range(81):
+                await _message(
+                    session,
+                    user_id=human.id,
+                    message_id=5_040_000 + suffix + offset,
+                    text=f"{offset:04d}" + (chr(0x410 + (offset % 32)) * 796),
+                    chat_id=chat_id,
+                )
+
+            with pytest.raises(DBAPIError):
+                await backfill_semantic_index(
+                    session,
+                    config=CONFIG,
+                    provider=provider,
+                    batch_size=100,
+                    chat_id=chat_id,
+                )
+        async with factory() as verify:
+            run = (
+                (
+                    await verify.execute(
+                        select(SemanticIndexRun).order_by(SemanticIndexRun.id.desc()).limit(1)
+                    )
+                )
+                .scalars()
+                .one()
+            )
+            run_id = run.id
+            assert run.status == "failed"
+            assert (
+                run.eligible_count,
+                run.indexed_count,
+                run.skipped_count,
+                run.failed_count,
+            ) == (81, 80, 0, 1)
+            assert run.reason_counts["indexed:new_embedding"] == 80
+            assert run.reason_counts["failed:DBAPIError"] == 1
+            assert run.cursor is None
+            units = (
+                (
+                    await verify.execute(
+                        select(SemanticRetrievalUnit).where(
+                            SemanticRetrievalUnit.chat_id == chat_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert [unit.embedding_status for unit in units].count("completed") == 80
+            assert [unit.embedding_status for unit in units].count("reserved") == 1
+            ledger_ids.update(unit.llm_usage_ledger_id for unit in units)
+            assert [len(call) for call in provider.calls] == [80, 1]
+    finally:
+        async with factory() as cleanup:
+            await cleanup.execute(
+                delete(SemanticRetrievalUnit).where(SemanticRetrievalUnit.chat_id == chat_id)
+            )
+            if run_id is not None:
+                await cleanup.execute(delete(SemanticIndexRun).where(SemanticIndexRun.id == run_id))
+            await cleanup.execute(delete(ChatMessage).where(ChatMessage.chat_id == chat_id))
+            if ledger_ids:
+                await cleanup.execute(
+                    delete(LlmUsageLedger).where(LlmUsageLedger.id.in_(ledger_ids))
+                )
+            await cleanup.execute(delete(User).where(User.id == user_id))
+            await cleanup.commit()
 
 
 @pytest.mark.asyncio
@@ -1442,8 +1836,11 @@ async def test_reconcile_invalidates_every_active_unit_that_became_ineligible(db
         embedding_model=CONFIG.model,
         embedding_model_version="text-embedding-3-small",
         embedding_dimensions=CONFIG.dimensions,
+        embedding_status="completed",
+        chunk_text="deapproved card",
         embedding=list(VECTOR_X),
         llm_usage_ledger_id=ledger.id,
+        indexed_at=datetime.now(timezone.utc),
     )
     db_session.add(card_unit)
     await db_session.flush()
@@ -1691,18 +2088,22 @@ async def test_vector_search_returns_approved_card_then_blocks_pending_forget(db
         title="Каноническая карточка",
     )
     ledger = await _ledger(db_session, suffix="b")
+    card_text = "\n".join(part.strip() for part in (card.title, card.body_markdown) if part.strip())
     unit = SemanticRetrievalUnit(
         source_type="card",
         source_id=str(card.id),
-        source_revision="updated:test:approved:test",
+        source_revision=f"updated:{card.updated_at.isoformat()}:approved:{card.approved_at.isoformat()}",
         chat_id=CHAT_ID,
-        content_hash="c" * 64,
+        content_hash=hashlib.sha256(card_text.encode()).hexdigest(),
         embedding_provider="openai",
         embedding_model="text-embedding-3-small",
         embedding_model_version="text-embedding-3-small",
         embedding_dimensions=1536,
+        embedding_status="completed",
+        chunk_text=card_text,
         embedding=list(VECTOR_X),
         llm_usage_ledger_id=ledger.id,
+        indexed_at=datetime.now(timezone.utc),
     )
     db_session.add(unit)
     await db_session.flush()

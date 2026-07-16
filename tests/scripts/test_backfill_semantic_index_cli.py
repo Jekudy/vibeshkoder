@@ -189,6 +189,7 @@ async def test_coverage_audit_rejects_missing_partial_or_reordered_provenance(
         "chat_id": -100404,
         "content_hash": "a" * 64,
         "embedding_model": "model",
+        "embedding_status": "completed",
         "invalidated_at": None,
         "message_version_ids": actual_sources,
     }
@@ -208,6 +209,97 @@ async def test_coverage_audit_rejects_missing_partial_or_reordered_provenance(
     assert report["status"] == "fail"
     assert report["indexed"] == 0
     assert report["reason_counts"]["failed:provenance_mismatch"] == 1
+
+
+async def test_coverage_audit_fails_on_unresolved_embedding_claim(monkeypatch) -> None:
+    identity = ("message", "11", "revision", 0, 1, -100404, "a" * 64, "model")
+    monkeypatch.setattr(
+        cli,
+        "_eligible_identities",
+        AsyncMock(return_value={identity: (11,)}),
+    )
+    row = {
+        "source_type": "message",
+        "source_id": "11",
+        "source_revision": "revision",
+        "chunk_index": 0,
+        "chunk_count": 1,
+        "chat_id": -100404,
+        "content_hash": "a" * 64,
+        "embedding_model": "model",
+        "embedding_status": "reserved",
+        "invalidated_at": None,
+        "message_version_ids": (11,),
+    }
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: [row]))
+        )
+    )
+
+    report = await cli._coverage_report(
+        session,
+        chat_id=-100404,
+        model="model",
+        batch_size=64,
+    )
+
+    assert report["status"] == "fail"
+    assert report["missing"] == 1
+    assert report["unresolved_claims"] == 1
+    assert report["unresolved_statuses"] == {"reserved": 1}
+
+
+async def test_coverage_ignores_superseded_invalidated_failed_claim(monkeypatch) -> None:
+    current = ("message", "12", "current", 0, 1, -100404, "b" * 64, "model")
+    monkeypatch.setattr(
+        cli,
+        "_eligible_identities",
+        AsyncMock(return_value={current: (12,)}),
+    )
+    rows = [
+        {
+            "source_type": "message",
+            "source_id": "12",
+            "source_revision": "current",
+            "chunk_index": 0,
+            "chunk_count": 1,
+            "chat_id": -100404,
+            "content_hash": "b" * 64,
+            "embedding_model": "model",
+            "embedding_status": "completed",
+            "invalidated_at": None,
+            "message_version_ids": (12,),
+        },
+        {
+            "source_type": "message",
+            "source_id": "11",
+            "source_revision": "old",
+            "chunk_index": 0,
+            "chunk_count": 1,
+            "chat_id": -100404,
+            "content_hash": "a" * 64,
+            "embedding_model": "model",
+            "embedding_status": "failed",
+            "invalidated_at": object(),
+            "message_version_ids": (11,),
+        },
+    ]
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))
+        )
+    )
+
+    report = await cli._coverage_report(
+        session,
+        chat_id=-100404,
+        model="model",
+        batch_size=64,
+    )
+
+    assert report["status"] == "pass"
+    assert report["unresolved_claims"] == 0
 
 
 def test_main_redacts_validation_error_details(capsys, tmp_path) -> None:

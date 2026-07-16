@@ -801,6 +801,20 @@ class SemanticRetrievalUnit(Base):
             name="ck_semantic_units_chunk_bounds",
         ),
         CheckConstraint(
+            "embedding_status IN ('reserved','completed','failed')",
+            name="ck_semantic_units_embedding_status",
+        ),
+        CheckConstraint(
+            "(embedding_status = 'reserved' AND embedding IS NULL "
+            "AND chunk_text IS NULL AND indexed_at IS NULL) OR "
+            "(embedding_status = 'completed' AND embedding IS NOT NULL "
+            "AND chunk_text IS NOT NULL AND length(trim(chunk_text)) BETWEEN 1 AND 800 "
+            "AND indexed_at IS NOT NULL) OR "
+            "(embedding_status = 'failed' AND embedding IS NULL "
+            "AND chunk_text IS NULL AND indexed_at IS NULL)",
+            name="ck_semantic_units_embedding_state",
+        ),
+        CheckConstraint(
             "(invalidated_at IS NULL) = (invalidation_reason IS NULL)",
             name="ck_semantic_units_invalidation_pair",
         ),
@@ -829,13 +843,13 @@ class SemanticRetrievalUnit(Base):
     embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
     embedding_model_version: Mapped[str] = mapped_column(String(64), nullable=False)
     embedding_dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(1536), nullable=False)
+    embedding_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    chunk_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
     llm_usage_ledger_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("llm_usage_ledger.id", ondelete="RESTRICT"), nullable=False
     )
-    indexed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     invalidation_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 

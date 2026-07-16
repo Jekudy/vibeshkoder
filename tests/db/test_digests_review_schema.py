@@ -196,13 +196,33 @@ async def test_089_schema_pins_jsonb_delivery_and_numeric_constraints(
             )
             == 1
         )
+        unit_columns = await conn.fetch(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'semantic_retrieval_units'
+              AND column_name IN ('embedding_status', 'chunk_text', 'embedding', 'indexed_at')
+            ORDER BY column_name
+            """
+        )
+        assert [
+            (row["column_name"], row["data_type"], row["is_nullable"]) for row in unit_columns
+        ] == [
+            ("chunk_text", "text", "YES"),
+            ("embedding", "USER-DEFINED", "YES"),
+            ("embedding_status", "character varying", "NO"),
+            ("indexed_at", "timestamp with time zone", "YES"),
+        ]
         constraints = await conn.fetch(
             """
             SELECT conname, convalidated
             FROM pg_constraint
             WHERE conname IN (
                 'ck_llm_usage_ledger_nonnegative_usage',
-                'ck_semantic_attempts_state'
+                'ck_semantic_attempts_state',
+                'ck_semantic_units_embedding_state',
+                'ck_semantic_units_embedding_status'
             )
             ORDER BY conname
             """
@@ -210,6 +230,8 @@ async def test_089_schema_pins_jsonb_delivery_and_numeric_constraints(
         assert [(row["conname"], row["convalidated"]) for row in constraints] == [
             ("ck_llm_usage_ledger_nonnegative_usage", True),
             ("ck_semantic_attempts_state", True),
+            ("ck_semantic_units_embedding_state", True),
+            ("ck_semantic_units_embedding_status", True),
         ]
     finally:
         await conn.close()

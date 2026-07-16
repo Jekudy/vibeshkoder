@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence, TextIO, cast
@@ -254,6 +255,7 @@ async def _coverage_report(
                        unit.chat_id,
                        unit.content_hash,
                        unit.embedding_model,
+                       unit.embedding_status,
                        unit.invalidated_at,
                        COALESCE(
                            ARRAY_AGG(source.message_version_id ORDER BY source.position)
@@ -277,6 +279,7 @@ async def _coverage_report(
 
     active: dict[tuple[str, str, str, int, int, int, str, str], tuple[int, ...]] = {}
     invalidated: dict[tuple[str, str, str, int, int, int, str, str], tuple[int, ...]] = {}
+    unresolved_statuses: Counter[str] = Counter()
     for row in rows:
         key = (
             str(row["source_type"]),
@@ -288,6 +291,10 @@ async def _coverage_report(
             str(row["content_hash"]),
             str(row["embedding_model"]),
         )
+        if row["embedding_status"] != "completed":
+            if row["invalidated_at"] is None:
+                unresolved_statuses[str(row["embedding_status"])] += 1
+            continue
         target = active if row["invalidated_at"] is None else invalidated
         target[key] = tuple(int(value) for value in row["message_version_ids"])
 
@@ -305,8 +312,16 @@ async def _coverage_report(
     eligible = len(expected)
     no_eligible_identities = eligible == 0
     coverage_percent = 0.0 if no_eligible_identities else round((len(covered) / eligible) * 100, 2)
+    unresolved_claims = sum(unresolved_statuses.values())
     status = (
-        "pass" if not no_eligible_identities and not missing and not unexpected_active else "fail"
+        "pass"
+        if (
+            not no_eligible_identities
+            and not missing
+            and not unexpected_active
+            and unresolved_claims == 0
+        )
+        else "fail"
     )
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -319,6 +334,8 @@ async def _coverage_report(
         "coverage_percent": coverage_percent,
         "missing": len(missing),
         "unexpected_active": len(unexpected_active),
+        "unresolved_claims": unresolved_claims,
+        "unresolved_statuses": dict(sorted(unresolved_statuses.items())),
         "reason_counts": {
             "failed:no_eligible_identities": int(no_eligible_identities),
             "indexed:active_identity": len(covered),
@@ -326,6 +343,7 @@ async def _coverage_report(
             "failed:expected_identity_invalidated": len(invalidated_expected),
             "failed:provenance_mismatch": len(provenance_mismatch),
             "failed:unexpected_active_identity": len(unexpected_active),
+            "failed:unresolved_claim": unresolved_claims,
         },
     }
 
@@ -418,6 +436,8 @@ async def _run_backfill(args: argparse.Namespace) -> int:
                 "coverage_percent",
                 "missing",
                 "unexpected_active",
+                "unresolved_claims",
+                "unresolved_statuses",
                 "reason_counts",
             }
         },

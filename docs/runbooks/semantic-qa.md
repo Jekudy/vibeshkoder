@@ -36,7 +36,7 @@ coverage audit, shadow/eval и Telegram E2E.
 - production image не предоставляет extension `vector` версии `0.8.2`;
 - `alembic current` не показывает ожидаемый release head;
 - backfill/audit возвращает `status != pass`, coverage ниже 100% или
-  `unexpected_active > 0`;
+  `unexpected_active > 0`, `unresolved_claims > 0`;
 - frozen eval не проходит хотя бы один blocking gate issue #404;
 - retrieval p95 выше 2 секунд или full-attempt p95 выше 15 секунд;
 - найден cross-chat, bot-authored, forgotten, redacted, stale или non-normal
@@ -228,12 +228,13 @@ python -m scripts.backfill_semantic_index backfill \
 
 - exit code `0`, `status=pass`, `failed=0`;
 - `coverage.status=pass`, `coverage.coverage_percent=100.0`;
-- `coverage.missing=0`, `coverage.unexpected_active=0`;
+- `coverage.missing=0`, `coverage.unexpected_active=0`,
+  `coverage.unresolved_claims=0`;
 - `eligible > 0` для текущей непустой production history;
 - `eligible = indexed + skipped`.
 
 Источник длиннее provider limit не обрезается и не пропускается: backfill
-детерминированно создаёт последовательные chunks до 8000 символов с тем же
+детерминированно создаёт непустые последовательные chunks до 800 символов с тем же
 `source_id`, полным provenance и проверяемыми `chunk_index/chunk_count`.
 Coverage считается по chunks; vector retrieval выбирает лучший chunk каждого
 источника и не позволяет одному длинному документу вытеснить остальные.
@@ -518,7 +519,12 @@ ORDER BY msk_day DESC, call_type;
 
 Каждый durable provider call сначала создаёт ledger row с
 `error='reserved_in_flight'`, а terminal update атомарно заменяет marker на
-`NULL` или фактический provider error. Зависший marker старше 15 минут означает
+`NULL` или фактический provider error. До HTTP-вызова тот же commit создаёт
+`semantic_retrieval_units.embedding_status='reserved'` и полный provenance;
+terminal commit одновременно переводит claim в `completed` с vector и точным
+`chunk_text` либо в `failed` без vector/source text. Поэтому failed/budget calls
+участвуют в forget cascade, а потерянный terminal commit не вызывает повторную
+оплату. Зависший marker старше 15 минут означает
 неоднозначный исход (например, crash после отправки запроса) и требует ручного
 расследования; повторять provider call или автоматически обнулять marker нельзя:
 
@@ -530,9 +536,62 @@ WHERE error='reserved_in_flight'
 ORDER BY created_at;
 ```
 
+Все unresolved claims диагностировать через ledger timestamp: `indexed_at` по
+state contract равен `NULL`, а отдельного created timestamp у unit нет.
+
+```sql
+SELECT u.id AS unit_id, u.embedding_status, u.llm_usage_ledger_id,
+       l.error, l.created_at, l.cost_usd
+FROM semantic_retrieval_units u
+JOIN llm_usage_ledger l ON l.id=u.llm_usage_ledger_id
+WHERE u.embedding_status IN ('reserved','failed')
+ORDER BY l.created_at, u.id;
+```
+
 Stop condition: любой такой row до canary/global enable. В evidence сохранять
 только ledger ID и технические поля из запроса выше, без пользовательского
 контента.
+
+Автоматического reset/retry нет. После расследования operator отдельно решает,
+допустима ли возможная повторная оплата `reserved` call. Для явного repair сначала
+редактировать hashes старого ledger, затем удалить только выбранный claim; cost,
+tokens, latency и error остаются audit evidence. Выполнять в одной транзакции,
+проверив `unit_id` и `llm_usage_ledger_id` вручную:
+
+```sql
+BEGIN;
+DO $$
+BEGIN
+  PERFORM 1
+  FROM semantic_retrieval_units u
+  JOIN llm_usage_ledger l ON l.id=u.llm_usage_ledger_id
+  WHERE u.id=<reviewed-unit-id>
+    AND u.llm_usage_ledger_id=<reviewed-ledger-id>
+    AND u.embedding_status IN ('reserved','failed')
+  FOR UPDATE OF u, l;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'reviewed semantic claim/ledger pair does not match';
+  END IF;
+
+  UPDATE llm_usage_ledger
+  SET prompt_hash=NULL, response_hash=NULL
+  WHERE id=<reviewed-ledger-id>;
+
+  DELETE FROM semantic_retrieval_units
+  WHERE id=<reviewed-unit-id>
+    AND llm_usage_ledger_id=<reviewed-ledger-id>
+    AND embedding_status IN ('reserved','failed');
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'reviewed semantic claim was not deleted';
+  END IF;
+END $$;
+COMMIT;
+```
+
+После repair сначала запустить read-only coverage audit: он должен показать
+`unresolved_claims=0` и ровно ожидаемые missing identities. Затем rerun backfill
+является явным новым provider attempt; после него coverage обязан вернуться к
+100%. Массовое удаление claims или reset статуса запрещены.
 
 Retrieval и full-attempt p95:
 
@@ -578,6 +637,7 @@ unknown-authored sources:
 SELECT count(*) AS invalid_active_units
 FROM semantic_retrieval_units u
 WHERE u.invalidated_at IS NULL
+  AND u.embedding_status='completed'
   AND EXISTS (
     SELECT 1
     FROM semantic_retrieval_unit_sources s
@@ -613,6 +673,7 @@ JOIN forget_events fe
     OR (fe.target_type='message_hash' AND fe.target_id=mv.content_hash)
   )
 WHERE u.invalidated_at IS NULL
+  AND u.embedding_status='completed'
   AND fe.status IN ('pending','processing','completed');
 ```
 

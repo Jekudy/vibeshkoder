@@ -29,6 +29,7 @@ from bot.services.forget_predicate import forget_excludes_sql_fragment
 from bot.services.llm_gateway import (
     EmbeddingBudgetExceeded,
     EmbeddingGatewayConfig,
+    MAX_QA_EVIDENCE_SNIPPET_CHARS,
     embed_texts,
 )
 from bot.services.llm_providers import ProviderStructuralError, ProviderTransientError
@@ -291,6 +292,7 @@ _VECTOR_CANDIDATES_SQL = text(
     FROM semantic_retrieval_units unit
     WHERE unit.chat_id = :chat_id
       AND unit.embedding_model = :embedding_model
+      AND unit.embedding_status = 'completed'
       AND unit.invalidated_at IS NULL
       AND EXISTS (
           SELECT 1 FROM semantic_retrieval_unit_sources source_any
@@ -369,12 +371,24 @@ _MESSAGE_HIT_SQL = text(
            cm.user_id,
            cm.message_thread_id,
            cm.reply_to_message_id,
+           unit.source_revision AS unit_source_revision,
+           unit.chunk_index AS unit_chunk_index,
+           unit.chunk_count AS unit_chunk_count,
+           unit.content_hash AS unit_content_hash,
+           unit.chunk_text AS unit_chunk_text,
+           mv.version_seq,
+           CASE WHEN mm.description_status = 'ready' THEN mm.updated_at ELSE NULL END
+               AS media_revision,
            concat_ws(
-               ' ',
+               E'\n',
                NULLIF(btrim(COALESCE(mv.normalized_text, mv.text, '')), ''),
                NULLIF(btrim(COALESCE(mv.caption, '')), ''),
-               CASE WHEN mm.description_status = 'ready' THEN mm.description ELSE NULL END
-           ) AS snippet,
+               CASE
+                   WHEN mm.description_status = 'ready'
+                   THEN NULLIF(btrim(COALESCE(mm.description, '')), '')
+                   ELSE NULL
+               END
+           ) AS current_canonical_text,
            mv.captured_at,
            cm.date AS message_date
     FROM semantic_retrieval_units unit
@@ -385,6 +399,7 @@ _MESSAGE_HIT_SQL = text(
     LEFT JOIN message_media mm ON mm.chat_message_id = cm.id
     WHERE unit.id = :unit_id
       AND unit.source_type = 'message'
+      AND unit.embedding_status = 'completed'
       AND unit.invalidated_at IS NULL
       AND cm.chat_id = :chat_id
       AND author.is_bot = FALSE
@@ -411,7 +426,14 @@ _CARD_HIT_SQL = text(
            anchor.message_id,
            anchor.message_thread_id,
            anchor.reply_to_message_id,
-           concat_ws(' ', kc.title, kc.body_markdown) AS snippet,
+           unit.source_revision AS unit_source_revision,
+           unit.chunk_index AS unit_chunk_index,
+           unit.chunk_count AS unit_chunk_count,
+           unit.content_hash AS unit_content_hash,
+           unit.chunk_text AS unit_chunk_text,
+           concat_ws(E'\n', NULLIF(btrim(kc.title), ''), NULLIF(btrim(kc.body_markdown), ''))
+               AS current_canonical_text,
+           kc.updated_at,
            kc.approved_at AS captured_at,
            COALESCE(kc.approved_at, anchor.message_date) AS message_date,
            ARRAY_AGG(source.message_version_id ORDER BY source.position ASC)
@@ -436,6 +458,7 @@ _CARD_HIT_SQL = text(
     ) anchor ON TRUE
     WHERE unit.id = :unit_id
       AND unit.source_type = 'card'
+      AND unit.embedding_status = 'completed'
       AND unit.invalidated_at IS NULL
       AND kc.card_status = 'approved'
       AND anchor.chat_id = :chat_id
@@ -459,7 +482,7 @@ _CARD_HIT_SQL = text(
                 OR NOT ({_FORGET_EXCLUDES})
             )
       )
-    GROUP BY kc.id, anchor.message_version_id, anchor.chat_message_id, anchor.chat_id,
+    GROUP BY kc.id, unit.id, anchor.message_version_id, anchor.chat_message_id, anchor.chat_id,
              anchor.message_id, anchor.message_thread_id, anchor.reply_to_message_id,
              anchor.message_date
     HAVING ARRAY_AGG(source.message_version_id ORDER BY source.position ASC) = ARRAY(
@@ -559,6 +582,202 @@ class _BatchResult:
     reason_counts: dict[str, int]
 
 
+class EmbeddingClaimUnresolved(RuntimeError):
+    """An exact source identity has an ambiguous or failed paid attempt."""
+
+    def __init__(self, *, unit_id: int, status: str) -> None:
+        super().__init__(
+            f"semantic embedding claim {unit_id} requires operator resolution: {status}"
+        )
+        self.unit_id = unit_id
+        self.status = status
+
+
+class _SemanticEmbeddingOutcomeRecorder:
+    """Persist semantic claims in the same transactions as their ledger row."""
+
+    def __init__(
+        self,
+        *,
+        documents: Sequence[RetrievalDocument],
+        config: EmbeddingGatewayConfig,
+    ) -> None:
+        self.documents = tuple(documents)
+        self.config = config
+        self.unit_ids: dict[RetrievalDocument, int] = {}
+        self.reason_counts: Counter[str] = Counter()
+
+    async def reserve(
+        self,
+        session: AsyncSession,
+        *,
+        llm_usage_ledger_id: int,
+        budget_denied: bool,
+    ) -> None:
+        if self.unit_ids:
+            raise RuntimeError("semantic embedding recorder was already reserved")
+        status = "failed" if budget_denied else "reserved"
+        for document in self.documents:
+            await _invalidate_previous_documents(
+                session,
+                document=document,
+                embedding_model=self.config.model,
+            )
+            result = await session.execute(
+                pg_insert(SemanticRetrievalUnit)
+                .values(
+                    source_type=document.source_type,
+                    source_id=document.source_id,
+                    source_revision=document.source_revision,
+                    chunk_index=document.chunk_index,
+                    chunk_count=document.chunk_count,
+                    chat_id=document.chat_id,
+                    content_hash=document.content_hash,
+                    embedding_provider=EMBEDDING_PROVIDER,
+                    embedding_model=self.config.model,
+                    embedding_model_version=EMBEDDING_MODEL_VERSION,
+                    embedding_dimensions=self.config.dimensions,
+                    embedding_status=status,
+                    chunk_text=None,
+                    embedding=None,
+                    llm_usage_ledger_id=llm_usage_ledger_id,
+                    indexed_at=None,
+                )
+                .on_conflict_do_nothing(constraint="uq_semantic_units_identity")
+                .returning(SemanticRetrievalUnit.id)
+            )
+            unit_id = result.scalar_one_or_none()
+            if unit_id is None:
+                existing = (
+                    await session.execute(
+                        select(
+                            SemanticRetrievalUnit.id,
+                            SemanticRetrievalUnit.embedding_status,
+                        ).where(
+                            SemanticRetrievalUnit.source_type == document.source_type,
+                            SemanticRetrievalUnit.source_id == document.source_id,
+                            SemanticRetrievalUnit.source_revision == document.source_revision,
+                            SemanticRetrievalUnit.chunk_index == document.chunk_index,
+                            SemanticRetrievalUnit.content_hash == document.content_hash,
+                            SemanticRetrievalUnit.embedding_model == self.config.model,
+                        )
+                    )
+                ).one_or_none()
+                if existing is None:
+                    raise LookupError("semantic claim conflict row is missing")
+                raise EmbeddingClaimUnresolved(
+                    unit_id=int(existing.id),
+                    status=str(existing.embedding_status),
+                )
+            claimed_id = int(unit_id)
+            self.unit_ids[document] = claimed_id
+            session.add_all(
+                [
+                    SemanticRetrievalUnitSource(
+                        unit_id=claimed_id,
+                        message_version_id=message_version_id,
+                        position=position,
+                    )
+                    for position, message_version_id in enumerate(document.message_version_ids)
+                ]
+            )
+        await session.flush()
+
+    async def fail(
+        self,
+        session: AsyncSession,
+        *,
+        llm_usage_ledger_id: int,
+    ) -> None:
+        await self._set_failed(
+            session,
+            llm_usage_ledger_id=llm_usage_ledger_id,
+            documents=self.documents,
+            invalidation_reason=None,
+        )
+
+    async def complete(
+        self,
+        session: AsyncSession,
+        *,
+        llm_usage_ledger_id: int,
+        vectors: Sequence[Sequence[float]],
+    ) -> None:
+        vector_values = tuple(vectors)
+        if len(vector_values) != len(self.documents):
+            raise ValueError("embedding provider returned the wrong vector count")
+        for vector in vector_values:
+            _vector_literal(vector)
+
+        valid_documents = set(await _revalidate_documents(session, documents=self.documents))
+        invalid_documents = tuple(
+            document for document in self.documents if document not in valid_documents
+        )
+        if invalid_documents:
+            await self._set_failed(
+                session,
+                llm_usage_ledger_id=llm_usage_ledger_id,
+                documents=invalid_documents,
+                invalidation_reason="governance_race",
+            )
+            self.reason_counts["skipped:governance_race"] += len(invalid_documents)
+
+        for document, vector in zip(self.documents, vector_values, strict=True):
+            if document not in valid_documents:
+                continue
+            result = await session.execute(
+                update(SemanticRetrievalUnit)
+                .where(
+                    SemanticRetrievalUnit.id == self.unit_ids[document],
+                    SemanticRetrievalUnit.llm_usage_ledger_id == llm_usage_ledger_id,
+                    SemanticRetrievalUnit.embedding_status == "reserved",
+                )
+                .values(
+                    embedding_status="completed",
+                    chunk_text=document.canonical_text,
+                    embedding=list(vector),
+                    indexed_at=datetime.now(timezone.utc),
+                )
+                .returning(SemanticRetrievalUnit.id)
+            )
+            if result.scalar_one_or_none() is None:
+                raise EmbeddingClaimUnresolved(
+                    unit_id=self.unit_ids[document],
+                    status="terminal_state_conflict",
+                )
+            self.reason_counts["indexed:new_embedding"] += 1
+
+    async def _set_failed(
+        self,
+        session: AsyncSession,
+        *,
+        llm_usage_ledger_id: int,
+        documents: Sequence[RetrievalDocument],
+        invalidation_reason: str | None,
+    ) -> None:
+        now = datetime.now(timezone.utc) if invalidation_reason is not None else None
+        for document in documents:
+            result = await session.execute(
+                update(SemanticRetrievalUnit)
+                .where(
+                    SemanticRetrievalUnit.id == self.unit_ids[document],
+                    SemanticRetrievalUnit.llm_usage_ledger_id == llm_usage_ledger_id,
+                    SemanticRetrievalUnit.embedding_status == "reserved",
+                )
+                .values(
+                    embedding_status="failed",
+                    invalidated_at=now,
+                    invalidation_reason=invalidation_reason,
+                )
+                .returning(SemanticRetrievalUnit.id)
+            )
+            if result.scalar_one_or_none() is None:
+                raise EmbeddingClaimUnresolved(
+                    unit_id=self.unit_ids[document],
+                    status="terminal_state_conflict",
+                )
+
+
 @dataclass(frozen=True, slots=True)
 class HybridSearchResult:
     hits: tuple[SearchHit, ...]
@@ -584,10 +803,11 @@ def _chunk_retrieval_document(
 ) -> list[RetrievalDocument]:
     """Split source text without truncation using stable character boundaries."""
 
-    chunks = tuple(
-        canonical_text[offset : offset + MAX_EMBEDDING_INPUT_CHARS]
-        for offset in range(0, len(canonical_text), MAX_EMBEDDING_INPUT_CHARS)
+    raw_chunks = tuple(
+        canonical_text[offset : offset + MAX_QA_EVIDENCE_SNIPPET_CHARS]
+        for offset in range(0, len(canonical_text), MAX_QA_EVIDENCE_SNIPPET_CHARS)
     )
+    chunks = tuple(chunk.strip() for chunk in raw_chunks if chunk.strip())
     if not chunks:
         raise ValueError("retrieval document canonical text must not be empty")
     chunk_count = len(chunks)
@@ -721,6 +941,7 @@ async def _load_existing_units(
                 SemanticRetrievalUnit.source_id,
             ).in_(source_keys),
             SemanticRetrievalUnit.embedding_model == embedding_model,
+            SemanticRetrievalUnit.embedding_status == "completed",
         )
         .order_by(SemanticRetrievalUnit.id.desc())
     )
@@ -744,6 +965,61 @@ async def _load_existing_units(
         )
         units_by_source.setdefault((unit.source_type, unit.source_id), []).append(unit)
     return units_by_source
+
+
+async def _raise_for_unresolved_claims(
+    session: AsyncSession,
+    *,
+    documents: Sequence[RetrievalDocument],
+    embedding_model: str,
+) -> None:
+    source_keys = sorted({(document.source_type, document.source_id) for document in documents})
+    if not source_keys:
+        return
+    result = await session.execute(
+        select(
+            SemanticRetrievalUnit.id,
+            SemanticRetrievalUnit.source_type,
+            SemanticRetrievalUnit.source_id,
+            SemanticRetrievalUnit.source_revision,
+            SemanticRetrievalUnit.chunk_index,
+            SemanticRetrievalUnit.content_hash,
+            SemanticRetrievalUnit.embedding_status,
+        ).where(
+            tuple_(
+                SemanticRetrievalUnit.source_type,
+                SemanticRetrievalUnit.source_id,
+            ).in_(source_keys),
+            SemanticRetrievalUnit.embedding_model == embedding_model,
+            SemanticRetrievalUnit.embedding_status != "completed",
+        )
+    )
+    unresolved = {
+        (
+            str(row.source_type),
+            str(row.source_id),
+            str(row.source_revision),
+            int(row.chunk_index),
+            str(row.content_hash),
+        ): (int(row.id), str(row.embedding_status))
+        for row in result
+    }
+    for document in documents:
+        existing = unresolved.get(
+            (
+                document.source_type,
+                document.source_id,
+                document.source_revision,
+                document.chunk_index,
+                document.content_hash,
+            )
+        )
+        if existing is not None:
+            logger.error(
+                "semantic_embedding_claim_unresolved",
+                extra={"unit_id": existing[0], "embedding_status": existing[1]},
+            )
+            raise EmbeddingClaimUnresolved(unit_id=existing[0], status=existing[1])
 
 
 async def _load_parent_message_units(
@@ -794,6 +1070,7 @@ async def _load_parent_message_units(
             current_version.id.in_(message_version_ids),
             SemanticRetrievalUnit.source_type == "message",
             SemanticRetrievalUnit.embedding_model == embedding_model,
+            SemanticRetrievalUnit.embedding_status == "completed",
         )
         .order_by(current_version.id, SemanticRetrievalUnit.id.desc())
     )
@@ -1139,8 +1416,11 @@ async def _store_document(
             embedding_model=config.model,
             embedding_model_version=embedding_model_version,
             embedding_dimensions=embedding_dimensions,
+            embedding_status="completed",
+            chunk_text=document.canonical_text,
             embedding=list(vector),
             llm_usage_ledger_id=llm_usage_ledger_id,
+            indexed_at=datetime.now(timezone.utc),
         )
         .on_conflict_do_nothing(constraint="uq_semantic_units_identity")
         .returning(SemanticRetrievalUnit.id)
@@ -1168,15 +1448,12 @@ async def _persist_document_batch(
     *,
     documents: Sequence[RetrievalDocument],
     config: EmbeddingGatewayConfig,
-    embeddings: dict[RetrievalDocument, tuple[Sequence[float], int]],
 ) -> Counter[str]:
-    """Persist one governed batch and classify every document."""
+    """Persist completed-vector reuse and classify every document."""
 
     batch = tuple(documents)
     if not batch:
         return Counter()
-    embedded_documents = set(embeddings)
-
     valid_documents = await _revalidate_documents(
         session,
         documents=batch,
@@ -1249,9 +1526,7 @@ async def _persist_document_batch(
                 and existing_sources == document.message_version_ids
             )
             if unchanged:
-                reasons[
-                    "skipped:conflict" if document in embedded_documents else "skipped:unchanged"
-                ] += 1
+                reasons["skipped:unchanged"] += 1
                 continue
             await _reuse_document(
                 session,
@@ -1276,23 +1551,7 @@ async def _persist_document_batch(
             )
             reasons["indexed:reused_embedding" if stored else "skipped:conflict"] += 1
             continue
-        embedded = embeddings.get(document)
-        if embedded is None:
-            raise LookupError("governed semantic document lost its reusable embedding")
-        vector, llm_usage_ledger_id = embedded
-        if await _store_document(
-            session,
-            document=document,
-            vector=vector,
-            config=config,
-            llm_usage_ledger_id=llm_usage_ledger_id,
-            embedding_provider=EMBEDDING_PROVIDER,
-            embedding_model_version=EMBEDDING_MODEL_VERSION,
-            embedding_dimensions=config.dimensions,
-        ):
-            reasons["indexed:new_embedding"] += 1
-        else:
-            reasons["skipped:conflict"] += 1
+        raise LookupError("governed semantic document lost its reusable embedding")
     return reasons
 
 
@@ -1349,14 +1608,15 @@ async def _index_batch_locked(
         is not None
     ]
     if reusable_documents:
-        reasons.update(
-            await _persist_document_batch(
-                session,
-                documents=reusable_documents,
-                config=config,
-                embeddings={},
-            )
+        reusable_reasons = await _persist_document_batch(
+            session,
+            documents=reusable_documents,
+            config=config,
         )
+        # Only publish counters after their reused units are durable. This
+        # keeps partial error accounting exact if claim reservation later fails.
+        await session.commit()
+        reasons.update(reusable_reasons)
 
     missing_documents = [
         document
@@ -1364,32 +1624,27 @@ async def _index_batch_locked(
         if document in prevalidated_set and document not in reusable_documents
     ]
     try:
+        await _raise_for_unresolved_claims(
+            session,
+            documents=missing_documents,
+            embedding_model=config.model,
+        )
         for embedding_batch in _partition_embedding_documents(missing_documents):
-            embedding_result = await embed_texts(
+            recorder = _SemanticEmbeddingOutcomeRecorder(
+                documents=embedding_batch,
+                config=config,
+            )
+            await embed_texts(
                 session,
                 inputs=[document.canonical_text for document in embedding_batch],
                 config=config,
                 ledger_repo=LedgerRepo(),
                 provider=provider,
+                outcome_recorder=recorder,
             )
-            embeddings = {
-                document: (vector, embedding_result.llm_usage_ledger_id)
-                for document, vector in zip(
-                    embedding_batch,
-                    embedding_result.vectors,
-                    strict=True,
-                )
-            }
-            partition_reasons = await _persist_document_batch(
-                session,
-                documents=embedding_batch,
-                config=config,
-                embeddings=embeddings,
-            )
-            # Make each paid partition discoverable by retries and forget
-            # cascade before the next independent provider call can fail.
-            await session.commit()
-            reasons.update(partition_reasons)
+            # embed_texts commits the terminal ledger and recorder state in one
+            # transaction, so every counter added here is already durable.
+            reasons.update(recorder.reason_counts)
     except Exception as exc:
         # The outer run still needs exact accounting for partitions committed
         # before any failure. Only no-content counters cross the boundary.
@@ -1439,9 +1694,6 @@ async def _index_batch(
             config=config,
             provider=provider,
         )
-        # Publish the claimed identity before releasing the dedicated lock, so
-        # a waiting backfill observes it and never dispatches a duplicate call.
-        await session.commit()
         return result
 
 
@@ -1585,6 +1837,7 @@ async def backfill_semantic_index(
         if invalidated:
             reasons["invalidated:ineligible"] += invalidated
     except (
+        EmbeddingClaimUnresolved,
         EmbeddingBudgetExceeded,
         LookupError,
         ProviderStructuralError,
@@ -1611,14 +1864,22 @@ async def backfill_semantic_index(
         await session.commit()
         raise
     except SQLAlchemyError as exc:
+        partial_batch = getattr(exc, "semantic_batch_result", None)
         await session.rollback()
+        if partial_batch is not None:
+            indexed += int(partial_batch.indexed)
+            skipped += int(partial_batch.skipped)
+            reasons.update(partial_batch.reason_counts)
         persisted_run = await session.get(SemanticIndexRun, run_id)
         if persisted_run is None:
             raise LookupError("semantic index run audit row is missing") from exc
-        persisted_run.status = "failed"
         failed = max(0, eligible - indexed - skipped)
-        persisted_run.failed_count = failed
         reasons[f"failed:{type(exc).__name__}"] += max(1, failed)
+        persisted_run.status = "failed"
+        persisted_run.eligible_count = eligible
+        persisted_run.indexed_count = indexed
+        persisted_run.skipped_count = skipped
+        persisted_run.failed_count = failed
         persisted_run.reason_counts = dict(reasons)
         persisted_run.completed_at = datetime.now(timezone.utc)
         await session.commit()
@@ -1671,6 +1932,42 @@ async def backfill_semantic_index(
     )
 
 
+def _current_chunk_text(
+    row: Any,
+    *,
+    source_type: Literal["message", "card"],
+    source_id: str,
+    source_revision: str,
+    message_version_ids: tuple[int, ...],
+) -> str | None:
+    canonical_text = str(row["current_canonical_text"]).strip()
+    if not canonical_text:
+        return None
+    current_documents = _chunk_retrieval_document(
+        source_type=source_type,
+        source_id=source_id,
+        source_revision=source_revision,
+        chat_id=int(row["chat_id"]),
+        canonical_text=canonical_text,
+        message_version_ids=message_version_ids,
+    )
+    chunk_index = int(row["unit_chunk_index"])
+    current = next(
+        (document for document in current_documents if document.chunk_index == chunk_index),
+        None,
+    )
+    if current is None:
+        return None
+    if (
+        current.source_revision != str(row["unit_source_revision"])
+        or current.chunk_count != int(row["unit_chunk_count"])
+        or current.content_hash != str(row["unit_content_hash"])
+        or current.canonical_text != str(row["unit_chunk_text"])
+    ):
+        return None
+    return current.canonical_text
+
+
 async def vector_search(
     session: AsyncSession,
     *,
@@ -1704,6 +2001,23 @@ async def vector_search(
             row = hit_result.mappings().one_or_none()
             if row is None:
                 continue
+            media_revision = row["media_revision"]
+            snippet = _current_chunk_text(
+                row,
+                source_type="message",
+                source_id=str(row["message_version_id"]),
+                source_revision=(
+                    f"v{row['version_seq']}:media:"
+                    f"{media_revision.isoformat() if media_revision else 'none'}"
+                ),
+                message_version_ids=(int(row["message_version_id"]),),
+            )
+            if snippet is None:
+                logger.info(
+                    "semantic_vector_candidate_stale",
+                    extra={"unit_id": int(candidate["id"]), "source_type": "message"},
+                )
+                continue
             hits.append(
                 SearchHit(
                     message_version_id=int(row["message_version_id"]),
@@ -1711,7 +2025,7 @@ async def vector_search(
                     chat_id=int(row["chat_id"]),
                     message_id=int(row["message_id"]),
                     user_id=int(row["user_id"]),
-                    snippet=str(row["snippet"])[:400],
+                    snippet=snippet[:MAX_QA_EVIDENCE_SNIPPET_CHARS],
                     ts_rank=float(candidate["similarity"]),
                     captured_at=row["captured_at"],
                     message_date=row["message_date"],
@@ -1726,6 +2040,24 @@ async def vector_search(
         row = hit_result.mappings().one_or_none()
         if row is None:
             continue
+        message_version_ids = tuple(int(value) for value in row["message_version_ids"])
+        approved_at = row["captured_at"]
+        snippet = _current_chunk_text(
+            row,
+            source_type="card",
+            source_id=str(row["card_id"]),
+            source_revision=(
+                f"updated:{row['updated_at'].isoformat()}:"
+                f"approved:{approved_at.isoformat() if approved_at else 'none'}"
+            ),
+            message_version_ids=message_version_ids,
+        )
+        if snippet is None:
+            logger.info(
+                "semantic_vector_candidate_stale",
+                extra={"unit_id": int(candidate["id"]), "source_type": "card"},
+            )
+            continue
         hits.append(
             SearchHit(
                 message_version_id=int(row["message_version_id"]),
@@ -1733,15 +2065,13 @@ async def vector_search(
                 chat_id=int(row["chat_id"]),
                 message_id=int(row["message_id"]),
                 user_id=None,
-                snippet=str(row["snippet"])[:400],
+                snippet=snippet[:MAX_QA_EVIDENCE_SNIPPET_CHARS],
                 ts_rank=float(candidate["similarity"]),
                 captured_at=row["captured_at"],
                 message_date=row["message_date"],
                 source_type="card",
                 card_id=uuid.UUID(str(row["card_id"])),
-                card_source_message_version_ids=tuple(
-                    int(value) for value in row["message_version_ids"]
-                ),
+                card_source_message_version_ids=message_version_ids,
                 message_thread_id=row["message_thread_id"],
                 reply_to_message_id=row["reply_to_message_id"],
             )

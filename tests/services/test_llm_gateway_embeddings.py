@@ -100,6 +100,52 @@ async def test_embedding_gateway_commits_reservation_before_provider() -> None:
     assert "pg_advisory_xact_lock" in lock_sql
 
 
+async def test_embedding_recorder_shares_reservation_and_terminal_commits() -> None:
+    session = AsyncMock()
+    ledger = _Ledger()
+    events: list[str] = []
+
+    async def commit() -> None:
+        events.append("commit")
+
+    session.commit.side_effect = commit
+
+    class Recorder:
+        async def reserve(self, session, *, llm_usage_ledger_id, budget_denied):
+            assert llm_usage_ledger_id == 1
+            assert budget_denied is False
+            events.append("reserve")
+
+        async def fail(self, session, *, llm_usage_ledger_id):
+            raise AssertionError("successful embedding must not fail its recorder")
+
+        async def complete(self, session, *, llm_usage_ledger_id, vectors):
+            assert llm_usage_ledger_id == 1
+            assert len(vectors) == 1
+            events.append("complete")
+
+    class Provider:
+        async def embed(self, **kwargs):
+            events.append("provider")
+            return EmbeddingResult(
+                vectors=((0.0,) * 1536,),
+                tokens_in=1,
+                request_id="recorder-order",
+                raw_latency_ms=1,
+            )
+
+    await embed_texts(
+        session,
+        inputs=["semantic recorder"],
+        config=_config(),
+        ledger_repo=ledger,
+        provider=Provider(),
+        outcome_recorder=Recorder(),
+    )
+
+    assert events == ["reserve", "commit", "provider", "complete", "commit"]
+
+
 async def test_embedding_budget_denial_is_audited_and_skips_provider() -> None:
     session = AsyncMock()
     ledger = _Ledger()

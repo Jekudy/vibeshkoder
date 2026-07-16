@@ -1688,12 +1688,15 @@ async def embed_texts(
     ledger_repo: LedgerRepoProtocol,
     provider: Any | None = None,
     qa_trace_id: int | None = None,
+    outcome_recorder: Any | None = None,
 ) -> EmbeddingGatewayResult:
     """Create audited embeddings through the shared provider boundary.
 
     The gateway commits the conservative ledger reservation while holding the
     budget lock, so concurrent calls can observe it before either provider is
-    entered. The caller owns the final cost/result commit boundary.
+    entered. When an outcome recorder is supplied, its durable claim is
+    committed with the reservation and its terminal state is committed with
+    the final ledger update.
     """
 
     from bot.services.llm_pricing import estimate_cost
@@ -1774,6 +1777,13 @@ async def embed_texts(
                 error="reserved_in_flight",
                 call_type="semantic_embedding",
             )
+        claim_ledger_id = budget_row.id if budget_row is not None else placeholder_row.id
+        if outcome_recorder is not None:
+            await outcome_recorder.reserve(
+                session,
+                llm_usage_ledger_id=claim_ledger_id,
+                budget_denied=budget_row is not None,
+            )
         # Publish the reservation and release the transaction-scoped lock.
         await session.commit()
     except Exception:
@@ -1800,33 +1810,51 @@ async def embed_texts(
             if subtype in {"auth", "bad_request", "model_not_found", "rate_limit"}
             else reservation_cost
         )
-        await ledger_repo.update_placeholder(
-            session,
-            llm_call_id=placeholder_row.id,
-            cost_usd=terminal_cost,
-            response_hash=None,
-            tokens_in=0,
-            tokens_out=0,
-            request_id=None,
-            latency_ms=int((_monotonic() - started) * 1000),
-            error=f"provider_{type(exc).__name__}:{subtype}",
-        )
-        await session.commit()
+        try:
+            await ledger_repo.update_placeholder(
+                session,
+                llm_call_id=placeholder_row.id,
+                cost_usd=terminal_cost,
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                request_id=None,
+                latency_ms=int((_monotonic() - started) * 1000),
+                error=f"provider_{type(exc).__name__}:{subtype}",
+            )
+            if outcome_recorder is not None:
+                await outcome_recorder.fail(
+                    session,
+                    llm_usage_ledger_id=placeholder_row.id,
+                )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
         setattr(exc, "llm_usage_ledger_id", placeholder_row.id)
         raise
     except Exception as exc:
-        await ledger_repo.update_placeholder(
-            session,
-            llm_call_id=placeholder_row.id,
-            cost_usd=reservation_cost,
-            response_hash=None,
-            tokens_in=0,
-            tokens_out=0,
-            request_id=None,
-            latency_ms=int((_monotonic() - started) * 1000),
-            error=f"provider_unknown:{type(exc).__name__}",
-        )
-        await session.commit()
+        try:
+            await ledger_repo.update_placeholder(
+                session,
+                llm_call_id=placeholder_row.id,
+                cost_usd=reservation_cost,
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                request_id=None,
+                latency_ms=int((_monotonic() - started) * 1000),
+                error=f"provider_unknown:{type(exc).__name__}",
+            )
+            if outcome_recorder is not None:
+                await outcome_recorder.fail(
+                    session,
+                    llm_usage_ledger_id=placeholder_row.id,
+                )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
         setattr(exc, "llm_usage_ledger_id", placeholder_row.id)
         raise
     cost = estimate_cost(
@@ -1835,18 +1863,28 @@ async def embed_texts(
         tokens_out=0,
     )
     request_id = _safe_qa_request_id(provider_result.request_id)
-    await ledger_repo.update_placeholder(
-        session,
-        llm_call_id=placeholder_row.id,
-        cost_usd=cost,
-        response_hash=_embedding_response_hash(provider_result.vectors),
-        tokens_in=provider_result.tokens_in,
-        tokens_out=0,
-        request_id=request_id,
-        latency_ms=provider_result.raw_latency_ms,
-        error=None,
-    )
-    await session.commit()
+    try:
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=cost,
+            response_hash=_embedding_response_hash(provider_result.vectors),
+            tokens_in=provider_result.tokens_in,
+            tokens_out=0,
+            request_id=request_id,
+            latency_ms=provider_result.raw_latency_ms,
+            error=None,
+        )
+        if outcome_recorder is not None:
+            await outcome_recorder.complete(
+                session,
+                llm_usage_ledger_id=placeholder_row.id,
+                vectors=provider_result.vectors,
+            )
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
     return EmbeddingGatewayResult(
         vectors=provider_result.vectors,
         tokens_in=provider_result.tokens_in,

@@ -141,8 +141,11 @@ async def _make_unit(
         embedding_model="text-embedding-3-small",
         embedding_model_version="text-embedding-3-small",
         embedding_dimensions=1536,
+        embedding_status="completed",
+        chunk_text=f"semantic chunk {ordinal}",
         embedding=[0.0] * 1536,
         llm_usage_ledger_id=ledger_id,
+        indexed_at=datetime.now(timezone.utc),
     )
     db_session.add(unit)
     await db_session.flush()
@@ -227,6 +230,137 @@ async def _make_forget_event(
         authorized_by="admin",
         tombstone_key=tombstone_key,
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_embedding_claim_is_forgettable_with_its_ledger(db_session) -> None:
+    from bot.db.models import LlmUsageLedger, SemanticRetrievalUnit
+    from bot.services.forget_cascade import _cascade_semantic_retrieval
+    from bot.services.llm_gateway import EmbeddingGatewayConfig
+    from bot.services.llm_providers import ProviderTransientError
+    from bot.services.semantic_index import (
+        _index_batch,
+        list_eligible_message_documents,
+        vector_search,
+    )
+
+    class FailingProvider:
+        async def embed(self, *, inputs, model, dimensions):
+            raise ProviderTransientError("timeout", message="redacted")
+
+    user_id = await _make_user(db_session)
+    message, versions = await _make_message(db_session, user_id=user_id)
+    documents = await list_eligible_message_documents(
+        db_session,
+        chat_id=message.chat_id,
+    )
+    config = EmbeddingGatewayConfig(
+        model="text-embedding-3-small",
+        dimensions=1536,
+        daily_ceiling_usd=Decimal("100"),
+        monthly_ceiling_usd=Decimal("1000"),
+    )
+
+    with pytest.raises(ProviderTransientError):
+        await _index_batch(
+            db_session,
+            documents=documents,
+            config=config,
+            provider=FailingProvider(),
+        )
+
+    unit = (await db_session.execute(select(SemanticRetrievalUnit))).scalars().one()
+    assert unit.embedding_status == "failed"
+    assert unit.embedding is None
+    ledger_id = unit.llm_usage_ledger_id
+    ledger = await db_session.get(LlmUsageLedger, ledger_id)
+    assert ledger is not None and ledger.prompt_hash is not None
+    assert (
+        await vector_search(
+            db_session,
+            query_embedding=(1.0,) + (0.0,) * 1535,
+            chat_id=message.chat_id,
+            embedding_model=config.model,
+        )
+        == []
+    )
+
+    event = await _make_forget_event(
+        db_session,
+        target_type="message",
+        target_id=str(message.id),
+        tombstone_key=f"failed-claim-forget-{versions[-1].id}",
+    )
+    await _cascade_semantic_retrieval(db_session, event)
+
+    assert await db_session.get(SemanticRetrievalUnit, unit.id) is None
+    redacted_ledger = await db_session.get(LlmUsageLedger, ledger_id)
+    assert redacted_ledger is not None
+    assert redacted_ledger.prompt_hash is None
+    assert redacted_ledger.response_hash is None
+
+
+@pytest.mark.asyncio
+async def test_budget_denied_embedding_claim_is_forgettable_without_provider_call(
+    db_session,
+) -> None:
+    from bot.db.models import LlmUsageLedger, SemanticRetrievalUnit
+    from bot.services.forget_cascade import _cascade_semantic_retrieval
+    from bot.services.llm_gateway import EmbeddingBudgetExceeded, EmbeddingGatewayConfig
+    from bot.services.semantic_index import _index_batch, list_eligible_message_documents
+
+    class ForbiddenProvider:
+        calls = 0
+
+        async def embed(self, *, inputs, model, dimensions):
+            self.calls += 1
+            raise AssertionError("budget denial must precede provider dispatch")
+
+    user_id = await _make_user(db_session)
+    message, versions = await _make_message(
+        db_session,
+        user_id=user_id,
+        texts=("x" * 800,),
+    )
+    documents = await list_eligible_message_documents(
+        db_session,
+        chat_id=message.chat_id,
+    )
+    provider = ForbiddenProvider()
+    config = EmbeddingGatewayConfig(
+        model="text-embedding-3-small",
+        dimensions=1536,
+        daily_ceiling_usd=Decimal("0.000001"),
+        monthly_ceiling_usd=Decimal("0.000001"),
+    )
+
+    with pytest.raises(EmbeddingBudgetExceeded):
+        await _index_batch(
+            db_session,
+            documents=documents,
+            config=config,
+            provider=provider,
+        )
+
+    assert provider.calls == 0
+    unit = (await db_session.execute(select(SemanticRetrievalUnit))).scalars().one()
+    assert unit.embedding_status == "failed"
+    ledger_id = unit.llm_usage_ledger_id
+    ledger = await db_session.get(LlmUsageLedger, ledger_id)
+    assert ledger is not None and ledger.error == "budget_exceeded"
+
+    event = await _make_forget_event(
+        db_session,
+        target_type="message",
+        target_id=str(message.id),
+        tombstone_key=f"budget-claim-forget-{versions[-1].id}",
+    )
+    await _cascade_semantic_retrieval(db_session, event)
+
+    assert await db_session.get(SemanticRetrievalUnit, unit.id) is None
+    redacted_ledger = await db_session.get(LlmUsageLedger, ledger_id)
+    assert redacted_ledger is not None
+    assert redacted_ledger.prompt_hash is None
 
 
 def test_semantic_layer_runs_before_message_versions_and_is_registered() -> None:

@@ -154,14 +154,11 @@ def upgrade() -> None:
         sa.Column("embedding_model", sa.String(length=128), nullable=False),
         sa.Column("embedding_model_version", sa.String(length=64), nullable=False),
         sa.Column("embedding_dimensions", sa.Integer(), nullable=False),
-        sa.Column("embedding", Vector(1536), nullable=False),
+        sa.Column("embedding_status", sa.String(length=16), nullable=False),
+        sa.Column("chunk_text", sa.Text(), nullable=True),
+        sa.Column("embedding", Vector(1536), nullable=True),
         sa.Column("llm_usage_ledger_id", sa.BigInteger(), nullable=False),
-        sa.Column(
-            "indexed_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.text("now()"),
-        ),
+        sa.Column("indexed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("invalidated_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("invalidation_reason", sa.String(length=64), nullable=True),
         sa.CheckConstraint(
@@ -171,6 +168,20 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "chunk_index >= 0 AND chunk_count > 0 AND chunk_index < chunk_count",
             name="ck_semantic_units_chunk_bounds",
+        ),
+        sa.CheckConstraint(
+            "embedding_status IN ('reserved','completed','failed')",
+            name="ck_semantic_units_embedding_status",
+        ),
+        sa.CheckConstraint(
+            "(embedding_status = 'reserved' AND embedding IS NULL "
+            "AND chunk_text IS NULL AND indexed_at IS NULL) OR "
+            "(embedding_status = 'completed' AND embedding IS NOT NULL "
+            "AND chunk_text IS NOT NULL AND length(trim(chunk_text)) BETWEEN 1 AND 800 "
+            "AND indexed_at IS NOT NULL) OR "
+            "(embedding_status = 'failed' AND embedding IS NULL "
+            "AND chunk_text IS NULL AND indexed_at IS NULL)",
+            name="ck_semantic_units_embedding_state",
         ),
         sa.CheckConstraint(
             "(invalidated_at IS NULL) = (invalidation_reason IS NULL)",
