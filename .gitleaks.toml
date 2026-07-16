@@ -3,8 +3,12 @@ title = "Vibe Gatekeeper gitleaks configuration"
 [extend]
 useDefault = true
 
-[[allowlists]]
-description = "Postmortems may quote already-rotated incident artifacts for audit context."
+[allowlist]
+description = "Exclude audited historical artifacts and generated BMAD vendor code."
 paths = [
   '''^docs/session-postmortems/.*''',
+  '''^\.agents/skills/bmad-.*''',
+  '''^\.claude/skills/bmad-.*''',
+  '''^_bmad/_config/.*''',
+  '''^_bmad/(bmm|core|scripts)/.*''',
 ]
