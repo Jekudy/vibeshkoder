@@ -8,7 +8,7 @@ exit immediately. Do not pick items from the backlog. Do not refactor. Do not
 nothing: it creates unsolicited PRs, wastes review bandwidth, and erodes trust in
 autonomous pipelines.
 
-Use superpowers:systematic-debugging skill mandatory before proposing or applying any fix.
+Use a root-cause-first systematic debugging process before proposing or applying any fix.
 Use test-driven development for code changes: reproduce the failure with a red test, implement the smallest fix, then prove green tests.
 
 Hard NEVER:
