@@ -29,6 +29,7 @@ from bot.db.repos.feature_flag import FeatureFlagRepo
 from bot.db.repos.ingestion_run import IngestionRunRepo
 from bot.db.repos.telegram_update import TelegramUpdateRepo
 from bot.services.governance import detect_policy, redact_raw_for_offrecord
+from bot.services.telegram_serialization import serialize_telegram_object
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ _UPDATE_EVENT_FIELDS: tuple[str, ...] = (
 
 def _compute_raw_hash(raw_dict: dict[str, Any]) -> str:
     """Deterministic SHA-256 over a stable JSON serialization of the update payload."""
-    canonical = json.dumps(raw_dict, sort_keys=True, default=str)
+    canonical = json.dumps(raw_dict, sort_keys=True, allow_nan=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -137,7 +138,7 @@ async def record_update(
     if not await is_raw_archive_enabled(session):
         return None
 
-    raw_dict = update.model_dump(mode="json", exclude_none=True)
+    raw_dict = serialize_telegram_object(update)
     raw_hash = _compute_raw_hash(raw_dict)
     update_type = _classify_update_type(update)
     chat_id, message_id = _extract_chat_and_message_ids(update)

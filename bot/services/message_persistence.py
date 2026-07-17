@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+from aiogram.types import TelegramObject
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +37,7 @@ from bot.db.repos.offrecord_mark import OffrecordMarkRepo
 from bot.services.content_hash import compute_content_hash
 from bot.services.governance import detect_policy
 from bot.services.normalization import extract_entities_unified, extract_normalized_fields
+from bot.services.telegram_serialization import serialize_telegram_object
 
 
 @dataclass(frozen=True)
@@ -226,15 +228,17 @@ async def persist_message_with_policy(
     else:
         persist_text = getattr(message, "text", None)
         persist_caption = normalized["caption"]
-        # raw_json tracks text presence (gatekeeper-era behaviour).
-        # Uses model_dump() when available (aiogram Message); falls back to None for
-        # importer ducks that lack model_dump.
+        # raw_json tracks text presence (gatekeeper-era behaviour). Live aiogram
+        # messages use aiogram's strict serializer so nested Default sentinels are
+        # resolved correctly. Structurally-compatible importer/test ducks retain the
+        # existing model_dump contract; ducks without it intentionally store no raw JSON.
         _model_dump = getattr(message, "model_dump", None)
-        persist_raw_json = (
-            _model_dump(mode="json", exclude_none=True)
-            if message.text and _model_dump is not None
-            else None
-        )
+        if message.text and isinstance(message, TelegramObject):
+            persist_raw_json = serialize_telegram_object(message)
+        elif message.text and _model_dump is not None:
+            persist_raw_json = _model_dump(mode="json", exclude_none=True)
+        else:
+            persist_raw_json = None
         is_redacted_flag = False
 
     user_id = message.from_user.id if message.from_user is not None else None

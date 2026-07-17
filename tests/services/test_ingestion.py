@@ -12,6 +12,7 @@ Covers the BLOCKER cross-cutting requirement from AUTHORIZED_SCOPE.md:
 from __future__ import annotations
 
 import itertools
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -112,6 +113,63 @@ def test_compute_raw_hash_is_deterministic(app_env) -> None:
     b = _compute_raw_hash({"y": [1, 2, 3], "x": 1})  # different key order
     assert a == b
     assert len(a) == 64
+
+
+def test_compute_raw_hash_rejects_non_json_values(app_env) -> None:
+    """Raw hashing must fail fast instead of stringifying unknown payload objects."""
+    from aiogram.client.default import Default
+
+    from bot.services.ingestion import _compute_raw_hash
+
+    with pytest.raises(TypeError):
+        _compute_raw_hash({"unexpected": Default("parse_mode")})
+
+
+def test_telegram_serializer_resolves_nested_aiogram_defaults(app_env) -> None:
+    """Telegram link previews carry aiogram Default sentinels in omitted fields."""
+    from aiogram.types import LinkPreviewOptions
+
+    from bot.services.telegram_serialization import serialize_telegram_object
+
+    update = _make_message_update(text="https://example.test/evidence")
+    assert update.message is not None
+    update = update.model_copy(
+        update={
+            "message": update.message.model_copy(
+                update={"link_preview_options": LinkPreviewOptions(is_disabled=False)}
+            )
+        }
+    )
+
+    payload = serialize_telegram_object(update)
+
+    assert payload["message"]["link_preview_options"] == {"is_disabled": False}
+    json.dumps(payload)
+
+
+async def test_record_update_persists_link_preview_without_defaults(db_session) -> None:
+    """Regression: raw archive ON must accept real updates containing link previews."""
+    from aiogram.types import LinkPreviewOptions
+
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+    from bot.services.ingestion import RAW_ARCHIVE_FLAG, record_update
+
+    await FeatureFlagRepo.set_enabled(db_session, RAW_ARCHIVE_FLAG, enabled=True)
+    update = _make_message_update(text="https://example.test/evidence")
+    assert update.message is not None
+    update = update.model_copy(
+        update={
+            "message": update.message.model_copy(
+                update={"link_preview_options": LinkPreviewOptions(is_disabled=False)}
+            )
+        }
+    )
+
+    row = await record_update(db_session, update)
+
+    assert row is not None
+    assert row.raw_json["message"]["link_preview_options"] == {"is_disabled": False}
+    assert "Default(" not in json.dumps(row.raw_json)
 
 
 # ─── get_or_create_live_run ─────────────────────────────────────────────────────────────
