@@ -28,7 +28,11 @@ async def test_semantic_index_tick_is_strict_noop_when_flag_off(monkeypatch) -> 
     backfill = AsyncMock()
 
     monkeypatch.setattr(scheduler, "async_session", _session_context(session))
-    monkeypatch.setattr(feature_flags.FeatureFlagRepo, "get", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        feature_flags.FeatureFlagRepo,
+        "any_enabled",
+        AsyncMock(return_value=False),
+    )
     monkeypatch.setattr(semantic_index, "backfill_semantic_index", backfill)
 
     await scheduler.run_semantic_index_tick()
@@ -36,7 +40,7 @@ async def test_semantic_index_tick_is_strict_noop_when_flag_off(monkeypatch) -> 
     backfill.assert_not_awaited()
 
 
-async def test_semantic_index_tick_runs_idempotent_reconciliation(monkeypatch) -> None:
+async def test_semantic_index_tick_runs_when_scoped_canary_is_enabled(monkeypatch) -> None:
     scheduler = import_module("bot.services.scheduler")
     feature_flags = import_module("bot.db.repos.feature_flag")
     gateway = import_module("bot.services.llm_gateway")
@@ -47,12 +51,14 @@ async def test_semantic_index_tick_runs_idempotent_reconciliation(monkeypatch) -
     backfill = AsyncMock(return_value=report)
 
     monkeypatch.setattr(scheduler, "async_session", _session_context(session))
-    monkeypatch.setattr(feature_flags.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    any_enabled = AsyncMock(return_value=True)
+    monkeypatch.setattr(feature_flags.FeatureFlagRepo, "any_enabled", any_enabled)
     monkeypatch.setattr(gateway, "load_embedding_gateway_config", Mock(return_value=config))
     monkeypatch.setattr(semantic_index, "backfill_semantic_index", backfill)
 
     await scheduler.run_semantic_index_tick()
 
+    any_enabled.assert_awaited_once_with(session, "memory.qa.semantic.enabled")
     backfill.assert_awaited_once_with(
         session,
         config=config,
@@ -71,7 +77,11 @@ async def test_semantic_index_tick_reports_unresolved_claim(monkeypatch, caplog)
     )
 
     monkeypatch.setattr(scheduler, "async_session", _session_context(session))
-    monkeypatch.setattr(feature_flags.FeatureFlagRepo, "get", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        feature_flags.FeatureFlagRepo,
+        "any_enabled",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(
         gateway,
         "load_embedding_gateway_config",

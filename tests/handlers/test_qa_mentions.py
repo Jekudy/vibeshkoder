@@ -7,7 +7,7 @@ from html.parser import HTMLParser
 import re
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 
@@ -49,6 +49,9 @@ def _mock_semantic_delivery_intent(monkeypatch, app_env):
     handler = import_module("bot.handlers.qa")
     marker = AsyncMock()
     monkeypatch.setattr(handler.SemanticQuotaRepo, "mark_delivery_started", marker)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "touch", AsyncMock())
+    monkeypatch.setattr(handler, "_question_is_governed", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "persist_semantic_retrieval_trace", AsyncMock())
     return marker
 
 
@@ -106,6 +109,7 @@ def _message(*, user_id: int = 1001, text: str = "@bot память") -> SimpleN
             is_bot=False,
         ),
         message_id=500,
+        date=datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
         text=text,
         caption=None,
         reply=AsyncMock(),
@@ -156,6 +160,31 @@ def _qa_result(
             created_at=now,
         ),
         query_redacted=query_redacted,
+    )
+
+
+def _question_bundle():
+    from bot.services.evidence import EvidenceBundle, EvidenceItem
+
+    now = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+    return EvidenceBundle(
+        query="что решили про память?",
+        chat_id=COMMUNITY_CHAT_ID,
+        items=(
+            EvidenceItem(
+                message_version_id=9501,
+                chat_message_id=8501,
+                chat_id=COMMUNITY_CHAT_ID,
+                message_id=500,
+                user_id=1001,
+                snippet="",
+                ts_rank=1.0,
+                captured_at=now,
+                message_date=now,
+            ),
+        ),
+        abstained=False,
+        created_at=now,
     )
 
 
@@ -240,12 +269,59 @@ def test_semantic_trace_binding_flattens_card_provenance() -> None:
     assert qa_service._semantic_evidence_provenance_ids(bundle) == [101, 102, 103, 104]
 
 
+async def test_semantic_retrieval_trace_persists_only_governed_result_ranks(
+    monkeypatch,
+) -> None:
+    qa_service = import_module("bot.services.qa")
+    session = AsyncMock()
+    session.add = Mock()
+    update_retrieval = AsyncMock()
+    monkeypatch.setattr(qa_service.QaTraceRepo, "update_retrieval_fields", update_retrieval)
+    result = SimpleNamespace(
+        bundle=_qa_result().bundle,
+        embedding_model="text-embedding-3-small",
+        retrieval=SimpleNamespace(
+            candidate_ranks={
+                "message:101": {"vector": 1, "fts": 2},
+                "message:999": {"vector": 2},
+            },
+            fts_latency_ms=2,
+            vector_latency_ms=3,
+            fusion_latency_ms=1,
+            total_latency_ms=6,
+        ),
+    )
+
+    trace = await qa_service.persist_semantic_retrieval_trace(
+        session,
+        result=result,
+        query="память",
+        attempt_id=3017,
+        qa_trace_id=5017,
+    )
+
+    assert trace.result_source_ids == ["message:101"]
+    assert trace.candidate_ranks == {"message:101": {"vector": 1, "fts": 2}}
+    update_retrieval.assert_awaited_once_with(
+        session,
+        qa_trace_id=5017,
+        evidence_ids=[101],
+        abstained=False,
+    )
+    session.add.assert_called_once_with(trace)
+    session.flush.assert_awaited_once()
+
+
 def _patch_common(handler, monkeypatch, *, member: bool = True) -> None:
     monkeypatch.setattr(handler.UserRepo, "upsert", AsyncMock())
     monkeypatch.setattr(
         handler,
         "persist_message_with_policy",
-        AsyncMock(return_value=SimpleNamespace(chat_message=SimpleNamespace(id=8501))),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                chat_message=SimpleNamespace(id=8501, current_version_id=9501)
+            )
+        ),
     )
     monkeypatch.setattr(
         handler.QaTraceRepo,
@@ -1125,10 +1201,104 @@ async def test_semantic_feature_routes_before_legacy_retrieval(monkeypatch) -> N
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=ANY,
         query="что решили про память?",
         query_redacted=False,
     )
     legacy.assert_not_awaited()
+
+
+async def test_semantic_question_forget_gate_blocks_attempt_before_provider(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    semantic = AsyncMock()
+    trace_create = AsyncMock()
+    finalize = AsyncMock()
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(return_value=SimpleNamespace(allowed=True, replayed=False, attempt_id=3003)),
+    )
+    monkeypatch.setattr(handler, "_question_is_governed", AsyncMock(return_value=False))
+    monkeypatch.setattr(handler.QaTraceRepo, "create", trace_create)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(handler, "run_semantic_qa", semantic)
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
+        query="что решили про память?",
+        query_redacted=False,
+    )
+
+    trace_create.assert_not_awaited()
+    semantic.assert_not_awaited()
+    assert finalize.await_args.kwargs["outcome"] == "technical_failure"
+    assert "удалён из памяти" in message.reply.await_args.args[0]
+    assert "лимит не списан" in message.reply.await_args.args[0]
+
+
+async def test_semantic_question_invalidation_after_embedding_blocks_synthesis(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    message = _message()
+    session = AsyncMock()
+    semantic_result = _qa_result()
+    synthesize = AsyncMock()
+    finalize = AsyncMock()
+
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(return_value=SimpleNamespace(allowed=True, replayed=False, attempt_id=3016)),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_question_is_governed",
+        AsyncMock(side_effect=[True, False]),
+    )
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "create",
+        AsyncMock(return_value=SimpleNamespace(id=5016)),
+    )
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "attach_trace", AsyncMock())
+    monkeypatch.setattr(
+        handler,
+        "run_semantic_qa",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                bundle=semantic_result.bundle,
+                embedding_llm_call_id=4016,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler,
+        "_load_gateway_config",
+        Mock(return_value=SimpleNamespace(provider="deepseek", model="deepseek-v4-flash")),
+    )
+    monkeypatch.setattr(handler, "_resolve_provider", Mock(return_value=object()))
+    monkeypatch.setattr(handler, "synthesize_answer", synthesize)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
+        query="что решили про память?",
+        query_redacted=False,
+    )
+
+    synthesize.assert_not_awaited()
+    assert finalize.await_args.kwargs["outcome"] == "technical_failure"
+    assert finalize.await_args.kwargs["embedding_llm_call_id"] == 4016
+    assert "удалён из памяти" in message.reply.await_args.args[0]
 
 
 async def test_semantic_user_scoped_flag_routes_when_global_is_off(monkeypatch) -> None:
@@ -1230,6 +1400,7 @@ async def test_semantic_third_question_calls_only_ordinary_search(monkeypatch) -
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="что решили про память?",
         query_redacted=False,
     )
@@ -1282,6 +1453,7 @@ async def test_semantic_empty_retrieval_consumes_abstention_slot(monkeypatch) ->
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="нет ответа",
         query_redacted=False,
     )
@@ -1337,6 +1509,7 @@ async def test_semantic_trace_is_committed_before_embedding_dispatch(monkeypatch
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="порядок",
         query_redacted=False,
     )
@@ -1395,6 +1568,7 @@ async def test_semantic_embedding_failure_releases_slot(monkeypatch) -> None:
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="техническая ошибка",
         query_redacted=False,
     )
@@ -1412,6 +1586,19 @@ async def test_semantic_answer_has_valid_link_and_consumes_slot(monkeypatch) -> 
     semantic_result = _qa_result()
     finalize = AsyncMock()
     author = SimpleNamespace(first_name="Author", last_name=None, username="author")
+    lock_depth = 0
+    lock_entries = 0
+
+    @asynccontextmanager
+    async def sequential_lock_scope(*_args, **_kwargs):
+        nonlocal lock_depth, lock_entries
+        lock_depth += 1
+        lock_entries += 1
+        assert lock_depth == 1, "semantic governance locks must never be nested"
+        try:
+            yield
+        finally:
+            lock_depth -= 1
 
     monkeypatch.setattr(
         handler.SemanticQuotaRepo,
@@ -1453,6 +1640,7 @@ async def test_semantic_answer_has_valid_link_and_consumes_slot(monkeypatch) -> 
         AsyncMock(return_value=semantic_result.bundle),
     )
     monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(handler, "hold_evidence_delivery_locks", sequential_lock_scope)
     monkeypatch.setattr(
         handler,
         "_load_gateway_config",
@@ -1484,6 +1672,7 @@ async def test_semantic_answer_has_valid_link_and_consumes_slot(monkeypatch) -> 
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="что решили",
         query_redacted=False,
     )
@@ -1492,6 +1681,9 @@ async def test_semantic_answer_has_valid_link_and_consumes_slot(monkeypatch) -> 
     assert handler.synthesize_answer.await_args.kwargs["max_evidence_items"] == 5
     assert handler.synthesize_answer.await_args.kwargs["durable_placeholder"] is True
     assert handler.synthesize_answer.await_args.kwargs["revalidate_after_provider"] is True
+    assert handler.synthesize_answer.await_args.kwargs["cache_enabled"] is False
+    assert lock_entries == 5
+    assert lock_depth == 0
     handler.SemanticQuotaRepo.attach_trace.assert_awaited_once_with(
         session,
         attempt_id=3006,
@@ -1540,6 +1732,7 @@ async def test_semantic_reserved_replay_never_dispatches_providers(monkeypatch) 
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="повтор",
         query_redacted=False,
     )
@@ -1590,6 +1783,7 @@ async def test_semantic_answer_replay_never_emits_stored_content(monkeypatch) ->
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="повтор",
         query_redacted=False,
     )
@@ -1637,6 +1831,11 @@ async def test_semantic_abstention_classifies_quota_outcome(
     monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
     monkeypatch.setattr(
         handler,
+        "filter_surviving_evidence",
+        AsyncMock(return_value=_qa_result().bundle),
+    )
+    monkeypatch.setattr(
+        handler,
         "run_semantic_qa",
         AsyncMock(
             return_value=SimpleNamespace(
@@ -1673,6 +1872,7 @@ async def test_semantic_abstention_classifies_quota_outcome(
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="классификация",
         query_redacted=False,
     )
@@ -1680,7 +1880,9 @@ async def test_semantic_abstention_classifies_quota_outcome(
     assert finalize.await_args.kwargs["outcome"] == expected_outcome
 
 
-async def test_semantic_render_revalidation_change_abstains_without_leak(monkeypatch) -> None:
+async def test_semantic_retrieval_trace_revalidation_change_abstains_without_leak(
+    monkeypatch,
+) -> None:
     handler = import_module("bot.handlers.qa")
     from bot.services.llm_gateway import AnswerWithCitations
 
@@ -1751,11 +1953,14 @@ async def test_semantic_render_revalidation_change_abstains_without_leak(monkeyp
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="гонка forget",
         query_redacted=False,
     )
 
     assert finalize.await_args.kwargs["outcome"] == "abstained"
+    handler.persist_semantic_retrieval_trace.assert_not_awaited()
+    handler.synthesize_answer.assert_not_awaited()
     reply = message.reply.await_args.args[0]
     assert "PRIVATE-FORGOTTEN-SNIPPET" not in reply
     assert "Не нашёл достаточно" in reply
@@ -1808,6 +2013,7 @@ async def test_semantic_technical_release_precedes_failing_ordinary_fallback(
         session=session,
         sender_id=1001,
         persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
         query="ошибка fallback",
         query_redacted=False,
     )
@@ -2022,6 +2228,32 @@ async def test_final_delivery_gate_blocks_invalidated_evidence(monkeypatch) -> N
     invalidate.assert_awaited()
     clear.assert_awaited_once_with(session, qa_trace_id=44)
     reply.assert_not_awaited()
+
+
+async def test_generic_semantic_delivery_revalidates_required_question(monkeypatch) -> None:
+    handler = import_module("bot.handlers.qa")
+    session = AsyncMock()
+    message = _message()
+    finalize = AsyncMock()
+    monkeypatch.setattr(handler, "_question_is_governed", AsyncMock(return_value=False))
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+
+    await handler._deliver_and_consume_semantic_attempt(
+        message,
+        session,
+        attempt_id=39,
+        outcome="abstained",
+        qa_trace_id=49,
+        embedding_llm_call_id=59,
+        synthesis_llm_call_id=None,
+        reply_text="must not be delivered",
+        required_governed_bundle=_question_bundle(),
+    )
+
+    handler.SemanticQuotaRepo.mark_delivery_started.assert_not_awaited()
+    assert finalize.await_args.kwargs["outcome"] == "technical_failure"
+    assert "must not be delivered" not in message.reply.await_args.args[0]
+    assert "удалён из памяти" in message.reply.await_args.args[0]
 
 
 async def test_semantic_ambiguous_delivery_failure_consumes_and_preserves_summary(

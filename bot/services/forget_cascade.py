@@ -417,26 +417,43 @@ async def _cascade_semantic_retrieval(session: AsyncSession, event) -> int:
     ledger_ids = {int(row.llm_usage_ledger_id) for row in unit_rows}
     attempt_ids: set[int] = set()
     qa_trace_ids: set[int] = set()
+    parent_chat_message_ids: set[int] = set()
 
     attempt_filters = []
-    if affected_mvids:
+    if event.target_type == "message":
+        # A persisted question can have a QaTrace even when no semantic attempt
+        # was admitted (quota denial) or no MessageVersion survived. Resolve it
+        # directly from the forget target instead of relying on attempt FKs.
+        parent_chat_message_ids.add(int(event.target_id))
+    if event.target_type == "message_hash" and affected_mvids:
         parent_result = await session.execute(
             select(MessageVersion.chat_message_id)
             .where(MessageVersion.id.in_(affected_mvids))
             .distinct()
         )
-        parent_chat_message_ids = {
+        parent_chat_message_ids.update(
             int(chat_message_id) for chat_message_id in parent_result.scalars()
-        }
-        if parent_chat_message_ids:
-            # The forgotten message can itself be a semantic question. It is
-            # deliberately excluded from retrieval results, so source-key
-            # matching alone cannot find its query_hash/embedding ledger row.
-            attempt_filters.append(
-                SemanticQaAttempt.source_chat_message_id.in_(parent_chat_message_ids)
-            )
+        )
+    if parent_chat_message_ids:
+        # The forgotten message can itself be a semantic question. It is
+        # deliberately excluded from retrieval results, so source-key matching
+        # cannot find its raw query or provider ledgers.
+        attempt_filters.append(
+            SemanticQaAttempt.source_chat_message_id.in_(parent_chat_message_ids)
+        )
     if event.target_type == "user":
         attempt_filters.append(SemanticQaAttempt.user_tg_id == int(event.target_id))
+
+    qa_trace_filters = []
+    if parent_chat_message_ids:
+        qa_trace_filters.append(QaTrace.source_chat_message_id.in_(parent_chat_message_ids))
+    if event.target_type == "user":
+        qa_trace_filters.append(QaTrace.user_tg_id == int(event.target_id))
+    if qa_trace_filters:
+        direct_trace_result = await session.execute(
+            select(QaTrace.id).where(or_(*qa_trace_filters))
+        )
+        qa_trace_ids.update(int(trace_id) for trace_id in direct_trace_result.scalars())
 
     if attempt_filters:
         attempts_result = await session.execute(

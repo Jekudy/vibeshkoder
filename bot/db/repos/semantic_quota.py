@@ -31,8 +31,8 @@ class SemanticQuotaDecision:
     qa_trace_id: int | None = None
 
 
-def _lock_id(user_tg_id: int, local_day: str) -> int:
-    payload = f"semantic_qa:{user_tg_id}:{local_day}".encode("ascii")
+def _user_lock_id(user_tg_id: int) -> int:
+    payload = f"semantic_qa_user:{user_tg_id}".encode("ascii")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=True)
 
 
@@ -61,12 +61,12 @@ class SemanticQuotaRepo:
         local_day = start_utc.astimezone(MOSCOW_TZ).date()
         await session.execute(
             text("SELECT pg_advisory_xact_lock(:lock_id)"),
-            {"lock_id": _lock_id(user_tg_id, local_day.isoformat())},
+            {"lock_id": _user_lock_id(user_tg_id)},
         )
         await SemanticQuotaRepo.release_stale_reserved(
             session,
             user_tg_id=user_tg_id,
-            local_day=local_day,
+            through_local_day=local_day,
             stale_before=effective_now - SemanticQuotaRepo.STALE_RESERVATION_AFTER,
             finalized_at=effective_now,
         )
@@ -163,15 +163,17 @@ class SemanticQuotaRepo:
         session: AsyncSession,
         *,
         user_tg_id: int,
-        local_day: date,
+        through_local_day: date,
         stale_before: datetime,
         finalized_at: datetime | None = None,
     ) -> int:
-        """Reconcile crashed reservations during the next admission lock.
+        """Reconcile crashed reservations through the current Moscow day.
 
         A durable delivery intent is conservatively consumed: Telegram may
         have accepted the message even if the process died before the final DB
-        commit. Reservations that never reached delivery are released.
+        commit. Reservations that never reached delivery are released. The
+        user-scoped admission lock makes reconciliation atomic across the day
+        boundary and prevents an old idempotent replay from remaining reserved.
         """
 
         effective_finalized_at = finalized_at or datetime.now(timezone.utc)
@@ -179,9 +181,9 @@ class SemanticQuotaRepo:
             update(SemanticQaAttempt)
             .where(
                 SemanticQaAttempt.user_tg_id == user_tg_id,
-                SemanticQaAttempt.local_day == local_day,
+                SemanticQaAttempt.local_day <= through_local_day,
                 SemanticQaAttempt.status == "reserved",
-                SemanticQaAttempt.reserved_at < stale_before,
+                SemanticQaAttempt.progress_at < stale_before,
                 SemanticQaAttempt.delivery_started_at.is_not(None),
             )
             .values(
@@ -193,9 +195,9 @@ class SemanticQuotaRepo:
             update(SemanticQaAttempt)
             .where(
                 SemanticQaAttempt.user_tg_id == user_tg_id,
-                SemanticQaAttempt.local_day == local_day,
+                SemanticQaAttempt.local_day <= through_local_day,
                 SemanticQaAttempt.status == "reserved",
-                SemanticQaAttempt.reserved_at < stale_before,
+                SemanticQaAttempt.progress_at < stale_before,
                 SemanticQaAttempt.delivery_started_at.is_(None),
             )
             .values(
@@ -235,6 +237,7 @@ class SemanticQuotaRepo:
                 qa_trace_id=qa_trace_id,
                 embedding_llm_call_id=embedding_llm_call_id,
                 synthesis_llm_call_id=synthesis_llm_call_id,
+                progress_at=datetime.now(timezone.utc),
                 delivery_started_at=datetime.now(timezone.utc),
             )
         )
@@ -255,7 +258,7 @@ class SemanticQuotaRepo:
                 SemanticQaAttempt.id == attempt_id,
                 SemanticQaAttempt.status == "reserved",
             )
-            .values(qa_trace_id=qa_trace_id)
+            .values(qa_trace_id=qa_trace_id, progress_at=datetime.now(timezone.utc))
         )
         if getattr(result, "rowcount", None) != 1:
             raise LookupError("semantic Q&A reservation is not active")
@@ -274,7 +277,10 @@ class SemanticQuotaRepo:
                 SemanticQaAttempt.id == attempt_id,
                 SemanticQaAttempt.status == "reserved",
             )
-            .values(embedding_llm_call_id=embedding_llm_call_id)
+            .values(
+                embedding_llm_call_id=embedding_llm_call_id,
+                progress_at=datetime.now(timezone.utc),
+            )
         )
         if getattr(result, "rowcount", None) != 1:
             raise LookupError("semantic Q&A reservation is not active")
@@ -305,17 +311,48 @@ class SemanticQuotaRepo:
                 qa_trace_id=qa_trace_id,
                 embedding_llm_call_id=embedding_llm_call_id,
                 synthesis_llm_call_id=synthesis_llm_call_id,
+                progress_at=datetime.now(timezone.utc),
                 finalized_at=datetime.now(MOSCOW_TZ),
             )
         )
         if getattr(result, "rowcount", None) != 1:
-            raise LookupError("semantic Q&A attempt is missing or already finalized")
+            existing = (
+                await session.execute(
+                    select(SemanticQaAttempt.status, SemanticQaAttempt.outcome).where(
+                        SemanticQaAttempt.id == attempt_id
+                    )
+                )
+            ).one_or_none()
+            if existing is not None and existing.status == status and existing.outcome == outcome:
+                return
+            raise LookupError("semantic Q&A attempt is missing or finalized differently")
         if qa_trace_id is not None:
             await session.execute(
                 update(SemanticRetrievalTrace)
                 .where(SemanticRetrievalTrace.attempt_id == attempt_id)
                 .values(qa_trace_id=qa_trace_id)
             )
+        await session.flush()
+
+    @staticmethod
+    async def touch(
+        session: AsyncSession,
+        *,
+        attempt_id: int,
+    ) -> None:
+        """Renew a live reservation before a potentially blocking phase."""
+
+        result = await session.execute(
+            update(SemanticQaAttempt)
+            .where(
+                SemanticQaAttempt.id == attempt_id,
+                SemanticQaAttempt.status == "reserved",
+                SemanticQaAttempt.delivery_started_at.is_(None),
+            )
+            .values(progress_at=datetime.now(timezone.utc))
+        )
+        if getattr(result, "rowcount", None) != 1:
+            raise LookupError("semantic Q&A reservation lease is no longer active")
         await session.flush()
 
     @staticmethod

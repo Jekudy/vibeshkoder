@@ -17,6 +17,20 @@ SemanticEvalCategory = Literal[
     "no_answer",
     "privacy_governance",
 ]
+PrivacyEvalClass = Literal[
+    "cross_chat",
+    "bot_authored",
+    "forgotten",
+    "redacted",
+    "non_normal",
+    "stale_version",
+]
+
+PRIVACY_LEAKAGE_CLASSES = frozenset(
+    {"cross_chat", "bot_authored", "forgotten", "redacted", "non_normal"}
+)
+STALE_VERSION_GOVERNANCE_CLASS = "stale_version"
+REQUIRED_PRIVACY_CLASSES = frozenset({*PRIVACY_LEAKAGE_CLASSES, STALE_VERSION_GOVERNANCE_CLASS})
 
 MIN_MACRO_RECALL_AT_5 = 0.80
 MIN_SEMANTIC_RECALL_DELTA_AT_5 = 0.15
@@ -56,6 +70,18 @@ def _validate_source_ids(name: str, source_ids: object) -> None:
         raise ValueError(f"{name} must not contain duplicate source ids")
 
 
+def _validate_privacy_classes(privacy_classes: object) -> None:
+    if not isinstance(privacy_classes, tuple):
+        raise TypeError("privacy_classes must be a tuple")
+    if any(
+        not isinstance(privacy_class, str) or privacy_class not in REQUIRED_PRIVACY_CLASSES
+        for privacy_class in privacy_classes
+    ):
+        raise ValueError("privacy_classes contains an unsupported governance class")
+    if len(privacy_classes) != len(set(privacy_classes)):
+        raise ValueError("privacy_classes must not contain duplicates")
+
+
 def _validate_non_negative_int(name: str, value: object) -> None:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
@@ -76,6 +102,7 @@ class SemanticEvalCase:
     category: SemanticEvalCategory
     expected_source_ids: tuple[str, ...]
     forbidden_source_ids: tuple[str, ...]
+    privacy_classes: tuple[PrivacyEvalClass, ...]
     expected_abstain: bool
 
     def __post_init__(self) -> None:
@@ -84,6 +111,7 @@ class SemanticEvalCase:
             raise ValueError(f"unsupported semantic evaluation category: {self.category!r}")
         _validate_source_ids("expected_source_ids", self.expected_source_ids)
         _validate_source_ids("forbidden_source_ids", self.forbidden_source_ids)
+        _validate_privacy_classes(self.privacy_classes)
         if set(self.expected_source_ids) & set(self.forbidden_source_ids):
             raise ValueError("expected and forbidden source ids must be disjoint")
         if type(self.expected_abstain) is not bool:
@@ -105,8 +133,12 @@ class SemanticEvalCase:
         if self.category == "privacy_governance":
             if not self.forbidden_source_ids:
                 raise ValueError("privacy_governance cases must include forbidden source ids")
+            if not self.privacy_classes:
+                raise ValueError("privacy_governance cases must include privacy_classes")
         elif self.forbidden_source_ids:
             raise ValueError("only privacy_governance cases may include forbidden source ids")
+        elif self.privacy_classes:
+            raise ValueError("only privacy_governance cases may include privacy_classes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +206,7 @@ class SemanticEvalReport:
     exact_case_count: int
     multi_source_case_count: int
     privacy_governance_case_count: int
+    privacy_classes: tuple[PrivacyEvalClass, ...]
     privacy_expected_abstention_case_count: int
     privacy_expected_abstention_failures: int
     unexpected_answerable_abstention_count: int
@@ -203,6 +236,27 @@ def _nearest_rank_p95(values: Sequence[float]) -> float:
     ordered = sorted(float(value) for value in values)
     rank = (95 * len(ordered) + 99) // 100
     return ordered[rank - 1]
+
+
+def validate_privacy_class_coverage(
+    cases: Sequence[SemanticEvalCase],
+) -> tuple[PrivacyEvalClass, ...]:
+    """Require every #404 leakage class plus the stale-version invariant."""
+
+    if any(not isinstance(case, SemanticEvalCase) for case in cases):
+        raise TypeError("cases must contain only SemanticEvalCase values")
+    covered = {
+        privacy_class
+        for case in cases
+        if case.category == "privacy_governance"
+        for privacy_class in case.privacy_classes
+    }
+    missing = sorted(REQUIRED_PRIVACY_CLASSES - covered)
+    if missing:
+        raise ValueError(
+            f"frozen evaluation must cover every privacy/governance class; missing={missing!r}"
+        )
+    return tuple(sorted(covered))  # type: ignore[return-value]
 
 
 def evaluate_semantic_run(
@@ -251,6 +305,7 @@ def evaluate_semantic_run(
             "frozen evaluation must contain every required category; "
             f"missing={missing_categories!r}"
         )
+    privacy_classes = validate_privacy_class_coverage(cases)
 
     answerable = [pair for pair in ordered_pairs if not pair[0].expected_abstain]
     semantic = [pair for pair in answerable if pair[0].category == "semantic"]
@@ -318,6 +373,7 @@ def evaluate_semantic_run(
         exact_case_count=len(category_pairs["exact"]),
         multi_source_case_count=len(category_pairs["multi_source"]),
         privacy_governance_case_count=len(privacy),
+        privacy_classes=privacy_classes,
         privacy_expected_abstention_case_count=len(privacy_expected_abstentions),
         privacy_expected_abstention_failures=privacy_expected_abstention_failures,
         unexpected_answerable_abstention_count=unexpected_answerable_abstention_count,
@@ -365,6 +421,16 @@ def validate_semantic_report(report: SemanticEvalReport) -> tuple[str, ...]:
         violations.append("retrieval_p95_seconds < 0")
     if report.full_p95_seconds < report.retrieval_p95_seconds:
         violations.append("full_p95_seconds < retrieval_p95_seconds")
+    if (
+        not isinstance(report.privacy_classes, tuple)
+        or any(
+            not isinstance(privacy_class, str) or privacy_class not in REQUIRED_PRIVACY_CLASSES
+            for privacy_class in report.privacy_classes
+        )
+        or len(report.privacy_classes) != len(set(report.privacy_classes))
+        or set(report.privacy_classes) != REQUIRED_PRIVACY_CLASSES
+    ):
+        violations.append("privacy_classes do not cover every required governance class")
     category_total = (
         report.semantic_case_count
         + report.exact_case_count
@@ -460,10 +526,15 @@ __all__ = [
     "MIN_MACRO_RECALL_AT_5",
     "MIN_NO_ANSWER_ABSTENTION_RATE",
     "MIN_SEMANTIC_RECALL_DELTA_AT_5",
+    "PRIVACY_LEAKAGE_CLASSES",
+    "REQUIRED_PRIVACY_CLASSES",
+    "STALE_VERSION_GOVERNANCE_CLASS",
     "SemanticEvalCase",
     "SemanticEvalCategory",
+    "PrivacyEvalClass",
     "SemanticEvalReport",
     "SemanticEvalResult",
     "evaluate_semantic_run",
+    "validate_privacy_class_coverage",
     "validate_semantic_report",
 ]

@@ -105,6 +105,15 @@ def _passing_rows(count: int = 50) -> tuple[list[dict[str, object]], list[dict[s
         + ["no_answer"] * 10
         + ["privacy_governance"] * 5
     )
+    privacy_class_groups = iter(
+        (
+            ["cross_chat", "stale_version"],
+            ["bot_authored"],
+            ["forgotten"],
+            ["redacted"],
+            ["non_normal"],
+        )
+    )
     cases: list[dict[str, object]] = []
     results: list[dict[str, object]] = []
     for index, category in enumerate(categories[:count], start=1):
@@ -117,6 +126,9 @@ def _passing_rows(count: int = 50) -> tuple[list[dict[str, object]], list[dict[s
                 "category": category,
                 "expected_source_ids": expected,
                 "forbidden_source_ids": forbidden,
+                "privacy_classes": next(privacy_class_groups)
+                if category == "privacy_governance"
+                else [],
                 "expected_abstain": abstain,
             }
         )
@@ -199,6 +211,14 @@ def test_private_fifty_case_report_is_hashed_release_bound_and_mode_0600(
     assert payload["results_sha256"] == hashlib.sha256(results_path.read_bytes()).hexdigest()
     assert payload["report"]["case_count"] == 50
     assert payload["report"]["privacy_governance_case_count"] == 5
+    assert payload["report"]["privacy_classes"] == [
+        "bot_authored",
+        "cross_chat",
+        "forgotten",
+        "non_normal",
+        "redacted",
+        "stale_version",
+    ]
     assert payload["contains_raw_text"] is False
     assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
     assert "private query case-001" not in capsys.readouterr().out
@@ -229,6 +249,15 @@ def test_validator_rejects_fractional_unexpected_abstention_count(tmp_path: Path
     payload["report"]["unexpected_answerable_abstention_count"] = 0.5
 
     with pytest.raises(ValueError, match="non-negative integer"):
+        validate_report_payload(payload, expected_release_sha=RELEASE_SHA)
+
+
+def test_validator_rejects_incomplete_privacy_class_evidence(tmp_path: Path) -> None:
+    _, _, _, _, report_path = _evaluate(tmp_path)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["report"]["privacy_classes"].remove("stale_version")
+
+    with pytest.raises(ValueError, match="blocking metric violation"):
         validate_report_payload(payload, expected_release_sha=RELEASE_SHA)
 
 
@@ -312,6 +341,38 @@ def test_gate_rejects_fewer_than_fifty_cases_without_report(tmp_path: Path) -> N
                 str(observations_path),
                 "--results",
                 str(results_path),
+                "--release-sha",
+                RELEASE_SHA,
+                "--report",
+                str(report_path),
+            ]
+        )
+        == 2
+    )
+    assert not report_path.exists()
+
+
+def test_gate_rejects_missing_privacy_class_before_loading_results(tmp_path: Path) -> None:
+    cases, _ = _passing_rows()
+    cases[-5]["privacy_classes"] = ["cross_chat"]
+    dataset_path = tmp_path / "dataset.jsonl"
+    cases_path = tmp_path / "cases.jsonl"
+    report_path = tmp_path / "report.json"
+    _write_jsonl(dataset_path, _dataset_rows(cases))
+    _write_jsonl(cases_path, cases)
+
+    assert (
+        main(
+            [
+                "evaluate",
+                "--dataset",
+                str(dataset_path),
+                "--cases",
+                str(cases_path),
+                "--observations",
+                str(tmp_path / "missing-observations.jsonl"),
+                "--results",
+                str(tmp_path / "missing-results.jsonl"),
                 "--release-sha",
                 RELEASE_SHA,
                 "--report",

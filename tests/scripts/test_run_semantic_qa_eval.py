@@ -27,6 +27,15 @@ def _rows(count: int = 50) -> list[dict[str, object]]:
         + ["no_answer"] * 10
         + ["privacy_governance"] * 5
     )
+    privacy_class_groups = iter(
+        (
+            ["cross_chat", "stale_version"],
+            ["bot_authored"],
+            ["forgotten"],
+            ["redacted"],
+            ["non_normal"],
+        )
+    )
     rows: list[dict[str, object]] = []
     for index, category in enumerate(categories[:count], start=1):
         abstain = category == "no_answer"
@@ -38,6 +47,9 @@ def _rows(count: int = 50) -> list[dict[str, object]]:
                 "query": f"private query {index}",
                 "expected_source_ids": [] if abstain else [f"message:{index}"],
                 "forbidden_source_ids": [f"message:{1000 + index}"]
+                if category == "privacy_governance"
+                else [],
+                "privacy_classes": next(privacy_class_groups)
                 if category == "privacy_governance"
                 else [],
                 "expected_abstain": abstain,
@@ -66,6 +78,43 @@ def test_input_is_fully_validated_before_provider_work(tmp_path: Path) -> None:
     _write(path, _rows(count=49))
     with pytest.raises(ValueError, match="at least 50"):
         runner.load_private_cases(path, smoke=False)
+
+    rows = _rows()
+    rows[-5]["privacy_classes"] = ["cross_chat"]
+    _write(path, rows)
+    with pytest.raises(ValueError, match="missing=.*stale_version"):
+        runner.load_private_cases(path, smoke=False)
+
+
+@pytest.mark.asyncio
+async def test_missing_privacy_coverage_stops_before_provider_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    rows = _rows()
+    rows[-5]["privacy_classes"] = ["cross_chat"]
+    _write(input_path, rows)
+    run_case = AsyncMock()
+    monkeypatch.setattr(runner, "_run_case", run_case)
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--cases-output",
+            str(tmp_path / "cases.jsonl"),
+            "--observations-output",
+            str(tmp_path / "observations.jsonl"),
+            "--review-output",
+            str(tmp_path / "review.jsonl"),
+            "--release-sha",
+            RELEASE_SHA,
+        ]
+    )
+
+    with pytest.raises(ValueError, match="missing=.*stale_version"):
+        await runner.run_private_evaluation(args)
+    run_case.assert_not_awaited()
 
 
 def test_smoke_mode_is_explicit_and_requires_exactly_one_case(tmp_path: Path) -> None:
@@ -115,6 +164,7 @@ async def test_run_case_rechecks_query_before_embedding(
             category="privacy_governance",
             expected_source_ids=(),
             forbidden_source_ids=("message:1",),
+            privacy_classes=("redacted",),
             expected_abstain=True,
         ),
         chat_id=-1001234567890,

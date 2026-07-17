@@ -436,6 +436,69 @@ async def test_forgetting_question_message_redacts_query_embedding_audit(
         assert row.cost_usd == Decimal("0.001234")
 
 
+async def test_forgetting_quota_denied_question_redacts_unlinked_query_trace(
+    db_session,
+) -> None:
+    from bot.db.models import QaTrace, SemanticQaAttempt
+    from bot.services.forget_cascade import run_cascade_worker_once
+
+    owner_id = await _make_user(db_session)
+    message, _ = await _make_message(
+        db_session,
+        user_id=owner_id,
+        texts=("quota denied private question",),
+    )
+    denied_attempt = SemanticQaAttempt(
+        idempotency_key=f"semantic-quota-denied-{_next()}",
+        user_tg_id=owner_id,
+        chat_id=message.chat_id,
+        source_chat_message_id=message.id,
+        local_day=date.today(),
+        slot_number=None,
+        status="denied",
+        outcome="quota_denied",
+        qa_trace_id=None,
+        finalized_at=datetime.now(timezone.utc),
+    )
+    denied_trace = QaTrace(
+        source_chat_message_id=message.id,
+        user_tg_id=owner_id,
+        chat_id=message.chat_id,
+        query_text="quota denied private question",
+        query_redacted=False,
+        evidence_ids=[],
+        abstained=True,
+        llm_response_summary="ordinary search result",
+        llm_response_redacted=False,
+    )
+    db_session.add_all([denied_attempt, denied_trace])
+    await db_session.flush()
+    assert denied_attempt.qa_trace_id is None
+
+    await _make_forget_event(
+        db_session,
+        target_type="message",
+        target_id=str(message.id),
+        tombstone_key=f"message:{message.chat_id}:{message.message_id}",
+    )
+
+    stats = await run_cascade_worker_once(db_session)
+
+    assert stats == {"claimed": 1, "processed": 1, "failed": 0}
+    surviving_attempt = await db_session.get(
+        SemanticQaAttempt,
+        denied_attempt.id,
+        populate_existing=True,
+    )
+    assert surviving_attempt is not None
+    assert surviving_attempt.qa_trace_id is None
+    redacted_trace = await db_session.get(QaTrace, denied_trace.id, populate_existing=True)
+    assert redacted_trace.query_text is None
+    assert redacted_trace.query_redacted is True
+    assert redacted_trace.llm_response_summary is None
+    assert redacted_trace.llm_response_redacted is True
+
+
 async def test_forget_redacts_inflight_trace_ledgers_without_hash_resurrection(
     db_session,
 ) -> None:

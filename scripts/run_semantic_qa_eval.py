@@ -39,12 +39,12 @@ from bot.services.llm_gateway import (
 from bot.services.llm_providers import ProviderStructuralError, ProviderTransientError
 from bot.services.qa_guardrails import build_guarded_llm_query, contains_secret_like_data
 from bot.services.qa_trigger import MAX_USER_QUERY_CHARS
-from bot.services.semantic_eval import SemanticEvalCase
+from bot.services.semantic_eval import SemanticEvalCase, validate_privacy_class_coverage
 from bot.services.semantic_index import HybridSearchResult, hybrid_search
 
 
 MIN_FROZEN_CASES = 50
-PRIVATE_RUN_SCHEMA_VERSION = 2
+PRIVATE_RUN_SCHEMA_VERSION = 3
 SEMANTIC_EVIDENCE_LIMIT = 5
 SEMANTIC_PROVIDER = "deepseek"
 SEMANTIC_MODEL = "deepseek-v4-flash"
@@ -58,6 +58,7 @@ _INPUT_FIELDS = {
     "query",
     "expected_source_ids",
     "forbidden_source_ids",
+    "privacy_classes",
     "expected_abstain",
     "exclude_chat_message_id",
 }
@@ -115,13 +116,21 @@ def load_private_cases(path: Path, *, smoke: bool) -> tuple[PrivateEvalCase, ...
             raise ValueError("case_id must be an opaque safe identifier")
         expected_ids = row["expected_source_ids"]
         forbidden_ids = row["forbidden_source_ids"]
-        if not isinstance(expected_ids, list) or not isinstance(forbidden_ids, list):
-            raise ValueError("expected and forbidden source ids must be JSON arrays")
+        privacy_classes = row["privacy_classes"]
+        if (
+            not isinstance(expected_ids, list)
+            or not isinstance(forbidden_ids, list)
+            or not isinstance(privacy_classes, list)
+        ):
+            raise ValueError(
+                "expected sources, forbidden sources, and privacy classes must be JSON arrays"
+            )
         label = SemanticEvalCase(
             case_id=case_id,
             category=row["category"],
             expected_source_ids=tuple(expected_ids),
             forbidden_source_ids=tuple(forbidden_ids),
+            privacy_classes=tuple(privacy_classes),
             expected_abstain=row["expected_abstain"],
         )
         chat_id = row["chat_id"]
@@ -164,6 +173,7 @@ def load_private_cases(path: Path, *, smoke: bool) -> tuple[PrivateEvalCase, ...
             "privacy_governance",
         }:
             raise ValueError("frozen private evaluation requires all five categories")
+        validate_privacy_class_coverage(tuple(case.label for case in cases))
     return tuple(cases)
 
 
@@ -208,6 +218,7 @@ def _sanitized_case_row(case: PrivateEvalCase) -> dict[str, Any]:
         "category": case.label.category,
         "expected_source_ids": list(case.label.expected_source_ids),
         "forbidden_source_ids": list(case.label.forbidden_source_ids),
+        "privacy_classes": list(case.label.privacy_classes),
         "expected_abstain": case.label.expected_abstain,
     }
 
@@ -277,6 +288,7 @@ async def _run_case(case: PrivateEvalCase) -> dict[str, Any]:
                 max_evidence_items=SEMANTIC_EVIDENCE_LIMIT,
                 durable_placeholder=True,
                 revalidate_after_provider=True,
+                cache_enabled=False,
             )
             if isinstance(synth_result, AnswerWithCitations):
                 rendered_bundle = await filter_surviving_evidence(

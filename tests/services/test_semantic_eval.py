@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from bot.services.semantic_eval import (
+    REQUIRED_PRIVACY_CLASSES,
     SemanticEvalCase,
     SemanticEvalResult,
     evaluate_semantic_run,
@@ -25,6 +26,7 @@ def _case(
     expected: tuple[str, ...],
     *,
     forbidden: tuple[str, ...] = (),
+    privacy_classes: tuple[str, ...] = (),
     abstain: bool = False,
 ) -> SemanticEvalCase:
     return SemanticEvalCase(
@@ -32,6 +34,7 @@ def _case(
         category=category,  # type: ignore[arg-type]
         expected_source_ids=expected,
         forbidden_source_ids=forbidden,
+        privacy_classes=privacy_classes,  # type: ignore[arg-type]
         expected_abstain=abstain,
     )
 
@@ -79,6 +82,7 @@ def _passing_run() -> tuple[list[SemanticEvalCase], list[SemanticEvalResult]]:
             "privacy_governance",
             (_message(30),),
             forbidden=(_message(999),),
+            privacy_classes=tuple(sorted(REQUIRED_PRIVACY_CLASSES)),
         ),
     ]
     results = [
@@ -99,6 +103,7 @@ def test_passing_report_has_every_category_and_separate_privacy_abstentions() ->
             "privacy_governance",
             (),
             forbidden=(_message(998),),
+            privacy_classes=("redacted",),
             abstain=True,
         )
     )
@@ -138,7 +143,14 @@ def test_privacy_leakage_is_computed_and_review_count_must_match() -> None:
 
 def test_privacy_expected_abstention_failure_is_blocking_but_not_no_answer_metric() -> None:
     cases, results = _passing_run()
-    cases[-1] = _case("privacy", "privacy_governance", (), forbidden=(_message(999),), abstain=True)
+    cases[-1] = _case(
+        "privacy",
+        "privacy_governance",
+        (),
+        forbidden=(_message(999),),
+        privacy_classes=tuple(sorted(REQUIRED_PRIVACY_CLASSES)),
+        abstain=True,
+    )
     results[-1] = _result("privacy", hybrid=(_message(30),))
 
     report, violations = evaluate_semantic_run(cases, results)
@@ -185,6 +197,7 @@ def test_source_ids_are_canonical_strings(source_id: str, valid: bool) -> None:
         "category": "semantic",
         "expected_source_ids": (source_id,),
         "forbidden_source_ids": (),
+        "privacy_classes": (),
         "expected_abstain": False,
     }
     if valid:
@@ -203,6 +216,7 @@ def test_source_ids_are_canonical_strings(source_id: str, valid: bool) -> None:
                 "category": "privacy_governance",
                 "expected_source_ids": (),
                 "forbidden_source_ids": (),
+                "privacy_classes": ("cross_chat",),
                 "expected_abstain": True,
             },
             "forbidden",
@@ -213,6 +227,7 @@ def test_source_ids_are_canonical_strings(source_id: str, valid: bool) -> None:
                 "category": "exact",
                 "expected_source_ids": (_message(1),),
                 "forbidden_source_ids": (_message(2),),
+                "privacy_classes": (),
                 "expected_abstain": False,
             },
             "only privacy",
@@ -223,6 +238,7 @@ def test_source_ids_are_canonical_strings(source_id: str, valid: bool) -> None:
                 "category": "privacy_governance",
                 "expected_source_ids": (_message(1),),
                 "forbidden_source_ids": (_message(1),),
+                "privacy_classes": ("cross_chat",),
                 "expected_abstain": False,
             },
             "disjoint",
@@ -246,6 +262,36 @@ def test_result_and_run_validation_fail_closed() -> None:
         _result("x", retrieval=float("nan"))
 
 
+def test_privacy_class_schema_and_frozen_coverage_fail_closed() -> None:
+    with pytest.raises(ValueError, match="privacy_classes"):
+        _case(
+            "privacy",
+            "privacy_governance",
+            (_message(1),),
+            forbidden=(_message(2),),
+        )
+    with pytest.raises(ValueError, match="only privacy"):
+        _case(
+            "semantic",
+            "semantic",
+            (_message(1),),
+            privacy_classes=("cross_chat",),
+        )
+    with pytest.raises(ValueError, match="unsupported governance"):
+        _case(
+            "privacy",
+            "privacy_governance",
+            (_message(1),),
+            forbidden=(_message(2),),
+            privacy_classes=("unknown",),
+        )
+
+    cases, results = _passing_run()
+    cases[-1] = replace(cases[-1], privacy_classes=("cross_chat",))
+    with pytest.raises(ValueError, match="missing=.*bot_authored"):
+        evaluate_semantic_run(cases, results)
+
+
 def test_sanitized_report_validator_rejects_impossible_metrics() -> None:
     cases, results = _passing_run()
     report, _ = evaluate_semantic_run(cases, results)
@@ -255,6 +301,12 @@ def test_sanitized_report_validator_rejects_impossible_metrics() -> None:
 
     assert any("outside [0,1]" in value for value in violations)
     assert "unsupported_claims > total_claims" in violations
+
+    incomplete_privacy = replace(report, privacy_classes=("cross_chat",))
+    assert (
+        "privacy_classes do not cover every required governance class"
+        in validate_semantic_report(incomplete_privacy)
+    )
 
 
 def test_sanitized_report_validator_rejects_unexpected_abstention_overflow() -> None:

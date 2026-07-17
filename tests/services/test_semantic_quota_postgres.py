@@ -259,6 +259,7 @@ async def test_next_admission_releases_stale_crashed_reservation(db_session) -> 
         status="reserved",
         outcome=None,
         reserved_at=now - timedelta(minutes=16),
+        progress_at=now - timedelta(minutes=16),
     )
     db_session.add(stale)
     await db_session.flush()
@@ -277,6 +278,13 @@ async def test_next_admission_releases_stale_crashed_reservation(db_session) -> 
     await db_session.refresh(stale)
     assert stale.status == "released"
     assert stale.outcome == "technical_failure"
+    # A late worker observes the reconciler's identical terminal state as an
+    # idempotent success instead of crashing after paid work.
+    await SemanticQuotaRepo.finalize(
+        db_session,
+        attempt_id=stale.id,
+        outcome="technical_failure",
+    )
 
 
 @pytest.mark.asyncio
@@ -292,6 +300,7 @@ async def test_stale_delivery_intent_is_consumed_not_released(db_session) -> Non
         status="reserved",
         outcome="answered",
         reserved_at=now - timedelta(minutes=16),
+        progress_at=now - timedelta(minutes=16),
         delivery_started_at=now - timedelta(minutes=15, seconds=30),
     )
     db_session.add(stale)
@@ -312,3 +321,114 @@ async def test_stale_delivery_intent_is_consumed_not_released(db_session) -> Non
     assert stale.finalized_at == now
     assert replacement.allowed is True
     assert replacement.used == 1
+
+
+@pytest.mark.asyncio
+async def test_prior_day_stale_idempotent_replay_is_released(db_session) -> None:
+    now = datetime(2026, 7, 16, 12, tzinfo=timezone.utc)
+    stale = SemanticQaAttempt(
+        idempotency_key="prior-day-stale:crashed",
+        user_tg_id=8_040_400_007,
+        chat_id=-100404,
+        source_chat_message_id=None,
+        local_day=(now - timedelta(days=1)).date(),
+        slot_number=1,
+        status="reserved",
+        outcome=None,
+        reserved_at=now - timedelta(days=1),
+        progress_at=now - timedelta(days=1),
+    )
+    db_session.add(stale)
+    await db_session.flush()
+
+    replay = await SemanticQuotaRepo.reserve(
+        db_session,
+        idempotency_key=stale.idempotency_key,
+        user_tg_id=stale.user_tg_id,
+        chat_id=stale.chat_id,
+        source_chat_message_id=None,
+        now=now,
+    )
+
+    await db_session.refresh(stale)
+    assert replay.allowed is False
+    assert replay.replayed is True
+    assert replay.status == "released"
+    assert replay.outcome == "technical_failure"
+    assert replay.used == 0
+    assert stale.status == "released"
+    assert stale.finalized_at == now
+
+
+@pytest.mark.asyncio
+async def test_prior_day_stale_delivery_replay_is_conservatively_consumed(db_session) -> None:
+    now = datetime(2026, 7, 16, 12, tzinfo=timezone.utc)
+    stale = SemanticQaAttempt(
+        idempotency_key="prior-day-stale:delivery-started",
+        user_tg_id=8_040_400_008,
+        chat_id=-100404,
+        source_chat_message_id=None,
+        local_day=(now - timedelta(days=1)).date(),
+        slot_number=1,
+        status="reserved",
+        outcome="answered",
+        reserved_at=now - timedelta(days=1),
+        progress_at=now - timedelta(days=1),
+        delivery_started_at=now - timedelta(hours=23, minutes=59),
+    )
+    db_session.add(stale)
+    await db_session.flush()
+
+    replay = await SemanticQuotaRepo.reserve(
+        db_session,
+        idempotency_key=stale.idempotency_key,
+        user_tg_id=stale.user_tg_id,
+        chat_id=stale.chat_id,
+        source_chat_message_id=None,
+        now=now,
+    )
+
+    await db_session.refresh(stale)
+    assert replay.allowed is False
+    assert replay.replayed is True
+    assert replay.status == "consumed"
+    assert replay.outcome == "answered"
+    assert replay.used == 0
+    assert stale.status == "consumed"
+    assert stale.finalized_at == now
+
+
+@pytest.mark.asyncio
+async def test_recent_progress_prevents_old_live_reservation_from_reconciliation(
+    db_session,
+) -> None:
+    now = datetime(2026, 7, 16, 12, tzinfo=timezone.utc)
+    live = SemanticQaAttempt(
+        idempotency_key="stale:live-progress",
+        user_tg_id=8_040_400_009,
+        chat_id=-100404,
+        source_chat_message_id=None,
+        local_day=now.date(),
+        slot_number=1,
+        status="reserved",
+        outcome=None,
+        reserved_at=now - timedelta(hours=1),
+        progress_at=now - timedelta(seconds=30),
+    )
+    db_session.add(live)
+    await db_session.flush()
+
+    replacement = await SemanticQuotaRepo.reserve(
+        db_session,
+        idempotency_key="stale:live-progress-replacement",
+        user_tg_id=live.user_tg_id,
+        chat_id=live.chat_id,
+        source_chat_message_id=None,
+        now=now,
+    )
+
+    await db_session.refresh(live)
+    assert live.status == "reserved"
+    assert replacement.allowed is True
+    assert replacement.used == 1
+    assert replacement.attempt_id != live.id

@@ -24,13 +24,14 @@ from bot.services.semantic_eval import (
     SemanticEvalReport,
     SemanticEvalResult,
     evaluate_semantic_run,
+    validate_privacy_class_coverage,
     validate_semantic_report,
 )
 
 
 MIN_FROZEN_CASES = 50
-REPORT_SCHEMA_VERSION = 3
-OBSERVATIONS_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 4
+OBSERVATIONS_SCHEMA_VERSION = 3
 REVIEWED_RESULTS_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _RELEASE_SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -93,25 +94,33 @@ def _load_cases(path: Path) -> tuple[SemanticEvalCase, ...]:
         "category",
         "expected_source_ids",
         "forbidden_source_ids",
+        "privacy_classes",
         "expected_abstain",
     }
     for value in _load_jsonl(path):
         _exact_fields(value, expected, kind="case")
         source_ids = value["expected_source_ids"]
         forbidden_ids = value["forbidden_source_ids"]
-        if not isinstance(source_ids, list) or not isinstance(forbidden_ids, list):
-            raise ValueError("case source ids must be JSON arrays")
+        privacy_classes = value["privacy_classes"]
+        if (
+            not isinstance(source_ids, list)
+            or not isinstance(forbidden_ids, list)
+            or not isinstance(privacy_classes, list)
+        ):
+            raise ValueError("case source ids and privacy classes must be JSON arrays")
         cases.append(
             SemanticEvalCase(
                 case_id=value["case_id"],
                 category=value["category"],
                 expected_source_ids=tuple(source_ids),
                 forbidden_source_ids=tuple(forbidden_ids),
+                privacy_classes=tuple(privacy_classes),
                 expected_abstain=value["expected_abstain"],
             )
         )
     if len(cases) < MIN_FROZEN_CASES:
         raise ValueError(f"frozen evaluation requires at least {MIN_FROZEN_CASES} cases")
+    validate_privacy_class_coverage(cases)
     return tuple(cases)
 
 
@@ -125,6 +134,7 @@ def _validate_cases_match_dataset(dataset_path: Path, cases: tuple[SemanticEvalC
         "query",
         "expected_source_ids",
         "forbidden_source_ids",
+        "privacy_classes",
         "expected_abstain",
         "exclude_chat_message_id",
     }
@@ -133,14 +143,20 @@ def _validate_cases_match_dataset(dataset_path: Path, cases: tuple[SemanticEvalC
         _exact_fields(value, dataset_fields, kind="dataset")
         expected_ids = value["expected_source_ids"]
         forbidden_ids = value["forbidden_source_ids"]
-        if not isinstance(expected_ids, list) or not isinstance(forbidden_ids, list):
-            raise ValueError("dataset source ids must be JSON arrays")
+        privacy_classes = value["privacy_classes"]
+        if (
+            not isinstance(expected_ids, list)
+            or not isinstance(forbidden_ids, list)
+            or not isinstance(privacy_classes, list)
+        ):
+            raise ValueError("dataset source ids and privacy classes must be JSON arrays")
         projected.append(
             SemanticEvalCase(
                 case_id=value["case_id"],
                 category=value["category"],
                 expected_source_ids=tuple(expected_ids),
                 forbidden_source_ids=tuple(forbidden_ids),
+                privacy_classes=tuple(privacy_classes),
                 expected_abstain=value["expected_abstain"],
             )
         )
@@ -353,8 +369,15 @@ def _parse_report_metrics(value: object) -> SemanticEvalReport:
     expected = {field.name for field in fields(SemanticEvalReport)}
     if set(value) != expected:
         raise ValueError("report metric fields do not match the versioned schema")
-    parsed: dict[str, int | float] = {}
+    parsed: dict[str, int | float | tuple[str, ...]] = {}
     for name, raw in value.items():
+        if name == "privacy_classes":
+            if not isinstance(raw, list) or any(
+                not isinstance(privacy_class, str) for privacy_class in raw
+            ):
+                raise ValueError("report privacy_classes must be a JSON array of strings")
+            parsed[name] = tuple(raw)
+            continue
         if name in _INTEGER_REPORT_FIELDS:
             if type(raw) is not int or raw < 0:
                 raise ValueError("report integer metrics must be non-negative integers")

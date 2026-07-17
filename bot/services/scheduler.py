@@ -393,7 +393,7 @@ async def run_semantic_index_tick() -> None:
 
     try:
         async with async_session() as session:
-            if not await FeatureFlagRepo.get(session, SEMANTIC_QA_FEATURE_FLAG):
+            if not await FeatureFlagRepo.any_enabled(session, SEMANTIC_QA_FEATURE_FLAG):
                 return
             try:
                 report = await backfill_semantic_index(

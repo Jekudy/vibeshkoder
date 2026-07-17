@@ -49,6 +49,7 @@ class SemanticQaResult:
     query_redacted: bool
     embedding_llm_call_id: int
     embedding_cost_usd: Decimal
+    embedding_model: str
     retrieval: HybridSearchResult
 
 
@@ -121,30 +122,6 @@ async def run_semantic_qa(
             exclude_chat_message_id=exclude_chat_message_id,
         )
         bundle = EvidenceBundle.from_hits(query, chat_id, list(retrieval.hits))
-        await QaTraceRepo.update_retrieval_fields(
-            session,
-            qa_trace_id=qa_trace_id,
-            evidence_ids=_semantic_evidence_provenance_ids(bundle),
-            abstained=bundle.abstained,
-        )
-        trace = SemanticRetrievalTrace(
-            attempt_id=attempt_id,
-            qa_trace_id=qa_trace_id,
-            query_hash=hashlib.sha256(query.encode("utf-8")).hexdigest(),
-            embedding_model=config.model,
-            retrieval_mode="hybrid",
-            candidate_ranks=retrieval.candidate_ranks,
-            result_source_ids=[
-                f"{item.source_type}:{item.card_id if item.source_type == 'card' else item.message_version_id}"
-                for item in retrieval.hits
-            ],
-            fts_latency_ms=retrieval.fts_latency_ms,
-            vector_latency_ms=retrieval.vector_latency_ms,
-            fusion_latency_ms=retrieval.fusion_latency_ms,
-            total_latency_ms=retrieval.total_latency_ms,
-        )
-        session.add(trace)
-        await session.flush()
     except SQLAlchemyError as exc:
         logger.error(
             "semantic_qa_retrieval_failed",
@@ -161,8 +138,57 @@ async def run_semantic_qa(
         query_redacted=redact_query_in_audit,
         embedding_llm_call_id=embedding.llm_usage_ledger_id,
         embedding_cost_usd=embedding.cost_usd,
+        embedding_model=config.model,
         retrieval=retrieval,
     )
+
+
+def _semantic_source_key(item) -> str:
+    return (
+        f"card:{item.card_id}"
+        if item.source_type == "card"
+        else f"message:{item.message_version_id}"
+    )
+
+
+async def persist_semantic_retrieval_trace(
+    session: AsyncSession,
+    *,
+    result: SemanticQaResult,
+    query: str,
+    attempt_id: int,
+    qa_trace_id: int,
+) -> SemanticRetrievalTrace:
+    """Persist only the governed final-result ranks under the caller's union fence."""
+
+    result_source_ids = [_semantic_source_key(item) for item in result.bundle.items]
+    selected_ranks = {
+        source_id: result.retrieval.candidate_ranks[source_id]
+        for source_id in result_source_ids
+        if source_id in result.retrieval.candidate_ranks
+    }
+    await QaTraceRepo.update_retrieval_fields(
+        session,
+        qa_trace_id=qa_trace_id,
+        evidence_ids=_semantic_evidence_provenance_ids(result.bundle),
+        abstained=result.bundle.abstained,
+    )
+    trace = SemanticRetrievalTrace(
+        attempt_id=attempt_id,
+        qa_trace_id=qa_trace_id,
+        query_hash=hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        embedding_model=result.embedding_model,
+        retrieval_mode="hybrid",
+        candidate_ranks=selected_ranks,
+        result_source_ids=result_source_ids,
+        fts_latency_ms=result.retrieval.fts_latency_ms,
+        vector_latency_ms=result.retrieval.vector_latency_ms,
+        fusion_latency_ms=result.retrieval.fusion_latency_ms,
+        total_latency_ms=result.retrieval.total_latency_ms,
+    )
+    session.add(trace)
+    await session.flush()
+    return trace
 
 
 __all__ = [
@@ -171,4 +197,5 @@ __all__ = [
     "SemanticRetrievalError",
     "run_qa",
     "run_semantic_qa",
+    "persist_semantic_retrieval_trace",
 ]

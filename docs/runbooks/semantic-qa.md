@@ -302,10 +302,15 @@ fi
 `no_answer`, `privacy_governance`. У privacy cases отдельно перечислить
 `forbidden_source_ids`; runner вычисляет leakage как пересечение с реально
 возвращёнными canonical keys, поэтому reviewer не может обнулить leakage.
+Blocking-набор обязан покрывать все классы `cross_chat`, `bot_authored`,
+`forgotten`, `redacted`, `non_normal` и отдельный governance-инвариант
+`stale_version` до первого provider-вызова.
 
 Private input JSONL содержит `case_id`, `category`, `chat_id`, `query`,
-`expected_source_ids`, `forbidden_source_ids`, `expected_abstain` и
-`exclude_chat_message_id`. Source keys имеют только формы
+`expected_source_ids`, `forbidden_source_ids`, `privacy_classes`,
+`expected_abstain` и `exclude_chat_message_id`. Для non-privacy cases
+`privacy_classes=[]`; для каждого `privacy_governance` case список непустой и
+содержит только перечисленные выше значения. Source keys имеют только формы
 `message:<positive-id>` и `card:<canonical-lowercase-uuid>`. Запускать на exact
 release commit через живые OpenAI embedding → hybrid retrieval → DeepSeek V4
 Flash synthesis. Runner не резервирует пользовательскую quota, но каждый
@@ -327,7 +332,8 @@ python -m scripts.run_semantic_qa_eval \
 CI или копировать в issue. Reviewer заполняет только link/claim annotations в
 `reviewed_result`. Runner-issued `semantic-eval-observations.jsonl` содержит
 только immutable objective fields (FTS/hybrid IDs, abstention, leakage и
-latency), не содержит raw text и после запуска не редактируется. После review
+latency), имеет `schema_version=3`, не содержит raw text и после запуска не
+редактируется. После review
 создать `semantic-eval-results.jsonl`: header с `record_type=header`,
 `schema_version=1`, `contains_raw_text=false`, exact `release_sha`,
 `dataset_sha256`, SHA-256 observations-файла в `observations_sha256` и
@@ -349,8 +355,9 @@ python -m scripts.evaluate_semantic_qa evaluate \
 ```
 
 Успех — exit code `0`, `status=pass`, `case_count >= 50` и пустой
-`violations`. Exit code `1` означает blocking gate; `2` — невалидный или
-неполный input. Report mode `0600`, `contains_raw_text=false`.
+`violations`. Sanitized report имеет `schema_version=4` и полный безопасный
+список `report.privacy_classes`. Exit code `1` означает blocking gate; `2` —
+невалидный или неполный input. Report mode `0600`, `contains_raw_text=false`.
 
 Передать exact sanitized report как repository secret и запустить manual-only
 workflow на том же commit (daily schedule намеренно отсутствует):
@@ -499,6 +506,21 @@ SELECT count(*) AS denied_with_provider_call
 FROM semantic_qa_attempts
 WHERE status='denied'
   AND (embedding_llm_call_id IS NOT NULL OR synthesis_llm_call_id IS NOT NULL);
+```
+
+`progress_at` — fail-closed lease активной попытки. Handler обновляет его при
+trace binding, после embedding и перед каждой потенциально долгой
+question+evidence фазой. Только `reserved` без прогресса более 15 минут можно
+считать crash residue; свежий `progress_at` запрещает admission-reconciler
+освобождать живую попытку:
+
+```sql
+SELECT id, user_tg_id, local_day, reserved_at, progress_at,
+       qa_trace_id, embedding_llm_call_id, synthesis_llm_call_id
+FROM semantic_qa_attempts
+WHERE status='reserved'
+  AND progress_at < now() - interval '15 minutes'
+ORDER BY progress_at, id;
 ```
 
 Ожидается `0`. Embedding и synthesis usage/cost:

@@ -501,35 +501,38 @@ _CONVERSATION_ROOTS_SQL = text(
     ), chain AS (
         SELECT requested.origin_message_id,
                message.message_id AS current_message_id,
-               message.reply_to_message_id,
-               ARRAY[message.message_id]::BIGINT[] AS path,
-               0 AS depth
+               message.reply_to_message_id
         FROM requested
         JOIN chat_messages message
           ON message.chat_id = :chat_id
          AND message.message_id = requested.origin_message_id
-        UNION ALL
+        UNION
         SELECT chain.origin_message_id,
                parent.message_id,
-               parent.reply_to_message_id,
-               chain.path || parent.message_id,
-               chain.depth + 1
+               parent.reply_to_message_id
         FROM chain
         JOIN chat_messages parent
           ON parent.chat_id = :chat_id
          AND parent.message_id = chain.reply_to_message_id
-        WHERE chain.depth < 64
-          AND NOT parent.message_id = ANY(chain.path)
     )
-    SELECT DISTINCT ON (origin_message_id)
+    SELECT
            origin_message_id,
-           CASE
-               WHEN reply_to_message_id IS NULL OR reply_to_message_id = ANY(path)
-               THEN current_message_id
-               ELSE reply_to_message_id
-           END AS root_message_id
+           COALESCE(
+               MIN(
+                   CASE
+                       WHEN reply_to_message_id IS NULL THEN current_message_id
+                       WHEN NOT EXISTS (
+                           SELECT 1
+                           FROM chat_messages missing_parent
+                           WHERE missing_parent.chat_id = :chat_id
+                             AND missing_parent.message_id = chain.reply_to_message_id
+                       ) THEN reply_to_message_id
+                   END
+               ),
+               MIN(current_message_id)
+           ) AS root_message_id
     FROM chain
-    ORDER BY origin_message_id, depth DESC
+    GROUP BY origin_message_id
     """
 )
 

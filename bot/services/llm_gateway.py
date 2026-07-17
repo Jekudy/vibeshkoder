@@ -628,6 +628,7 @@ async def synthesize_answer(
     max_evidence_items: int = MAX_QA_EVIDENCE_ITEMS,
     durable_placeholder: bool = False,
     revalidate_after_provider: bool = False,
+    cache_enabled: bool = True,
 ) -> SynthesisResult:
     """Single Phase 5 LLM entry point.
 
@@ -664,6 +665,9 @@ async def synthesize_answer(
     provider:
         ``LLMProvider`` Protocol implementation (Anthropic by default,
         OpenAI fallback via ``config.provider``). Tests inject fakes.
+    cache_enabled:
+        Disable answer-cache reads and writes for erase-sensitive flows whose
+        source question is not part of the citation provenance.
 
     Returns
     -------
@@ -802,7 +806,11 @@ async def synthesize_answer(
         # message_version_id therefore cannot reuse a stale answer.
         prompt_template_version=f"{config.prompt_template_version}:{prompt_hash}",
     )
-    cached = await cache_repo.get_or_none(session, input_hash=cache_input_hash)
+    cached = (
+        await cache_repo.get_or_none(session, input_hash=cache_input_hash)
+        if cache_enabled
+        else None
+    )
     if cached is not None:
         if _contains_sensitive_qa_output(cached.answer_text):
             return await _reject_sensitive_cache(cached, prompt_hash=prompt_hash)
@@ -868,7 +876,11 @@ async def synthesize_answer(
     try:
         await session.execute(lock_sql, {"lock_id": LLM_BUDGET_LOCK_ID})
         # (a) re-check cache under the lock.
-        cached_under_lock = await cache_repo.get_or_none(session, input_hash=cache_input_hash)
+        cached_under_lock = (
+            await cache_repo.get_or_none(session, input_hash=cache_input_hash)
+            if cache_enabled
+            else None
+        )
         if cached_under_lock is not None:
             if _contains_sensitive_qa_output(cached_under_lock.answer_text):
                 early_result = await _reject_sensitive_cache(
@@ -1177,6 +1189,27 @@ async def synthesize_answer(
     # Success — persist cache row (with surviving_ids in citation_ids JSONB,
     # NOT the pre-filter bundle.evidence_ids) + UPDATE placeholder + return.
     cost_usd = provider_result_cost
+    if not cache_enabled:
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=cost_usd,
+            response_hash=_response_hash(answer_text),
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=request_id,
+            latency_ms=latency,
+            error=None,
+        )
+        return AnswerWithCitations(
+            answer_text=answer_text,
+            citation_ids=provider_result.citation_ids,
+            cost_usd=cost_usd,
+            cache_hit=False,
+            llm_call_id=placeholder_row.id,
+            surviving_evidence_ids=ordered_surviving_ids,
+        )
     # F4-RACE-FIX (Codex round-2 HIGH-2): cache store may race with a
     # concurrent winner that also dispatched between unlock and store. The
     # ``input_hash`` UNIQUE constraint catches the duplicate; we treat it as

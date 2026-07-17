@@ -1542,6 +1542,44 @@ async def test_cache_miss_calls_provider_and_stores() -> None:
     assert ledger.rows[-1].cache_hit is False
 
 
+@pytest.mark.asyncio
+async def test_cache_disabled_ignores_existing_row_and_does_not_store() -> None:
+    bundle = _make_bundle((100,))
+    ledger = FakeLedgerRepo()
+    cache = FakeCacheRepo()
+    provider = FakeProvider(answer_text="fresh", citation_ids=(100,))
+    session = FakeSession(
+        query_results=[
+            [{"message_version_id": 100}],
+            [],
+        ]
+    )
+    await cache.store(
+        session,
+        input_hash="unrelated-seed",
+        answer_text="cached",
+        citation_ids=[100],
+        model=_config().model,
+    )
+
+    result = await synthesize_answer(
+        session,  # type: ignore[arg-type]
+        bundle=bundle,
+        query="q",
+        config=_config(),
+        qa_trace_id=11,
+        ledger_repo=ledger,
+        cache_repo=cache,
+        provider=provider,
+        cache_enabled=False,
+    )
+
+    assert isinstance(result, AnswerWithCitations)
+    assert result.answer_text == "fresh"
+    assert len(provider.calls) == 1
+    assert list(cache.rows) == ["unrelated-seed"]
+
+
 # ─── Tests: invariant 5 — budget guard ──────────────────────────────────────
 
 

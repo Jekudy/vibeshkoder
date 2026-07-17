@@ -51,6 +51,14 @@ is_allowed_path() {
   # policy and must name the canonical privacy literals in docstrings.
   [[ "$path" =~ ^alembic/versions/05[0-9]_.*\.py$ ]] && return 0
 
+  # Issue #404 semantic Q&A evaluation code and tests enumerate the mandatory
+  # leakage classes by their canonical names. Keep these entries path-exact:
+  # adjacent runtime code remains subject to the privacy-token lint.
+  [[ "$path" == "bot/services/semantic_eval.py" ]] && return 0
+  [[ "$path" == "tests/services/test_semantic_eval.py" ]] && return 0
+  [[ "$path" == "tests/scripts/test_evaluate_semantic_qa.py" ]] && return 0
+  [[ "$path" == "tests/scripts/test_run_semantic_qa_eval.py" ]] && return 0
+
   return 1
 }
 

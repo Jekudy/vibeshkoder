@@ -2275,3 +2275,42 @@ async def test_nested_replies_share_resolved_root_for_diversity(db_session) -> N
     assert {hit.conversation_root_message_id for hit in enriched[:4]} == {5000}
     assert sum(hit.conversation_root_message_id == 5000 for hit in selected) == 2
     assert any(hit.message_id == 6000 for hit in selected)
+
+
+@pytest.mark.asyncio
+async def test_deep_adjacent_replies_share_the_actual_conversation_root(db_session) -> None:
+    human = await _user(db_session, user_id=8_044_045_002, is_bot=False)
+    first_message_id = 7000
+    await _message(
+        db_session,
+        user_id=human.id,
+        message_id=first_message_id,
+        text="root",
+    )
+    for message_id in range(first_message_id + 1, first_message_id + 71):
+        await _message(
+            db_session,
+            user_id=human.id,
+            message_id=message_id,
+            text=f"reply-{message_id}",
+            reply_to_message_id=message_id - 1,
+        )
+    origin = first_message_id + 70
+
+    enriched = await _with_conversation_roots(
+        db_session,
+        chat_id=CHAT_ID,
+        hits=[
+            _hit(
+                version_id=message_id,
+                author_id=human.id,
+                reply_to_message_id=message_id - 1,
+            )
+            for message_id in (origin, origin - 1)
+        ],
+    )
+
+    assert [hit.conversation_root_message_id for hit in enriched] == [
+        first_message_id,
+        first_message_id,
+    ]

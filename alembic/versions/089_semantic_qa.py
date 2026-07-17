@@ -262,6 +262,12 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("now()"),
         ),
+        sa.Column(
+            "progress_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
+        ),
         sa.Column("delivery_started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finalized_at", sa.DateTime(timezone=True), nullable=True),
         sa.ForeignKeyConstraint(
