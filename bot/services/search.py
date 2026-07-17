@@ -23,8 +23,7 @@ The default is ``include_cards=True`` per PHASE6_PLAN.md §5.D; passing
 ``include_cards=False`` preserves Phase 4 behaviour byte-for-byte (literal
 copy of the Phase 4 SQL, no UNION).
 
-``SearchHit`` gains three defaulted fields (``source_type`` /
-``card_id`` / ``card_source_message_version_ids``) so existing callers
+``SearchHit`` gains reply/thread metadata as defaulted fields so existing callers
 treating hits as message-shape see no breaking change. For card hits the
 ``message_version_id`` / ``chat_message_id`` / ``chat_id`` / ``message_id``
 columns point at the anchor source (lowest-position ``card_sources`` row)
@@ -72,6 +71,9 @@ class SearchHit:
     source_type: Literal["message", "card"] = "message"
     card_id: uuid.UUID | None = None
     card_source_message_version_ids: tuple[int, ...] = field(default_factory=tuple)
+    message_thread_id: int | None = None
+    reply_to_message_id: int | None = None
+    conversation_root_message_id: int | None = None
 
 
 # ─── Phase 4 SQL — preserved verbatim for ``include_cards=False`` callers ────
@@ -237,6 +239,8 @@ message_hits AS (
         ) AS rank,
         mv.captured_at AS captured_at,
         c.date AS message_date,
+        c.message_thread_id AS message_thread_id,
+        c.reply_to_message_id AS reply_to_message_id,
         'message'::text AS source_type,
         NULL::uuid AS card_id,
         ARRAY[]::int[] AS card_source_message_version_ids
@@ -244,9 +248,21 @@ message_hits AS (
     JOIN chat_messages AS c
         ON c.id = mv.chat_message_id
         AND c.current_version_id = mv.id
+    LEFT JOIN users AS author ON author.id = c.user_id
     LEFT JOIN message_media AS mm ON mm.chat_message_id = c.id
     CROSS JOIN q
     WHERE c.chat_id = :chat_id
+        AND (
+            CAST(:exclude_chat_message_id AS bigint) IS NULL
+            OR c.id <> CAST(:exclude_chat_message_id AS bigint)
+        )
+        AND (
+            CAST(:human_only AS boolean) = FALSE
+            OR (
+                author.is_bot = FALSE
+                AND COALESCE(c.message_kind, 'text') NOT IN ('voice', 'audio')
+            )
+        )
         AND c.memory_policy = 'normal'
         AND c.is_redacted = FALSE
         AND mv.is_redacted = FALSE
@@ -298,6 +314,30 @@ approved_card_hits AS (
     CROSS JOIN q
     WHERE kc.card_status = 'approved'
         AND kc.body_tsv @@ q.tsq
+        AND NOT EXISTS (
+            SELECT 1
+            FROM card_sources cs_excluded
+            JOIN message_versions mv_excluded ON mv_excluded.id = cs_excluded.message_version_id
+            JOIN chat_messages c_excluded ON c_excluded.id = mv_excluded.chat_message_id
+            WHERE cs_excluded.card_id = kc.id
+                AND CAST(:exclude_chat_message_id AS bigint) IS NOT NULL
+                AND c_excluded.id = CAST(:exclude_chat_message_id AS bigint)
+        )
+        AND (
+            CAST(:human_only AS boolean) = FALSE
+            OR NOT EXISTS (
+                SELECT 1
+                FROM card_sources cs_bot
+                JOIN message_versions mv_bot ON mv_bot.id = cs_bot.message_version_id
+                JOIN chat_messages c_bot ON c_bot.id = mv_bot.chat_message_id
+                LEFT JOIN users author_bot ON author_bot.id = c_bot.user_id
+                WHERE cs_bot.card_id = kc.id
+                    AND (
+                        author_bot.is_bot IS DISTINCT FROM FALSE
+                        OR COALESCE(c_bot.message_kind, 'text') IN ('voice', 'audio')
+                    )
+            )
+        )
         AND EXISTS (
             -- A searchable card must be owned by the requested chat.
             SELECT 1
@@ -389,9 +429,21 @@ unforgotten_card_sources AS (
     FROM card_sources cs
     JOIN message_versions mv ON mv.id = cs.message_version_id
     JOIN chat_messages c ON c.id = mv.chat_message_id
+    LEFT JOIN users author ON author.id = c.user_id
     WHERE cs.card_id IN (SELECT card_id FROM approved_card_hits)
         AND c.chat_id = :chat_id
         AND c.current_version_id = mv.id
+        AND (
+            CAST(:exclude_chat_message_id AS bigint) IS NULL
+            OR c.id <> CAST(:exclude_chat_message_id AS bigint)
+        )
+        AND (
+            CAST(:human_only AS boolean) = FALSE
+            OR (
+                author.is_bot = FALSE
+                AND COALESCE(c.message_kind, 'text') NOT IN ('voice', 'audio')
+            )
+        )
         AND NOT EXISTS (
             SELECT 1
             FROM forget_events AS fe
@@ -418,6 +470,8 @@ card_anchors AS (
         c.id AS chat_message_id,
         c.chat_id AS chat_id,
         c.message_id AS message_id,
+        c.message_thread_id AS message_thread_id,
+        c.reply_to_message_id AS reply_to_message_id,
         c.date AS source_message_date
     FROM unforgotten_card_sources ucs
     JOIN message_versions mv ON mv.id = ucs.message_version_id
@@ -444,6 +498,8 @@ card_hits AS (
         ach.rank * :card_rank_boost AS rank,
         ach.approved_at AS captured_at,
         COALESCE(ach.approved_at, ca.source_message_date) AS message_date,
+        ca.message_thread_id AS message_thread_id,
+        ca.reply_to_message_id AS reply_to_message_id,
         'card'::text AS source_type,
         ach.card_id AS card_id,
         csl.mvids AS card_source_message_version_ids
@@ -470,6 +526,8 @@ async def search_messages(
     limit: int = 3,
     headline_max_words: int = 35,
     include_cards: bool = True,
+    exclude_chat_message_id: int | None = None,
+    human_only: bool = False,
 ) -> list[SearchHit]:
     """Search visible message versions (+ optionally approved cards) in one chat.
 
@@ -506,6 +564,8 @@ async def search_messages(
         raise ValueError("limit must be >= 1")
     if headline_max_words < 1:
         raise ValueError("headline_max_words must be >= 1")
+    if not include_cards and (exclude_chat_message_id is not None or human_only):
+        raise ValueError("semantic search filters require include_cards=True")
     if len(normalized_query) > MAX_QUERY_LENGTH:
         logger.info(
             "search_messages: truncating overlong query",
@@ -574,6 +634,8 @@ async def search_messages(
             "limit": limit,
             "headline_options": headline_options,
             "card_rank_boost": CARD_RANK_BOOST,
+            "exclude_chat_message_id": exclude_chat_message_id,
+            "human_only": human_only,
         },
     )
 
@@ -595,6 +657,8 @@ async def search_messages(
                 source_type=row["source_type"],
                 card_id=row["card_id"],
                 card_source_message_version_ids=mvids_tuple,
+                message_thread_id=row["message_thread_id"],
+                reply_to_message_id=row["reply_to_message_id"],
             )
         )
     return hits

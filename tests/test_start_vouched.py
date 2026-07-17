@@ -52,6 +52,7 @@ def test_start_vouched_status_sends_pending_message(app_env, monkeypatch) -> Non
         username="alice",
         first_name="Alice",
         last_name=None,
+        is_bot=None,
     )
     application_get_active.assert_awaited_once_with(session, 111)
     message.answer.assert_awaited_once_with(texts.VOUCHED_PENDING)

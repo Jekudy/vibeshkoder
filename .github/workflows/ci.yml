@@ -8,13 +8,92 @@ on:
       - master
 
 jobs:
+  postgres-image-smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install migration dependencies
+        run: pip install -e .
+
+      - name: Build production-compatible PostgreSQL image
+        run: docker build --file Dockerfile.postgres --tag shkoder-postgres:ci .
+
+      - name: Verify PostgreSQL and pgvector
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name shkoder-postgres-smoke \
+            --env POSTGRES_USER=vibe \
+            --env POSTGRES_PASSWORD=smoke-only \
+            --env POSTGRES_DB=vibe_gatekeeper \
+            --publish 55432:5432 \
+            shkoder-postgres:ci
+          trap 'docker rm --force shkoder-postgres-smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            if docker exec shkoder-postgres-smoke \
+              pg_isready -h 127.0.0.1 -U vibe -d vibe_gatekeeper >/dev/null; then
+              postgres_ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "${postgres_ready:-false}" = "true"
+          docker exec shkoder-postgres-smoke \
+            psql -U vibe -d vibe_gatekeeper -v ON_ERROR_STOP=1 \
+              -c 'CREATE EXTENSION vector;'
+          vector_version=$(docker exec shkoder-postgres-smoke \
+            psql -U vibe -d vibe_gatekeeper -Atqc \
+              "SELECT extversion FROM pg_extension WHERE extname='vector'")
+          test "$vector_version" = "0.8.2"
+          postgres_major=$(docker exec shkoder-postgres-smoke \
+            psql -U vibe -d vibe_gatekeeper -Atqc \
+              "SELECT current_setting('server_version_num')::integer / 10000")
+          test "$postgres_major" = "15"
+          cosine_distance=$(docker exec shkoder-postgres-smoke \
+            psql -U vibe -d vibe_gatekeeper -Atqc \
+              "SELECT '[1,0,0]'::vector <=> '[1,0,0]'::vector")
+          test "$cosine_distance" = "0"
+
+          export DATABASE_URL=postgresql+asyncpg://vibe:smoke-only@127.0.0.1:55432/vibe_gatekeeper
+          alembic upgrade 089
+          alembic downgrade 088
+          alembic upgrade head
+          test "$(docker exec shkoder-postgres-smoke \
+            psql -U vibe -d vibe_gatekeeper -Atqc \
+              "SELECT version_num FROM alembic_version")" = "089"
+          test "$(docker exec shkoder-postgres-smoke \
+            psql -U vibe -d vibe_gatekeeper -Atqc \
+              "SELECT count(*) FROM information_schema.columns \
+               WHERE table_schema='public' AND table_name='semantic_qa_attempts' \
+                 AND column_name='delivery_started_at'")" = "1"
+          test "$(docker exec shkoder-postgres-smoke \
+            psql -U vibe -d vibe_gatekeeper -Atqc \
+              "SELECT count(*) FROM information_schema.columns \
+               WHERE table_schema='public' AND data_type='jsonb' \
+                 AND (table_name, column_name) IN ( \
+                   ('semantic_index_runs','reason_counts'), \
+                   ('semantic_retrieval_traces','candidate_ranks'), \
+                   ('semantic_retrieval_traces','result_source_ids'))")" = "3"
+          test "$(docker exec shkoder-postgres-smoke \
+            psql -U vibe -d vibe_gatekeeper -Atqc \
+              "SELECT count(*) FROM pg_constraint \
+               WHERE conname IN ('ck_llm_usage_ledger_nonnegative_usage', \
+                                 'ck_semantic_attempts_state') AND convalidated")" = "2"
+
   test:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     services:
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:0.8.2-pg16-bookworm@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
         env:
           POSTGRES_USER: vibe
           POSTGRES_PASSWORD: changeme

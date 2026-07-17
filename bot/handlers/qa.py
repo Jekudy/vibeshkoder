@@ -2,13 +2,25 @@ from __future__ import annotations
 
 import html
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import Router
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramEntityTooLarge,
+    TelegramForbiddenError,
+    TelegramMigrateToChat,
+    TelegramNotFound,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
 from aiogram.filters import CommandObject
 from aiogram.types import Message
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
@@ -17,20 +29,33 @@ from bot.db.repos.feature_flag import FeatureFlagRepo
 from bot.db.repos.llm_synthesis_cache import SynthesisCacheRepo
 from bot.db.repos.llm_usage_ledger import LedgerRepo
 from bot.db.repos.qa_trace import QaTraceRepo
+from bot.db.repos.semantic_quota import SemanticQuotaRepo
 from bot.db.repos.user import UserRepo
 from bot.services.evidence import EvidenceBundle, EvidenceItem
 from bot.services.governance import detect_policy
 from bot.services.llm_gateway import (
     AnswerWithCitations,
+    EmbeddingBudgetExceeded,
     LLMGatewayConfig,
     _safe_qa_provider_error_subtype,
+    filter_surviving_evidence,
+    hold_evidence_delivery_locks,
     load_gateway_config,
     resolve_provider,
     synthesize_answer,
 )
-from bot.services.llm_providers import LLMProvider
+from bot.services.llm_providers import (
+    LLMProvider,
+    ProviderStructuralError,
+    ProviderTransientError,
+)
 from bot.services.message_persistence import persist_message_with_policy
-from bot.services.qa import run_qa
+from bot.services.qa import (
+    SemanticRetrievalError,
+    persist_semantic_retrieval_trace,
+    run_qa,
+    run_semantic_qa,
+)
 from bot.services.qa_guardrails import (
     MAX_AI_ANSWER_CHARS,
     SENSITIVE_QA_REFUSAL,
@@ -48,11 +73,45 @@ router = Router(name="qa")
 
 QA_FEATURE_FLAG = "memory.qa.enabled"
 LLM_SYNTHESIS_FEATURE_FLAG = "memory.qa.llm_synthesis.enabled"
+SEMANTIC_QA_FEATURE_FLAG = "memory.qa.semantic.enabled"
 QA_EVIDENCE_LIMIT = 3
+SEMANTIC_QA_EVIDENCE_LIMIT = 5
+SEMANTIC_SYNTHESIS_PROVIDER = "deepseek"
+SEMANTIC_SYNTHESIS_MODEL = "deepseek-v4-flash"
 
 # The evidence-bearing prompt shipped after the original v1.0.0 cache format.
 # Keep this pin explicit so old ungrounded cache rows can never be reused.
 DEFAULT_PROMPT_TEMPLATE_VERSION = "v1.1.0"
+_MV_CITATION_RE = re.compile(r"\[\[mv:(\d+)\]\]")
+_SEMANTIC_REPLAY_HTML_PREFIX = "semantic-html-v1:"
+_CONTENT_ABSTENTION_REASONS = frozenset(
+    {
+        "empty_bundle",
+        "all_filtered",
+        "forget_invalidated",
+        "sensitive_input",
+        "sensitive_output",
+        "insufficient_evidence",
+    }
+)
+_DEFINITIVE_TELEGRAM_REJECTIONS = (
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramEntityTooLarge,
+    TelegramForbiddenError,
+    TelegramMigrateToChat,
+    TelegramNotFound,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
+
+
+class EvidenceInvalidatedBeforeDelivery(RuntimeError):
+    """Final governed evidence changed before Telegram dispatch."""
+
+
+class SemanticQuestionInvalidated(RuntimeError):
+    """The persisted source question was removed before provider dispatch."""
 
 
 def _short_chat_id(chat_id: int) -> str:
@@ -293,18 +352,23 @@ def _format_bounded_mention_response(
                 users_by_id.get(item.user_id) if item.user_id is not None else None
             )
         )
-        for item in bundle.items[:QA_EVIDENCE_LIMIT]
+        for item in bundle.items[:SEMANTIC_QA_EVIDENCE_LIMIT]
     ):
         return SENSITIVE_QA_REFUSAL
 
     source_lines: list[str] = []
-    for idx, item in enumerate(bundle.items[:QA_EVIDENCE_LIMIT], start=1):
+    short_chat_id = _short_chat_id(bundle.chat_id)
+    for idx, item in enumerate(bundle.items[:SEMANTIC_QA_EVIDENCE_LIMIT], start=1):
         date_text = item.message_date.astimezone().strftime("%Y-%m-%d")
         author = _compact_author(
             users_by_id.get(item.user_id) if item.user_id is not None else None
         )
         snippet = _escaped_text_with_budget(item.snippet, 120)
-        source_lines.append(f"[{idx}] {date_text} — {author}: {snippet}")
+        link = f"https://t.me/c/{short_chat_id}/{item.message_id}"
+        source_lines.append(
+            f'[{idx}] <a href="{html.escape(link, quote=True)}">источник</a> · '
+            f"{date_text} — {author}: {snippet}"
+        )
 
     # ponytail: a fixed three-source footer avoids an HTML-aware truncator;
     # add one only if Telegram formatting grows beyond this known-safe shape.
@@ -312,12 +376,12 @@ def _format_bounded_mention_response(
     separator = "\n\n" if answer_text else ""
     answer_budget = MAX_AI_ANSWER_CHARS - len(separator) - len(footer)
     if answer_budget < 1:
-        # Defensive fallback for future footer changes.  Evidence identifiers
-        # remain visible while untrusted snippets are omitted.
+        # Keep citations useful even with five worst-case sources.  Snippets
+        # and authors are optional, clickable provenance is not.
         source_lines = [
-            f"[{idx}] message_version_id:{item.message_version_id}"
+            f'[{idx}] <a href="https://t.me/c/{short_chat_id}/{item.message_id}">источник</a>'
             for idx, item in enumerate(
-                bundle.items[:QA_EVIDENCE_LIMIT],
+                bundle.items[:SEMANTIC_QA_EVIDENCE_LIMIT],
                 start=1,
             )
         ]
@@ -331,6 +395,21 @@ def _format_bounded_mention_response(
     if len(rendered) > MAX_AI_ANSWER_CHARS:
         raise ValueError("bounded mention response exceeds configured limit")
     return rendered
+
+
+def _normalize_provider_citations(answer_text: str, bundle: EvidenceBundle) -> str:
+    """Map validated provider mvid markers to deterministic visible source numbers."""
+
+    positions = {item.message_version_id: index for index, item in enumerate(bundle.items, start=1)}
+
+    def replace(match: re.Match[str]) -> str:
+        message_version_id = int(match.group(1))
+        position = positions.get(message_version_id)
+        if position is None:
+            raise ValueError("provider citation is absent from the rendered evidence bundle")
+        return f"[{position}]"
+
+    return _MV_CITATION_RE.sub(replace, answer_text)
 
 
 async def _reply_to_mention(message: Message, text: str, **kwargs: Any) -> None:
@@ -398,6 +477,1212 @@ async def _write_sensitive_trace(
     )
 
 
+async def _bundle_users(
+    session: AsyncSession,
+    bundle: EvidenceBundle,
+) -> tuple[dict[int, object], bool]:
+    users_by_id: dict[int, object] = {}
+    for item in bundle.items:
+        if item.user_id is None or item.user_id in users_by_id:
+            continue
+        author = await UserRepo.get(session, item.user_id)
+        if author is None:
+            continue
+        if contains_secret_like_data(_compact_author_value(author)):
+            return {}, True
+        users_by_id[item.user_id] = author
+    return users_by_id, False
+
+
+async def _ordinary_search_result(
+    session: AsyncSession,
+    *,
+    query: str,
+    chat_id: int,
+    query_redacted: bool,
+    exclude_chat_message_id: int,
+):
+    return await run_qa(
+        session,
+        query=query,
+        chat_id=chat_id,
+        redact_query_in_audit=query_redacted,
+        limit=SEMANTIC_QA_EVIDENCE_LIMIT,
+        exclude_chat_message_id=exclude_chat_message_id,
+        human_only=True,
+    )
+
+
+async def _reply_with_ordinary_search(
+    message: Message,
+    *,
+    bundle: EvidenceBundle,
+    users_by_id: dict[int, object],
+    notice: str,
+) -> None:
+    if bundle.abstained:
+        reply_text = f"{notice}\n\nОбычный поиск тоже не нашёл подходящих свидетельств."
+    else:
+        reply_text = _format_bounded_mention_response(
+            notice,
+            bundle,
+            users_by_id,
+            sources_heading="Обычный поиск — найденные свидетельства:",
+        )
+    await _reply_to_mention(
+        message,
+        reply_text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def _reply_with_governed_ordinary_search(
+    message: Message,
+    session: AsyncSession,
+    *,
+    bundle: EvidenceBundle,
+    notice: str,
+    required_governed_bundle: EvidenceBundle | None = None,
+) -> None:
+    """Revalidate ordinary evidence under the same locks as privacy writers."""
+
+    await session.commit()
+    lock_bundle = _merge_governance_bundles(bundle, required_governed_bundle)
+    async with hold_evidence_delivery_locks(session, lock_bundle):
+        if required_governed_bundle is not None and not await _question_is_governed(
+            session,
+            required_governed_bundle,
+        ):
+            await _reply_to_mention(
+                message,
+                "Этот вопрос уже удалён из памяти; ответ не показывается.",
+            )
+            return
+        if bundle.abstained or not bundle.evidence_ids:
+            await _reply_with_ordinary_search(
+                message,
+                bundle=bundle,
+                users_by_id={},
+                notice=notice,
+            )
+            return
+        locked_bundle = await filter_surviving_evidence(
+            session,
+            bundle,
+            max_evidence_items=SEMANTIC_QA_EVIDENCE_LIMIT,
+        )
+        if tuple(locked_bundle.evidence_ids) != tuple(bundle.evidence_ids):
+            await _reply_to_mention(
+                message,
+                f"{notice}\n\nИсточники изменились; обычный поиск больше не показывает эти свидетельства.",
+            )
+            return
+        users_by_id, sensitive_author = await _bundle_users(session, locked_bundle)
+        if sensitive_author:
+            await _reply_to_mention(message, SENSITIVE_QA_REFUSAL)
+            return
+        await _reply_with_ordinary_search(
+            message,
+            bundle=locked_bundle,
+            users_by_id=users_by_id,
+            notice=notice,
+        )
+
+
+async def _reply_semantic_replay(
+    message: Message,
+    session: AsyncSession,
+    *,
+    source_chat_message_id: int,
+    status: str | None,
+    outcome: str | None,
+) -> None:
+    # Never replay stored generated content: it may have become stale between
+    # the idempotent attempt and a completed forget cascade.
+    del session, source_chat_message_id, outcome
+    if status == "reserved":
+        await _reply_to_mention(message, "Этот semantic AI-запрос уже обрабатывается.")
+        return
+    await _reply_to_mention(
+        message,
+        "Этот semantic AI-запрос уже был обработан; провайдеры повторно не вызывались.",
+    )
+
+
+async def _deliver_and_consume_semantic_attempt(
+    message: Message,
+    session: AsyncSession,
+    *,
+    attempt_id: int,
+    outcome: str,
+    qa_trace_id: int,
+    embedding_llm_call_id: int,
+    synthesis_llm_call_id: int | None,
+    reply_text: str,
+    clear_summary_on_failure: bool = False,
+    parse_mode: str | None = None,
+    disable_web_page_preview: bool | None = None,
+    delivery_bundle: EvidenceBundle | None = None,
+    expected_evidence_ids: tuple[int, ...] = (),
+    required_governed_bundle: EvidenceBundle | None = None,
+) -> None:
+    """Persist delivery intent, then consume or definitively release the quota."""
+
+    delivery_intent_durable = False
+
+    async def release_pre_delivery_database_failure(exc: SQLAlchemyError) -> None:
+        """Release only while Telegram delivery is provably impossible."""
+
+        await session.rollback()
+        logger.error(
+            "semantic_qa_pre_delivery_database_failed",
+            extra={"attempt_id": attempt_id, "error_class": type(exc).__name__},
+        )
+        if clear_summary_on_failure:
+            await QaTraceRepo.clear_undelivered_llm_summary(
+                session,
+                qa_trace_id=qa_trace_id,
+            )
+        await SemanticQuotaRepo.finalize(
+            session,
+            attempt_id=attempt_id,
+            outcome="technical_failure",
+            qa_trace_id=qa_trace_id,
+            embedding_llm_call_id=embedding_llm_call_id,
+            synthesis_llm_call_id=synthesis_llm_call_id,
+        )
+        await session.commit()
+        await _reply_to_mention(
+            message,
+            "Semantic AI-ответ технически недоступен; лимит не списан.",
+        )
+
+    async def deliver() -> None:
+        nonlocal delivery_intent_durable
+        await SemanticQuotaRepo.mark_delivery_started(
+            session,
+            attempt_id=attempt_id,
+            outcome=outcome,  # type: ignore[arg-type]  # handler passes answered/abstained only
+            qa_trace_id=qa_trace_id,
+            embedding_llm_call_id=embedding_llm_call_id,
+            synthesis_llm_call_id=synthesis_llm_call_id,
+        )
+        # Durable intent prevents a post-send DB failure from later releasing
+        # a response that Telegram may already have delivered.
+        await session.commit()
+        delivery_intent_durable = True
+        try:
+            await _reply_to_mention(
+                message,
+                reply_text,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+        except _DEFINITIVE_TELEGRAM_REJECTIONS:
+            await session.rollback()
+            if clear_summary_on_failure:
+                await QaTraceRepo.clear_undelivered_llm_summary(
+                    session,
+                    qa_trace_id=qa_trace_id,
+                )
+            await SemanticQuotaRepo.finalize(
+                session,
+                attempt_id=attempt_id,
+                outcome="technical_failure",
+                qa_trace_id=qa_trace_id,
+                embedding_llm_call_id=embedding_llm_call_id,
+                synthesis_llm_call_id=synthesis_llm_call_id,
+            )
+            await session.commit()
+            raise
+        except TelegramAPIError as exc:
+            # Network/5xx failures are ambiguous: Telegram may have accepted
+            # the message before the client lost the response. Conservatively
+            # consume the already-durable delivery intent so retries cannot
+            # produce more than two semantic answers in a Moscow day.
+            await session.rollback()
+            logger.error(
+                "semantic_qa_telegram_delivery_ambiguous",
+                extra={"attempt_id": attempt_id, "error_class": type(exc).__name__},
+            )
+            await SemanticQuotaRepo.finalize(
+                session,
+                attempt_id=attempt_id,
+                outcome=outcome,  # type: ignore[arg-type]
+                qa_trace_id=qa_trace_id,
+                embedding_llm_call_id=embedding_llm_call_id,
+                synthesis_llm_call_id=synthesis_llm_call_id,
+            )
+            await session.commit()
+            raise
+        await SemanticQuotaRepo.finalize(
+            session,
+            attempt_id=attempt_id,
+            outcome=outcome,
+            qa_trace_id=qa_trace_id,
+            embedding_llm_call_id=embedding_llm_call_id,
+            synthesis_llm_call_id=synthesis_llm_call_id,
+        )
+        await session.commit()
+
+    try:
+        # Provider/cache/trace audit must survive a Telegram failure. Committing
+        # before the dedicated delivery lock also avoids a lock-order deadlock
+        # with a forget cascade that deletes an uncommitted cache row.
+        await session.commit()
+        if delivery_bundle is None and required_governed_bundle is None:
+            await deliver()
+            return
+        if delivery_bundle is None:
+            assert required_governed_bundle is not None
+            async with hold_evidence_delivery_locks(session, required_governed_bundle):
+                if not await _question_is_governed(session, required_governed_bundle):
+                    if clear_summary_on_failure:
+                        await QaTraceRepo.clear_undelivered_llm_summary(
+                            session,
+                            qa_trace_id=qa_trace_id,
+                        )
+                    await SemanticQuotaRepo.finalize(
+                        session,
+                        attempt_id=attempt_id,
+                        outcome="technical_failure",
+                        qa_trace_id=qa_trace_id,
+                        embedding_llm_call_id=embedding_llm_call_id,
+                        synthesis_llm_call_id=synthesis_llm_call_id,
+                    )
+                    await session.commit()
+                    await _reply_to_mention(
+                        message,
+                        "Этот вопрос уже удалён из памяти; semantic-лимит не списан.",
+                    )
+                    return
+                await deliver()
+                return
+
+        lock_bundle = _merge_governance_bundles(
+            delivery_bundle,
+            required_governed_bundle,
+        )
+        async with hold_evidence_delivery_locks(session, lock_bundle):
+            required_is_governed = required_governed_bundle is None or await _question_is_governed(
+                session,
+                required_governed_bundle,
+            )
+            locked_bundle = await filter_surviving_evidence(
+                session,
+                delivery_bundle,
+                max_evidence_items=SEMANTIC_QA_EVIDENCE_LIMIT,
+            )
+            if (
+                not required_is_governed
+                or tuple(locked_bundle.evidence_ids) != expected_evidence_ids
+            ):
+                for item in delivery_bundle.items:
+                    for message_version_id in (
+                        item.message_version_id,
+                        *item.card_source_message_version_ids,
+                    ):
+                        await SynthesisCacheRepo.invalidate_by_citation(
+                            session,
+                            message_version_id=message_version_id,
+                        )
+                if clear_summary_on_failure:
+                    await QaTraceRepo.clear_undelivered_llm_summary(
+                        session,
+                        qa_trace_id=qa_trace_id,
+                    )
+                await session.commit()
+                raise EvidenceInvalidatedBeforeDelivery
+            await deliver()
+    except LookupError as exc:
+        if delivery_intent_durable:
+            await session.rollback()
+            logger.error(
+                "semantic_qa_post_delivery_lease_already_reconciled",
+                extra={"attempt_id": attempt_id, "error_class": type(exc).__name__},
+            )
+            return
+        if clear_summary_on_failure:
+            await session.rollback()
+            await QaTraceRepo.clear_undelivered_llm_summary(
+                session,
+                qa_trace_id=qa_trace_id,
+            )
+            await session.commit()
+        await _reply_semantic_lease_lost(
+            message,
+            session,
+            attempt_id=attempt_id,
+            phase="delivery",
+            error=exc,
+        )
+    except SQLAlchemyError as exc:
+        if delivery_intent_durable:
+            raise
+        await release_pre_delivery_database_failure(exc)
+
+
+async def _reply_after_technical_release(
+    message: Message,
+    session: AsyncSession,
+    *,
+    query: str,
+    chat_id: int,
+    query_redacted: bool,
+    exclude_chat_message_id: int,
+    notice: str,
+    required_governed_bundle: EvidenceBundle,
+) -> None:
+    """Best-effort ordinary search after quota was already released durably."""
+
+    try:
+        ordinary = await _ordinary_search_result(
+            session,
+            query=query,
+            chat_id=chat_id,
+            query_redacted=query_redacted,
+            exclude_chat_message_id=exclude_chat_message_id,
+        )
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        logger.error(
+            "semantic_qa_ordinary_fallback_failed",
+            extra={"chat_id": chat_id, "error_class": type(exc).__name__},
+        )
+        await _reply_to_mention(message, f"{notice} Лимит не списан.")
+        return
+    await _reply_with_governed_ordinary_search(
+        message,
+        session,
+        bundle=ordinary.bundle,
+        notice=notice,
+        required_governed_bundle=required_governed_bundle,
+    )
+
+
+def _semantic_question_bundle(
+    message: Message,
+    *,
+    current_message_version_id: int | None,
+    persisted_chat_message_id: int,
+    query: str,
+) -> EvidenceBundle:
+    """Build the governed provenance bundle for the persisted source question."""
+
+    if current_message_version_id is None:
+        raise LookupError("semantic question is missing its current message version")
+    return EvidenceBundle(
+        query=query,
+        chat_id=message.chat.id,
+        items=(
+            EvidenceItem(
+                message_version_id=current_message_version_id,
+                chat_message_id=persisted_chat_message_id,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                user_id=None,
+                snippet="",
+                ts_rank=1.0,
+                captured_at=message.date,
+                message_date=message.date,
+            ),
+        ),
+        abstained=False,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def _merge_governance_bundles(
+    first: EvidenceBundle,
+    second: EvidenceBundle | None,
+) -> EvidenceBundle:
+    """Combine complete lock provenance without changing either delivery bundle."""
+
+    if second is None:
+        return first
+    if first.chat_id != second.chat_id:
+        raise ValueError("governance lock bundles must belong to the same chat")
+    return EvidenceBundle(
+        query=first.query,
+        chat_id=first.chat_id,
+        items=(*first.items, *second.items),
+        abstained=False,
+        created_at=min(first.created_at, second.created_at),
+    )
+
+
+async def _question_is_governed(
+    session: AsyncSession,
+    question_bundle: EvidenceBundle,
+) -> bool:
+    surviving = await filter_surviving_evidence(
+        session,
+        question_bundle,
+        max_evidence_items=1,
+    )
+    return tuple(surviving.evidence_ids) == tuple(question_bundle.evidence_ids)
+
+
+async def _release_invalidated_semantic_question(
+    message: Message,
+    session: AsyncSession,
+    *,
+    attempt_id: int,
+    qa_trace_id: int | None,
+    embedding_llm_call_id: int | None,
+) -> None:
+    logger.info(
+        "semantic_qa_question_invalidated",
+        extra={"attempt_id": attempt_id, "qa_trace_id": qa_trace_id},
+    )
+    try:
+        await SemanticQuotaRepo.finalize(
+            session,
+            attempt_id=attempt_id,
+            outcome="technical_failure",
+            qa_trace_id=qa_trace_id,
+            embedding_llm_call_id=embedding_llm_call_id,
+        )
+        await session.commit()
+    except LookupError:
+        # A concurrent admission may already have reconciled an expired lease.
+        # The question is still suppressed; never resurrect or deliver it.
+        await session.rollback()
+        logger.info(
+            "semantic_qa_invalidated_lease_already_reconciled",
+            extra={"attempt_id": attempt_id, "qa_trace_id": qa_trace_id},
+        )
+    await _reply_to_mention(
+        message,
+        "Этот вопрос уже удалён из памяти; semantic-лимит не списан.",
+    )
+
+
+async def _reply_semantic_lease_lost(
+    message: Message,
+    session: AsyncSession,
+    *,
+    attempt_id: int,
+    phase: str,
+    error: LookupError,
+) -> None:
+    await session.rollback()
+    logger.error(
+        "semantic_qa_reservation_lease_lost",
+        extra={
+            "attempt_id": attempt_id,
+            "phase": phase,
+            "error_class": type(error).__name__,
+        },
+    )
+    await _reply_to_mention(
+        message,
+        "Semantic AI-запрос истёк до выдачи ответа; лимит не списан.",
+    )
+
+
+async def _semantic_mention_question(
+    *,
+    message: Message,
+    session: AsyncSession,
+    sender_id: int,
+    persisted_chat_message_id: int,
+    question_bundle: EvidenceBundle,
+    query: str,
+    query_redacted: bool,
+) -> None:
+    """Execute the complete admitted semantic Q&A state machine."""
+
+    quota = await SemanticQuotaRepo.reserve(
+        session,
+        idempotency_key=f"chat-message:{persisted_chat_message_id}",
+        user_tg_id=sender_id,
+        chat_id=message.chat.id,
+        source_chat_message_id=persisted_chat_message_id,
+    )
+    # Reservation must be visible before any paid provider call and releases
+    # the transaction advisory lock for concurrent requests from this member.
+    await session.commit()
+
+    if getattr(quota, "replayed", False):
+        await _reply_semantic_replay(
+            message,
+            session,
+            source_chat_message_id=persisted_chat_message_id,
+            status=getattr(quota, "status", None),
+            outcome=getattr(quota, "outcome", None),
+        )
+        return
+
+    if not quota.allowed:
+        async with hold_evidence_delivery_locks(session, question_bundle):
+            if not await _question_is_governed(session, question_bundle):
+                await _reply_to_mention(
+                    message,
+                    "Этот вопрос уже удалён из памяти; обычный поиск не выполнялся.",
+                )
+                return
+            ordinary = await _ordinary_search_result(
+                session,
+                query=query,
+                chat_id=message.chat.id,
+                query_redacted=query_redacted,
+                exclude_chat_message_id=persisted_chat_message_id,
+            )
+            users_by_id, sensitive_author = await _bundle_users(session, ordinary.bundle)
+            if sensitive_author:
+                await _reply_to_mention(message, SENSITIVE_QA_REFUSAL)
+                return
+            await _write_trace(
+                session,
+                user_tg_id=sender_id,
+                chat_id=message.chat.id,
+                query=query,
+                evidence_ids=ordinary.bundle.evidence_ids,
+                abstained=ordinary.bundle.abstained,
+                redact_query=query_redacted,
+                source_chat_message_id=persisted_chat_message_id,
+            )
+            await session.commit()
+        await _reply_with_governed_ordinary_search(
+            message,
+            session,
+            bundle=ordinary.bundle,
+            notice=(
+                f"Лимит — {quota.limit} semantic AI-вопроса в день. "
+                "Embedding и AI-синтез не вызывались."
+            ),
+            required_governed_bundle=question_bundle,
+        )
+        return
+
+    durable_trace_id: int | None = None
+    try:
+        # The quota commit above releases persistence's caller-transaction
+        # chat-message lock. This dedicated fence now covers every query-bearing
+        # row created before and during embedding; all writes are committed
+        # before the fence is released so a waiting cascade can erase them.
+        async with hold_evidence_delivery_locks(session, question_bundle):
+            if not await _question_is_governed(session, question_bundle):
+                raise SemanticQuestionInvalidated
+            try:
+                trace = await QaTraceRepo.create(
+                    session,
+                    user_tg_id=sender_id,
+                    chat_id=message.chat.id,
+                    query=query,
+                    evidence_ids=[],
+                    abstained=False,
+                    redact_query=query_redacted,
+                    source_chat_message_id=persisted_chat_message_id,
+                )
+                await SemanticQuotaRepo.attach_trace(
+                    session,
+                    attempt_id=quota.attempt_id,
+                    qa_trace_id=trace.id,
+                )
+                await session.commit()
+                durable_trace_id = trace.id
+            except LookupError as exc:
+                await _reply_semantic_lease_lost(
+                    message,
+                    session,
+                    attempt_id=quota.attempt_id,
+                    phase="trace_setup",
+                    error=exc,
+                )
+                return
+            except SQLAlchemyError as exc:
+                await session.rollback()
+                logger.error(
+                    "semantic_qa_trace_setup_failed",
+                    extra={
+                        "attempt_id": quota.attempt_id,
+                        "chat_id": message.chat.id,
+                        "error_class": type(exc).__name__,
+                    },
+                )
+                await SemanticQuotaRepo.finalize(
+                    session,
+                    attempt_id=quota.attempt_id,
+                    outcome="technical_failure",
+                )
+                await session.commit()
+                await _reply_to_mention(
+                    message,
+                    "Semantic AI-поиск технически недоступен; лимит не списан.",
+                )
+                return
+            semantic = await run_semantic_qa(
+                session,
+                query=query,
+                chat_id=message.chat.id,
+                redact_query_in_audit=query_redacted,
+                attempt_id=quota.attempt_id,
+                qa_trace_id=trace.id,
+                exclude_chat_message_id=persisted_chat_message_id,
+            )
+            # Close the read transaction before acquiring the complete
+            # question+evidence fence. Retrieval-derived rows are deliberately
+            # persisted only in that next, non-nested phase.
+            await session.commit()
+    except SemanticQuestionInvalidated:
+        await _release_invalidated_semantic_question(
+            message,
+            session,
+            attempt_id=quota.attempt_id,
+            qa_trace_id=None,
+            embedding_llm_call_id=None,
+        )
+        return
+    except LookupError as exc:
+        await _reply_semantic_lease_lost(
+            message,
+            session,
+            attempt_id=quota.attempt_id,
+            phase="embedding",
+            error=exc,
+        )
+        return
+    except (
+        EmbeddingBudgetExceeded,
+        ProviderStructuralError,
+        ProviderTransientError,
+        SemanticRetrievalError,
+        ValueError,
+    ) as exc:
+        logger.error(
+            "semantic_qa_embedding_failed",
+            extra={
+                "attempt_id": quota.attempt_id,
+                "chat_id": message.chat.id,
+                "error_class": type(exc).__name__,
+                "error_subtype": _safe_qa_provider_error_subtype(exc),
+            },
+        )
+        embedding_call_id = getattr(
+            exc,
+            "llm_usage_ledger_id",
+            getattr(exc, "embedding_llm_call_id", None),
+        )
+        await SemanticQuotaRepo.finalize(
+            session,
+            attempt_id=quota.attempt_id,
+            outcome="technical_failure",
+            qa_trace_id=trace.id,
+            embedding_llm_call_id=embedding_call_id,
+        )
+        # Release first: ordinary fallback failure must not consume quota.
+        await session.commit()
+        await _reply_after_technical_release(
+            message,
+            session,
+            query=query,
+            chat_id=message.chat.id,
+            query_redacted=query_redacted,
+            exclude_chat_message_id=persisted_chat_message_id,
+            notice="Semantic AI-поиск технически недоступен. Показываю обычный поиск без AI.",
+            required_governed_bundle=question_bundle,
+        )
+        return
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        logger.error(
+            "semantic_qa_database_failed",
+            extra={
+                "attempt_id": quota.attempt_id,
+                "chat_id": message.chat.id,
+                "error_class": type(exc).__name__,
+            },
+        )
+        await SemanticQuotaRepo.finalize(
+            session,
+            attempt_id=quota.attempt_id,
+            outcome="technical_failure",
+            qa_trace_id=durable_trace_id,
+        )
+        await session.commit()
+        await _reply_after_technical_release(
+            message,
+            session,
+            query=query,
+            chat_id=message.chat.id,
+            query_redacted=query_redacted,
+            exclude_chat_message_id=persisted_chat_message_id,
+            notice="Semantic AI-поиск технически недоступен.",
+            required_governed_bundle=question_bundle,
+        )
+        return
+
+    retrieval_lock_bundle = _merge_governance_bundles(
+        question_bundle,
+        semantic.bundle,
+    )
+    retrieval_invalidated = False
+    try:
+        async with hold_evidence_delivery_locks(session, retrieval_lock_bundle):
+            await SemanticQuotaRepo.touch(session, attempt_id=quota.attempt_id)
+            if not await _question_is_governed(session, question_bundle):
+                raise SemanticQuestionInvalidated
+            governed_retrieval = await filter_surviving_evidence(
+                session,
+                semantic.bundle,
+                max_evidence_items=SEMANTIC_QA_EVIDENCE_LIMIT,
+            )
+            retrieval_invalidated = tuple(governed_retrieval.evidence_ids) != tuple(
+                semantic.bundle.evidence_ids
+            )
+            if retrieval_invalidated:
+                await QaTraceRepo.update_retrieval_fields(
+                    session,
+                    qa_trace_id=trace.id,
+                    evidence_ids=[],
+                    abstained=True,
+                )
+            else:
+                await persist_semantic_retrieval_trace(
+                    session,
+                    result=semantic,
+                    query=query,
+                    attempt_id=quota.attempt_id,
+                    qa_trace_id=trace.id,
+                )
+            # No retrieval-derived row may appear after a waiting source
+            # cascade has completed; commit every such row before union unlock.
+            await session.commit()
+    except SemanticQuestionInvalidated:
+        await _release_invalidated_semantic_question(
+            message,
+            session,
+            attempt_id=quota.attempt_id,
+            qa_trace_id=trace.id,
+            embedding_llm_call_id=semantic.embedding_llm_call_id,
+        )
+        return
+    except LookupError as exc:
+        await _reply_semantic_lease_lost(
+            message,
+            session,
+            attempt_id=quota.attempt_id,
+            phase="retrieval_trace",
+            error=exc,
+        )
+        return
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        logger.error(
+            "semantic_qa_retrieval_trace_failed",
+            extra={
+                "attempt_id": quota.attempt_id,
+                "chat_id": message.chat.id,
+                "error_class": type(exc).__name__,
+            },
+        )
+        await SemanticQuotaRepo.finalize(
+            session,
+            attempt_id=quota.attempt_id,
+            outcome="technical_failure",
+            qa_trace_id=trace.id,
+            embedding_llm_call_id=semantic.embedding_llm_call_id,
+        )
+        await session.commit()
+        await _reply_after_technical_release(
+            message,
+            session,
+            query=query,
+            chat_id=message.chat.id,
+            query_redacted=query_redacted,
+            exclude_chat_message_id=persisted_chat_message_id,
+            notice="Semantic trace технически недоступен.",
+            required_governed_bundle=question_bundle,
+        )
+        return
+
+    if retrieval_invalidated or semantic.bundle.abstained or not semantic.bundle.evidence_ids:
+        await _deliver_and_consume_semantic_attempt(
+            message,
+            session,
+            attempt_id=quota.attempt_id,
+            outcome="abstained",
+            qa_trace_id=trace.id,
+            embedding_llm_call_id=semantic.embedding_llm_call_id,
+            synthesis_llm_call_id=None,
+            reply_text="Не нашёл достаточно подтверждений в памяти сообщества.",
+            required_governed_bundle=question_bundle,
+        )
+        return
+
+    if any(contains_secret_like_data(item.snippet) for item in semantic.bundle.items):
+        await QaTraceRepo.update_retrieval_fields(
+            session,
+            qa_trace_id=trace.id,
+            evidence_ids=[],
+            abstained=True,
+        )
+        await _deliver_and_consume_semantic_attempt(
+            message,
+            session,
+            attempt_id=quota.attempt_id,
+            outcome="abstained",
+            qa_trace_id=trace.id,
+            embedding_llm_call_id=semantic.embedding_llm_call_id,
+            synthesis_llm_call_id=None,
+            reply_text=SENSITIVE_QA_REFUSAL,
+            required_governed_bundle=question_bundle,
+        )
+        return
+
+    try:
+        cfg = _load_gateway_config()
+        if cfg.provider != SEMANTIC_SYNTHESIS_PROVIDER or cfg.model != SEMANTIC_SYNTHESIS_MODEL:
+            raise ValueError("semantic Q&A synthesis requires DeepSeek V4 Flash configuration")
+        provider = _resolve_provider(cfg.provider)
+        # Keep every evidence writer blocked from the final governance check
+        # through provider dispatch and cache/ledger materialization.  The
+        # dedicated lock connection survives the placeholder commit inside the
+        # gateway, so a concurrent deletion cannot expose removed text
+        # to the provider.
+        provider_lock_bundle = _merge_governance_bundles(
+            question_bundle,
+            semantic.bundle,
+        )
+        async with hold_evidence_delivery_locks(session, provider_lock_bundle):
+            await SemanticQuotaRepo.touch(session, attempt_id=quota.attempt_id)
+            await session.commit()
+            if not await _question_is_governed(session, question_bundle):
+                raise SemanticQuestionInvalidated
+            synth_result = await synthesize_answer(
+                session,
+                bundle=semantic.bundle,
+                query=build_guarded_llm_query(query),
+                config=cfg,
+                qa_trace_id=trace.id,
+                ledger_repo=LedgerRepo(),
+                cache_repo=SynthesisCacheRepo(),
+                provider=provider,
+                max_evidence_items=SEMANTIC_QA_EVIDENCE_LIMIT,
+                durable_placeholder=True,
+                revalidate_after_provider=True,
+                cache_enabled=False,
+            )
+            # The provider result and final ledger mutation must be visible
+            # before the union fence is released. A waiting cascade can then
+            # remove/redact the complete committed state without lock inversion.
+            await SemanticQuotaRepo.touch(session, attempt_id=quota.attempt_id)
+            await session.commit()
+    except SemanticQuestionInvalidated:
+        await _release_invalidated_semantic_question(
+            message,
+            session,
+            attempt_id=quota.attempt_id,
+            qa_trace_id=trace.id,
+            embedding_llm_call_id=semantic.embedding_llm_call_id,
+        )
+        return
+    except LookupError as exc:
+        await _reply_semantic_lease_lost(
+            message,
+            session,
+            attempt_id=quota.attempt_id,
+            phase="synthesis",
+            error=exc,
+        )
+        return
+    except (ValueError, SQLAlchemyError) as exc:
+        if isinstance(exc, SQLAlchemyError):
+            await session.rollback()
+        logger.error(
+            "semantic_qa_synthesis_config_failed",
+            extra={
+                "attempt_id": quota.attempt_id,
+                "qa_trace_id": trace.id,
+                "error_class": type(exc).__name__,
+            },
+        )
+        await SemanticQuotaRepo.finalize(
+            session,
+            attempt_id=quota.attempt_id,
+            outcome="technical_failure",
+            qa_trace_id=trace.id,
+            embedding_llm_call_id=semantic.embedding_llm_call_id,
+        )
+        await session.commit()
+        await _reply_after_technical_release(
+            message,
+            session,
+            query=query,
+            chat_id=message.chat.id,
+            query_redacted=query_redacted,
+            exclude_chat_message_id=persisted_chat_message_id,
+            notice="AI-синтез технически недоступен. Показываю обычный поиск без AI.",
+            required_governed_bundle=question_bundle,
+        )
+        return
+
+    if isinstance(synth_result, AnswerWithCitations):
+        try:
+            # Reacquire the complete sorted union for the render/trace phase.
+            # The provider ledger is already committed. Any summary written
+            # here is committed before unlock, so a waiting cascade observes
+            # and removes the complete state instead of racing a later update.
+            async with hold_evidence_delivery_locks(session, provider_lock_bundle):
+                await SemanticQuotaRepo.touch(session, attempt_id=quota.attempt_id)
+                if not await _question_is_governed(session, question_bundle):
+                    raise SemanticQuestionInvalidated
+                render_bundle = await filter_surviving_evidence(
+                    session,
+                    semantic.bundle,
+                    max_evidence_items=SEMANTIC_QA_EVIDENCE_LIMIT,
+                )
+
+                expected_ids = synth_result.surviving_evidence_ids
+                if tuple(render_bundle.evidence_ids) != expected_ids or not set(
+                    synth_result.citation_ids
+                ).issubset(expected_ids):
+                    await QaTraceRepo.update_retrieval_fields(
+                        session,
+                        qa_trace_id=trace.id,
+                        evidence_ids=render_bundle.evidence_ids,
+                        abstained=True,
+                    )
+                    await QaTraceRepo.update_llm_fields(
+                        session,
+                        qa_trace_id=trace.id,
+                        llm_call_id=synth_result.llm_call_id,
+                        llm_response_summary=None,
+                        llm_response_redacted=True,
+                        cost_usd=synth_result.cost_usd,
+                    )
+                    await _deliver_and_consume_semantic_attempt(
+                        message,
+                        session,
+                        attempt_id=quota.attempt_id,
+                        outcome="abstained",
+                        qa_trace_id=trace.id,
+                        embedding_llm_call_id=semantic.embedding_llm_call_id,
+                        synthesis_llm_call_id=synth_result.llm_call_id,
+                        reply_text="Не нашёл достаточно подтверждений в памяти сообщества.",
+                    )
+                    return
+
+                users_by_id, sensitive_author = await _bundle_users(session, render_bundle)
+                if sensitive_author or any(
+                    contains_secret_like_data(item.snippet) for item in render_bundle.items
+                ):
+                    await QaTraceRepo.update_retrieval_fields(
+                        session,
+                        qa_trace_id=trace.id,
+                        evidence_ids=[],
+                        abstained=True,
+                    )
+                    await QaTraceRepo.update_llm_fields(
+                        session,
+                        qa_trace_id=trace.id,
+                        llm_call_id=synth_result.llm_call_id,
+                        llm_response_summary=None,
+                        llm_response_redacted=True,
+                        cost_usd=synth_result.cost_usd,
+                    )
+                    await _deliver_and_consume_semantic_attempt(
+                        message,
+                        session,
+                        attempt_id=quota.attempt_id,
+                        outcome="abstained",
+                        qa_trace_id=trace.id,
+                        embedding_llm_call_id=semantic.embedding_llm_call_id,
+                        synthesis_llm_call_id=synth_result.llm_call_id,
+                        reply_text=SENSITIVE_QA_REFUSAL,
+                    )
+                    return
+
+                normalized_answer = _normalize_provider_citations(
+                    synth_result.answer_text,
+                    render_bundle,
+                )
+                reply_text = _format_bounded_mention_response(
+                    normalized_answer,
+                    render_bundle,
+                    users_by_id,
+                )
+                await QaTraceRepo.update_llm_fields(
+                    session,
+                    qa_trace_id=trace.id,
+                    llm_call_id=synth_result.llm_call_id,
+                    llm_response_summary=f"{_SEMANTIC_REPLAY_HTML_PREFIX}{reply_text}",
+                    llm_response_redacted=False,
+                    cost_usd=synth_result.cost_usd,
+                )
+                await session.commit()
+        except SemanticQuestionInvalidated:
+            await _release_invalidated_semantic_question(
+                message,
+                session,
+                attempt_id=quota.attempt_id,
+                qa_trace_id=trace.id,
+                embedding_llm_call_id=semantic.embedding_llm_call_id,
+            )
+            return
+        except LookupError as exc:
+            await _reply_semantic_lease_lost(
+                message,
+                session,
+                attempt_id=quota.attempt_id,
+                phase="render",
+                error=exc,
+            )
+            return
+        except SQLAlchemyError as exc:
+            await session.rollback()
+            logger.error(
+                "semantic_qa_render_revalidation_failed",
+                extra={
+                    "attempt_id": quota.attempt_id,
+                    "error_class": type(exc).__name__,
+                },
+            )
+            await SemanticQuotaRepo.finalize(
+                session,
+                attempt_id=quota.attempt_id,
+                outcome="technical_failure",
+                qa_trace_id=trace.id,
+                embedding_llm_call_id=semantic.embedding_llm_call_id,
+                synthesis_llm_call_id=synth_result.llm_call_id,
+            )
+            await session.commit()
+            await _reply_after_technical_release(
+                message,
+                session,
+                query=query,
+                chat_id=message.chat.id,
+                query_redacted=query_redacted,
+                exclude_chat_message_id=persisted_chat_message_id,
+                notice="AI-синтез технически недоступен.",
+                required_governed_bundle=question_bundle,
+            )
+            return
+        except ValueError as exc:
+            logger.error(
+                "semantic_qa_citation_render_failed",
+                extra={
+                    "attempt_id": quota.attempt_id,
+                    "error_class": type(exc).__name__,
+                },
+            )
+            await SemanticQuotaRepo.finalize(
+                session,
+                attempt_id=quota.attempt_id,
+                outcome="technical_failure",
+                qa_trace_id=trace.id,
+                embedding_llm_call_id=semantic.embedding_llm_call_id,
+                synthesis_llm_call_id=synth_result.llm_call_id,
+            )
+            await session.commit()
+            await _reply_after_technical_release(
+                message,
+                session,
+                query=query,
+                chat_id=message.chat.id,
+                query_redacted=query_redacted,
+                exclude_chat_message_id=persisted_chat_message_id,
+                notice="AI-синтез технически недоступен.",
+                required_governed_bundle=question_bundle,
+            )
+            return
+        try:
+            await _deliver_and_consume_semantic_attempt(
+                message,
+                session,
+                attempt_id=quota.attempt_id,
+                outcome="answered",
+                qa_trace_id=trace.id,
+                embedding_llm_call_id=semantic.embedding_llm_call_id,
+                synthesis_llm_call_id=synth_result.llm_call_id,
+                reply_text=reply_text,
+                clear_summary_on_failure=True,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                delivery_bundle=render_bundle,
+                expected_evidence_ids=tuple(render_bundle.evidence_ids),
+                required_governed_bundle=question_bundle,
+            )
+        except EvidenceInvalidatedBeforeDelivery:
+            await QaTraceRepo.update_retrieval_fields(
+                session,
+                qa_trace_id=trace.id,
+                evidence_ids=[],
+                abstained=True,
+            )
+            await QaTraceRepo.update_llm_fields(
+                session,
+                qa_trace_id=trace.id,
+                llm_call_id=synth_result.llm_call_id,
+                llm_response_summary=None,
+                llm_response_redacted=True,
+                cost_usd=synth_result.cost_usd,
+            )
+            await _deliver_and_consume_semantic_attempt(
+                message,
+                session,
+                attempt_id=quota.attempt_id,
+                outcome="abstained",
+                qa_trace_id=trace.id,
+                embedding_llm_call_id=semantic.embedding_llm_call_id,
+                synthesis_llm_call_id=synth_result.llm_call_id,
+                reply_text="Не нашёл достаточно подтверждений в памяти сообщества.",
+                required_governed_bundle=question_bundle,
+            )
+        return
+
+    quota_outcome = (
+        "abstained" if synth_result.reason in _CONTENT_ABSTENTION_REASONS else "technical_failure"
+    )
+    await QaTraceRepo.update_llm_fields(
+        session,
+        qa_trace_id=trace.id,
+        llm_call_id=synth_result.llm_call_id,
+        llm_response_summary=None,
+        llm_response_redacted=synth_result.reason.startswith("sensitive_"),
+        cost_usd=synth_result.cost_usd,
+    )
+    if quota_outcome == "technical_failure":
+        await SemanticQuotaRepo.finalize(
+            session,
+            attempt_id=quota.attempt_id,
+            outcome=quota_outcome,
+            qa_trace_id=trace.id,
+            embedding_llm_call_id=semantic.embedding_llm_call_id,
+            synthesis_llm_call_id=synth_result.llm_call_id,
+        )
+        await session.commit()
+        await _reply_after_technical_release(
+            message,
+            session,
+            query=query,
+            chat_id=message.chat.id,
+            query_redacted=query_redacted,
+            exclude_chat_message_id=persisted_chat_message_id,
+            notice="AI-синтез технически недоступен. Показываю обычный поиск без AI.",
+            required_governed_bundle=question_bundle,
+        )
+    else:
+        await _deliver_and_consume_semantic_attempt(
+            message,
+            session,
+            attempt_id=quota.attempt_id,
+            outcome="abstained",
+            qa_trace_id=trace.id,
+            embedding_llm_call_id=semantic.embedding_llm_call_id,
+            synthesis_llm_call_id=synth_result.llm_call_id,
+            reply_text=(
+                SENSITIVE_QA_REFUSAL
+                if synth_result.reason.startswith("sensitive_")
+                else "Не нашёл достаточно подтверждений в памяти сообщества."
+            ),
+            required_governed_bundle=question_bundle,
+        )
+
+
 async def recall_handler(
     message: Message,
     command: CommandObject,
@@ -415,6 +1700,7 @@ async def recall_handler(
             username=getattr(message.from_user, "username", None),
             first_name=getattr(message.from_user, "first_name", None),
             last_name=getattr(message.from_user, "last_name", None),
+            is_bot=getattr(message.from_user, "is_bot", None),
         )
         await persist_message_with_policy(
             session,
@@ -653,6 +1939,7 @@ async def mention_question_handler(
         username=getattr(sender, "username", None),
         first_name=sender.first_name,
         last_name=getattr(sender, "last_name", None),
+        is_bot=getattr(sender, "is_bot", None),
     )
     persisted = await persist_message_with_policy(
         session,
@@ -689,22 +1976,10 @@ async def mention_question_handler(
             )
         return
     if existing_trace is not None:
-        if existing_trace.llm_response_summary:
-            if contains_secret_like_data(existing_trace.llm_response_summary):
-                await _reply_to_mention(message, SENSITIVE_QA_REFUSAL)
-            else:
-                prefix = "Уже отвечал на этот вопрос:\n\n"
-                previous = _escaped_text_with_budget(
-                    existing_trace.llm_response_summary,
-                    MAX_AI_ANSWER_CHARS - len(prefix),
-                )
-                await _reply_to_mention(
-                    message,
-                    f"{prefix}{previous}",
-                    parse_mode="HTML",
-                )
-        else:
-            await _reply_to_mention(message, "Этот вопрос уже обработан.")
+        await _reply_to_mention(
+            message,
+            "Этот вопрос уже обработан; сохранённый ответ повторно не показывается.",
+        )
         return
 
     if not query:
@@ -737,6 +2012,32 @@ async def mention_question_handler(
             abstained=True,
             redact_query=query_redacted,
             source_chat_message_id=persisted.chat_message.id,
+        )
+        return
+
+    semantic_enabled = await FeatureFlagRepo.get(session, SEMANTIC_QA_FEATURE_FLAG)
+    if not semantic_enabled:
+        semantic_enabled = await FeatureFlagRepo.get(
+            session,
+            SEMANTIC_QA_FEATURE_FLAG,
+            scope_type="user",
+            scope_id=str(sender.id),
+        )
+    if semantic_enabled:
+        question_bundle = _semantic_question_bundle(
+            message,
+            current_message_version_id=persisted.chat_message.current_version_id,
+            persisted_chat_message_id=persisted.chat_message.id,
+            query=query,
+        )
+        await _semantic_mention_question(
+            message=message,
+            session=session,
+            sender_id=sender.id,
+            persisted_chat_message_id=persisted.chat_message.id,
+            question_bundle=question_bundle,
+            query=query,
+            query_redacted=query_redacted,
         )
         return
 

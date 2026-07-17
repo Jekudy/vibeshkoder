@@ -51,9 +51,12 @@ import os
 import re
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from time import monotonic as _monotonic
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol, Sequence
 
 if TYPE_CHECKING:
@@ -98,6 +101,7 @@ AbstentionReason = Literal[
     "forget_invalidated",
     "sensitive_input",
     "sensitive_output",
+    "insufficient_evidence",
 ]
 
 
@@ -110,6 +114,9 @@ class AnswerWithCitations:
     cost_usd: Decimal
     cache_hit: bool
     llm_call_id: int
+    # Exact ordered evidence anchors that survived governance and were
+    # eligible for this answer. Default keeps legacy constructors compatible.
+    surviving_evidence_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +152,26 @@ class VisionGatewayConfig:
 
 
 @dataclass(frozen=True)
+class EmbeddingGatewayConfig:
+    """Independent OpenAI embedding model and spend ceilings."""
+
+    model: str
+    dimensions: int
+    daily_ceiling_usd: Decimal
+    monthly_ceiling_usd: Decimal
+
+
+@dataclass(frozen=True)
+class EmbeddingGatewayResult:
+    vectors: tuple[tuple[float, ...], ...]
+    tokens_in: int
+    cost_usd: Decimal
+    llm_usage_ledger_id: int
+    request_id: str
+    latency_ms: int
+
+
+@dataclass(frozen=True)
 class ImageDescriptionResult:
     description: str
     model: str
@@ -162,6 +189,14 @@ class ImageDescriptionOutcomeRef:
 
 class ImageDescriptionBudgetExceeded(RuntimeError):
     """Image description was refused by the configured cost ceiling."""
+
+
+class EmbeddingBudgetExceeded(RuntimeError):
+    """Embedding call was refused by its independent spend ceiling."""
+
+    def __init__(self, *, llm_usage_ledger_id: int) -> None:
+        super().__init__("embedding spend ceiling exceeded")
+        self.llm_usage_ledger_id = llm_usage_ledger_id
 
 
 class ImageDescriptionAmbiguousError(RuntimeError):
@@ -305,6 +340,7 @@ VISION_BUDGET_LOCK_ID: int = int.from_bytes(
 MAX_QUERY_LENGTH = 256
 MAX_QA_EVIDENCE_ITEMS = 3
 MAX_QA_EVIDENCE_SNIPPET_CHARS = 800
+SEMANTIC_QA_RESERVED_OUTPUT_TOKENS = 512
 MAX_WIKI_CARD_SOURCES = 64
 MAX_WIKI_DIRECT_SOURCES = 128
 MAX_WIKI_PRIOR_BODY_CHARS = 100_000
@@ -381,12 +417,13 @@ def _build_prompt(
     surviving_ids: tuple[int, ...] | list[int],
     *,
     evidence_items: tuple[EvidenceItem, ...] | list[EvidenceItem] = (),
+    max_evidence_items: int = MAX_QA_EVIDENCE_ITEMS,
 ) -> str:
     """Render a bounded evidence-only prompt for provider dispatch.
 
     Evidence is serialized as JSONL so snippets remain data even when they
     contain prompt-like text or delimiter strings. Only post-filter IDs are
-    eligible, and at most three records leave the process.
+    eligible; legacy callers default to three records and semantic QA requests five.
     """
 
     if contains_secret_like_data(query_normalized):
@@ -401,7 +438,7 @@ def _build_prompt(
             continue
         selected.append(item)
         seen.add(evidence_id)
-        if len(selected) == MAX_QA_EVIDENCE_ITEMS:
+        if len(selected) == max_evidence_items:
             break
 
     if any(contains_secret_like_data(item.snippet) for item in selected):
@@ -437,22 +474,24 @@ def _build_prompt(
 # ─── SQL fragments ──────────────────────────────────────────────────────────
 
 
-# Built from primitives so the literal policy strings live as constants. The
-# policy values still match what bot/services/search.py:91+ enforces.
-_POLICY_OFFRECORD = "off" + "record"
-_POLICY_FORGOTTEN = "for" + "gotten"
-
+# Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
+# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
 _SOURCE_FILTER_SQL = text(
-    """
+    f"""
     SELECT mv.id AS message_version_id
     FROM message_versions AS mv
-    JOIN chat_messages AS c
-        ON c.id = mv.chat_message_id
-        AND c.current_version_id = mv.id
+    JOIN chat_messages AS cm
+        ON cm.id = mv.chat_message_id
+        AND cm.current_version_id = mv.id
+    JOIN users AS author ON author.id = cm.user_id
     WHERE mv.id = ANY(:ids)
-        AND c.memory_policy NOT IN (:p_off, :p_forgot)
-        AND c.is_redacted = FALSE
+        AND cm.chat_id = :chat_id
+        AND author.is_bot = FALSE
+        AND cm.memory_policy = 'normal'
+        AND COALESCE(cm.message_kind, 'text') NOT IN ('voice', 'audio')
+        AND cm.is_redacted = FALSE
         AND mv.is_redacted = FALSE
+        AND {_FORGET_EXCLUDES}
     """
 )
 
@@ -494,15 +533,25 @@ _TOMBSTONE_GATE_SQL = text(
     """
 )
 
-# Session-scoped advisory lock used by the placeholder-pattern path: held
-# only across the cost-read + placeholder INSERT (sub-millisecond), then
-# released BEFORE dispatching the provider HTTP call. Closes F1 (lock
-# held across HTTP + global serialisation on bursts). The transaction-
-# scoped variant (``pg_advisory_xact_lock``) is intentionally NOT used —
-# it would only release at outer-tx commit, which happens AFTER the
-# provider round-trip.
+# Legacy callers keep the session-scoped lock.  Semantic callers use the
+# transaction-scoped lock and commit their durable reservation before provider
+# dispatch, which both publishes the reservation and releases the lock.
 _BUDGET_LOCK_SESSION_SQL = text("SELECT pg_advisory_lock(:lock_id)")
 _BUDGET_UNLOCK_SESSION_SQL = text("SELECT pg_advisory_unlock(:lock_id)")
+_BUDGET_LOCK_XACT_SQL = text("SELECT pg_advisory_xact_lock(:lock_id)")
+
+_APPROVED_CARD_PROVENANCE_SQL = text(
+    """
+    SELECT
+        kc.id::text AS card_id,
+        ARRAY_AGG(cs.message_version_id ORDER BY cs.position, cs.id) AS source_ids
+    FROM knowledge_cards AS kc
+    JOIN card_sources AS cs ON cs.card_id = kc.id
+    WHERE kc.id::text = ANY(:card_ids)
+      AND kc.card_status = 'approved'
+    GROUP BY kc.id
+    """
+)
 
 
 # ─── Gateway entry point ────────────────────────────────────────────────────
@@ -528,6 +577,44 @@ def _safe_qa_provider_error_subtype(exc: BaseException) -> str:
     return "unknown"
 
 
+def _ambiguous_provider_error_cost(
+    *, durable_placeholder: bool, reservation_cost: Decimal, subtype: str
+) -> Decimal:
+    """Keep the reservation when the provider may have processed the call."""
+
+    if durable_placeholder and subtype in {
+        "timeout",
+        "5xx",
+        "connection_reset",
+        "contract_violation",
+        "unknown",
+    }:
+        return reservation_cost
+    return Decimal("0")
+
+
+def _validate_provider_result(result: Any) -> None:
+    """Fail closed before malformed usage can reduce budget aggregates."""
+
+    if not isinstance(result.answer_text, str):
+        raise ProviderStructuralError(
+            "contract_violation",
+            message="provider answer_text must be a string",
+        )
+    if (
+        type(result.tokens_in) is not int
+        or type(result.tokens_out) is not int
+        or result.tokens_in < 0
+        or result.tokens_out < 0
+        or type(result.raw_latency_ms) is not int
+        or result.raw_latency_ms < 0
+    ):
+        raise ProviderStructuralError(
+            "contract_violation",
+            message="provider usage must contain non-negative integer counters",
+        )
+
+
 async def synthesize_answer(
     session: AsyncSession,
     *,
@@ -538,17 +625,21 @@ async def synthesize_answer(
     ledger_repo: LedgerRepoProtocol,
     cache_repo: SynthesisCacheRepoProtocol,
     provider: LLMProvider,
+    max_evidence_items: int = MAX_QA_EVIDENCE_ITEMS,
+    durable_placeholder: bool = False,
+    revalidate_after_provider: bool = False,
+    cache_enabled: bool = True,
 ) -> SynthesisResult:
     """Single Phase 5 LLM entry point.
 
     Parameters
     ----------
     session:
-        Async session. The caller owns the transaction lifecycle; this
-        function flushes via the repos but never commits.
+        Async session. The caller owns the transaction lifecycle; semantic
+        callers may opt into one pre-provider placeholder commit.
     bundle:
-        Phase 4 ``EvidenceBundle``. ``bundle.evidence_ids`` is the
-        authoritative whitelist for citation enforcement (invariant 7).
+        Phase 4 ``EvidenceBundle``. Full card provenance is revalidated and
+        the resulting anchor IDs become the citation whitelist.
     query:
         Raw user query. Normalised internally via :func:`_normalize_query`.
     config:
@@ -574,6 +665,9 @@ async def synthesize_answer(
     provider:
         ``LLMProvider`` Protocol implementation (Anthropic by default,
         OpenAI fallback via ``config.provider``). Tests inject fakes.
+    cache_enabled:
+        Disable answer-cache reads and writes for erase-sensitive flows whose
+        source question is not part of the citation provenance.
 
     Returns
     -------
@@ -581,6 +675,8 @@ async def synthesize_answer(
         Either ``AnswerWithCitations`` on success or ``Abstention`` on any
         documented refusal path. Never raises on documented failure paths.
     """
+    if not 1 <= max_evidence_items <= 8:
+        raise ValueError("max_evidence_items must be between 1 and 8")
     query_normalized = _normalize_query(query)
 
     async def _ledger(
@@ -652,13 +748,21 @@ async def synthesize_answer(
             llm_call_id=row.id,
         )
 
-    # Invariant 2 — source filter (defense-in-depth).
-    surviving_ids_list = await _source_filter(session, bundle.evidence_ids)
-    if not surviving_ids_list:
+    # Invariants 2/3 — one authoritative governance filter over every message
+    # in card provenance, not only the display anchor.
+    governed_bundle, tombstoned_ids = await _filter_governed_evidence(
+        session,
+        bundle,
+        max_evidence_items=max_evidence_items,
+    )
+    if not governed_bundle.items:
         empty_prompt_hash = _prompt_hash(_build_prompt(query_normalized, ()))
-        row = await _ledger(error="all_filtered", prompt_hash=empty_prompt_hash)
+        reason: AbstentionReason = "forget_invalidated" if tombstoned_ids else "all_filtered"
+        for vid in tombstoned_ids:
+            await cache_repo.invalidate_by_citation(session, message_version_id=vid)
+        row = await _ledger(error=reason, prompt_hash=empty_prompt_hash)
         return Abstention(
-            reason="all_filtered",
+            reason=reason,
             cost_usd=Decimal("0"),
             llm_call_id=row.id,
         )
@@ -667,25 +771,9 @@ async def synthesize_answer(
     # cache key, citation enforcement, and the cache STORE payload. Closes
     # F2/F3 (citation enforcement + cache poisoning by pre-filter ids).
     # Sorted for determinism so prompt body is order-independent.
-    surviving_id_set = set(surviving_ids_list)
-    selected_items: list[EvidenceItem] = []
-    selected_ids: set[int] = set()
-    for item in bundle.items:
-        evidence_id = item.message_version_id
-        if evidence_id not in surviving_id_set or evidence_id in selected_ids:
-            continue
-        selected_items.append(item)
-        selected_ids.add(evidence_id)
-        if len(selected_items) == MAX_QA_EVIDENCE_ITEMS:
-            break
-    if not selected_items:
-        empty_prompt_hash = _prompt_hash(_build_prompt(query_normalized, ()))
-        row = await _ledger(error="all_filtered", prompt_hash=empty_prompt_hash)
-        return Abstention(
-            reason="all_filtered",
-            cost_usd=Decimal("0"),
-            llm_call_id=row.id,
-        )
+    selected_items = list(governed_bundle.items)
+    ordered_surviving_ids = tuple(item.message_version_id for item in selected_items)
+    full_provenance_ids = _bundle_provenance_ids(selected_items)
 
     surviving_ids: tuple[int, ...] = tuple(
         sorted(item.message_version_id for item in selected_items)
@@ -694,11 +782,10 @@ async def synthesize_answer(
         query_normalized,
         surviving_ids,
         evidence_items=selected_items,
+        max_evidence_items=max_evidence_items,
     )
     prompt_hash = _prompt_hash(prompt)
 
-    # Invariant 3 — forget-invalidation gate (three tombstone keys).
-    tombstoned_ids = await _forget_tombstone_check(session, list(surviving_ids))
     if tombstoned_ids:
         for vid in tombstoned_ids:
             await cache_repo.invalidate_by_citation(session, message_version_id=vid)
@@ -712,14 +799,18 @@ async def synthesize_answer(
     # Invariant 4 — cache lookup (AFTER step 3 so tombstoned content stays out).
     cache_input_hash = _cache_input_hash(
         query_normalized=query_normalized,
-        citation_ids=surviving_ids,
+        citation_ids=tuple(sorted(full_provenance_ids)),
         model=config.model,
         # The prompt hash binds mutable evidence text (not just source IDs)
         # into the cache key.  A revised card snippet under the same anchor
         # message_version_id therefore cannot reuse a stale answer.
         prompt_template_version=f"{config.prompt_template_version}:{prompt_hash}",
     )
-    cached = await cache_repo.get_or_none(session, input_hash=cache_input_hash)
+    cached = (
+        await cache_repo.get_or_none(session, input_hash=cache_input_hash)
+        if cache_enabled
+        else None
+    )
     if cached is not None:
         if _contains_sensitive_qa_output(cached.answer_text):
             return await _reject_sensitive_cache(cached, prompt_hash=prompt_hash)
@@ -733,10 +824,15 @@ async def synthesize_answer(
         )
         return AnswerWithCitations(
             answer_text=cached_answer,
-            citation_ids=tuple(cached.citation_ids),
+            citation_ids=tuple(
+                citation_id
+                for citation_id in cached.citation_ids
+                if citation_id in set(surviving_ids)
+            ),
             cost_usd=Decimal("0"),
             cache_hit=True,
             llm_call_id=row.id,
+            surviving_evidence_ids=ordered_surviving_ids,
         )
 
     # Invariant 5 — placeholder ledger row pattern (closes F1 + F4).
@@ -748,11 +844,11 @@ async def synthesize_answer(
     #      cache_hit row WITHOUT dispatching provider.
     #   b) read daily / monthly totals via repo.
     #   c) if over ceiling — insert ledger row with error='budget_exceeded'.
-    #   d) else — insert PLACEHOLDER ledger row (cost_usd=0, error=NULL,
-    #      response_hash=NULL, tokens=0). Concurrent callers observe the
-    #      placeholder via daily/monthly cost aggregates AFTER it's UPDATEd
-    #      with the real cost post-dispatch.
-    #   e) release the lock + commit the inner tx BEFORE provider dispatch.
+    #   d) else — insert a PLACEHOLDER ledger row. Semantic callers reserve a
+    #      conservative non-zero cost and commit it before dispatch; legacy
+    #      callers retain the prior zero-cost outer-transaction behaviour.
+    #   e) release the lock; semantic callers have already committed the
+    #      reservation before provider dispatch.
     #
     # Provider dispatch then runs WITHOUT holding the lock, so bursts no
     # longer serialise globally on the 5-15s HTTP call.
@@ -760,73 +856,100 @@ async def synthesize_answer(
     # The lock is session-scoped (``pg_advisory_lock`` + ``pg_advisory_unlock``)
     # rather than transaction-scoped so we control release timing.
     #
-    # KNOWN LIMITATION until T5-04: placeholder INSERT is NOT committed before
-    # lock release. Under Postgres read-committed isolation, concurrent gateway
-    # calls can miss each other's in-flight reservations between unlock and
-    # the outer handler tx commit (which happens AFTER provider HTTP returns).
-    # Daily budget ceiling may overshoot by up to N*call_cost where N = burst
-    # size. Acceptable for Wave 1 ship (flag default OFF; no production burst).
-    # T5-04 integration test MUST exercise burst load under real Postgres and
-    # either (a) wire savepoint-commit inside the lock window, or (b) move
-    # placeholder INSERT to a dedicated short-lived connection.
-    #
     # Unit tests use a fake session that no-ops both lock SQL statements; the
     # ordering test asserts lock_idx < unlock_idx < provider_idx.
     placeholder_row: Any
+    reservation_cost = Decimal("0")
+    if durable_placeholder:
+        # Character-count-as-token deliberately overestimates prompt usage;
+        # 512 is the semantic DeepSeek adapter's configured output ceiling.
+        reservation_cost = max(
+            _estimate_cost(
+                config=config,
+                tokens_in=len(prompt),
+                tokens_out=SEMANTIC_QA_RESERVED_OUTPUT_TOKENS,
+            ),
+            Decimal("0.000001"),
+        )
+    early_result: SynthesisResult | None = None
+    lock_sql = _BUDGET_LOCK_XACT_SQL if durable_placeholder else _BUDGET_LOCK_SESSION_SQL
     try:
-        await session.execute(_BUDGET_LOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID})
+        await session.execute(lock_sql, {"lock_id": LLM_BUDGET_LOCK_ID})
         # (a) re-check cache under the lock.
-        cached_under_lock = await cache_repo.get_or_none(session, input_hash=cache_input_hash)
+        cached_under_lock = (
+            await cache_repo.get_or_none(session, input_hash=cache_input_hash)
+            if cache_enabled
+            else None
+        )
         if cached_under_lock is not None:
             if _contains_sensitive_qa_output(cached_under_lock.answer_text):
-                return await _reject_sensitive_cache(
+                early_result = await _reject_sensitive_cache(
                     cached_under_lock,
                     prompt_hash=prompt_hash,
                 )
-            cached_answer = cached_under_lock.answer_text
-            await cache_repo.bump_hit(session, cache_id=cached_under_lock.id)
-            row = await _ledger(
-                error=None,
-                cache_hit=True,
-                response_hash=_response_hash(cached_answer),
-                prompt_hash=prompt_hash,
-            )
-            return AnswerWithCitations(
-                answer_text=cached_answer,
-                citation_ids=tuple(cached_under_lock.citation_ids),
-                cost_usd=Decimal("0"),
-                cache_hit=True,
-                llm_call_id=row.id,
-            )
+            else:
+                cached_answer = cached_under_lock.answer_text
+                await cache_repo.bump_hit(session, cache_id=cached_under_lock.id)
+                row = await _ledger(
+                    error=None,
+                    cache_hit=True,
+                    response_hash=_response_hash(cached_answer),
+                    prompt_hash=prompt_hash,
+                )
+                early_result = AnswerWithCitations(
+                    answer_text=cached_answer,
+                    citation_ids=tuple(
+                        citation_id
+                        for citation_id in cached_under_lock.citation_ids
+                        if citation_id in set(surviving_ids)
+                    ),
+                    cost_usd=Decimal("0"),
+                    cache_hit=True,
+                    llm_call_id=row.id,
+                    surviving_evidence_ids=ordered_surviving_ids,
+                )
 
-        # (b) read totals.
-        over_budget = await _budget_check(session, config, ledger_repo)
-        if over_budget:
-            # (c) budget_exceeded ledger row.
-            row = await _ledger(error="budget_exceeded", prompt_hash=prompt_hash)
-            return Abstention(
-                reason="budget_exceeded",
-                cost_usd=Decimal("0"),
-                llm_call_id=row.id,
+        if early_result is None:
+            # (b) read totals.
+            over_budget = await _budget_check(
+                session,
+                config,
+                ledger_repo,
+                pending_cost=reservation_cost,
             )
-
-        # (d) placeholder ledger row.
-        placeholder_row = await _ledger(
-            error=None,
-            cost_usd=Decimal("0"),
-            response_hash=None,
-            tokens_in=0,
-            tokens_out=0,
-            prompt_hash=prompt_hash,
-        )
+            if over_budget:
+                # (c) budget_exceeded ledger row.
+                row = await _ledger(error="budget_exceeded", prompt_hash=prompt_hash)
+                early_result = Abstention(
+                    reason="budget_exceeded",
+                    cost_usd=Decimal("0"),
+                    llm_call_id=row.id,
+                )
+            else:
+                # (d) placeholder ledger row.
+                placeholder_row = await _ledger(
+                    error="reserved_in_flight" if durable_placeholder else None,
+                    cost_usd=reservation_cost,
+                    response_hash=None,
+                    tokens_in=0,
+                    tokens_out=0,
+                    prompt_hash=prompt_hash,
+                )
+        if durable_placeholder:
+            await session.commit()
+    except Exception:
+        if durable_placeholder:
+            await session.rollback()
+        raise
     finally:
-        # (e) release lock regardless of outcome. Even if we returned early
-        # above via early `return` statements inside the try block, this
-        # finally clause still runs and unlocks. NOTE: this requires the
-        # SQL execute itself not to raise — production code under T5-04 uses
-        # ``session.begin_nested()`` or a fresh connection so lock release
-        # is guaranteed even on session-level errors.
-        await session.execute(_BUDGET_UNLOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID})
+        if not durable_placeholder:
+            await session.execute(
+                _BUDGET_UNLOCK_SESSION_SQL,
+                {"lock_id": LLM_BUDGET_LOCK_ID},
+            )
+
+    if early_result is not None:
+        return early_result
 
     # Invariant 6 — provider dispatch with categorised error handling.
     # Provider HTTP runs OUTSIDE the lock so concurrent gateway calls no
@@ -834,13 +957,19 @@ async def synthesize_answer(
     started = time.monotonic()
     try:
         provider_result = await provider.call(prompt=prompt, model=config.model)
+        _validate_provider_result(provider_result)
     except ProviderTransientError as exc:
         latency = int((time.monotonic() - started) * 1000)
         error_subtype = _safe_qa_provider_error_subtype(exc)
+        failure_cost = _ambiguous_provider_error_cost(
+            durable_placeholder=durable_placeholder,
+            reservation_cost=reservation_cost,
+            subtype=error_subtype,
+        )
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
-            cost_usd=Decimal("0"),
+            cost_usd=failure_cost,
             response_hash=None,
             tokens_in=0,
             tokens_out=0,
@@ -850,7 +979,7 @@ async def synthesize_answer(
         )
         return Abstention(
             reason="provider_error",
-            cost_usd=Decimal("0"),
+            cost_usd=failure_cost,
             llm_call_id=placeholder_row.id,
         )
 
@@ -868,10 +997,15 @@ async def synthesize_answer(
 
         observability.emit_stop_signal("llm_provider_structural")
         latency = int((time.monotonic() - started) * 1000)
+        failure_cost = _ambiguous_provider_error_cost(
+            durable_placeholder=durable_placeholder,
+            reservation_cost=reservation_cost,
+            subtype=error_subtype,
+        )
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
-            cost_usd=Decimal("0"),
+            cost_usd=failure_cost,
             response_hash=None,
             tokens_in=0,
             tokens_out=0,
@@ -881,22 +1015,28 @@ async def synthesize_answer(
         )
         return Abstention(
             reason="provider_error",
-            cost_usd=Decimal("0"),
+            cost_usd=failure_cost,
             llm_call_id=placeholder_row.id,
         )
     except Exception as exc:
+        error_subtype = _safe_qa_provider_error_subtype(exc)
         logger.error(
             "qa_llm_provider_failed",
             extra={
                 "error_class": type(exc).__name__,
-                "error_subtype": _safe_qa_provider_error_subtype(exc),
+                "error_subtype": error_subtype,
             },
         )
         latency = int((time.monotonic() - started) * 1000)
+        failure_cost = _ambiguous_provider_error_cost(
+            durable_placeholder=durable_placeholder,
+            reservation_cost=reservation_cost,
+            subtype=error_subtype,
+        )
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
-            cost_usd=Decimal("0"),
+            cost_usd=failure_cost,
             response_hash=None,
             tokens_in=0,
             tokens_out=0,
@@ -906,19 +1046,59 @@ async def synthesize_answer(
         )
         return Abstention(
             reason="provider_error",
-            cost_usd=Decimal("0"),
+            cost_usd=failure_cost,
             llm_call_id=placeholder_row.id,
         )
 
+    if revalidate_after_provider:
+        post_provider_bundle, post_provider_tombstones = await _filter_governed_evidence(
+            session,
+            governed_bundle,
+            max_evidence_items=max_evidence_items,
+        )
+        post_provider_ids = tuple(item.message_version_id for item in post_provider_bundle.items)
+        if post_provider_ids != ordered_surviving_ids:
+            latency = int((time.monotonic() - started) * 1000)
+            revalidation_cost = _estimate_cost(
+                config=config,
+                tokens_in=provider_result.tokens_in,
+                tokens_out=provider_result.tokens_out,
+            )
+            for vid in post_provider_tombstones:
+                await cache_repo.invalidate_by_citation(
+                    session,
+                    message_version_id=vid,
+                )
+            reason: AbstentionReason = (
+                "forget_invalidated" if post_provider_tombstones else "all_filtered"
+            )
+            await ledger_repo.update_placeholder(
+                session,
+                llm_call_id=placeholder_row.id,
+                cost_usd=revalidation_cost,
+                response_hash=None,
+                tokens_in=provider_result.tokens_in,
+                tokens_out=provider_result.tokens_out,
+                request_id=_safe_qa_request_id(provider_result.request_id),
+                latency_ms=latency,
+                error=f"{reason}_after_provider",
+            )
+            return Abstention(
+                reason=reason,
+                cost_usd=revalidation_cost,
+                llm_call_id=placeholder_row.id,
+            )
+
+    provider_result_cost = _estimate_cost(
+        config=config,
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+    )
     request_id = _safe_qa_request_id(provider_result.request_id)
     answer_text = provider_result.answer_text
     if _contains_sensitive_qa_output(answer_text):
         latency = int((time.monotonic() - started) * 1000)
-        sensitive_output_cost = _estimate_cost(
-            config=config,
-            tokens_in=provider_result.tokens_in,
-            tokens_out=provider_result.tokens_out,
-        )
+        sensitive_output_cost = provider_result_cost
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
@@ -936,6 +1116,26 @@ async def synthesize_answer(
             llm_call_id=placeholder_row.id,
         )
 
+    if answer_text.strip() == "INSUFFICIENT_EVIDENCE":
+        latency = int((time.monotonic() - started) * 1000)
+        abstention_cost = provider_result_cost
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=abstention_cost,
+            response_hash=_response_hash(answer_text),
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=request_id,
+            latency_ms=latency,
+            error="insufficient_evidence",
+        )
+        return Abstention(
+            reason="insufficient_evidence",
+            cost_usd=abstention_cost,
+            llm_call_id=placeholder_row.id,
+        )
+
     # F5 — defensive abort when provider returns empty citation_ids while
     # bundle has surviving evidence. The real AnthropicProvider /
     # OpenAIProvider currently return ``tuple()`` unconditionally (T5-04
@@ -949,7 +1149,7 @@ async def synthesize_answer(
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
-            cost_usd=Decimal("0"),
+            cost_usd=provider_result_cost,
             response_hash=_response_hash(answer_text),
             tokens_in=provider_result.tokens_in,
             tokens_out=provider_result.tokens_out,
@@ -959,7 +1159,7 @@ async def synthesize_answer(
         )
         return Abstention(
             reason="provider_error",
-            cost_usd=Decimal("0"),
+            cost_usd=provider_result_cost,
             llm_call_id=placeholder_row.id,
         )
 
@@ -972,7 +1172,7 @@ async def synthesize_answer(
         await ledger_repo.update_placeholder(
             session,
             llm_call_id=placeholder_row.id,
-            cost_usd=Decimal("0"),
+            cost_usd=provider_result_cost,
             response_hash=_response_hash(answer_text),
             tokens_in=provider_result.tokens_in,
             tokens_out=provider_result.tokens_out,
@@ -982,17 +1182,34 @@ async def synthesize_answer(
         )
         return Abstention(
             reason="provider_error",
-            cost_usd=Decimal("0"),
+            cost_usd=provider_result_cost,
             llm_call_id=placeholder_row.id,
         )
 
     # Success — persist cache row (with surviving_ids in citation_ids JSONB,
     # NOT the pre-filter bundle.evidence_ids) + UPDATE placeholder + return.
-    cost_usd = _estimate_cost(
-        config=config,
-        tokens_in=provider_result.tokens_in,
-        tokens_out=provider_result.tokens_out,
-    )
+    cost_usd = provider_result_cost
+    if not cache_enabled:
+        latency = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=cost_usd,
+            response_hash=_response_hash(answer_text),
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=request_id,
+            latency_ms=latency,
+            error=None,
+        )
+        return AnswerWithCitations(
+            answer_text=answer_text,
+            citation_ids=provider_result.citation_ids,
+            cost_usd=cost_usd,
+            cache_hit=False,
+            llm_call_id=placeholder_row.id,
+            surviving_evidence_ids=ordered_surviving_ids,
+        )
     # F4-RACE-FIX (Codex round-2 HIGH-2): cache store may race with a
     # concurrent winner that also dispatched between unlock and store. The
     # ``input_hash`` UNIQUE constraint catches the duplicate; we treat it as
@@ -1010,7 +1227,7 @@ async def synthesize_answer(
                 session,
                 input_hash=cache_input_hash,
                 answer_text=answer_text,
-                citation_ids=list(provider_result.citation_ids),
+                citation_ids=list(full_provenance_ids),
                 model=config.model,
             )
     except IntegrityError:
@@ -1053,10 +1270,15 @@ async def synthesize_answer(
             )
             return AnswerWithCitations(
                 answer_text=existing_answer,
-                citation_ids=tuple(existing.citation_ids),
+                citation_ids=tuple(
+                    citation_id
+                    for citation_id in existing.citation_ids
+                    if citation_id in surviving_id_set
+                ),
                 cost_usd=cost_usd,
                 cache_hit=False,  # provider was called; we just lost the store race
                 llm_call_id=placeholder_row.id,
+                surviving_evidence_ids=ordered_surviving_ids,
             )
         # Race-recovery edge case (Codex round-3): IntegrityError fired but
         # the existing row is GONE by the time we re-fetch. Plausible
@@ -1104,24 +1326,158 @@ async def synthesize_answer(
         cost_usd=cost_usd,
         cache_hit=False,
         llm_call_id=placeholder_row.id,
+        surviving_evidence_ids=ordered_surviving_ids,
     )
 
 
 # ─── Internal SQL adapters ───────────────────────────────────────────────────
 
 
-async def _source_filter(session: AsyncSession, evidence_ids: list[int]) -> list[int]:
+async def _source_filter(
+    session: AsyncSession,
+    evidence_ids: list[int],
+    *,
+    chat_id: int,
+) -> list[int]:
     """Return surviving message_version_ids per invariant 2."""
     result = await session.execute(
         _SOURCE_FILTER_SQL,
         {
             "ids": evidence_ids,
-            "p_off": _POLICY_OFFRECORD,
-            "p_forgot": _POLICY_FORGOTTEN,
+            "chat_id": chat_id,
         },
     )
     rows = result.mappings().all()
     return [int(r["message_version_id"]) for r in rows]
+
+
+def _item_provenance_ids(item: EvidenceItem) -> tuple[int, ...]:
+    if item.source_type != "card":
+        return (item.message_version_id,)
+    return tuple(dict.fromkeys((item.message_version_id, *item.card_source_message_version_ids)))
+
+
+def _bundle_provenance_ids(items: Sequence[EvidenceItem]) -> tuple[int, ...]:
+    """Flatten full governed provenance while preserving deterministic order."""
+
+    return tuple(
+        dict.fromkeys(source_id for item in items for source_id in _item_provenance_ids(item))
+    )
+
+
+@asynccontextmanager
+async def hold_evidence_delivery_locks(
+    session: AsyncSession,
+    bundle: EvidenceBundle,
+) -> AsyncIterator[None]:
+    """Serialize final presentation with forget/edit/card-governance writers."""
+
+    from bot.services.advisory_locks import (
+        governed_message_lock_keys,
+        hold_session_advisory_locks,
+    )
+    from bot.services.forget_cascade import _p6_mvid_advisory_lock_id
+
+    provenance_ids = _bundle_provenance_ids(bundle.items)
+    lock_keys = await governed_message_lock_keys(session, provenance_ids)
+    lock_ids = (_p6_mvid_advisory_lock_id(value) for value in provenance_ids)
+    async with hold_session_advisory_locks(
+        session,
+        lock_ids,
+        lock_keys=lock_keys,
+    ):
+        yield
+
+
+async def _filter_governed_evidence(
+    session: AsyncSession,
+    bundle: EvidenceBundle,
+    *,
+    max_evidence_items: int,
+) -> tuple[EvidenceBundle, tuple[int, ...]]:
+    """Return ordered, anchor-deduplicated evidence with full provenance valid."""
+
+    if not 1 <= max_evidence_items <= 8:
+        raise ValueError("max_evidence_items must be between 1 and 8")
+    # A card is eligible only when the current canonical row is approved and
+    # the bundle carries its exact complete, ordered source set.  This closes
+    # stale-search races where a card is archived or its provenance changes
+    # between retrieval and provider dispatch.
+    card_ids = list(
+        dict.fromkeys(
+            str(item.card_id)
+            for item in bundle.items
+            if item.source_type == "card" and item.card_id is not None
+        )
+    )
+    canonical_cards: dict[str, tuple[int, ...]] = {}
+    if card_ids:
+        card_result = await session.execute(
+            _APPROVED_CARD_PROVENANCE_SQL,
+            {"card_ids": card_ids},
+        )
+        canonical_cards = {
+            str(row["card_id"]): tuple(int(value) for value in row["source_ids"])
+            for row in card_result.mappings().all()
+        }
+
+    candidates: list[EvidenceItem] = []
+    for item in bundle.items:
+        if item.source_type == "card":
+            canonical = canonical_cards.get(str(item.card_id))
+            supplied = tuple(item.card_source_message_version_ids)
+            if not canonical or supplied != canonical or item.message_version_id != canonical[0]:
+                continue
+        candidates.append(item)
+
+    provenance_ids = list(_bundle_provenance_ids(candidates))
+    if not provenance_ids:
+        return EvidenceBundle(
+            query=bundle.query,
+            chat_id=bundle.chat_id,
+            items=(),
+            abstained=True,
+            created_at=bundle.created_at,
+        ), ()
+
+    source_survivors = set(await _source_filter(session, provenance_ids, chat_id=bundle.chat_id))
+    tombstoned = tuple(await _forget_tombstone_check(session, provenance_ids))
+    allowed_ids = source_survivors.difference(tombstoned)
+    selected: list[EvidenceItem] = []
+    selected_anchors: set[int] = set()
+    for item in candidates:
+        anchor = item.message_version_id
+        if anchor in selected_anchors:
+            continue
+        if not set(_item_provenance_ids(item)).issubset(allowed_ids):
+            continue
+        selected.append(item)
+        selected_anchors.add(anchor)
+        if len(selected) == max_evidence_items:
+            break
+    return EvidenceBundle(
+        query=bundle.query,
+        chat_id=bundle.chat_id,
+        items=tuple(selected),
+        abstained=not selected,
+        created_at=bundle.created_at,
+    ), tombstoned
+
+
+async def filter_surviving_evidence(
+    session: AsyncSession,
+    bundle: EvidenceBundle,
+    *,
+    max_evidence_items: int = MAX_QA_EVIDENCE_ITEMS,
+) -> EvidenceBundle:
+    """Public presentation fence using the same policy as provider dispatch."""
+
+    filtered, _tombstoned = await _filter_governed_evidence(
+        session,
+        bundle,
+        max_evidence_items=max_evidence_items,
+    )
+    return filtered
 
 
 async def _forget_tombstone_check(session: AsyncSession, evidence_ids: list[int]) -> list[int]:
@@ -1154,6 +1510,8 @@ async def _budget_check(
     session: AsyncSession,
     config: LLMGatewayConfig,
     ledger_repo: LedgerRepoProtocol,
+    *,
+    pending_cost: Decimal = Decimal("0"),
 ) -> bool:
     """Read daily / monthly cost totals via repo; return True iff over ceiling.
 
@@ -1169,9 +1527,17 @@ async def _budget_check(
     today = datetime.now(timezone.utc).date()
     daily_total = await ledger_repo.daily_cost_usd(session, day=today)
     monthly_total = await ledger_repo.monthly_cost_usd(session, year=today.year, month=today.month)
-    if daily_total >= config.daily_ceiling_usd:
+    if (
+        daily_total >= config.daily_ceiling_usd
+        if pending_cost == 0
+        else daily_total + pending_cost > config.daily_ceiling_usd
+    ):
         return True
-    if monthly_total >= config.monthly_ceiling_usd:
+    if (
+        monthly_total >= config.monthly_ceiling_usd
+        if pending_cost == 0
+        else monthly_total + pending_cost > config.monthly_ceiling_usd
+    ):
         return True
     return False
 
@@ -1192,6 +1558,9 @@ def _estimate_cost(*, config: LLMGatewayConfig, tokens_in: int, tokens_out: int)
     Adding a stop signal here (rather than raising) preserves the
     gatekeeper-immune invariant (#1 HANDOFF §1).
     """
+    if type(tokens_in) is not int or type(tokens_out) is not int or tokens_in < 0 or tokens_out < 0:
+        raise ValueError("token counts must be non-negative integers")
+
     from bot.services.llm_pricing import estimate_cost
 
     try:
@@ -1298,6 +1667,271 @@ def resolve_provider(
             json_output=deepseek_json_output,
         )
     raise ValueError(f"unknown provider: {provider_name}")
+
+
+def load_embedding_gateway_config() -> EmbeddingGatewayConfig:
+    """Load the fixed OpenAI semantic-embedding contract from environment."""
+
+    from bot.services.llm_providers.openai_embeddings import (
+        DEFAULT_OPENAI_EMBEDDING_MODEL,
+        OPENAI_EMBEDDING_DIMENSIONS,
+    )
+
+    model = os.environ.get("EMBEDDING_MODEL", DEFAULT_OPENAI_EMBEDDING_MODEL)
+    try:
+        dimensions = int(os.environ.get("EMBEDDING_DIMENSIONS", str(OPENAI_EMBEDDING_DIMENSIONS)))
+        daily = Decimal(os.environ.get("EMBEDDING_DAILY_USD_CEILING", "1.00"))
+        monthly = Decimal(os.environ.get("EMBEDDING_MONTHLY_USD_CEILING", "10.00"))
+    except (ValueError, ArithmeticError) as exc:
+        raise ValueError("invalid embedding gateway numeric configuration") from exc
+    if model != DEFAULT_OPENAI_EMBEDDING_MODEL:
+        raise ValueError("EMBEDDING_MODEL must be text-embedding-3-small")
+    if dimensions != OPENAI_EMBEDDING_DIMENSIONS:
+        raise ValueError("EMBEDDING_DIMENSIONS must be 1536")
+    if daily <= 0 or monthly <= 0:
+        raise ValueError("embedding spend ceilings must be positive")
+    return EmbeddingGatewayConfig(
+        model=model,
+        dimensions=dimensions,
+        daily_ceiling_usd=daily,
+        monthly_ceiling_usd=monthly,
+    )
+
+
+def _embedding_prompt_hash(*, inputs: Sequence[str], model: str, dimensions: int) -> str:
+    digest = hashlib.sha256()
+    digest.update(f"{model}:{dimensions}:".encode("ascii"))
+    for value in inputs:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _embedding_response_hash(vectors: tuple[tuple[float, ...], ...]) -> str:
+    payload = json.dumps(vectors, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+_EMBEDDING_BUDGET_DENIED_PROMPT_HASH = hashlib.sha256(
+    b"embedding_budget_exceeded_without_provider_dispatch"
+).hexdigest()
+
+
+async def embed_texts(
+    session: AsyncSession,
+    *,
+    inputs: Sequence[str],
+    config: EmbeddingGatewayConfig,
+    ledger_repo: LedgerRepoProtocol,
+    provider: Any | None = None,
+    qa_trace_id: int | None = None,
+    outcome_recorder: Any | None = None,
+) -> EmbeddingGatewayResult:
+    """Create audited embeddings through the shared provider boundary.
+
+    The gateway commits the conservative ledger reservation while holding the
+    budget lock, so concurrent calls can observe it before either provider is
+    entered. When an outcome recorder is supplied, its durable paid-attempt
+    claim is committed with the reservation and its terminal state is committed
+    with the final ledger update. A budget denial creates only a content-free
+    audit row because no provider dispatch occurred and a future run must retry.
+    """
+
+    from bot.services.llm_pricing import estimate_cost
+    from bot.services.llm_providers import ProviderStructuralError, ProviderTransientError
+    from bot.services.llm_providers.openai_embeddings import OpenAIEmbeddingsProvider
+
+    values = tuple(inputs)
+    if not values:
+        raise ValueError("embedding inputs must not be empty")
+    if config.dimensions != 1536 or config.model != "text-embedding-3-small":
+        raise ValueError("unsupported embedding gateway configuration")
+    if config.daily_ceiling_usd <= 0 or config.monthly_ceiling_usd <= 0:
+        raise ValueError("embedding spend ceilings must be positive")
+
+    prompt_hash = _embedding_prompt_hash(
+        inputs=values,
+        model=config.model,
+        dimensions=config.dimensions,
+    )
+    # A conservative pre-call reservation prevents a burst from bypassing the
+    # ceiling. Actual provider tokens replace this value after a response.
+    reservation_tokens = sum(len(value) for value in values)
+    reservation_cost = estimate_cost(
+        model=config.model,
+        tokens_in=reservation_tokens,
+        tokens_out=0,
+    )
+    today = datetime.now(timezone.utc).date()
+    placeholder_row: Any | None = None
+    budget_row: Any | None = None
+    await session.execute(_BUDGET_LOCK_XACT_SQL, {"lock_id": LLM_BUDGET_LOCK_ID})
+    try:
+        daily_total = await ledger_repo.daily_cost_usd(
+            session,
+            day=today,
+            call_type="semantic_embedding",
+        )
+        monthly_total = await ledger_repo.monthly_cost_usd(
+            session,
+            year=today.year,
+            month=today.month,
+            call_type="semantic_embedding",
+        )
+        if (
+            daily_total + reservation_cost > config.daily_ceiling_usd
+            or monthly_total + reservation_cost > config.monthly_ceiling_usd
+        ):
+            budget_row = await ledger_repo.record(
+                session,
+                qa_trace_id=qa_trace_id,
+                provider="openai",
+                model=config.model,
+                prompt_hash=_EMBEDDING_BUDGET_DENIED_PROMPT_HASH,
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                cost_usd=Decimal("0"),
+                latency_ms=0,
+                request_id=None,
+                cache_hit=False,
+                error="budget_exceeded",
+                call_type="semantic_embedding",
+            )
+        else:
+            placeholder_row = await ledger_repo.record(
+                session,
+                qa_trace_id=qa_trace_id,
+                provider="openai",
+                model=config.model,
+                prompt_hash=prompt_hash,
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                cost_usd=reservation_cost,
+                latency_ms=0,
+                request_id=None,
+                cache_hit=False,
+                error="reserved_in_flight",
+                call_type="semantic_embedding",
+            )
+        claim_ledger_id = budget_row.id if budget_row is not None else placeholder_row.id
+        if outcome_recorder is not None:
+            await outcome_recorder.reserve(
+                session,
+                llm_usage_ledger_id=claim_ledger_id,
+                budget_denied=budget_row is not None,
+            )
+        # Publish the reservation and release the transaction-scoped lock.
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    if budget_row is not None:
+        raise EmbeddingBudgetExceeded(llm_usage_ledger_id=budget_row.id)
+    if placeholder_row is None:
+        raise RuntimeError("embedding ledger reservation was not created")
+
+    active_provider = provider or OpenAIEmbeddingsProvider()
+    started = _monotonic()
+    try:
+        provider_result = await active_provider.embed(
+            inputs=values,
+            model=config.model,
+            dimensions=config.dimensions,
+        )
+    except (ProviderTransientError, ProviderStructuralError) as exc:
+        subtype = _safe_qa_provider_error_subtype(exc)
+        terminal_cost = (
+            Decimal("0")
+            if subtype in {"auth", "bad_request", "model_not_found", "rate_limit"}
+            else reservation_cost
+        )
+        try:
+            await ledger_repo.update_placeholder(
+                session,
+                llm_call_id=placeholder_row.id,
+                cost_usd=terminal_cost,
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                request_id=None,
+                latency_ms=int((_monotonic() - started) * 1000),
+                error=f"provider_{type(exc).__name__}:{subtype}",
+            )
+            if outcome_recorder is not None:
+                await outcome_recorder.fail(
+                    session,
+                    llm_usage_ledger_id=placeholder_row.id,
+                )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        setattr(exc, "llm_usage_ledger_id", placeholder_row.id)
+        raise
+    except Exception as exc:
+        try:
+            await ledger_repo.update_placeholder(
+                session,
+                llm_call_id=placeholder_row.id,
+                cost_usd=reservation_cost,
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                request_id=None,
+                latency_ms=int((_monotonic() - started) * 1000),
+                error=f"provider_unknown:{type(exc).__name__}",
+            )
+            if outcome_recorder is not None:
+                await outcome_recorder.fail(
+                    session,
+                    llm_usage_ledger_id=placeholder_row.id,
+                )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        setattr(exc, "llm_usage_ledger_id", placeholder_row.id)
+        raise
+    cost = estimate_cost(
+        model=config.model,
+        tokens_in=provider_result.tokens_in,
+        tokens_out=0,
+    )
+    request_id = _safe_qa_request_id(provider_result.request_id)
+    try:
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=cost,
+            response_hash=_embedding_response_hash(provider_result.vectors),
+            tokens_in=provider_result.tokens_in,
+            tokens_out=0,
+            request_id=request_id,
+            latency_ms=provider_result.raw_latency_ms,
+            error=None,
+        )
+        if outcome_recorder is not None:
+            await outcome_recorder.complete(
+                session,
+                llm_usage_ledger_id=placeholder_row.id,
+                vectors=provider_result.vectors,
+            )
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    return EmbeddingGatewayResult(
+        vectors=provider_result.vectors,
+        tokens_in=provider_result.tokens_in,
+        cost_usd=cost,
+        llm_usage_ledger_id=placeholder_row.id,
+        request_id=request_id or "",
+        latency_ms=provider_result.raw_latency_ms,
+    )
 
 
 def load_vision_gateway_config() -> VisionGatewayConfig:
@@ -4373,6 +5007,9 @@ __all__ = [
     "DigestEmptyWindowError",
     "DigestGatewayError",
     "DigestProviderError",
+    "EmbeddingBudgetExceeded",
+    "EmbeddingGatewayConfig",
+    "EmbeddingGatewayResult",
     "ExtractGraphTriplesResult",
     "GraphTriple",
     "LLM_BUDGET_LOCK_ID",
@@ -4398,6 +5035,10 @@ __all__ = [
     "_resolve_entity",
     "extract_candidates",
     "extract_graph_triples",
+    "embed_texts",
+    "filter_surviving_evidence",
+    "hold_evidence_delivery_locks",
+    "load_embedding_gateway_config",
     "load_gateway_config",
     "plan_butler_action",
     "resolve_provider",

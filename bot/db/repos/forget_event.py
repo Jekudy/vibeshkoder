@@ -15,11 +15,15 @@ Any other transition raises ``ValueError`` immediately (before any DB call).
 
 from __future__ import annotations
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import ForgetEvent
+from bot.services.advisory_locks import (
+    forget_target_advisory_key,
+    session_uses_postgresql,
+)
 
 # Valid transitions: key = current status, value = set of allowed next statuses.
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
@@ -56,6 +60,18 @@ class ForgetEventRepo:
         This is race-safe: two concurrent callers both pass no application-level check;
         one wins the insert, the other hits the conflict path and fetches the winner's row.
         """
+        if (
+            target_type in {"message", "user", "message_hash"}
+            and target_id is not None
+            and session_uses_postgresql(session)
+        ):
+            # Serialize the first visible pending tombstone with governed
+            # evidence delivery. The delivery side holds the same key through
+            # its final revalidation and Telegram call.
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                {"lock_key": forget_target_advisory_key(target_type, target_id)},
+            )
         stmt = (
             pg_insert(ForgetEvent)
             .values(
@@ -139,9 +155,7 @@ class ForgetEventRepo:
             )
 
         # Compute which current statuses may transition to the requested status.
-        allowed_old = [
-            old for old, nexts in _ALLOWED_TRANSITIONS.items() if status in nexts
-        ]
+        allowed_old = [old for old, nexts in _ALLOWED_TRANSITIONS.items() if status in nexts]
 
         values: dict = {"status": status, "updated_at": func.now()}
         if cascade_status is not None:
@@ -164,9 +178,7 @@ class ForgetEventRepo:
         # Re-fetch with populate_existing=True so identity-map cache (expire_on_commit=False
         # in bot/db/engine.py) does not shadow the actual current DB status in the error
         # message. Without this flag a stale cached row would mislead the caller.
-        actual = await session.get(
-            ForgetEvent, forget_event_id, populate_existing=True
-        )
+        actual = await session.get(ForgetEvent, forget_event_id, populate_existing=True)
         if actual is None:
             raise ValueError(f"ForgetEvent(id={forget_event_id}) not found")
         allowed_next = _ALLOWED_TRANSITIONS.get(actual.status, frozenset())
@@ -212,9 +224,7 @@ class ForgetEventRepo:
             return row
 
         # Either the id doesn't exist or the row is not in 'processing'.
-        actual = await session.get(
-            ForgetEvent, forget_event_id, populate_existing=True
-        )
+        actual = await session.get(ForgetEvent, forget_event_id, populate_existing=True)
         if actual is None:
             raise ValueError(f"ForgetEvent(id={forget_event_id}) not found")
         raise ValueError(

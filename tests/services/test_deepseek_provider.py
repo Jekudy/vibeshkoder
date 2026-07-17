@@ -130,6 +130,36 @@ async def test_deepseek_provider_requires_api_key_before_network() -> None:
     assert exc_info.value.subtype == "auth"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {},
+        {"prompt_tokens": -1, "completion_tokens": 1},
+        {"prompt_tokens": "1", "completion_tokens": 1},
+        {"prompt_tokens": True, "completion_tokens": 1},
+    ],
+)
+async def test_deepseek_provider_rejects_missing_or_invalid_usage(usage: object) -> None:
+    from bot.services.llm_providers import ProviderStructuralError
+    from bot.services.llm_providers.deepseek import DeepSeekProvider
+
+    payload = {
+        "id": "ds-invalid-usage",
+        "choices": [{"message": {"content": "answer"}}],
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    async with _client(transport) as client:
+        provider = DeepSeekProvider(api_key="test-key", client=client)
+        with pytest.raises(ProviderStructuralError) as exc_info:
+            await provider.call(prompt="question", model="deepseek-v4-flash")
+
+    assert exc_info.value.subtype == "contract_violation"
+
+
 def test_deepseek_pricing_is_pinned_to_official_v4_flash_rates() -> None:
     from bot.services.llm_pricing import MODEL_PRICING, estimate_cost
 

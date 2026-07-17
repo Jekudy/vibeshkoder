@@ -11,7 +11,7 @@ from calendar import monthrange
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 
 from bot.db.models import LlmUsageLedger
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -101,9 +101,7 @@ class LedgerRepo:
         if call_type is not None:
             filters.append(LlmUsageLedger.call_type == call_type)
 
-        result = await session.execute(
-            select(func.sum(LlmUsageLedger.cost_usd)).where(*filters)
-        )
+        result = await session.execute(select(func.sum(LlmUsageLedger.cost_usd)).where(*filters))
         total = result.scalar_one_or_none()
         return Decimal(str(total)) if total is not None else Decimal("0")
 
@@ -136,9 +134,7 @@ class LedgerRepo:
         if call_type is not None:
             filters.append(LlmUsageLedger.call_type == call_type)
 
-        result = await session.execute(
-            select(func.sum(LlmUsageLedger.cost_usd)).where(*filters)
-        )
+        result = await session.execute(select(func.sum(LlmUsageLedger.cost_usd)).where(*filters))
         total = result.scalar_one_or_none()
         return Decimal(str(total)) if total is not None else Decimal("0")
 
@@ -175,7 +171,12 @@ class LedgerRepo:
                 cost_usd=cost_usd,
                 latency_ms=latency_ms,
                 request_id=request_id,
-                response_hash=response_hash,
+                # A forget cascade may redact this row while the provider call
+                # is still in flight. Do not resurrect its response hash.
+                response_hash=case(
+                    (LlmUsageLedger.prompt_hash.is_(None), None),
+                    else_=response_hash,
+                ),
                 error=error,
             )
         )

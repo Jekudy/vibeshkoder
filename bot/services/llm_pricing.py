@@ -61,6 +61,11 @@ MODEL_PRICING: dict[str, ModelPricing] = {
         input_per_million_tokens_usd=Decimal("0.05"),
         output_per_million_tokens_usd=Decimal("0.40"),
     ),
+    # OpenAI model catalog, verified 2026-07-16: $0.02 / 1M input tokens.
+    "text-embedding-3-small": ModelPricing(
+        input_per_million_tokens_usd=Decimal("0.02"),
+        output_per_million_tokens_usd=Decimal("0"),
+    ),
 }
 
 

@@ -146,6 +146,7 @@ async def _handle_join(
         username=tg_user.username,
         first_name=tg_user.first_name,
         last_name=tg_user.last_name,
+        is_bot=getattr(tg_user, "is_bot", None),
     )
 
     is_admin = tg_user.id in settings.ADMIN_IDS

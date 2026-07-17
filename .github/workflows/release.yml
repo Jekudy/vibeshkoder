@@ -14,6 +14,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_BOT: ghcr.io/jekudy/vibe-gatekeeper-bot
+  IMAGE_DB: ghcr.io/jekudy/vibe-gatekeeper-postgres
   IMAGE_WEB: ghcr.io/jekudy/vibe-gatekeeper-web
 
 jobs:
@@ -66,3 +67,16 @@ jobs:
           tags: |
             ${{ env.IMAGE_WEB }}:${{ steps.meta.outputs.sha_tag }}
             ${{ env.IMAGE_WEB }}:main
+
+      - name: Build and push PostgreSQL image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.postgres
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/Jekudy/vibe-gatekeeper
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+          tags: |
+            ${{ env.IMAGE_DB }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.IMAGE_DB }}:main

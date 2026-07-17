@@ -39,7 +39,9 @@ mdurl==0.1.2
 multidict==6.7.1
 neo4j==5.28.4
 networkx==3.6.1
+numpy==2.5.1
 oauthlib==3.3.1
+pgvector==0.4.2
 propcache==0.4.1
 pyasn1==0.6.3
 pyasn1-modules==0.4.2

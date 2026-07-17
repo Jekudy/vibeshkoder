@@ -269,9 +269,7 @@ async def test_monthly_cost_usd_respects_calendar_month(db_session) -> None:
     )
     await db_session.flush()
 
-    total = await LedgerRepo.monthly_cost_usd(
-        db_session, year=target_year, month=target_month
-    )
+    total = await LedgerRepo.monthly_cost_usd(db_session, year=target_year, month=target_month)
 
     # Only the two March rows should sum: 0.300000 + 0.200000 = 0.500000
     assert total == Decimal("0.500000"), f"expected 0.500000, got {total}"
@@ -326,6 +324,43 @@ async def test_update_placeholder_updates_row_and_returns_one(db_session) -> Non
     assert updated.request_id == "req-xyz"
     assert updated.response_hash == "c" * 64
     assert updated.error is None
+
+
+async def test_update_placeholder_never_resurrects_redacted_response_hash(db_session) -> None:
+    from bot.db.models import LlmUsageLedger
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+
+    placeholder = LlmUsageLedger(
+        provider="openai",
+        model="text-embedding-3-small",
+        prompt_hash=None,
+        response_hash=None,
+        tokens_in=0,
+        tokens_out=0,
+        cost_usd=Decimal("0"),
+        latency_ms=0,
+        cache_hit=False,
+        error=None,
+        call_type="semantic_embedding",
+    )
+    db_session.add(placeholder)
+    await db_session.flush()
+
+    await LedgerRepo.update_placeholder(
+        db_session,
+        llm_call_id=placeholder.id,
+        tokens_in=12,
+        tokens_out=0,
+        cost_usd=Decimal("0.000001"),
+        latency_ms=5,
+        request_id="req-redacted",
+        response_hash="d" * 64,
+        error=None,
+    )
+    await db_session.refresh(placeholder)
+
+    assert placeholder.prompt_hash is None
+    assert placeholder.response_hash is None
 
 
 # ─── Test 8: update_placeholder raises LookupError when id not found ─────────

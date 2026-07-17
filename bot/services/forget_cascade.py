@@ -39,15 +39,20 @@ import struct
 from typing import Any
 
 from aiogram import Bot
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.engine import async_session
 from bot.db.models import (
+    CardSource,
     ChatMessage,
     LlmUsageLedger,
     MessageVersion,
     QaTrace,
+    SemanticQaAttempt,
+    SemanticRetrievalTrace,
+    SemanticRetrievalUnit,
+    SemanticRetrievalUnitSource,
 )
 from bot.db.repos.feature_flag import FeatureFlagRepo
 from bot.db.repos.forget_event import ForgetEventRepo
@@ -122,6 +127,7 @@ def _p6_event_advisory_lock_id(event_id) -> int:
     (lock_id,) = struct.unpack(">q", digest[:8])
     return lock_id
 
+
 # Feature flag key — read by the scheduler tick to decide whether to run the worker.
 CASCADE_WORKER_FLAG = "memory.forget.cascade_worker.enabled"
 
@@ -132,6 +138,11 @@ CASCADE_WORKER_FLAG = "memory.forget.cascade_worker.enabled"
 # replaces the per-layer function and existing rows are reprocessed naturally.
 CASCADE_LAYER_ORDER: tuple[str, ...] = (
     "chat_messages",
+    # Issue #404 semantic memory is a derived privacy surface. Purge vectors,
+    # provenance, and content-derived audit hashes while message_versions and
+    # card_sources still exist, because both are required to resolve every
+    # affected message/card revision. The durable quota attempt row survives.
+    "semantic_retrieval",
     "message_versions",
     "qa_traces",
     # Phase 5 / T5-04 layers — ORDER binding per contracts.md §8:
@@ -200,6 +211,7 @@ _LAYER_APPLICABLE_TARGET_TYPES: dict[str, frozenset[str]] = {
     # content_hash). Restricting them here makes the dispatcher route
     # message_hash through Phase 5 layers without raising in Phase 1.
     "chat_messages": frozenset({"message", "user"}),
+    "semantic_retrieval": frozenset({"message", "message_hash", "user"}),
     "message_versions": frozenset({"message", "user"}),
     "qa_traces": frozenset({"user"}),  # user-targeted forgets only
     # Phase 5 / T5-04 layers — applicability per contracts.md §8:
@@ -304,8 +316,301 @@ async def _cascade_chat_messages(session: AsyncSession, event) -> int:
 
     # Should not reach here: _process_one_event guards unsupported target_types
     # before calling _LAYER_FUNCS.  Raise so a regression surfaces immediately.
-    raise ValueError(
-        f"_cascade_chat_messages: unsupported target_type={event.target_type!r}"
+    raise ValueError(f"_cascade_chat_messages: unsupported target_type={event.target_type!r}")
+
+
+async def _semantic_affected_mvids(session: AsyncSession, event) -> list[int]:
+    """Resolve every message revision covered by a semantic-memory purge.
+
+    Unlike the Phase 6 card resolver, a ``message`` target intentionally returns
+    *all* versions of the chat message. Old semantic units are retained after an
+    edit for audit/idempotency, so purging only ``current_version_id`` would leave
+    stale vectors derived from the forgotten body behind.
+    """
+    if event.target_id is None:
+        raise ValueError(
+            f"forget_event target_type={event.target_type!r} requires a non-None target_id"
+        )
+
+    if event.target_type == "message":
+        try:
+            chat_message_id = int(event.target_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "forget_event target_type='message' requires integer target_id; "
+                f"got {event.target_id!r}"
+            )
+        statement = select(MessageVersion.id).where(
+            MessageVersion.chat_message_id == chat_message_id
+        )
+    elif event.target_type == "message_hash":
+        statement = select(MessageVersion.id).where(
+            MessageVersion.content_hash == str(event.target_id)
+        )
+    elif event.target_type == "user":
+        try:
+            telegram_id = int(event.target_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "forget_event target_type='user' requires integer target_id "
+                f"(telegram_id); got {event.target_id!r}"
+            )
+        statement = (
+            select(MessageVersion.id)
+            .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
+            .where(ChatMessage.user_id == telegram_id)
+        )
+    else:
+        raise ValueError(f"_semantic_affected_mvids: unsupported target_type={event.target_type!r}")
+
+    result = await session.execute(statement)
+    return sorted({int(message_version_id) for message_version_id in result.scalars()})
+
+
+async def _cascade_semantic_retrieval(session: AsyncSession, event) -> int:
+    """Purge issue #404 semantic derived data while preserving budget audit.
+
+    The layer runs before ``message_versions`` and ``card_sources`` are mutated.
+    It therefore can resolve message and card source keys, remove every vector
+    unit plus its normalized provenance, and redact the hashes of the embedding
+    ledger calls that produced those units. For a user forget, query retrieval
+    traces are deleted as derived content while the quota-attempt row survives;
+    the attempt's provider-ledger hashes are also NULLed. Cost, token, latency,
+    outcome, and slot aggregates remain intact, matching the existing Phase 5
+    ``NULL hashes, preserve audit aggregates`` policy.
+    """
+    from sqlalchemy import String, bindparam
+    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+
+    affected_mvids = await _semantic_affected_mvids(session, event)
+    unit_rows: list[Any] = []
+    affected_source_keys = {
+        f"message:{message_version_id}" for message_version_id in affected_mvids
+    }
+
+    if affected_mvids:
+        units_result = await session.execute(
+            select(
+                SemanticRetrievalUnit.id,
+                SemanticRetrievalUnit.llm_usage_ledger_id,
+            )
+            .join(
+                SemanticRetrievalUnitSource,
+                SemanticRetrievalUnitSource.unit_id == SemanticRetrievalUnit.id,
+            )
+            .where(SemanticRetrievalUnitSource.message_version_id.in_(affected_mvids))
+            .distinct()
+        )
+        unit_rows = list(units_result.all())
+
+        # A card may have surfaced through FTS even when its semantic unit was
+        # never built. Resolve card keys from canonical provenance as well so
+        # no retrieval trace retains a forgotten-source reference.
+        card_result = await session.execute(
+            select(CardSource.card_id)
+            .where(CardSource.message_version_id.in_(affected_mvids))
+            .distinct()
+        )
+        affected_source_keys.update(f"card:{card_id}" for card_id in card_result.scalars())
+
+    unit_ids = {int(row.id) for row in unit_rows}
+    ledger_ids = {int(row.llm_usage_ledger_id) for row in unit_rows}
+    attempt_ids: set[int] = set()
+    qa_trace_ids: set[int] = set()
+    parent_chat_message_ids: set[int] = set()
+
+    attempt_filters = []
+    if event.target_type == "message":
+        # A persisted question can have a QaTrace even when no semantic attempt
+        # was admitted (quota denial) or no MessageVersion survived. Resolve it
+        # directly from the forget target instead of relying on attempt FKs.
+        parent_chat_message_ids.add(int(event.target_id))
+    if event.target_type == "message_hash" and affected_mvids:
+        parent_result = await session.execute(
+            select(MessageVersion.chat_message_id)
+            .where(MessageVersion.id.in_(affected_mvids))
+            .distinct()
+        )
+        parent_chat_message_ids.update(
+            int(chat_message_id) for chat_message_id in parent_result.scalars()
+        )
+    if parent_chat_message_ids:
+        # The forgotten message can itself be a semantic question. It is
+        # deliberately excluded from retrieval results, so source-key matching
+        # cannot find its raw query or provider ledgers.
+        attempt_filters.append(
+            SemanticQaAttempt.source_chat_message_id.in_(parent_chat_message_ids)
+        )
+    if event.target_type == "user":
+        attempt_filters.append(SemanticQaAttempt.user_tg_id == int(event.target_id))
+
+    qa_trace_filters = []
+    if parent_chat_message_ids:
+        qa_trace_filters.append(QaTrace.source_chat_message_id.in_(parent_chat_message_ids))
+    if event.target_type == "user":
+        qa_trace_filters.append(QaTrace.user_tg_id == int(event.target_id))
+    if qa_trace_filters:
+        direct_trace_result = await session.execute(
+            select(QaTrace.id).where(or_(*qa_trace_filters))
+        )
+        qa_trace_ids.update(int(trace_id) for trace_id in direct_trace_result.scalars())
+
+    if attempt_filters:
+        attempts_result = await session.execute(
+            select(
+                SemanticQaAttempt.id,
+                SemanticQaAttempt.qa_trace_id,
+                SemanticQaAttempt.embedding_llm_call_id,
+                SemanticQaAttempt.synthesis_llm_call_id,
+            ).where(or_(*attempt_filters))
+        )
+        for row in attempts_result.all():
+            attempt_ids.add(int(row.id))
+            if row.qa_trace_id is not None:
+                qa_trace_ids.add(int(row.qa_trace_id))
+            if row.embedding_llm_call_id is not None:
+                ledger_ids.add(int(row.embedding_llm_call_id))
+            if row.synthesis_llm_call_id is not None:
+                ledger_ids.add(int(row.synthesis_llm_call_id))
+
+    qa_traces_redacted = 0
+    if qa_trace_ids:
+        qa_result = await session.execute(
+            update(QaTrace)
+            .where(QaTrace.id.in_(qa_trace_ids))
+            .values(
+                query_text=None,
+                query_redacted=True,
+                llm_response_summary=None,
+                llm_response_redacted=True,
+            )
+            .returning(QaTrace.id)
+        )
+        qa_traces_redacted = len(qa_result.scalars().all())
+
+    traces_deleted = 0
+    if attempt_ids:
+        trace_result = await session.execute(
+            delete(SemanticRetrievalTrace)
+            .where(SemanticRetrievalTrace.attempt_id.in_(attempt_ids))
+            .returning(SemanticRetrievalTrace.id)
+        )
+        traces_deleted += len(trace_result.scalars().all())
+
+    if affected_source_keys:
+        # candidate_ranks is a JSON object keyed by ``message:<mvid>`` or
+        # ``card:<uuid>``; result_source_ids is a JSON array of the same keys.
+        # Delete the derived trace instead of replacing non-null JSON/hash
+        # columns with an invented sentinel.
+        trace_statement = text(
+            "DELETE FROM semantic_retrieval_traces AS trace "
+            "WHERE EXISTS ("
+            "  SELECT 1 "
+            "  FROM jsonb_array_elements_text(trace.result_source_ids::jsonb) "
+            "       AS result_key(value) "
+            "  WHERE result_key.value = ANY(:source_keys)"
+            ") OR EXISTS ("
+            "  SELECT 1 "
+            "  FROM jsonb_object_keys(trace.candidate_ranks::jsonb) "
+            "       AS candidate_key(value) "
+            "  WHERE candidate_key.value = ANY(:source_keys)"
+            ") "
+            "RETURNING trace.attempt_id"
+        ).bindparams(bindparam("source_keys", type_=PG_ARRAY(String())))
+        trace_result = await session.execute(
+            trace_statement,
+            {"source_keys": sorted(affected_source_keys)},
+        )
+        source_trace_attempt_ids = {int(attempt_id) for attempt_id in trace_result.scalars().all()}
+        traces_deleted += len(source_trace_attempt_ids)
+        if source_trace_attempt_ids:
+            synthesis_result = await session.execute(
+                select(
+                    SemanticQaAttempt.qa_trace_id,
+                    SemanticQaAttempt.synthesis_llm_call_id,
+                ).where(
+                    SemanticQaAttempt.id.in_(source_trace_attempt_ids),
+                )
+            )
+            source_qa_trace_ids: set[int] = set()
+            for row in synthesis_result.all():
+                if row.qa_trace_id is not None:
+                    source_qa_trace_ids.add(int(row.qa_trace_id))
+                if row.synthesis_llm_call_id is not None:
+                    ledger_ids.add(int(row.synthesis_llm_call_id))
+            if source_qa_trace_ids:
+                qa_trace_ids.update(source_qa_trace_ids)
+                source_qa_result = await session.execute(
+                    update(QaTrace)
+                    .where(QaTrace.id.in_(source_qa_trace_ids))
+                    .values(
+                        llm_response_summary=None,
+                        llm_response_redacted=True,
+                    )
+                    .returning(QaTrace.id)
+                )
+                qa_traces_redacted += len(source_qa_result.scalars().all())
+
+    # Durable provider placeholders are linked to qa_trace_id before HTTP
+    # dispatch, while attempt-level embedding/synthesis FKs are attached only
+    # after a result exists. Discover both in-flight calls through the trace so
+    # a concurrent forget can irreversibly redact their hashes as well.
+    if qa_trace_ids:
+        trace_ledger_result = await session.execute(
+            select(LlmUsageLedger.id).where(LlmUsageLedger.qa_trace_id.in_(qa_trace_ids))
+        )
+        ledger_ids.update(int(value) for value in trace_ledger_result.scalars())
+
+    ledger_hashes_redacted = 0
+    if ledger_ids:
+        ledger_result = await session.execute(
+            update(LlmUsageLedger)
+            .where(
+                LlmUsageLedger.id.in_(ledger_ids),
+                (LlmUsageLedger.prompt_hash.is_not(None))
+                | (LlmUsageLedger.response_hash.is_not(None)),
+            )
+            .values(prompt_hash=None, response_hash=None)
+            .returning(LlmUsageLedger.id)
+        )
+        ledger_hashes_redacted = len(ledger_result.scalars().all())
+
+    provenance_deleted = 0
+    units_deleted = 0
+    if unit_ids:
+        provenance_result = await session.execute(
+            delete(SemanticRetrievalUnitSource)
+            .where(SemanticRetrievalUnitSource.unit_id.in_(unit_ids))
+            .returning(SemanticRetrievalUnitSource.unit_id)
+        )
+        provenance_deleted = len(provenance_result.scalars().all())
+        units_result = await session.execute(
+            delete(SemanticRetrievalUnit)
+            .where(SemanticRetrievalUnit.id.in_(unit_ids))
+            .returning(SemanticRetrievalUnit.id)
+        )
+        units_deleted = len(units_result.scalars().all())
+
+    await session.flush()
+    logger.info(
+        "semantic_forget_cascade_completed",
+        extra={
+            "forget_event_id": event.id,
+            "target_type": event.target_type,
+            "affected_message_version_count": len(affected_mvids),
+            "semantic_unit_count": units_deleted,
+            "semantic_provenance_count": provenance_deleted,
+            "semantic_trace_count": traces_deleted,
+            "qa_trace_count": qa_traces_redacted,
+            "semantic_ledger_hash_count": ledger_hashes_redacted,
+        },
+    )
+    return (
+        units_deleted
+        + provenance_deleted
+        + traces_deleted
+        + qa_traces_redacted
+        + ledger_hashes_redacted
     )
 
 
@@ -392,9 +697,7 @@ async def _cascade_message_versions(session: AsyncSession, event) -> int:
         return result.rowcount or 0
 
     # Should not reach here: _process_one_event guards unsupported target_types.
-    raise ValueError(
-        f"_cascade_message_versions: unsupported target_type={event.target_type!r}"
-    )
+    raise ValueError(f"_cascade_message_versions: unsupported target_type={event.target_type!r}")
 
 
 async def _cascade_qa_traces(session: AsyncSession, event) -> int:
@@ -412,9 +715,7 @@ async def _cascade_qa_traces(session: AsyncSession, event) -> int:
     try:
         telegram_id = int(event.target_id)
     except (TypeError, ValueError):
-        raise ValueError(
-            f"target_id must be integer telegram_id; got {event.target_id!r}"
-        )
+        raise ValueError(f"target_id must be integer telegram_id; got {event.target_id!r}")
 
     stmt = (
         update(QaTrace)
@@ -443,8 +744,7 @@ async def _cascade_llm_synthesis_cache(session: AsyncSession, event) -> int:
 
     target_types:
 
-    * ``message`` — resolve the chat_message's current_version_id → call
-      ``SynthesisCacheRepo.invalidate_by_citation`` once.
+    * ``message`` — invalidate every revision of the chat_message.
     * ``message_hash`` — resolve all message_version_ids sharing the
       ``content_hash`` → invalidate each.
     * ``user`` — bulk DELETE every cache row citing ANY of the user's
@@ -457,39 +757,8 @@ async def _cascade_llm_synthesis_cache(session: AsyncSession, event) -> int:
             f"forget_event target_type={event.target_type!r} requires non-None target_id"
         )
 
-    if event.target_type == "message":
-        try:
-            cm_id = int(event.target_id)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"forget_event target_type='message' requires integer target_id; "
-                f"got {event.target_id!r}"
-            )
-        # Resolve current_version_id of the chat_message. The chat_messages
-        # cascade layer (which runs earlier) NULLed text/caption/raw_json but
-        # left current_version_id intact, so this read still resolves.
-        row = (
-            await session.execute(
-                select(ChatMessage.current_version_id).where(ChatMessage.id == cm_id)
-            )
-        ).first()
-        if row is None or row[0] is None:
-            return 0
-        return await SynthesisCacheRepo.invalidate_by_citation(
-            session, message_version_id=int(row[0])
-        )
-
-    if event.target_type == "message_hash":
-        # Resolve every message_version_id whose chat_message has the given
-        # content_hash. (The hash is stored on message_versions.content_hash;
-        # chat_messages does NOT carry content_hash. So we query
-        # message_versions directly.)
-        target_hash = str(event.target_id)
-        version_ids = (
-            await session.execute(
-                select(MessageVersion.id).where(MessageVersion.content_hash == target_hash)
-            )
-        ).scalars().all()
+    if event.target_type in {"message", "message_hash", "user"}:
+        version_ids = await _semantic_affected_mvids(session, event)
         total = 0
         for vid in version_ids:
             total += await SynthesisCacheRepo.invalidate_by_citation(
@@ -497,37 +766,7 @@ async def _cascade_llm_synthesis_cache(session: AsyncSession, event) -> int:
             )
         return total
 
-    if event.target_type == "user":
-        try:
-            telegram_id = int(event.target_id)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"forget_event target_type='user' requires integer target_id (telegram_id); "
-                f"got {event.target_id!r}"
-            )
-        # Resolve user's complete set of message_version_ids and invalidate
-        # every cache row whose ``citation_ids`` JSONB array intersects.
-        # The chat_messages layer NULLed body fields but the user_id column
-        # is preserved, so this query resolves correctly regardless of layer
-        # ordering. Iterates per-id (instead of a single DELETE) so the
-        # repo's portable PG / SQLite fallback path is reused.
-        version_ids = (
-            await session.execute(
-                select(MessageVersion.id)
-                .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
-                .where(ChatMessage.user_id == telegram_id)
-            )
-        ).scalars().all()
-        total = 0
-        for vid in version_ids:
-            total += await SynthesisCacheRepo.invalidate_by_citation(
-                session, message_version_id=int(vid)
-            )
-        return total
-
-    raise ValueError(
-        f"_cascade_llm_synthesis_cache: unsupported target_type={event.target_type!r}"
-    )
+    raise ValueError(f"_cascade_llm_synthesis_cache: unsupported target_type={event.target_type!r}")
 
 
 async def _cascade_qa_traces_llm(session: AsyncSession, event) -> int:
@@ -540,12 +779,11 @@ async def _cascade_qa_traces_llm(session: AsyncSession, event) -> int:
 
     target_types:
 
-    * ``message`` — NULL ``llm_response_summary`` on every trace whose
-      ``evidence_ids JSONB`` contains the chat_message's current_version_id.
+    * ``message`` — redact summaries citing any revision of the chat_message.
     * ``message_hash`` — NULL on every trace citing ANY version_id matching
       the content_hash.
-    * ``user`` — NULL ``llm_response_summary`` for every trace owned by the
-      user (query_text already handled by Phase 4 ``_cascade_qa_traces``).
+    * ``user`` — redact traces owned by the user and traces citing any of the
+      user's message revisions.
 
     Returns rowcount.
     """
@@ -554,71 +792,31 @@ async def _cascade_qa_traces_llm(session: AsyncSession, event) -> int:
             f"forget_event target_type={event.target_type!r} requires non-None target_id"
         )
 
-    if event.target_type == "message":
-        try:
-            cm_id = int(event.target_id)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"target_type='message' requires integer target_id; got {event.target_id!r}"
-            )
-        # Resolve the chat_message's current_version_id (preserved across the
-        # Phase 1 cascade layers).
-        row = (
-            await session.execute(
-                select(ChatMessage.current_version_id).where(ChatMessage.id == cm_id)
-            )
-        ).first()
-        if row is None or row[0] is None:
-            return 0
-        vid = int(row[0])
-        # JSONB containment: NULL summary on traces citing this version.
-        stmt = text(
-            "UPDATE qa_traces SET llm_response_summary = NULL "
-            "WHERE evidence_ids @> CAST(:vid AS jsonb)"
-        )
-        result = await session.execute(stmt, {"vid": f"[{vid}]"})
-        await session.flush()
-        return result.rowcount or 0
-
-    if event.target_type == "message_hash":
-        target_hash = str(event.target_id)
-        version_ids = (
-            await session.execute(
-                select(MessageVersion.id).where(MessageVersion.content_hash == target_hash)
-            )
-        ).scalars().all()
+    if event.target_type in {"message", "message_hash", "user"}:
+        version_ids = await _semantic_affected_mvids(session, event)
         total = 0
         for vid in version_ids:
             stmt = text(
-                "UPDATE qa_traces SET llm_response_summary = NULL "
+                "UPDATE qa_traces SET llm_response_summary = NULL, "
+                "llm_response_redacted = TRUE "
                 "WHERE evidence_ids @> CAST(:vid AS jsonb)"
             )
             result = await session.execute(stmt, {"vid": f"[{int(vid)}]"})
             total += result.rowcount or 0
-        if total:
-            await session.flush()
+        if event.target_type == "user":
+            owner_result = await session.execute(
+                update(QaTrace)
+                .where(QaTrace.user_tg_id == int(event.target_id))
+                .values(
+                    llm_response_summary=None,
+                    llm_response_redacted=True,
+                )
+            )
+            total += owner_result.rowcount or 0
+        await session.flush()
         return total
 
-    if event.target_type == "user":
-        try:
-            telegram_id = int(event.target_id)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"target_type='user' requires integer target_id (telegram_id); "
-                f"got {event.target_id!r}"
-            )
-        stmt = (
-            update(QaTrace)
-            .where(QaTrace.user_tg_id == telegram_id)
-            .values(llm_response_summary=None)
-        )
-        result = await session.execute(stmt)
-        await session.flush()
-        return result.rowcount or 0
-
-    raise ValueError(
-        f"_cascade_qa_traces_llm: unsupported target_type={event.target_type!r}"
-    )
+    raise ValueError(f"_cascade_qa_traces_llm: unsupported target_type={event.target_type!r}")
 
 
 async def _cascade_llm_usage_ledger(session: AsyncSession, event) -> int:
@@ -648,9 +846,7 @@ async def _cascade_llm_usage_ledger(session: AsyncSession, event) -> int:
     try:
         telegram_id = int(event.target_id)
     except (TypeError, ValueError):
-        raise ValueError(
-            f"target_id must be integer telegram_id; got {event.target_id!r}"
-        )
+        raise ValueError(f"target_id must be integer telegram_id; got {event.target_id!r}")
 
     subq = select(QaTrace.id).where(QaTrace.user_tg_id == telegram_id)
     stmt = (
@@ -737,14 +933,11 @@ async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
             cm_id = int(event.target_id)
         except (TypeError, ValueError):
             raise ValueError(
-                f"target_type='message' requires integer target_id; "
-                f"got {event.target_id!r}"
+                f"target_type='message' requires integer target_id; got {event.target_id!r}"
             )
         row = (
             await session.execute(
-                select(ChatMessage.current_version_id).where(
-                    ChatMessage.id == cm_id
-                )
+                select(ChatMessage.current_version_id).where(ChatMessage.id == cm_id)
             )
         ).first()
         if row is None or row[0] is None:
@@ -757,11 +950,11 @@ async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
             int(v)
             for v in (
                 await session.execute(
-                    select(MessageVersion.id).where(
-                        MessageVersion.content_hash == target_hash
-                    )
+                    select(MessageVersion.id).where(MessageVersion.content_hash == target_hash)
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         ]
         if not mvids:
             return 0
@@ -782,15 +975,16 @@ async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
                     .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
                     .where(ChatMessage.user_id == telegram_id)
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         ]
         if not mvids:
             return 0
 
     else:
         raise ValueError(
-            f"_cascade_card_sources_on_forget: unsupported target_type="
-            f"{event.target_type!r}"
+            f"_cascade_card_sources_on_forget: unsupported target_type={event.target_type!r}"
         )
 
     # ── Step B: gather affected card_ids and lock them FOR UPDATE ────────────
@@ -802,7 +996,9 @@ async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
                 .where(CardSource.message_version_id.in_(mvids))
                 .distinct()
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     ]
     if not affected_card_ids:
         return 0
@@ -812,9 +1008,7 @@ async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
     # apply_forget_event orchestrator level, but this guards stragglers
     # inserted under a PREVIOUS advisory lock that has since released.
     await session.execute(
-        select(KnowledgeCard)
-        .where(KnowledgeCard.id.in_(affected_card_ids))
-        .with_for_update()
+        select(KnowledgeCard).where(KnowledgeCard.id.in_(affected_card_ids)).with_for_update()
     )
 
     # ── Step C: DELETE matching card_sources rows ────────────────────────────
@@ -827,14 +1021,10 @@ async def _cascade_card_sources_on_forget(session: AsyncSession, event) -> int:
     # ── Step D: per-card recount + demote when remaining == 0 ────────────────
     # PHASE6_PLAN.md §5.A.5 privacy invariant: archived_reason carries only
     # the forget_event_id reference, never quoted body content.
-    archived_reason = (
-        f"all sources forgotten via cascade {event.id}"
-    )
+    archived_reason = f"all sources forgotten via cascade {event.id}"
     for card_id in affected_card_ids:
         remaining = (
-            await session.execute(
-                select(CardSource).where(CardSource.card_id == card_id).limit(1)
-            )
+            await session.execute(select(CardSource).where(CardSource.card_id == card_id).limit(1))
         ).scalar()
         if remaining is None:
             # All sources gone → demote.
@@ -875,9 +1065,9 @@ async def _cascade_digests(session: AsyncSession, event) -> int:
     # Resolve card_source ids whose message_version is in the affected set.
     # This MUST happen BEFORE the card_sources cascade layer DELETEs the rows.
     cs_rows = await session.execute(
-        text(
-            "SELECT id::text FROM card_sources WHERE message_version_id = ANY(:mvids)"
-        ).bindparams(bindparam("mvids", type_=PG_ARRAY(BigInteger))),
+        text("SELECT id::text FROM card_sources WHERE message_version_id = ANY(:mvids)").bindparams(
+            bindparam("mvids", type_=PG_ARRAY(BigInteger))
+        ),
         {"mvids": list(mvids)},
     )
     affected_cs_ids = {r[0] for r in cs_rows}
@@ -931,9 +1121,7 @@ async def _cascade_digests(session: AsyncSession, event) -> int:
             )
             count += 1
         except Exception:
-            logger.exception(
-                "_cascade_digests: redact failed for digest_id=%s", digest_id
-            )
+            logger.exception("_cascade_digests: redact failed for digest_id=%s", digest_id)
     return count
 
 
@@ -985,9 +1173,7 @@ async def _cascade_wiki_pages(session: AsyncSession, event) -> int:
         text(
             "SELECT DISTINCT wiki_page_id::text FROM wiki_page_message_sources "
             "WHERE message_version_id = ANY(:mvids)"
-        ).bindparams(
-            bindparam("mvids", type_=_ARRAY_BIGINT)
-        ),
+        ).bindparams(bindparam("mvids", type_=_ARRAY_BIGINT)),
         {"mvids": list(mvids)},
     )
     direct_page_ids: set[str] = {r[0] for r in direct_rows}
@@ -999,9 +1185,7 @@ async def _cascade_wiki_pages(session: AsyncSession, event) -> int:
             "FROM wiki_page_card_sources wpcs "
             "JOIN card_sources cs ON cs.card_id = wpcs.card_id "
             "WHERE cs.message_version_id = ANY(:mvids)"
-        ).bindparams(
-            bindparam("mvids", type_=_ARRAY_BIGINT)
-        ),
+        ).bindparams(bindparam("mvids", type_=_ARRAY_BIGINT)),
         {"mvids": list(mvids)},
     )
     transitive_page_ids: set[str] = {r[0] for r in transitive_rows}
@@ -1067,9 +1251,7 @@ async def _cascade_wiki_pages(session: AsyncSession, event) -> int:
         surviving_direct = direct_total - len(set(gov.invalid_mvids))
         surviving_cards = card_total - len(set(gov.invalid_card_ids))
         # archived when every cited source is invalid (or there are none).
-        new_status = (
-            "archived" if (surviving_direct <= 0 and surviving_cards <= 0) else "stale"
-        )
+        new_status = "archived" if (surviving_direct <= 0 and surviving_cards <= 0) else "stale"
 
         # UPDATE wiki_pages: set page_status, public_enabled=false, AND robots
         # policy back to 'noindex' (Codex MED #6 fix part b — cascade flip
@@ -1190,9 +1372,7 @@ async def _cascade_wiki_revisions(session: AsyncSession, event) -> int:
             "    SELECT jsonb_build_array(v::bigint) "
             "    FROM unnest(CAST(:mvids AS bigint[])) AS v"
             ")"
-        ).bindparams(
-            bindparam("mvids", type_=_ARRAY_BIGINT)
-        ),
+        ).bindparams(bindparam("mvids", type_=_ARRAY_BIGINT)),
         {
             "redact_text": redact_text,
             "event_id": event.id,
@@ -1710,6 +1890,8 @@ async def _cascade_butler_undo_invocations(session: AsyncSession, event) -> int:
 # skipped. When a future phase adds a layer's table, add its function here.
 _LAYER_FUNCS: dict[str, Any] = {
     "chat_messages": _cascade_chat_messages,
+    # Issue #404: derived vector/provenance purge must precede message redaction.
+    "semantic_retrieval": _cascade_semantic_retrieval,
     "message_versions": _cascade_message_versions,
     "qa_traces": _cascade_qa_traces,
     # T5-04 Phase 5 layers — ORDER binding per contracts.md §8.
@@ -1763,9 +1945,7 @@ async def _resolve_affected_mvids(session: AsyncSession, event) -> list[int]:
             return []
         row = (
             await session.execute(
-                select(ChatMessage.current_version_id).where(
-                    ChatMessage.id == cm_id
-                )
+                select(ChatMessage.current_version_id).where(ChatMessage.id == cm_id)
             )
         ).first()
         if row is None or row[0] is None:
@@ -1775,12 +1955,14 @@ async def _resolve_affected_mvids(session: AsyncSession, event) -> list[int]:
     if event.target_type == "message_hash":
         target_hash = str(event.target_id)
         rows = (
-            await session.execute(
-                select(MessageVersion.id).where(
-                    MessageVersion.content_hash == target_hash
+            (
+                await session.execute(
+                    select(MessageVersion.id).where(MessageVersion.content_hash == target_hash)
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         return [int(v) for v in rows]
 
     if event.target_type == "user":
@@ -1789,12 +1971,16 @@ async def _resolve_affected_mvids(session: AsyncSession, event) -> list[int]:
         except (TypeError, ValueError):
             return []
         rows = (
-            await session.execute(
-                select(MessageVersion.id)
-                .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
-                .where(ChatMessage.user_id == telegram_id)
+            (
+                await session.execute(
+                    select(MessageVersion.id)
+                    .join(ChatMessage, ChatMessage.id == MessageVersion.chat_message_id)
+                    .where(ChatMessage.user_id == telegram_id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         return [int(v) for v in rows]
 
     return []
@@ -1897,9 +2083,7 @@ async def _process_one_event(session: AsyncSession, event, bot: Bot | None = Non
 
             # Step 3: per-mvid advisory locks (sorted) — matches the order
             # /approve acquires them in, preserving deadlock-avoidance.
-            for lock_id in sorted(
-                _p6_mvid_advisory_lock_id(m) for m in affected_mvids
-            ):
+            for lock_id in sorted(_p6_mvid_advisory_lock_id(m) for m in affected_mvids):
                 await session.execute(
                     text("SELECT pg_advisory_xact_lock(:lock_id)"),
                     {"lock_id": lock_id},
@@ -2003,9 +2187,7 @@ async def run_cascade_worker_once(
         # WHERE-status filter; if another worker already claimed this row, the
         # repo raises ValueError and we skip silently.
         try:
-            claimed = await ForgetEventRepo.mark_status(
-                session, event.id, status="processing"
-            )
+            claimed = await ForgetEventRepo.mark_status(session, event.id, status="processing")
         except ValueError:
             logger.debug(
                 "cascade_worker: skipping already-claimed forget_event id=%s",
@@ -2064,9 +2246,7 @@ async def cascade_worker_tick(
         if not await FeatureFlagRepo.get(own_session, CASCADE_WORKER_FLAG):
             return {"claimed": 0, "processed": 0, "failed": 0}
         try:
-            stats = await run_cascade_worker_once(
-                own_session, bot=bot, batch_size=batch_size
-            )
+            stats = await run_cascade_worker_once(own_session, bot=bot, batch_size=batch_size)
             await own_session.commit()
             return stats
         except Exception:

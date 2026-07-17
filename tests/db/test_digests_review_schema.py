@@ -153,9 +153,329 @@ async def test_alembic_head_is_latest(migrated_database_url: str) -> None:
     Migration 079: weekly digests publish automatically without admin attribution.
     Migration 080: image memory storage and wiki/image ledger call types.
     Migration 082: complete-history supersession and active-version uniqueness.
+    Migration 089: semantic Q&A retrieval, quota, provenance, and audit schema.
     """
     current = await _fetch_value(migrated_database_url, "SELECT version_num FROM alembic_version")
-    assert current == "088"
+    assert current == "089"
+
+
+async def test_089_schema_pins_jsonb_delivery_and_numeric_constraints(
+    migrated_database_url: str,
+) -> None:
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        jsonb_columns = await conn.fetch(
+            """
+            SELECT table_name, column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND (table_name, column_name) IN (
+                ('semantic_index_runs', 'reason_counts'),
+                ('semantic_retrieval_traces', 'candidate_ranks'),
+                ('semantic_retrieval_traces', 'result_source_ids')
+              )
+            ORDER BY table_name, column_name
+            """
+        )
+        assert [
+            (row["table_name"], row["column_name"], row["data_type"]) for row in jsonb_columns
+        ] == [
+            ("semantic_index_runs", "reason_counts", "jsonb"),
+            ("semantic_retrieval_traces", "candidate_ranks", "jsonb"),
+            ("semantic_retrieval_traces", "result_source_ids", "jsonb"),
+        ]
+        assert (
+            await conn.fetchval(
+                """
+            SELECT count(*)
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'semantic_qa_attempts'
+              AND column_name = 'delivery_started_at'
+            """
+            )
+            == 1
+        )
+        unit_columns = await conn.fetch(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'semantic_retrieval_units'
+              AND column_name IN ('embedding_status', 'chunk_text', 'embedding', 'indexed_at')
+            ORDER BY column_name
+            """
+        )
+        assert [
+            (row["column_name"], row["data_type"], row["is_nullable"]) for row in unit_columns
+        ] == [
+            ("chunk_text", "text", "YES"),
+            ("embedding", "USER-DEFINED", "YES"),
+            ("embedding_status", "character varying", "NO"),
+            ("indexed_at", "timestamp with time zone", "YES"),
+        ]
+        constraints = await conn.fetch(
+            """
+            SELECT conname, convalidated
+            FROM pg_constraint
+            WHERE conname IN (
+                'ck_llm_usage_ledger_nonnegative_usage',
+                'ck_semantic_attempts_state',
+                'ck_semantic_units_embedding_state',
+                'ck_semantic_units_embedding_status'
+            )
+            ORDER BY conname
+            """
+        )
+        assert [(row["conname"], row["convalidated"]) for row in constraints] == [
+            ("ck_llm_usage_ledger_nonnegative_usage", True),
+            ("ck_semantic_attempts_state", True),
+            ("ck_semantic_units_embedding_state", True),
+            ("ck_semantic_units_embedding_status", True),
+        ]
+    finally:
+        await conn.close()
+
+
+async def test_089_enforces_quota_state_matrix_and_nonnegative_ledger(
+    migrated_database_url: str,
+) -> None:
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(migrated_database_url)))
+    try:
+        valid_states = (
+            ("denied", "quota_denied", None, None, None),
+            ("reserved", None, 1, None, None),
+            ("reserved", "answered", 2, "now()", None),
+            ("consumed", "answered", 1, "now()", "now()"),
+            ("consumed", "abstained", 2, "now()", "now()"),
+            ("released", "technical_failure", 1, None, "now()"),
+            ("released", "technical_failure", 2, "now()", "now()"),
+        )
+        for index, (status, outcome, slot, delivery_sql, finalized_sql) in enumerate(
+            valid_states,
+            start=1,
+        ):
+            await conn.execute(
+                f"""
+                INSERT INTO semantic_qa_attempts (
+                    idempotency_key, user_tg_id, chat_id, local_day,
+                    slot_number, status, outcome, delivery_started_at, finalized_at
+                ) VALUES (
+                    $1, $2, -100404, CURRENT_DATE,
+                    $3, $4, $5, {delivery_sql or "NULL"}, {finalized_sql or "NULL"}
+                )
+                """,
+                f"schema-valid-{index}",
+                989100000000 + index,
+                slot,
+                status,
+                outcome,
+            )
+
+        invalid_states = (
+            ("consumed", "technical_failure", 1, "now()", "now()"),
+            ("consumed", "quota_denied", 1, "now()", "now()"),
+            ("consumed", "answered", 1, None, "now()"),
+            ("released", "answered", 1, "now()", "now()"),
+            ("released", "abstained", 1, None, "now()"),
+        )
+        for index, (status, outcome, slot, delivery_sql, finalized_sql) in enumerate(
+            invalid_states,
+            start=1,
+        ):
+            transaction = conn.transaction()
+            await transaction.start()
+            with pytest.raises(asyncpg.CheckViolationError):
+                await conn.execute(
+                    f"""
+                    INSERT INTO semantic_qa_attempts (
+                        idempotency_key, user_tg_id, chat_id, local_day,
+                        slot_number, status, outcome, delivery_started_at, finalized_at
+                    ) VALUES (
+                        $1, $2, -100404, CURRENT_DATE,
+                        $3, $4, $5, {delivery_sql or "NULL"}, {finalized_sql or "NULL"}
+                    )
+                    """,
+                    f"schema-invalid-{index}",
+                    989200000000 + index,
+                    slot,
+                    status,
+                    outcome,
+                )
+            await transaction.rollback()
+
+        transaction = conn.transaction()
+        await transaction.start()
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                """
+                INSERT INTO llm_usage_ledger (
+                    provider, model, prompt_hash, tokens_in, tokens_out,
+                    cost_usd, latency_ms, cache_hit, call_type
+                ) VALUES (
+                    'openai', 'text-embedding-3-small', repeat('a', 64),
+                    -1, 0, 0, 0, FALSE, 'semantic_embedding'
+                )
+                """
+            )
+        await transaction.rollback()
+    finally:
+        await conn.close()
+
+
+async def test_089_classifies_only_evidenced_authors_and_roundtrips(
+    temp_database_url: str,
+) -> None:
+    _run_alembic(temp_database_url, "upgrade", "088")
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(temp_database_url)))
+    try:
+        await conn.execute(
+            """
+            INSERT INTO users (id, first_name, is_member, is_admin) VALUES
+                (989000000101, 'Member', TRUE, FALSE),
+                (989000000102, 'Admin', FALSE, TRUE),
+                (989000000103, 'Imported human', FALSE, FALSE),
+                (989000000104, 'Chat raw human', FALSE, FALSE),
+                (989000000105, 'Live human', FALSE, FALSE),
+                (989000000106, 'Edited bot', FALSE, FALSE),
+                (989000000107, 'Unknown', FALSE, FALSE),
+                (989000000108, 'Channel', FALSE, FALSE),
+                (989000000109, 'True wins', TRUE, FALSE)
+            """
+        )
+        ingestion_run_id = await conn.fetchval(
+            """
+            INSERT INTO ingestion_runs (run_type, status)
+            VALUES ('import', 'completed')
+            RETURNING id
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO telegram_updates (
+                update_id, update_type, raw_json, ingestion_run_id
+            ) VALUES
+                (NULL, 'import_message',
+                 '{"from_id":"user989000000103"}'::json, $1),
+                (NULL, 'import_message',
+                 '{"from_id":"channel989000000108"}'::json, $1),
+                (989000000105, 'message',
+                 '{"message":{"from_user":{"id":989000000105,"is_bot":false}}}'::json,
+                 NULL),
+                (989000000106, 'edited_message',
+                 '{"edited_message":{"from_user":{"id":989000000106,"is_bot":true}}}'::json,
+                 NULL),
+                (989000000109, 'message',
+                 '{"message":{"from_user":{"id":989000000109,"is_bot":true}}}'::json,
+                 NULL),
+                (989000000110, 'edited_message',
+                 '{"edited_message":{"from_user":{"id":989000000109,"is_bot":false}}}'::json,
+                 NULL),
+                (989000000107, 'message',
+                 '{"message":{"from_user":{"id":989000000107,"is_bot":"invalid"}}}'::json,
+                 NULL)
+            """,
+            ingestion_run_id,
+        )
+        await conn.execute(
+            """
+            INSERT INTO chat_messages (
+                message_id, chat_id, user_id, text, date, raw_json
+            ) VALUES (
+                989000000104, -100989000000104, 989000000104,
+                'human evidence', now(),
+                '{"from_user":{"id":989000000104,"is_bot":false}}'::json
+            )
+            """
+        )
+    finally:
+        await conn.close()
+
+    expected = {
+        989000000101: None,
+        989000000102: None,
+        989000000103: None,
+        989000000104: False,
+        989000000105: False,
+        989000000106: True,
+        989000000107: None,
+        989000000108: None,
+        989000000109: True,
+    }
+    for _ in range(2):
+        _run_alembic(temp_database_url, "upgrade", "089")
+        conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(temp_database_url)))
+        try:
+            rows = await conn.fetch(
+                "SELECT id, is_bot FROM users WHERE id BETWEEN 989000000101 AND 989000000109"
+            )
+        finally:
+            await conn.close()
+        assert {row["id"]: row["is_bot"] for row in rows} == expected
+        _run_alembic(temp_database_url, "downgrade", "088")
+
+
+def test_089_downgrade_guard_names_every_semantic_table() -> None:
+    migration = (PROJECT_ROOT / "alembic/versions/089_semantic_qa.py").read_text(encoding="utf-8")
+    for table_name in (
+        "semantic_index_runs",
+        "semantic_retrieval_units",
+        "semantic_retrieval_unit_sources",
+        "semantic_qa_attempts",
+        "semantic_retrieval_traces",
+    ):
+        assert f"SELECT 1 FROM {table_name}" in migration
+
+
+async def test_089_downgrade_fails_closed_with_index_audit_row(
+    temp_database_url: str,
+) -> None:
+    _run_alembic(temp_database_url, "upgrade", "089")
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(temp_database_url)))
+    try:
+        await conn.execute(
+            """
+            INSERT INTO semantic_index_runs (
+                run_type, embedding_provider, embedding_model,
+                embedding_dimensions, status
+            ) VALUES (
+                'backfill', 'openai', 'text-embedding-3-small', 1536, 'running'
+            )
+            """
+        )
+    finally:
+        await conn.close()
+
+    result = _run_alembic(temp_database_url, "downgrade", "088", check=False)
+    assert result.returncode != 0
+    assert "Cannot downgrade 089 with semantic Q&A audit data" in (result.stdout + result.stderr)
+    assert await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version") == "089"
+
+
+async def test_089_downgrade_fails_closed_with_semantic_embedding_audit(
+    temp_database_url: str,
+) -> None:
+    _run_alembic(temp_database_url, "upgrade", "089")
+    conn = await asyncpg.connect(**_asyncpg_kwargs(make_url(temp_database_url)))
+    try:
+        await conn.execute(
+            """
+            INSERT INTO llm_usage_ledger (
+                provider, model, prompt_hash, tokens_in, tokens_out,
+                cost_usd, latency_ms, cache_hit, call_type
+            ) VALUES (
+                'openai', 'text-embedding-3-small', repeat('a', 64),
+                1, 0, 0.000001, 1, FALSE, 'semantic_embedding'
+            )
+            """
+        )
+    finally:
+        await conn.close()
+
+    result = _run_alembic(temp_database_url, "downgrade", "088", check=False)
+    assert result.returncode != 0
+    assert "Cannot downgrade 089 with semantic Q&A audit data" in (result.stdout + result.stderr)
+    assert await _fetch_value(temp_database_url, "SELECT version_num FROM alembic_version") == "089"
 
 
 async def test_080_message_media_and_ledger_call_types(

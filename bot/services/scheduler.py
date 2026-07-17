@@ -46,6 +46,7 @@ PHOTO_DESCRIPTION_FEATURE_FLAG = "memory.images.description.enabled"
 AUTO_PROMOTION_FEATURE_FLAG = "memory.candidates.auto_promote.enabled"
 WIKI_COMPILER_FEATURE_FLAG = "memory.wiki.compiler.enabled"
 WIKI_STATIC_PUBLISH_FEATURE_FLAG = "memory.wiki.static_publish.enabled"
+SEMANTIC_QA_FEATURE_FLAG = "memory.qa.semantic.enabled"
 DEEPSEEK_EXTRACTION_MAX_TOKENS = 8_192
 DEEPSEEK_DIGEST_MAX_TOKENS = 4_096
 DEEPSEEK_WIKI_MAX_TOKENS = 8_192
@@ -374,6 +375,61 @@ async def run_extraction_scheduler_tick() -> None:
                 logger.exception("candidate_auto_promotion failed")
     except Exception:
         logger.exception("candidate_auto_promotion session setup failed")
+
+
+async def run_semantic_index_tick() -> None:
+    """Reconcile current governed sources while semantic Q&A is enabled."""
+
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+    from bot.services.llm_gateway import (
+        EmbeddingBudgetExceeded,
+        load_embedding_gateway_config,
+    )
+    from bot.services.llm_providers import (
+        ProviderStructuralError,
+        ProviderTransientError,
+    )
+    from bot.services.semantic_index import EmbeddingClaimUnresolved, backfill_semantic_index
+
+    try:
+        async with async_session() as session:
+            if not await FeatureFlagRepo.any_enabled(session, SEMANTIC_QA_FEATURE_FLAG):
+                return
+            try:
+                report = await backfill_semantic_index(
+                    session,
+                    config=load_embedding_gateway_config(),
+                    chat_id=settings.COMMUNITY_CHAT_ID,
+                )
+            except (
+                EmbeddingClaimUnresolved,
+                EmbeddingBudgetExceeded,
+                ProviderStructuralError,
+                ProviderTransientError,
+                SQLAlchemyError,
+                ValueError,
+            ) as exc:
+                await session.rollback()
+                logger.error(
+                    "semantic_index_tick_failed",
+                    extra={"error_class": type(exc).__name__},
+                )
+                return
+            logger.info(
+                "semantic_index_tick_completed",
+                extra={
+                    "run_id": report.run_id,
+                    "eligible": report.eligible,
+                    "indexed": report.indexed,
+                    "skipped": report.skipped,
+                    "failed": report.failed,
+                },
+            )
+    except SQLAlchemyError as exc:
+        logger.error(
+            "semantic_index_tick_session_failed",
+            extra={"error_class": type(exc).__name__},
+        )
 
 
 async def wiki_automation_job() -> None:
@@ -1289,6 +1345,16 @@ def start_scheduler(bot: Bot) -> None:
         "interval",
         minutes=15,
         id="extraction_scheduler_tick",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    scheduler.add_job(
+        run_semantic_index_tick,
+        "interval",
+        minutes=15,
+        id="semantic_index_tick",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
