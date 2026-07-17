@@ -259,6 +259,43 @@ async def test_persist_normal_sets_raw_json_for_text_message(app_env) -> None:
     assert call_kwargs["raw_json"] is not None
 
 
+async def test_persist_live_link_preview_resolves_aiogram_defaults(app_env) -> None:
+    """Regression: normalized live persistence accepts Telegram link previews."""
+    from aiogram.types import Chat, LinkPreviewOptions, Message, User
+
+    from bot.services.message_persistence import persist_message_with_policy
+
+    message = Message(
+        message_id=101,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=-1_001_234_567_890, type="supergroup", title="dev"),
+        from_user=User(id=999, is_bot=False, first_name="Probe"),
+        text="https://example.test/evidence",
+        link_preview_options=LinkPreviewOptions(is_disabled=False),
+    )
+    fake_row = _fake_cm(1)
+    session = AsyncMock()
+
+    with (
+        patch("bot.services.message_persistence.advisory_lock_chat_message", new=AsyncMock()),
+        patch(
+            "bot.services.message_persistence.MessageRepo.save",
+            new=AsyncMock(return_value=fake_row),
+        ) as mock_save,
+        patch(
+            "bot.services.message_persistence.OffrecordMarkRepo.create_for_message",
+            new=AsyncMock(),
+        ),
+        patch(
+            "bot.services.message_persistence.MessageVersionRepo.insert_version",
+            new=AsyncMock(return_value=_fake_v1()),
+        ),
+    ):
+        await persist_message_with_policy(session, message)
+
+    assert mock_save.call_args.kwargs["raw_json"]["link_preview_options"] == {"is_disabled": False}
+
+
 async def test_persist_normal_no_raw_json_for_caption_only(app_env) -> None:
     """Caption-only photo: raw_json is None (message.text is falsy)."""
     from bot.services.message_persistence import persist_message_with_policy
