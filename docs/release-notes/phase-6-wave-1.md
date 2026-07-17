@@ -229,5 +229,3 @@ technical reviewer, gpt-5.5 high reasoning):
 - Phase 11 binding: `tests/evals/test_leakage.py`, `test_citations.py`, `test_refusal.py`, `test_no_llm_imports.py`
 - Feature flag: `memory.extraction.scheduler.enabled` (default OFF)
 - Migration head after Wave 1: revision `035`
-
-<!-- updated-by-superflow:2026-05-12 -->

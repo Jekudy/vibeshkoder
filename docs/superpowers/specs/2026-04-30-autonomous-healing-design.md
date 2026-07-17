@@ -132,7 +132,7 @@ codex exec review --base main -m gpt-5.5 -c model_reasoning_effort=high --epheme
 ```
 Auth via `codex login`. If verdict ≠ `APPROVE`, healing reads codex feedback, returns control to Claude for attempt #2 (counts toward retry budget).
 
-Rationale: dual-model review per superflow-enforcement rule 6. Single autonomous reviewer can convince itself. Codex is independent and free under subscription.
+Rationale: dual-model review keeps implementation and verification independent. A single autonomous reviewer can convince itself. Codex is independent and free under subscription.
 
 ### 5.6 Post-fix watch
 

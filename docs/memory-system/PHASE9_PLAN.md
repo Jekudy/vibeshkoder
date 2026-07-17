@@ -5,7 +5,7 @@
 **Predecessors:** Phase 6 (knowledge cards + admin review, CLOSED 2026-05-12), Phase 7
 (daily digest, CLOSED 2026-05-15), Phase 8 (weekly editorial digest, CLOSED 2026-05-15),
 Phase 11 (privacy binding suite, ACTIVE 42/42).
-**Charter:** `governance_mode = standard`, `git_workflow_mode = sprint_pr_queue`.
+**Execution policy:** standard governance with one queued PR per sprint.
 Per-sprint PAR (Claude product + Codex technical). FHR mandatory at end of phase.
 **Supersedes:** `docs/memory-system/prompts/PHASE9_PLAN_DRAFT.md` (promoted to canonical
 path 2026-05-16; all Q1-Q7 + visibility_scope decisions finalized — see §13).

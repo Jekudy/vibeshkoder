@@ -7,7 +7,7 @@
 - **Authorizer:** jekudy@gmail.com (team lead, this session).
 - **Predecessor ratification:** `PHASE12_PLAN.md` ratified 2026-05-02 (Orchestrator B sprint 0a, PR #171). `PHASE12_DESIGN.md` companion landed 2026-05-19.
 - **Phase 12 owner:** Orchestrator B per `ORCHESTRATOR_REGISTRY.md §1`.
-- **Charter:** `governance_mode = critical` (privacy invariants binding); `git_workflow_mode = parallel_wave_prs`; per-PR PAR dual review (Claude product + Codex technical); FHR mandatory after T12-10.
+- **Execution policy:** critical governance because privacy invariants are binding; parallel sprint PRs; per-PR PAR dual review (Claude product + Codex technical); FHR mandatory after T12-10.
 - **Predecessor gates (all CLOSED before this sprint):** Phase 0 (gatekeeper) CLOSED; Phase 1 (source of truth) CLOSED 2026-04-27; Phase 2 (importer + governance skeleton) CLOSED 2026-04-29; Phase 3 (governance skeleton) CLOSED 2026-04-29; Phase 4 (FTS + Q&A) CLOSED 2026-04-30; Phase 5 (LLM gateway + ledger) CLOSED 2026-05-11; Phase 6 (cards) CLOSED 2026-05-12; Phase 7 (daily digest) CLOSED 2026-05-15; Phase 8 (weekly digest) CLOSED 2026-05-15; Phase 9 (wiki) CLOSED 2026-05-19; Phase 10 (graph projection) CLOSED 2026-05-21; Phase 11 (binding suite) **77/77 green on `main`**.
 
 This document **refreshes** the 2026-05-02 ratified plan with deltas accumulated since Phase 9/10 closure. It does NOT supersede `PHASE12_PLAN.md` — it patches it. Where this file and `PHASE12_PLAN.md` disagree, this file wins for execution; `PHASE12_PLAN.md` remains the authoritative source for §1–§11 invariants, schema sketches, and the §6 wave structure.
@@ -681,7 +681,7 @@ Codex audit claim: "DESIGN says migration 064 added CHECK".
 
 Sequencing enforcement:
 
-1. Sprint 0 PR: `feat/p12-s0-ratification` → `main`. Dual-model spec review (Claude `deep-spec-reviewer` + Codex `deep audit`) per Rule 3. PAR evidence written.
+1. Sprint 0 PR: `feat/p12-s0-ratification` → `main`. Dual-model spec review (Claude `deep-spec-reviewer` + Codex `deep audit`) is mandatory. PAR evidence written.
 2. After Sprint 0 merges: T12-01 worktree under `.worktrees/orch-B` may be created on branch `feat/p12-w1-t12-01`.
 3. No execution sprint claims migration 070+ until Sprint 0 is on `main`.
 
@@ -848,8 +848,8 @@ Authorized scope (per `PHASE12_PLAN_REFRESH.md`):
   (AFTER `graph_nodes`). All three mask privacy-sensitive payload fields
   with `[CONTENT_REDACTED: forget_event_id={n}]` per Phase 9 redaction format.
 - Per-PR PAR (Claude product + Codex technical) on each of 10 execution sprints.
-  FHR mandatory after T12-10 (governance_mode=critical + 10 sprints + privacy
-  invariants binding triggers superflow Rule 9).
+  FHR mandatory after T12-10 because critical governance, 10 sprints, and privacy
+  invariants require a phase-level holistic review.
 - 5 feature flags all default OFF (1 master + 4 per-tool), layered per substep §10 of refresh:
   `memory.butler.enabled` (parent), `memory.butler.schedule_meeting.enabled`,
   `memory.butler.send_intro.enabled` + `memory.butler.update_intro.enabled`,
@@ -989,9 +989,9 @@ Sprint 0 is DONE when ALL of the following hold:
 3. `docs/memory-system/ORCHESTRATOR_REGISTRY.md` §1 and §2 reflect the **050-099** migration window for Orchestrator B (§9 above) — Phase 12 reserves 070-073; 074-079 hotfix buffer; 080-099 Phase 12.5+ runway.
 4. `docs/memory-system/PHASE12_PLAN.md` has a new §12 errata addendum (4 items per §7) PLUS a single errata-note line at §0 per §7.2.
 5. `docs/memory-system/PHASE12_DESIGN.md` has a new §14 errata addendum (2 items per §7) PLUS a single errata-note line at §0 per §7.2.
-6. Dual-model spec review verdicts: Claude `deep-spec-reviewer` ACCEPTED + Codex `deep audit` APPROVE. Both verdicts recorded in `.par-evidence.json` at branch root with the schema from `superflow-enforcement.md` Hard Rule 3.
+6. Dual-model spec review verdicts: Claude `deep-spec-reviewer` ACCEPTED + Codex `deep audit` APPROVE. Both verdicts recorded in `.par-evidence.json` at branch root using the project review-evidence schema.
 7. CI green on `feat/p12-s0-ratification` (`evals.yml` privacy-binding suite + privacy lint + Phase 11 baseline all green at 77/77).
-8. PR title and body follow superflow per-sprint PR convention. Body includes the Sprint 0 DoD checklist.
+8. PR title and body follow the project per-sprint PR convention. Body includes the Sprint 0 DoD checklist.
 9. After merge, `git diff main...HEAD` on `feat/p12-s0-ratification` shows ZERO changes to any `bot/`, `tests/`, `alembic/`, `web/`, or `.github/workflows/` paths. Docs-only invariant verified.
 10. **C1 single-script carve-out.** `scripts/lint_privacy_check.sh` allowlist regex is extended to `^docs/memory-system/PHASE[0-9]+_PLAN(_REFRESH)?\.md$` (replacing the current `PHASE[0-9]+_PLAN\.md` branch) as the ONE explicitly authorized exception to the docs-only invariant. Justification: this refresh doc legitimately names `#nomem`, `#offrecord`, `forgotten`, `forget` and would otherwise fail the CI gate on its own merge. The rest of `scripts/`, `bot/`, `tests/`, `alembic/`, `web/`, and `.github/workflows/` remain off-limits in Sprint 0.
 
@@ -1177,5 +1177,3 @@ feat/p12-s0-ratification
 ```
 
 ---
-
-<!-- updated-by-superflow:2026-05-25 -->

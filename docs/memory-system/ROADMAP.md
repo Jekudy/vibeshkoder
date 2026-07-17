@@ -84,5 +84,3 @@ Cannot parallelize without gate:
 Phase 12 CLOSED 2026-05-30. All 12 phases of the memory system cycle are now COMPLETE.
 Phase 12.5 carryovers (redact-at-rest candidate content, downgrade guards, per-tool
 service-layer defense-in-depth) are tracked in `IMPLEMENTATION_STATUS.md §Phase 12.5`.
-
-<!-- updated-by-superflow:2026-05-30 -->

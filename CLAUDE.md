@@ -352,12 +352,12 @@ registry). Phase 11 binding **86 → 86** (L12/C10/I9/R8/G3 lands in T12-09).
 Commits `a411e9e`..`3122431`. Alembic head 075 → 076. No flag flipped.
 Operator steps: none. 2-round dual-model review: Claude product ACCEPTED +
 Claude tech APPROVE (Codex companion stalled; fell back to second Claude
-reviewer per Rule 7).
+reviewer under the documented secondary-review fallback).
 
 **Phase 12 (Butler) — CLOSED 2026-05-30.** All 10 sprints merged (T12-01..T12-10).
 Phase 11 binding **102/102** green (+25 Butler ACs: L11.a-e, C10.a-c, I9.a-f, R8.a-g,
 G3.a-d). FHR APPROVE (Claude `deep-product-reviewer` + Claude `standard-code-reviewer`
-per Rule 7; Codex companion stalled through all FHR rounds). 1 HIGH fixed: scheduler
+under the documented secondary-review fallback; Codex companion stalled through all FHR rounds). 1 HIGH fixed: scheduler
 TTL tick now uses a savepoint per action so a single expiry failure does not roll back
 the entire batch (mirrors `digest_daily_job` pattern). 1 MEDIUM fixed: ORM
 `ButlerActionConfirmation.status` CheckConstraint now includes `'revoked'` (migration
@@ -391,7 +391,7 @@ M4 configurable fake session in tests. No migration (uses existing
 Phase 11 binding **86 → 86** (delta 0; L12/C10/I9/R8/G3 family lands in T12-09).
 Commits `e8dc08f`..`92326c3`. No flag flipped. Rollout: `docs/rollout-fragments/phase12/T12-08.md`.
 2-round dual-model review: Claude product ACCEPTED + Claude tech APPROVE (Codex companion
-stalled; fell back to second Claude reviewer per Rule 7). FHR required at T12-10 (cycle-end).
+stalled; fell back to the documented second-Claude fallback). FHR required at T12-10 (cycle-end).
 
 **Phase 12 (Butler) — T12-09 (Phase 11 binding suite 77 → 102 + empty-evidence abstention guard) 2026-05-30.**
 Wave 3 sprint: 25 new binding ACs across `tests/evals/test_butler_{leakage,citations,
@@ -409,7 +409,7 @@ sibling path (T12-08). Handler maps `'empty_evidence'` → `_MSG_EMPTY_EVIDENCE`
 column from T12-04). No flag flipped (`memory.butler.*` all default OFF). Commits
 `3285039`..`2a598f8` (9 commits). Phase 11 binding **77 → 102** (+25 ACs). 2-round
 dual-model review: Claude product ACCEPTED + Claude tech APPROVE (Codex companion
-stalled; Rule 7 Claude fallback; 1 LOW handler routing finding fixed + regression test).
+stalled; documented second-Claude fallback; 1 LOW handler routing finding fixed + regression test).
 Phase 12 remains IN PROGRESS — FHR + T12-10 required for closure. Phase 12.5 carryovers:
 I9.b auto-followup_correction edge case deferred; spec mask-format divergence
 (`[CONTENT_REDACTED: forget_event_id={n}]` spec vs shipped JSONB `{"redacted":true,
@@ -502,5 +502,3 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 Historical memory-cycle labels such as `phase:0` and `phase:1` remain valid, but GitHub
 Issues is the canonical tracker for all work in this repository. Local status documents
 are derived snapshots.
-
-<!-- updated-by-superflow:2026-05-27 -->

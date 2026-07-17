@@ -216,5 +216,3 @@ the test, not silently degrade apply throughput.
 - **Cross-chat resolution.** Explicitly forbidden by the chat_id scoping rule
   above.
 - **Mutating the resolved row.** Read-only by contract.
-
-<!-- updated-by-superflow:2026-04-28 -->
