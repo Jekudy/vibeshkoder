@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from decimal import Decimal
 from types import SimpleNamespace
@@ -162,6 +163,10 @@ async def test_embedding_budget_denial_is_audited_and_skips_provider() -> None:
 
     assert raised.value.llm_usage_ledger_id == 1
     assert ledger.records[0]["error"] == "budget_exceeded"
+    assert (
+        ledger.records[0]["prompt_hash"]
+        == hashlib.sha256(b"embedding_budget_exceeded_without_provider_dispatch").hexdigest()
+    )
     session.commit.assert_awaited_once()
     provider.embed.assert_not_awaited()
 

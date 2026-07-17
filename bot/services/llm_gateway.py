@@ -1713,6 +1713,11 @@ def _embedding_response_hash(vectors: tuple[tuple[float, ...], ...]) -> str:
     return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
+_EMBEDDING_BUDGET_DENIED_PROMPT_HASH = hashlib.sha256(
+    b"embedding_budget_exceeded_without_provider_dispatch"
+).hexdigest()
+
+
 async def embed_texts(
     session: AsyncSession,
     *,
@@ -1727,9 +1732,10 @@ async def embed_texts(
 
     The gateway commits the conservative ledger reservation while holding the
     budget lock, so concurrent calls can observe it before either provider is
-    entered. When an outcome recorder is supplied, its durable claim is
-    committed with the reservation and its terminal state is committed with
-    the final ledger update.
+    entered. When an outcome recorder is supplied, its durable paid-attempt
+    claim is committed with the reservation and its terminal state is committed
+    with the final ledger update. A budget denial creates only a content-free
+    audit row because no provider dispatch occurred and a future run must retry.
     """
 
     from bot.services.llm_pricing import estimate_cost
@@ -1782,7 +1788,7 @@ async def embed_texts(
                 qa_trace_id=qa_trace_id,
                 provider="openai",
                 model=config.model,
-                prompt_hash=prompt_hash,
+                prompt_hash=_EMBEDDING_BUDGET_DENIED_PROMPT_HASH,
                 response_hash=None,
                 tokens_in=0,
                 tokens_out=0,

@@ -301,20 +301,30 @@ async def test_failed_embedding_claim_is_forgettable_with_its_ledger(db_session)
 
 
 @pytest.mark.asyncio
-async def test_budget_denied_embedding_claim_is_forgettable_without_provider_call(
+async def test_budget_denial_is_retryable_with_content_free_audit(
     db_session,
 ) -> None:
     from bot.db.models import LlmUsageLedger, SemanticRetrievalUnit
     from bot.services.forget_cascade import _cascade_semantic_retrieval
     from bot.services.llm_gateway import EmbeddingBudgetExceeded, EmbeddingGatewayConfig
+    from bot.services.llm_providers.openai_embeddings import EmbeddingResult
     from bot.services.semantic_index import _index_batch, list_eligible_message_documents
 
-    class ForbiddenProvider:
-        calls = 0
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.allowed = False
 
         async def embed(self, *, inputs, model, dimensions):
             self.calls += 1
-            raise AssertionError("budget denial must precede provider dispatch")
+            if not self.allowed:
+                raise AssertionError("budget denial must precede provider dispatch")
+            return EmbeddingResult(
+                vectors=((1.0,) + (0.0,) * 1535,),
+                tokens_in=8,
+                request_id="retry-after-budget",
+                raw_latency_ms=1,
+            )
 
     user_id = await _make_user(db_session)
     message, versions = await _make_message(
@@ -326,7 +336,7 @@ async def test_budget_denied_embedding_claim_is_forgettable_without_provider_cal
         db_session,
         chat_id=message.chat_id,
     )
-    provider = ForbiddenProvider()
+    provider = Provider()
     config = EmbeddingGatewayConfig(
         model="text-embedding-3-small",
         dimensions=1536,
@@ -343,11 +353,38 @@ async def test_budget_denied_embedding_claim_is_forgettable_without_provider_cal
         )
 
     assert provider.calls == 0
+    assert (await db_session.execute(select(SemanticRetrievalUnit))).scalars().all() == []
+    budget_ledger = (
+        (
+            await db_session.execute(
+                select(LlmUsageLedger).where(LlmUsageLedger.error == "budget_exceeded")
+            )
+        )
+        .scalars()
+        .one()
+    )
+    safe_budget_hash = hashlib.sha256(
+        b"embedding_budget_exceeded_without_provider_dispatch"
+    ).hexdigest()
+    assert budget_ledger.prompt_hash == safe_budget_hash
+
+    provider.allowed = True
+    retry = await _index_batch(
+        db_session,
+        documents=documents,
+        config=EmbeddingGatewayConfig(
+            model="text-embedding-3-small",
+            dimensions=1536,
+            daily_ceiling_usd=Decimal("100"),
+            monthly_ceiling_usd=Decimal("1000"),
+        ),
+        provider=provider,
+    )
+    assert retry.indexed == 1
+    assert provider.calls == 1
     unit = (await db_session.execute(select(SemanticRetrievalUnit))).scalars().one()
-    assert unit.embedding_status == "failed"
-    ledger_id = unit.llm_usage_ledger_id
-    ledger = await db_session.get(LlmUsageLedger, ledger_id)
-    assert ledger is not None and ledger.error == "budget_exceeded"
+    assert unit.embedding_status == "completed"
+    successful_ledger_id = unit.llm_usage_ledger_id
 
     event = await _make_forget_event(
         db_session,
@@ -358,9 +395,15 @@ async def test_budget_denied_embedding_claim_is_forgettable_without_provider_cal
     await _cascade_semantic_retrieval(db_session, event)
 
     assert await db_session.get(SemanticRetrievalUnit, unit.id) is None
-    redacted_ledger = await db_session.get(LlmUsageLedger, ledger_id)
+    redacted_ledger = await db_session.get(LlmUsageLedger, successful_ledger_id)
     assert redacted_ledger is not None
     assert redacted_ledger.prompt_hash is None
+    unchanged_budget_ledger = await db_session.get(
+        LlmUsageLedger,
+        budget_ledger.id,
+        populate_existing=True,
+    )
+    assert unchanged_budget_ledger.prompt_hash == safe_budget_hash
 
 
 def test_semantic_layer_runs_before_message_versions_and_is_registered() -> None:

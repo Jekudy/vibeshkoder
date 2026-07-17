@@ -619,7 +619,12 @@ class _SemanticEmbeddingOutcomeRecorder:
     ) -> None:
         if self.unit_ids:
             raise RuntimeError("semantic embedding recorder was already reserved")
-        status = "failed" if budget_denied else "reserved"
+        if budget_denied:
+            # No provider dispatch means no ambiguous paid result to fence. The
+            # gateway records a content-free budget audit row; leaving no unique
+            # source claim allows the same identity to retry after the ceiling
+            # is raised or the accounting window rolls over.
+            return
         for document in self.documents:
             await _invalidate_previous_documents(
                 session,
@@ -640,7 +645,7 @@ class _SemanticEmbeddingOutcomeRecorder:
                     embedding_model=self.config.model,
                     embedding_model_version=EMBEDDING_MODEL_VERSION,
                     embedding_dimensions=self.config.dimensions,
-                    embedding_status=status,
+                    embedding_status="reserved",
                     chunk_text=None,
                     embedding=None,
                     llm_usage_ledger_id=llm_usage_ledger_id,

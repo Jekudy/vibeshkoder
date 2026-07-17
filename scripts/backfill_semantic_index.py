@@ -25,6 +25,7 @@ from typing import Any, Sequence, TextIO, cast
 from sqlalchemy.exc import SQLAlchemyError
 
 from bot.services.llm_providers import ProviderError
+from bot.services.qa_guardrails import contains_secret_like_data
 
 
 REPORT_SCHEMA_VERSION = 1
@@ -101,6 +102,10 @@ def _parse_shadow_case(raw: Any, *, line_number: int) -> ShadowCase:
         )
     if len(question_id) > MAX_QUESTION_ID_LENGTH:
         raise ValueError(f"shadow input line {line_number} question_id is too long")
+    if contains_secret_like_data(question_id):
+        raise ValueError(
+            f"shadow input line {line_number} question_id must be a safe opaque identifier"
+        )
 
     chat_id = raw.get("chat_id")
     if isinstance(chat_id, bool) or not isinstance(chat_id, int):
@@ -111,6 +116,9 @@ def _parse_shadow_case(raw: Any, *, line_number: int) -> ShadowCase:
         raise ValueError(f"shadow input line {line_number} query must be non-empty text")
     if len(query) > MAX_SHADOW_QUERY_CHARS:
         raise ValueError(f"shadow input line {line_number} query is too long")
+    normalized_query = query.strip()
+    if contains_secret_like_data(normalized_query):
+        raise ValueError(f"shadow input line {line_number} contains sensitive input")
 
     exclude_id = raw.get("exclude_chat_message_id")
     if exclude_id is not None and (
@@ -122,7 +130,7 @@ def _parse_shadow_case(raw: Any, *, line_number: int) -> ShadowCase:
     return ShadowCase(
         question_id=question_id,
         chat_id=chat_id,
-        query=query.strip(),
+        query=normalized_query,
         exclude_chat_message_id=exclude_id,
     )
 

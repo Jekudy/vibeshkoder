@@ -65,8 +65,18 @@ def test_load_shadow_cases_accepts_only_bounded_opaque_metadata(tmp_path) -> Non
     "payload",
     [
         {"question_id": "raw question with spaces", "chat_id": 1, "query": "x"},
+        {
+            "question_id": "sk-A1b2C3d4E5f6G7h8I9j0",
+            "chat_id": 1,
+            "query": "x",
+        },
         {"question_id": "q1", "chat_id": True, "query": "x"},
         {"question_id": "q1", "chat_id": 1, "query": "   "},
+        {
+            "question_id": "q1",
+            "chat_id": 1,
+            "query": "token=Abcd1234EfgH5678!",
+        },
         {"question_id": "q1", "chat_id": 1, "query": "x", "snippet": "forbidden"},
     ],
 )
