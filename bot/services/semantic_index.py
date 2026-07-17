@@ -49,6 +49,7 @@ EMBEDDING_MODEL_VERSION = "text-embedding-3-small"
 DEFAULT_BACKFILL_BATCH_SIZE = 64
 DEFAULT_VECTOR_CANDIDATE_LIMIT = 20
 MAX_SEMANTIC_EVIDENCE = 5
+MAX_RESULTS_PER_AUTHOR = 3
 RRF_K = 60
 
 _FORGET_EXCLUDES = forget_excludes_sql_fragment()
@@ -2159,7 +2160,7 @@ def reciprocal_rank_fusion(
             if card_count >= 2:
                 continue
         elif hit.user_id is not None:
-            if author_counts.get(hit.user_id, 0) >= 2:
+            if author_counts.get(hit.user_id, 0) >= MAX_RESULTS_PER_AUTHOR:
                 continue
         if hit.message_thread_id is not None and thread_counts.get(hit.message_thread_id, 0) >= 2:
             continue
