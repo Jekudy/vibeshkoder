@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock
+import hashlib
 import json
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -115,6 +118,242 @@ async def test_missing_privacy_coverage_stops_before_provider_dispatch(
     with pytest.raises(ValueError, match="missing=.*stale_version"):
         await runner.run_private_evaluation(args)
     run_case.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "overlap",
+    ["input-output", "output-output", "input-hardlink", "output-hardlink", "symlink"],
+)
+@pytest.mark.asyncio
+async def test_overlapping_eval_paths_fail_before_truncate_or_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overlap: str,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    cases_path = tmp_path / "cases.jsonl"
+    observations_path = tmp_path / "observations.jsonl"
+    review_path = tmp_path / "review.jsonl"
+    _write(input_path, _rows())
+    original_input = input_path.read_bytes()
+    original_output: bytes | None = None
+    if overlap == "input-output":
+        cases_path = input_path
+    elif overlap == "output-output":
+        observations_path = cases_path
+    elif overlap == "input-hardlink":
+        cases_path.hardlink_to(input_path)
+    elif overlap == "output-hardlink":
+        cases_path.write_bytes(b"existing private artifact\n")
+        observations_path.hardlink_to(cases_path)
+        original_output = cases_path.read_bytes()
+    else:
+        cases_path.symlink_to(input_path)
+    run_case = AsyncMock()
+    monkeypatch.setattr(runner, "_run_case", run_case)
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--cases-output",
+            str(cases_path),
+            "--observations-output",
+            str(observations_path),
+            "--review-output",
+            str(review_path),
+            "--release-sha",
+            RELEASE_SHA,
+            "--overwrite",
+        ]
+    )
+
+    expected_error = "symbolic links" if overlap == "symlink" else "paths must be distinct"
+    with pytest.raises(ValueError, match=expected_error):
+        await runner.run_private_evaluation(args)
+
+    assert input_path.read_bytes() == original_input
+    if original_output is not None:
+        assert cases_path.read_bytes() == original_output
+    run_case.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_hardlink_substitution_is_detected_by_open_fds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    cases_path = tmp_path / "cases.jsonl"
+    observations_path = tmp_path / "observations.jsonl"
+    review_path = tmp_path / "review.jsonl"
+    _write(input_path, _rows())
+    original_input = input_path.read_bytes()
+    original_mode = stat.S_IMODE(input_path.stat().st_mode)
+    open_window = threading.Event()
+    substitution_done = threading.Event()
+    original_open = runner._open_private_text
+
+    def synchronized_open(path: Path, *, overwrite: bool):  # type: ignore[no-untyped-def]
+        if path == cases_path:
+            open_window.set()
+            assert substitution_done.wait(timeout=5)
+        return original_open(path, overwrite=overwrite)
+
+    def substitute_output_with_input_hardlink() -> None:
+        assert open_window.wait(timeout=5)
+        cases_path.hardlink_to(input_path)
+        substitution_done.set()
+
+    monkeypatch.setattr(runner, "_open_private_text", synchronized_open)
+    run_case = AsyncMock()
+    monkeypatch.setattr(runner, "_run_case", run_case)
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--cases-output",
+            str(cases_path),
+            "--observations-output",
+            str(observations_path),
+            "--review-output",
+            str(review_path),
+            "--release-sha",
+            RELEASE_SHA,
+            "--overwrite",
+        ]
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        attacker = executor.submit(substitute_output_with_input_hardlink)
+        with pytest.raises(ValueError, match="paths must be distinct"):
+            await runner.run_private_evaluation(args)
+        attacker.result(timeout=5)
+
+    assert input_path.read_bytes() == original_input
+    assert stat.S_IMODE(input_path.stat().st_mode) == original_mode
+    run_case.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_input_path_substitution_after_open_cannot_change_cases_or_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    detached_path = tmp_path / "detached-input.jsonl"
+    cases_path = tmp_path / "cases.jsonl"
+    observations_path = tmp_path / "observations.jsonl"
+    review_path = tmp_path / "review.jsonl"
+    original_row = _rows()[0]
+    replacement_row = dict(original_row)
+    replacement_row["query"] = "replacement query"
+    _write(input_path, [original_row])
+    original_bytes = input_path.read_bytes()
+    original_load = runner._load_jsonl
+
+    def substitute_after_fd_open(source):  # type: ignore[no-untyped-def]
+        input_path.rename(detached_path)
+        _write(input_path, [replacement_row])
+        return original_load(source)
+
+    async def fake_run_case(case: runner.PrivateEvalCase) -> dict[str, object]:
+        assert case.query == original_row["query"]
+        return {
+            "record_type": "case_review",
+            "case_id": case.label.case_id,
+            "query": case.query,
+            "answer": None,
+            "fts_source_ids": [],
+            "hybrid_source_ids": [],
+            "objective_leakage_count": 0,
+            "reviewed_result": {
+                "abstained": True,
+                "retrieval_latency_seconds": 0.1,
+                "full_latency_seconds": 0.2,
+            },
+        }
+
+    monkeypatch.setattr(runner, "_load_jsonl", substitute_after_fd_open)
+    run_case = AsyncMock(side_effect=fake_run_case)
+    monkeypatch.setattr(runner, "_run_case", run_case)
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--cases-output",
+            str(cases_path),
+            "--observations-output",
+            str(observations_path),
+            "--review-output",
+            str(review_path),
+            "--release-sha",
+            RELEASE_SHA,
+            "--smoke",
+        ]
+    )
+
+    assert await runner.run_private_evaluation(args) == 0
+
+    header = json.loads(observations_path.read_text(encoding="utf-8").splitlines()[0])
+    assert header["dataset_sha256"] == hashlib.sha256(original_bytes).hexdigest()
+    run_case.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_observations_hash_stays_bound_to_open_output_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    cases_path = tmp_path / "cases.jsonl"
+    observations_path = tmp_path / "observations.jsonl"
+    detached_observations_path = tmp_path / "detached-observations.jsonl"
+    review_path = tmp_path / "review.jsonl"
+    _write(input_path, [_rows()[0]])
+
+    async def fake_run_case(case: runner.PrivateEvalCase) -> dict[str, object]:
+        observations_path.rename(detached_observations_path)
+        observations_path.write_text("substituted pathname\n", encoding="utf-8")
+        return {
+            "record_type": "case_review",
+            "case_id": case.label.case_id,
+            "query": case.query,
+            "answer": None,
+            "fts_source_ids": [],
+            "hybrid_source_ids": [],
+            "objective_leakage_count": 0,
+            "reviewed_result": {
+                "abstained": True,
+                "retrieval_latency_seconds": 0.1,
+                "full_latency_seconds": 0.2,
+            },
+        }
+
+    monkeypatch.setattr(runner, "_run_case", fake_run_case)
+    args = runner.build_parser().parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--cases-output",
+            str(cases_path),
+            "--observations-output",
+            str(observations_path),
+            "--review-output",
+            str(review_path),
+            "--release-sha",
+            RELEASE_SHA,
+            "--smoke",
+        ]
+    )
+
+    assert await runner.run_private_evaluation(args) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    detached_bytes = detached_observations_path.read_bytes()
+    assert report["observations_sha256"] == hashlib.sha256(detached_bytes).hexdigest()
+    assert (
+        report["observations_sha256"] != hashlib.sha256(observations_path.read_bytes()).hexdigest()
+    )
 
 
 def test_smoke_mode_is_explicit_and_requires_exactly_one_case(tmp_path: Path) -> None:

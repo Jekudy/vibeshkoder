@@ -1057,6 +1057,7 @@ async def _semantic_mention_question(
         )
         return
 
+    durable_trace_id: int | None = None
     try:
         # The quota commit above releases persistence's caller-transaction
         # chat-message lock. This dedicated fence now covers every query-bearing
@@ -1082,6 +1083,7 @@ async def _semantic_mention_question(
                     qa_trace_id=trace.id,
                 )
                 await session.commit()
+                durable_trace_id = trace.id
             except LookupError as exc:
                 await _reply_semantic_lease_lost(
                     message,
@@ -1198,7 +1200,7 @@ async def _semantic_mention_question(
             session,
             attempt_id=quota.attempt_id,
             outcome="technical_failure",
-            qa_trace_id=trace.id,
+            qa_trace_id=durable_trace_id,
         )
         await session.commit()
         await _reply_after_technical_release(

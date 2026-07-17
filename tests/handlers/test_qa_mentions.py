@@ -1517,6 +1517,107 @@ async def test_semantic_trace_is_committed_before_embedding_dispatch(monkeypatch
     assert events[:5] == ["commit", "trace", "attach", "commit", "embedding"]
 
 
+@pytest.mark.parametrize(
+    ("failure_phase", "expected_trace_id", "expected_events"),
+    [
+        pytest.param(
+            "pre_trace",
+            None,
+            ("commit", "released", "commit", "fallback"),
+            id="pre-trace",
+        ),
+        pytest.param(
+            "post_trace",
+            5017,
+            ("commit", "commit", "released", "commit", "fallback"),
+            id="post-trace",
+        ),
+    ],
+)
+async def test_semantic_database_failure_releases_before_ordinary_fallback(
+    monkeypatch,
+    failure_phase: str,
+    expected_trace_id: int | None,
+    expected_events: tuple[str, ...],
+) -> None:
+    handler = import_module("bot.handlers.qa")
+    from sqlalchemy.exc import SQLAlchemyError
+
+    message = _message()
+    session = AsyncMock()
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def locked(*_args, **_kwargs):
+        yield
+
+    async def commit() -> None:
+        events.append("commit")
+
+    async def record_finalize(*_args, **_kwargs) -> None:
+        events.append("released")
+
+    async def fallback(*_args, **_kwargs) -> None:
+        events.append("fallback")
+
+    governed = AsyncMock(return_value=True)
+    run_semantic = AsyncMock()
+    if failure_phase == "pre_trace":
+        governed.side_effect = SQLAlchemyError("question governance read failed")
+    else:
+        run_semantic.side_effect = SQLAlchemyError("embedding audit write failed")
+
+    session.commit.side_effect = commit
+    monkeypatch.setattr(
+        handler.SemanticQuotaRepo,
+        "reserve",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                replayed=False,
+                attempt_id=3016,
+                limit=2,
+            )
+        ),
+    )
+    monkeypatch.setattr(handler, "hold_evidence_delivery_locks", locked)
+    monkeypatch.setattr(handler, "_question_is_governed", governed)
+    create_trace = AsyncMock(return_value=SimpleNamespace(id=5017))
+    monkeypatch.setattr(
+        handler.QaTraceRepo,
+        "create",
+        create_trace,
+    )
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "attach_trace", AsyncMock())
+    finalize = AsyncMock(side_effect=record_finalize)
+    monkeypatch.setattr(handler.SemanticQuotaRepo, "finalize", finalize)
+    monkeypatch.setattr(handler, "run_semantic_qa", run_semantic)
+    monkeypatch.setattr(handler, "_reply_after_technical_release", fallback)
+
+    await handler._semantic_mention_question(
+        message=message,
+        session=session,
+        sender_id=1001,
+        persisted_chat_message_id=8501,
+        question_bundle=_question_bundle(),
+        query=f"ошибка {failure_phase}",
+        query_redacted=False,
+    )
+
+    assert tuple(events) == expected_events
+    assert finalize.await_args.kwargs == {
+        "attempt_id": 3016,
+        "outcome": "technical_failure",
+        "qa_trace_id": expected_trace_id,
+    }
+    if failure_phase == "pre_trace":
+        create_trace.assert_not_awaited()
+        run_semantic.assert_not_awaited()
+    else:
+        create_trace.assert_awaited_once()
+        run_semantic.assert_awaited_once()
+
+
 async def test_semantic_embedding_failure_releases_slot(monkeypatch) -> None:
     handler = import_module("bot.handlers.qa")
     from bot.services.llm_providers import ProviderTransientError

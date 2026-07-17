@@ -11,15 +11,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence, TextIO
+from typing import Any, BinaryIO, Sequence, TextIO
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -80,37 +82,34 @@ def _guard_eval_query(query: str) -> str:
     return build_guarded_llm_query(query)
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+def _load_jsonl(source: BinaryIO) -> tuple[list[dict[str, Any]], str]:
     rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"input line {line_number} is not valid JSON") from exc
-            if not isinstance(row, dict) or set(row) != _INPUT_FIELDS:
-                raise ValueError(f"input line {line_number} has an invalid schema")
-            rows.append(row)
+    digest = hashlib.sha256()
+    for line_number, raw_line in enumerate(source, start=1):
+        digest.update(raw_line)
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"input line {line_number} is not valid UTF-8") from exc
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"input line {line_number} is not valid JSON") from exc
+        if not isinstance(row, dict) or set(row) != _INPUT_FIELDS:
+            raise ValueError(f"input line {line_number} has an invalid schema")
+        rows.append(row)
     if not rows:
         raise ValueError("private evaluation input is empty")
-    return rows
+    return rows, digest.hexdigest()
 
 
-def load_private_cases(path: Path, *, smoke: bool) -> tuple[PrivateEvalCase, ...]:
-    """Validate the complete private input before any provider dispatch."""
-
+def _validate_private_cases(
+    rows: list[dict[str, Any]], *, smoke: bool
+) -> tuple[PrivateEvalCase, ...]:
     cases: list[PrivateEvalCase] = []
-    for row in _load_jsonl(path):
+    for row in rows:
         case_id = row["case_id"]
         if not isinstance(case_id, str) or _CASE_ID_RE.fullmatch(case_id) is None:
             raise ValueError("case_id must be an opaque safe identifier")
@@ -177,17 +176,72 @@ def load_private_cases(path: Path, *, smoke: bool) -> tuple[PrivateEvalCase, ...
     return tuple(cases)
 
 
+def _open_private_input(path: Path) -> BinaryIO:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("private eval artifacts must not be symbolic links") from exc
+        raise
+    return os.fdopen(descriptor, "rb")
+
+
+def _load_private_cases_from_source(
+    source: BinaryIO, *, smoke: bool
+) -> tuple[tuple[PrivateEvalCase, ...], str]:
+    rows, dataset_hash = _load_jsonl(source)
+    return _validate_private_cases(rows, smoke=smoke), dataset_hash
+
+
+def load_private_cases(path: Path, *, smoke: bool) -> tuple[PrivateEvalCase, ...]:
+    """Validate the complete private input before any provider dispatch."""
+
+    with _open_private_input(path) as source:
+        cases, _ = _load_private_cases_from_source(source, smoke=smoke)
+    return cases
+
+
 def _open_private_text(path: Path, *, overwrite: bool) -> TextIO:
-    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    flags |= os.O_TRUNC if overwrite else os.O_EXCL
-    descriptor = os.open(path, flags, 0o600)
-    os.fchmod(descriptor, 0o600)
-    return os.fdopen(descriptor, "w", encoding="utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    if not overwrite:
+        flags |= os.O_EXCL
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("private eval artifacts must not be symbolic links") from exc
+        raise
+    # Disable platform newline translation so the streamed digest is over the
+    # exact bytes written to the held descriptor.
+    return os.fdopen(descriptor, "w", encoding="utf-8", newline="")
 
 
-def _write_jsonl(target: TextIO, payload: dict[str, Any]) -> None:
-    target.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+def _prepare_private_outputs(source: BinaryIO, targets: Sequence[TextIO]) -> None:
+    artifacts = (("input", source),) + tuple(
+        (f"output-{index}", target) for index, target in enumerate(targets, start=1)
+    )
+    identities: dict[tuple[int, int], str] = {}
+    for label, artifact in artifacts:
+        metadata = os.fstat(artifact.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("private eval artifacts must be regular files")
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in identities:
+            raise ValueError("private eval input and output paths must be distinct")
+        identities[identity] = label
+
+    for target in targets:
+        os.fchmod(target.fileno(), 0o600)
+    for target in targets:
+        os.ftruncate(target.fileno(), 0)
+        target.seek(0)
+
+
+def _write_jsonl(target: TextIO, payload: dict[str, Any]) -> bytes:
+    line = json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n"
+    target.write(line)
     target.flush()
+    return line.encode("utf-8")
 
 
 def _source_key(item: EvidenceItem) -> str:
@@ -363,49 +417,60 @@ async def run_private_evaluation(args: argparse.Namespace) -> int:
     release_sha = args.release_sha
     if _RELEASE_SHA_RE.fullmatch(release_sha) is None:
         raise ValueError("release SHA must be exactly 40 lowercase hexadecimal characters")
-    input_path = Path(args.input).expanduser()
-    cases = load_private_cases(input_path, smoke=args.smoke)
-    dataset_hash = _sha256_file(input_path)
-    cases_path = Path(args.cases_output).expanduser()
-    observations_path = Path(args.observations_output).expanduser()
-    review_path = Path(args.review_output).expanduser()
-    with (
-        _open_private_text(cases_path, overwrite=args.overwrite) as cases_target,
-        _open_private_text(observations_path, overwrite=args.overwrite) as observations_target,
-        _open_private_text(review_path, overwrite=args.overwrite) as review_target,
-    ):
-        for case in cases:
-            _write_jsonl(cases_target, _sanitized_case_row(case))
-        _write_jsonl(
-            observations_target,
-            {
-                "record_type": "header",
-                "schema_version": PRIVATE_RUN_SCHEMA_VERSION,
-                "contains_raw_text": False,
-                "release_sha": release_sha,
-                "dataset_sha256": dataset_hash,
-                "case_count": len(cases),
-            },
-        )
-        _write_jsonl(
-            review_target,
-            {
-                "record_type": "header",
-                "schema_version": PRIVATE_RUN_SCHEMA_VERSION,
-                "contains_raw_text": True,
-                "private_review_required": True,
-                "release_sha": release_sha,
-                "dataset_sha256": dataset_hash,
-                "case_count": len(cases),
-            },
-        )
-        for case in cases:
-            row = await _run_case(case)
-            row["release_sha"] = release_sha
-            row["dataset_sha256"] = dataset_hash
-            _write_jsonl(observations_target, _sanitized_observation_row(row))
-            _write_jsonl(review_target, row)
-    observations_hash = _sha256_file(observations_path)
+    input_path = Path(args.input).expanduser().absolute()
+    cases_path = Path(args.cases_output).expanduser().absolute()
+    observations_path = Path(args.observations_output).expanduser().absolute()
+    review_path = Path(args.review_output).expanduser().absolute()
+    artifact_paths = (input_path, cases_path, observations_path, review_path)
+    if len(set(artifact_paths)) != len(artifact_paths):
+        raise ValueError("private eval input and output paths must be distinct")
+    observations_digest = hashlib.sha256()
+    with _open_private_input(input_path) as input_source:
+        cases, dataset_hash = _load_private_cases_from_source(input_source, smoke=args.smoke)
+        with (
+            _open_private_text(cases_path, overwrite=args.overwrite) as cases_target,
+            _open_private_text(observations_path, overwrite=args.overwrite) as observations_target,
+            _open_private_text(review_path, overwrite=args.overwrite) as review_target,
+        ):
+            _prepare_private_outputs(
+                input_source, (cases_target, observations_target, review_target)
+            )
+            for case in cases:
+                _write_jsonl(cases_target, _sanitized_case_row(case))
+            observations_digest.update(
+                _write_jsonl(
+                    observations_target,
+                    {
+                        "record_type": "header",
+                        "schema_version": PRIVATE_RUN_SCHEMA_VERSION,
+                        "contains_raw_text": False,
+                        "release_sha": release_sha,
+                        "dataset_sha256": dataset_hash,
+                        "case_count": len(cases),
+                    },
+                )
+            )
+            _write_jsonl(
+                review_target,
+                {
+                    "record_type": "header",
+                    "schema_version": PRIVATE_RUN_SCHEMA_VERSION,
+                    "contains_raw_text": True,
+                    "private_review_required": True,
+                    "release_sha": release_sha,
+                    "dataset_sha256": dataset_hash,
+                    "case_count": len(cases),
+                },
+            )
+            for case in cases:
+                row = await _run_case(case)
+                row["release_sha"] = release_sha
+                row["dataset_sha256"] = dataset_hash
+                observations_digest.update(
+                    _write_jsonl(observations_target, _sanitized_observation_row(row))
+                )
+                _write_jsonl(review_target, row)
+    observations_hash = observations_digest.hexdigest()
     print(
         json.dumps(
             {

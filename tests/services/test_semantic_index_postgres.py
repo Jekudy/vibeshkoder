@@ -1435,10 +1435,10 @@ async def test_sql_failure_preserves_committed_partition_accounting(
     original_complete = _SemanticEmbeddingOutcomeRecorder.complete
     terminal_calls = 0
 
-    async def fail_second_terminal(self, session, *, llm_usage_ledger_id, vectors):
+    async def fail_third_terminal(self, session, *, llm_usage_ledger_id, vectors):
         nonlocal terminal_calls
         terminal_calls += 1
-        if terminal_calls == 2:
+        if terminal_calls == 3:
             await session.execute(text("SELECT 1 / 0"))
         await original_complete(
             self,
@@ -1450,7 +1450,7 @@ async def test_sql_failure_preserves_committed_partition_accounting(
     monkeypatch.setattr(
         _SemanticEmbeddingOutcomeRecorder,
         "complete",
-        fail_second_terminal,
+        fail_third_terminal,
     )
     provider = CountingEmbeddingProvider()
     run_id: int | None = None
@@ -1458,7 +1458,7 @@ async def test_sql_failure_preserves_committed_partition_accounting(
     try:
         async with factory() as session:
             human = await _user(session, user_id=user_id, is_bot=False)
-            for offset in range(81):
+            for offset in range(82):
                 await _message(
                     session,
                     user_id=human.id,
@@ -1466,6 +1466,19 @@ async def test_sql_failure_preserves_committed_partition_accounting(
                     text=f"{offset:04d}" + (chr(0x410 + (offset % 32)) * 796),
                     chat_id=chat_id,
                 )
+            documents = await list_eligible_message_documents(
+                session,
+                chat_id=chat_id,
+                limit=100,
+            )
+            assert len(documents) == 82
+            preindexed = await _index_batch(
+                session,
+                documents=documents[:1],
+                config=CONFIG,
+                provider=CountingEmbeddingProvider(),
+            )
+            assert (preindexed.indexed, preindexed.skipped) == (1, 0)
 
             with pytest.raises(DBAPIError):
                 await backfill_semantic_index(
@@ -1492,8 +1505,10 @@ async def test_sql_failure_preserves_committed_partition_accounting(
                 run.indexed_count,
                 run.skipped_count,
                 run.failed_count,
-            ) == (81, 80, 0, 1)
+            ) == (82, 80, 1, 1)
+            assert run.eligible_count == run.indexed_count + run.skipped_count + run.failed_count
             assert run.reason_counts["indexed:new_embedding"] == 80
+            assert run.reason_counts["skipped:unchanged"] == 1
             assert run.reason_counts["failed:DBAPIError"] == 1
             assert run.cursor is None
             units = (
@@ -1507,7 +1522,7 @@ async def test_sql_failure_preserves_committed_partition_accounting(
                 .scalars()
                 .all()
             )
-            assert [unit.embedding_status for unit in units].count("completed") == 80
+            assert [unit.embedding_status for unit in units].count("completed") == 81
             assert [unit.embedding_status for unit in units].count("reserved") == 1
             ledger_ids.update(unit.llm_usage_ledger_id for unit in units)
             assert [len(call) for call in provider.calls] == [80, 1]
@@ -1875,10 +1890,31 @@ async def test_reconcile_invalidates_every_active_unit_that_became_ineligible(db
         )
         == 4
     )
-    units = (await db_session.execute(select(SemanticRetrievalUnit))).scalars().all()
+    units = (
+        (
+            await db_session.execute(
+                select(SemanticRetrievalUnit).execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert len(units) == 4
     assert all(unit.invalidated_at is not None for unit in units)
     assert {unit.invalidation_reason for unit in units} == {"source_ineligible"}
+    assert {unit.embedding_status for unit in units} == {"failed"}
+    assert all(unit.chunk_text is None for unit in units)
+    assert all(unit.embedding is None for unit in units)
+    assert all(unit.indexed_at is None for unit in units)
+    redacted_ledger = await db_session.get(
+        LlmUsageLedger,
+        ledger.id,
+        populate_existing=True,
+    )
+    assert redacted_ledger.prompt_hash is None
+    assert redacted_ledger.response_hash is None
+    assert redacted_ledger.tokens_in == 1
+    assert redacted_ledger.latency_ms == 1
     assert (
         await _reconcile_ineligible_units(
             db_session,

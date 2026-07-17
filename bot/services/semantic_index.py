@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from bot.db.models import (
+    LlmUsageLedger,
     MessageVersion,
     SemanticIndexRun,
     SemanticRetrievalUnit,
@@ -91,7 +92,11 @@ _REVALIDATE_CARDS_SQL = text(
 _RECONCILE_INELIGIBLE_SQL = text(
     f"""
     UPDATE semantic_retrieval_units AS unit
-    SET invalidated_at = :invalidated_at,
+    SET embedding_status = 'failed',
+        chunk_text = NULL,
+        embedding = NULL,
+        indexed_at = NULL,
+        invalidated_at = :invalidated_at,
         invalidation_reason = 'source_ineligible'
     WHERE unit.embedding_model = :embedding_model
       AND unit.invalidated_at IS NULL
@@ -176,7 +181,7 @@ _RECONCILE_INELIGIBLE_SQL = text(
               )
           )
       )
-    RETURNING unit.id
+    RETURNING unit.id, unit.llm_usage_ledger_id
     """
 )
 
@@ -1738,7 +1743,18 @@ async def _reconcile_ineligible_units(
             "chat_id": chat_id,
         },
     )
-    invalidated = len(result.scalars().all())
+    invalidated_rows = list(result.all())
+    invalidated = len(invalidated_rows)
+    ledger_ids = {int(row.llm_usage_ledger_id) for row in invalidated_rows}
+    if ledger_ids:
+        # A batch ledger hashes all provider inputs/results together. If any
+        # source becomes ineligible, retain only aggregate spend/latency and
+        # irreversibly remove the content-derived hashes for the whole call.
+        await session.execute(
+            update(LlmUsageLedger)
+            .where(LlmUsageLedger.id.in_(ledger_ids))
+            .values(prompt_hash=None, response_hash=None)
+        )
     if invalidated:
         logger.info(
             "semantic_index_units_reconciled",
