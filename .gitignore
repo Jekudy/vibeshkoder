@@ -9,6 +9,8 @@
 .worktrees/
 .claude/agent-memory/
 .claude/worktrees/
+.claude/skills/bmad-*/
+.agents/skills/bmad-*/
 memory/
 __pycache__/
 *.pyc
