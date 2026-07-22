@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from collections import Counter
 from datetime import datetime, timezone
 
 from aiogram import Bot
@@ -31,13 +33,18 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Digest, DigestRun
+from bot.services.control_messages import control_message_excludes_sql_fragment
 from bot.services.digest_admin_notify import notify_admins_digest_failure
 from bot.services.digest_renderer import render_digest_html
 from bot.services.digests import DigestConfig
+from bot.services.image_memory import telegram_source_message_url
 
 logger = logging.getLogger(__name__)
 
+_CONTROL_EXCLUDES = control_message_excludes_sql_fragment()
+
 _LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+_MESSAGE_CITATION_RE = re.compile(r"\[\[mv:([1-9]\d*)\]\]")
 
 
 def _is_lock_not_available(exc: DBAPIError) -> bool:
@@ -57,8 +64,7 @@ class DigestPublisherInvalidState(Exception):
     """Publisher trigger guard fired, OR the guarded UPDATE returned
     rowcount=0 (concurrent race).
 
-    Structured fields mirror ``DigestReviewInvalidState`` (PHASE8_PLAN.md
-    §5.L — R2 HIGH-Cdx-1). Handlers branch on ``current_status`` to
+    Handlers branch on ``current_status`` to
     render context-aware replies:
 
       ``digest_id``: int
@@ -74,20 +80,10 @@ class DigestPublisherInvalidState(Exception):
 
     def __init__(
         self,
-        *args,
         digest_id: int | None = None,
         current_status: str | None = None,
         reason: str | None = None,
     ) -> None:
-        # Support the legacy positional form ``DigestPublisherInvalidState(msg)``
-        # used by Phase 7 baseline so callers in flight (handlers, tests) can
-        # adapt without a flag day. Structured kwargs are the canonical form.
-        if args and digest_id is None and current_status is None and reason is None:
-            self.digest_id = None
-            self.current_status = None
-            self.reason = str(args[0])
-            super().__init__(*args)
-            return
         self.digest_id = digest_id
         self.current_status = current_status
         self.reason = reason or ""
@@ -97,16 +93,50 @@ class DigestPublisherInvalidState(Exception):
         )
 
 
-# T8-04 / Phase 8 §5.L — eligible status set for the publisher trigger.
-#
-# Widened from Phase 7's single ``'draft'`` to also accept
-# ``'approved_for_publish'`` — the status set by
-# ``digest_review.approve_digest`` step 3. Daily auto-publish path is
-# unchanged (still passes ``'draft'``, which matches the first tuple entry).
-_PUBLISHER_TRIGGER_STATUSES: tuple[str, ...] = (
-    "draft",
-    "approved_for_publish",
-)
+async def resolve_digest_source_links(
+    session: AsyncSession, *, citations: list[dict], source_chat_id: int
+) -> dict[str, str]:
+    """Resolve every internal message token to an application-built URL."""
+    citation_keys: set[tuple[str, str, int]] = set()
+    for citation in citations:
+        if (
+            citation.get("kind") != "message_version"
+            or not isinstance(citation.get("position"), int)
+            or isinstance(citation["position"], bool)
+            or citation["position"] < 0
+        ):
+            raise ValueError("digest citations are malformed")
+        key = (citation["kind"], str(citation.get("id")), citation["position"])
+        if key in citation_keys:
+            raise ValueError("digest citations contain a duplicate")
+        citation_keys.add(key)
+    try:
+        mv_ids = [int(c["id"]) for c in citations if c["kind"] == "message_version"]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("digest citations are malformed") from exc
+    by_key: dict[tuple[str, str], str] = {}
+    if mv_ids:
+        sql = (
+            f"SELECT mv.id::text, cm.chat_id, cm.message_id FROM message_versions mv "
+            "JOIN chat_messages cm ON cm.id=mv.chat_message_id "
+            "WHERE mv.id=ANY(:ids) AND cm.chat_id=:chat_id "
+            "AND cm.current_version_id=mv.id AND cm.memory_policy='normal' "
+            f"AND cm.is_redacted=FALSE AND mv.is_redacted=FALSE AND {_CONTROL_EXCLUDES}"
+        )
+        for source_id, chat_id, message_id in (
+            await session.execute(text(sql), {"ids": mv_ids, "chat_id": source_chat_id})
+        ).all():
+            by_key[("message_version", source_id)] = telegram_source_message_url(
+                int(chat_id), int(message_id), username=None
+            )
+
+    links: dict[str, str] = {}
+    for citation in citations:
+        url = by_key.get((str(citation.get("kind")), str(citation.get("id"))))
+        if url is None:
+            raise ValueError("digest citation has no safe source URL")
+        links[f"[[mv:{int(citation['id'])}]]"] = url
+    return links
 
 
 async def _digest_revalidate_citations(session: AsyncSession, *, digest: Digest) -> bool:
@@ -122,11 +152,13 @@ async def _digest_revalidate_citations(session: AsyncSession, *, digest: Digest)
     if mv_ids:
         result = await session.execute(
             text(
-                "SELECT mv.id FROM message_versions mv "
+                f"SELECT mv.id FROM message_versions mv "
                 "JOIN chat_messages cm ON cm.id = mv.chat_message_id "
                 "WHERE mv.id = ANY(:mv_ids) "
                 "  AND cm.memory_policy = 'normal' "
+                "  AND cm.is_redacted = FALSE "
                 "  AND mv.is_redacted = FALSE "
+                f"  AND {_CONTROL_EXCLUDES} "
                 "  AND NOT EXISTS ("
                 "      SELECT 1 FROM forget_events fe "
                 "      WHERE fe.status IN ('pending','processing','completed') "
@@ -145,14 +177,16 @@ async def _digest_revalidate_citations(session: AsyncSession, *, digest: Digest)
     if cs_ids:
         result = await session.execute(
             text(
-                "SELECT cs.id::text FROM card_sources cs "
+                f"SELECT cs.id::text FROM card_sources cs "
                 "JOIN knowledge_cards kc ON kc.id = cs.card_id "
                 "JOIN message_versions mv ON mv.id = cs.message_version_id "
                 "JOIN chat_messages cm ON cm.id = mv.chat_message_id "
                 "WHERE cs.id::text = ANY(:cs_ids) "
                 "  AND kc.card_status = 'approved' "
                 "  AND cm.memory_policy = 'normal' "
+                "  AND cm.is_redacted = FALSE "
                 "  AND mv.is_redacted = FALSE "
+                f"  AND {_CONTROL_EXCLUDES} "
                 "  AND NOT EXISTS ("
                 "      SELECT 1 FROM forget_events fe "
                 "      WHERE fe.status IN ('pending','processing','completed') "
@@ -183,14 +217,11 @@ async def publish_digest(
     The function owns two durable transaction boundaries: ``posting`` before
     outbound send, and ``posted``/``failed`` after the Telegram result.
     """
-    if digest.status not in _PUBLISHER_TRIGGER_STATUSES:
+    if digest.status != "draft":
         raise DigestPublisherInvalidState(
             digest_id=digest.id,
             current_status=digest.status,
-            reason=(
-                f"publisher trigger requires status in "
-                f"{_PUBLISHER_TRIGGER_STATUSES!r}, found {digest.status!r}"
-            ),
+            reason=(f"publisher trigger requires status 'draft', found {digest.status!r}"),
         )
 
     # If no destination, skip publication cleanly.
@@ -244,7 +275,7 @@ async def publish_digest(
             text(
                 "UPDATE digests "
                 "SET status='failed', error_text='publish_lock_timeout', updated_at=now() "
-                "WHERE id=:id AND status IN ('draft','approved_for_publish') "
+                "WHERE id=:id AND status='draft' "
                 "RETURNING id"
             ),
             {"id": digest.id},
@@ -266,9 +297,7 @@ async def publish_digest(
                 digest_id=digest.id,
                 current_status=current,
                 reason=(
-                    "publish_lock_timeout transition requires status IN "
-                    "('draft','approved_for_publish'), "
-                    f"found {current!r}"
+                    f"publish_lock_timeout transition requires status 'draft', found {current!r}"
                 ),
             )
 
@@ -291,19 +320,15 @@ async def publish_digest(
         )
         return digest
 
-    # T8-04 / Phase 8 §5.L — guarded transition to ``posting``.
-    #
-    # Widened WHERE-clause to accept BOTH ``draft`` (daily auto-publish path)
-    # AND ``approved_for_publish`` (weekly admin-approve path). rowcount=0
-    # follows the canonical §5.E classifier (re-read row; None ⇒ deleted,
-    # str ⇒ wrong state).
+    # Guarded transition to ``posting``. Rowcount=0 means a concurrent
+    # transition won and is classified by re-reading the row.
     posting_result = await session.execute(
         text(
             "UPDATE digests "
             "SET status='posting', "
             "    posting_started_at=now(), "
             "    updated_at=now() "
-            "WHERE id=:id AND status IN ('draft','approved_for_publish') "
+            "WHERE id=:id AND status='draft' "
             "RETURNING id"
         ),
         {"id": digest.id},
@@ -326,7 +351,7 @@ async def publish_digest(
         raise DigestPublisherInvalidState(
             digest_id=digest.id,
             current_status=current,
-            reason=(f"expected status IN ('draft','approved_for_publish'), found {current!r}"),
+            reason=(f"expected status 'draft', found {current!r}"),
         )
 
     # Refresh ORM state to reflect the guarded UPDATE so subsequent code
@@ -359,16 +384,43 @@ async def publish_digest(
         )
         return digest
 
-    # Render + send. Weekly digests need ``window_end_utc`` for the week-range
-    # footer and the ``## Раздел: …`` section-header bolding (Phase 8 §5.I /
-    # FHR HIGH-5). Daily passes only the start so the Phase 7 single-day
-    # footer is preserved byte-for-byte.
-    body_html = render_digest_html(
-        digest.body_markdown or "",
-        window_start_utc=digest.window_start,
-        digest_type=digest.type,
-        window_end_utc=digest.window_end if digest.type == "weekly" else None,
-    )
+    try:
+        body_tokens = Counter(
+            match.group(0) for match in _MESSAGE_CITATION_RE.finditer(digest.body_markdown or "")
+        )
+        citation_tokens = Counter(
+            f"[[mv:{int(citation['id'])}]]" for citation in (digest.citations or [])
+        )
+        if body_tokens != citation_tokens:
+            raise ValueError("digest body citations do not match stored provenance")
+        body_html = render_digest_html(
+            digest.body_markdown or "",
+            window_start_utc=digest.window_start,
+            source_links_by_citation=await resolve_digest_source_links(
+                session,
+                citations=digest.citations or [],
+                source_chat_id=digest_config.source_chat_id,
+            ),
+            digest_type=digest.type,
+            window_end_utc=digest.window_end if digest.type == "weekly" else None,
+        )
+    except (TypeError, ValueError):
+        digest.status = "failed"
+        digest.error_text = "source_link_validation_failed"
+        digest.posting_started_at = None
+        session.add(
+            DigestRun(
+                digest_id=digest.id,
+                status="failed",
+                error_text=digest.error_text,
+                finished_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.flush()
+        await notify_admins_digest_failure(
+            bot, digest_id=digest.id, status="failed", error_text=digest.error_text
+        )
+        return digest
     # At-most-once delivery boundary.  If the process dies after Telegram
     # accepts the message, ``posting`` remains durable and no cron path sends
     # the same digest again.  The stale reaper later marks it failed/uncertain.
@@ -463,4 +515,4 @@ async def publish_digest(
     return digest
 
 
-__all__ = ["publish_digest", "DigestPublisherInvalidState"]
+__all__ = ["publish_digest", "resolve_digest_source_links", "DigestPublisherInvalidState"]

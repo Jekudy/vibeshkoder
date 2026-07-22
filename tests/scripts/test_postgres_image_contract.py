@@ -33,8 +33,8 @@ def test_ci_smokes_image_and_release_publishes_commit_bound_db_image() -> None:
     assert "CREATE EXTENSION vector" in ci_text
     assert "server_version_num" in ci_text
     assert "::vector <=>" in ci_text
-    assert "alembic upgrade 089" in ci_text
-    assert "alembic downgrade 088" in ci_text
+    assert "alembic upgrade 090" in ci_text
+    assert "alembic downgrade 089" in ci_text
     assert "alembic upgrade head" in ci_text
     assert "ck_semantic_attempts_state" in ci_text
     assert release["env"]["IMAGE_DB"] == "ghcr.io/jekudy/vibe-gatekeeper-postgres"

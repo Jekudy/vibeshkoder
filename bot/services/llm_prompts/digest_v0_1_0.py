@@ -1,56 +1,306 @@
-"""Digest synthesis prompt template — v0.1.0.
-
-Used by `bot/services/llm_gateway.py::synthesize_digest` (T7-02 / Phase 7).
-Output format is enforced by parsing in the caller — if the LLM violates
-format, the caller raises and the digest is marked `failed`.
-"""
+"""Issue #406 digest instructions, inputs, and strict response schemas."""
 
 from __future__ import annotations
 
-PROMPT_VERSION = "digest-v0.1.0"
+import json
+import os
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
 
-SYSTEM_PROMPT = """You are writing a daily digest for a private community chat.
+from bot.services.digest_contract import VERIFIER_VERDICT_PAIRS
 
-Output format (strict):
-  Line 1-3: TL;DR — 3 short sentences in Russian, prose.
-  Blank line.
-  Then 5-7 bullets, each:
-    - Topic title (≤8 words).
-    - 1-2 sentence summary.
-    - Citation tokens: [[cs:UUID]] for an approved card source, [[mv:INT]] for
-      a raw message version. EVERY bullet MUST contain at least one citation
-      token. Citation tokens MUST reference verbatim ids from the input below.
+PROMPT_VERSION = "digest-v0.3.0"
 
-Use Russian. Be neutral. Do not invent facts.
-Citations MUST reference input ids verbatim. Do not invent ids.
-If the input has no cards and no messages, return exactly: EMPTY_WINDOW
+DRAFT_INSTRUCTIONS = """Ты редактор приватного русскоязычного Telegram-чата.
+Составь редакторский дайджест: коротко покажи, что происходило в чате и кто внёс
+существенный вклад. Используй только предоставленные сообщения.
+
+Сохраняй точные Telegram display names, названия, модели, версии, цифры, ссылки и полезные
+детали. Краткий опыт, вывод или характерная цитата допустимы, если подтверждены evidence.
+Не пересказывай тред по порядку и не перечисляй все аргументы: покажи значимые темы,
+участников, вклад или результат и путь к источнику. Один пункт может объединять несколько
+вкладов. В text пиши только обычный текст без citation tokens и Telegram URLs. Подтверждающие
+tokens укажи отдельно в citations в порядке релевантности.
+
+Для короткого окна выбери layout=flat и одну секцию с пустым heading. Для насыщенного —
+layout=sectioned и разговорные тематические headings. Жёсткого лимита пунктов нет. Weekly —
+самостоятельная карта недели: объединяй повторы в кластеры и держи цельный пост примерно на
+2–3 минуты чтения. Не добавляй filler ради объёма.
+
+Для publish=true добавь короткую grounded closing-реплику или шутку с citations. Не выдумывай
+факты и не шути над участником. Не включай команды, телефоны, credentials или raw payloads.
+Не создавай заголовок поста, #дайджест или Telegram URLs источников — их добавит приложение.
+Если значимых кластеров нет, верни publish=false, layout=none, пустые sections и пустую closing.
+Следуй JSON schema; никакого текста вне JSON.
+"""
+
+VERIFIER_INSTRUCTIONS = """Проверь каждый item и closing только по приложенному cited_evidence.
+Проверяй факты, Telegram display names, числа, версии, модальность и соответствие citations.
+Не оценивай стиль, порядок, рубрики, полноту или сходство с gold. Верни каждый item_key ровно
+один раз; порядок не важен. Для каждого выбери один verdict: keep_ok означает точное
+подтверждение; fix_* — текст можно исправить, не меняя citations; block_* — citations не
+позволяют безопасно исправить утверждение.
+Следуй JSON schema; никакого текста вне JSON.
+"""
+
+EDITOR_INSTRUCTIONS = """Исправь только переданные factual findings по cited_evidence.
+Не меняй структуру, item_key или citation provenance. В text верни только обычный текст без
+citation tokens и Telegram URLs; приложение сохранит citations само.
+Не добавляй новые факты, источники или внешние знания. Верни каждый item_key ровно один раз
+и в исходном порядке. Следуй JSON schema; никакого текста вне JSON.
+"""
+
+FINALIZER_INSTRUCTIONS = """Ты финальный редактор уже проверенного недельного дайджеста.
+Верни полный adaptive digest с publish=true. Исправь findings с action=fix, а claims с
+action=keep не искажай. Можно объединять, переставлять и удалять менее важные пункты, чтобы
+весь пост уложился в visible_character_target; жёсткого лимита пунктов нет.
+
+Используй только факты из cited_evidence и только citation tokens, уже использованные в
+исходном draft. Не добавляй новые факты, источники или tokens. У каждого factual item и у
+короткой grounded closing должны остаться отдельные citations, а text должен быть без citation
+tokens и Telegram URLs. Приложение само добавит заголовок, source labels и #дайджест; их длина
+уже включена в target. Следуй JSON schema; никакого текста вне JSON.
 """
 
 
-def build_user_prompt(
+def load_private_gold_examples() -> list[dict[str, Any]]:
+    """Load exactly two runtime-injected human gold examples without logging them."""
+    raw_path = os.environ.get("DIGEST_GOLD_EXAMPLES_PATH")
+    if raw_path is None or not raw_path.strip():
+        raise ValueError("DIGEST_GOLD_EXAMPLES_PATH is required")
+    path = Path(raw_path).expanduser()
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("DIGEST_GOLD_EXAMPLES_PATH must be a regular file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("DIGEST_GOLD_EXAMPLES_PATH is unreadable or invalid JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != {"examples"}:
+        raise ValueError("digest gold file must contain only examples")
+    examples = payload["examples"]
+    if not isinstance(examples, list) or len(examples) != 2:
+        raise ValueError("digest gold file must contain exactly two examples")
+    expected_activities = {"short", "busy"}
+    if any(
+        not isinstance(example, dict)
+        or set(example) != {"activity", "input", "output"}
+        or example["activity"] not in expected_activities
+        or not isinstance(example["input"], dict)
+        or not isinstance(example["output"], dict)
+        for example in examples
+    ):
+        raise ValueError("digest gold examples have an invalid schema")
+    if {example["activity"] for example in examples} != expected_activities:
+        raise ValueError("digest gold file requires one short and one busy example")
+    return examples
+
+
+def message_payload(message: Any) -> dict[str, Any]:
+    return {
+        "citation": f"[[mv:{message.message_version_id}]]",
+        "telegram_message_id": getattr(message, "telegram_message_id", None),
+        "author_display": message.author_display,
+        "timestamp": message.ts.isoformat(),
+        "text": message.text,
+        "caption": getattr(message, "caption", None),
+        "message_kind": getattr(message, "message_kind", None),
+        "reply_to_message_id": getattr(message, "reply_to_message_id", None),
+        "message_thread_id": getattr(message, "message_thread_id", None),
+        "media_kind": getattr(message, "media_kind", None),
+        "media_description": getattr(message, "media_description", None),
+        "forward_origin": {
+            "type": getattr(message, "forward_origin_type", None),
+            "display": getattr(message, "forward_origin_display", None),
+            "date": getattr(message, "forward_origin_date", None),
+        },
+    }
+
+
+def build_draft_input(
     *,
+    digest_type: str,
     window_start_msk: str,
     window_end_msk: str,
-    cards: list,
-    messages: list,
+    messages: Sequence[Any],
+    gold_examples: Sequence[Mapping[str, Any]],
 ) -> str:
-    """Compose the user-side of the digest prompt. Returns a single string."""
-    lines = [
-        f"Window: {window_start_msk} .. {window_end_msk} (Europe/Moscow)",
-        f"Cards ({len(cards)}):",
-    ]
-    for c in cards:
-        # c is DigestContextCard from bot.services.digest_context
-        sids_csv = ", ".join(str(s) for s in c.card_source_ids)
-        lines.append(f'  Card "{c.title}" (approved). Source ids you may cite: {sids_csv}')
-        lines.append(f"  Card body: {c.body_markdown}")
-        lines.append("  ---")
-    lines.append(f"Messages ({len(messages)}):")
-    for m in messages:
-        # m is DigestContextMessage
-        lines.append(
-            f"  [mv:{m.message_version_id}] {m.author_display},"
-            f" {m.ts.isoformat()}: {m.text}"
+    return json.dumps(
+        {
+            "digest_type": digest_type,
+            "window": {"start": window_start_msk, "end": window_end_msk},
+            "human_gold_examples": list(gold_examples),
+            "messages": [message_payload(message) for message in messages],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _citation_schema(citation_tokens: Sequence[str]) -> dict[str, Any]:
+    allowed = list(citation_tokens) or ["__NO_CITATIONS_AVAILABLE__"]
+    return {"type": "string", "enum": allowed}
+
+
+def draft_response_schema(citation_tokens: Sequence[str]) -> dict[str, Any]:
+    citation = _citation_schema(citation_tokens)
+    citations = {"type": "array", "items": citation}
+    content = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["text", "citations"],
+        "properties": {
+            "text": {"type": "string"},
+            "citations": citations,
+        },
+    }
+    section = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["heading", "items"],
+        "properties": {
+            "heading": {"type": "string"},
+            "items": {"type": "array", "items": content},
+        },
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["publish", "layout", "sections", "closing"],
+        "properties": {
+            "publish": {"type": "boolean"},
+            "layout": {"type": "string", "enum": ["none", "flat", "sectioned"]},
+            "sections": {"type": "array", "items": section},
+            "closing": content,
+        },
+    }
+
+
+def verifier_response_schema(item_keys: Sequence[str]) -> dict[str, Any]:
+    keys = list(item_keys)
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": len(keys),
+                "maxItems": len(keys),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_key", "verdict"],
+                    "properties": {
+                        "item_key": {"type": "string", "enum": keys},
+                        "verdict": {"type": "string", "enum": list(VERIFIER_VERDICT_PAIRS)},
+                    },
+                },
+            }
+        },
+    }
+
+
+def editor_response_schema(item_keys: Sequence[str]) -> dict[str, Any]:
+    keys = list(item_keys)
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": len(keys),
+                "maxItems": len(keys),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_key", "text"],
+                    "properties": {
+                        "item_key": {"type": "string", "enum": keys},
+                        "text": {"type": "string"},
+                    },
+                },
+            }
+        },
+    }
+
+
+def build_verifier_input(
+    *, items: Sequence[Mapping[str, Any]], citation_evidence: Mapping[str, Mapping[str, Any]]
+) -> str:
+    scoped = []
+    for item in items:
+        scoped.append(
+            {
+                "item_key": item["item_key"],
+                "text": item["text"],
+                "citations": item["citations"],
+                "cited_evidence": [citation_evidence[token] for token in item["citations"]],
+            }
         )
-        lines.append("  ---")
-    return "\n".join(lines)
+    return json.dumps({"items": scoped}, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_editor_input(
+    *, fixes: Sequence[Mapping[str, Any]], citation_evidence: Mapping[str, Mapping[str, Any]]
+) -> str:
+    scoped = []
+    for item in fixes:
+        scoped.append(
+            {
+                "item_key": item["item_key"],
+                "text": item["text"],
+                "citations": item["citations"],
+                "reason": item["reason"],
+                "cited_evidence": [citation_evidence[token] for token in item["citations"]],
+            }
+        )
+    return json.dumps({"items": scoped}, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_finalizer_input(
+    *,
+    draft: Mapping[str, Any],
+    decisions: Sequence[Mapping[str, str]],
+    citation_evidence: Mapping[str, Mapping[str, Any]],
+    visible_target: int,
+) -> str:
+    used_tokens = [
+        token
+        for section in draft["sections"]
+        for item in section["items"]
+        for token in item["citations"]
+    ]
+    used_tokens.extend(draft["closing"]["citations"])
+    scoped_evidence = {
+        token: citation_evidence[token] for token in dict.fromkeys(used_tokens)
+    }
+    return json.dumps(
+        {
+            "visible_character_target": visible_target,
+            "draft": draft,
+            "verifier_decisions": list(decisions),
+            "cited_evidence": scoped_evidence,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+__all__ = [
+    "DRAFT_INSTRUCTIONS",
+    "EDITOR_INSTRUCTIONS",
+    "FINALIZER_INSTRUCTIONS",
+    "PROMPT_VERSION",
+    "VERIFIER_INSTRUCTIONS",
+    "build_draft_input",
+    "build_editor_input",
+    "build_finalizer_input",
+    "build_verifier_input",
+    "draft_response_schema",
+    "editor_response_schema",
+    "load_private_gold_examples",
+    "message_payload",
+    "verifier_response_schema",
+]

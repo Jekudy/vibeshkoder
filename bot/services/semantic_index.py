@@ -26,6 +26,7 @@ from bot.db.models import (
     SemanticRetrievalUnitSource,
 )
 from bot.db.repos.llm_usage_ledger import LedgerRepo
+from bot.services.control_messages import control_message_excludes_sql_fragment
 from bot.services.forget_predicate import forget_excludes_sql_fragment
 from bot.services.llm_gateway import (
     EmbeddingBudgetExceeded,
@@ -53,6 +54,7 @@ MAX_RESULTS_PER_AUTHOR = 3
 RRF_K = 60
 
 _FORGET_EXCLUDES = forget_excludes_sql_fragment()
+_CONTROL_EXCLUDES = control_message_excludes_sql_fragment()
 
 # Only the static _FORGET_EXCLUDES fragment is interpolated; runtime values are bound.
 # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
@@ -71,6 +73,7 @@ _REVALIDATE_PROVENANCE_SQL = text(
       AND COALESCE(cm.message_kind, 'text') NOT IN ('voice', 'audio')
       AND cm.is_redacted = FALSE
       AND mv.is_redacted = FALSE
+      AND {_CONTROL_EXCLUDES}
       AND {_FORGET_EXCLUDES}
     """
 )
@@ -123,6 +126,7 @@ _RECONCILE_INELIGIBLE_SQL = text(
                     OR cm.is_redacted = TRUE
                     OR mv.is_redacted = TRUE
                     OR author.is_bot IS DISTINCT FROM FALSE
+                    OR NOT ({_CONTROL_EXCLUDES})
                     OR NOT ({_FORGET_EXCLUDES})
                 )
           )
@@ -219,6 +223,7 @@ _ELIGIBLE_MESSAGES_SQL = text(
       AND COALESCE(cm.message_kind, 'text') NOT IN ('voice', 'audio')
       AND cm.is_redacted = FALSE
       AND mv.is_redacted = FALSE
+      AND {_CONTROL_EXCLUDES}
       AND btrim(
             concat_ws(
                 ' ',
@@ -277,6 +282,7 @@ _ELIGIBLE_CARDS_SQL = text(
                 OR cm.is_redacted = TRUE
                 OR mv.is_redacted = TRUE
                 OR author.is_bot IS DISTINCT FROM FALSE
+                OR NOT ({_CONTROL_EXCLUDES})
                 OR NOT ({_FORGET_EXCLUDES})
             )
       )
@@ -342,6 +348,7 @@ _VECTOR_CANDIDATES_SQL = text(
                 OR cm.is_redacted = TRUE
                 OR mv.is_redacted = TRUE
                 OR author.is_bot IS DISTINCT FROM FALSE
+                OR NOT ({_CONTROL_EXCLUDES})
                 OR (CAST(:exclude_chat_message_id AS INTEGER) IS NOT NULL
                     AND cm.id = CAST(:exclude_chat_message_id AS INTEGER))
                 OR NOT ({_FORGET_EXCLUDES})
@@ -413,6 +420,7 @@ _MESSAGE_HIT_SQL = text(
       AND COALESCE(cm.message_kind, 'text') NOT IN ('voice', 'audio')
       AND cm.is_redacted = FALSE
       AND mv.is_redacted = FALSE
+      AND {_CONTROL_EXCLUDES}
       AND (CAST(:exclude_chat_message_id AS INTEGER) IS NULL
            OR cm.id <> CAST(:exclude_chat_message_id AS INTEGER))
       AND {_FORGET_EXCLUDES}
@@ -483,6 +491,7 @@ _CARD_HIT_SQL = text(
                 OR cm.is_redacted = TRUE
                 OR mv.is_redacted = TRUE
                 OR author.is_bot IS DISTINCT FROM FALSE
+                OR NOT ({_CONTROL_EXCLUDES})
                 OR (CAST(:exclude_chat_message_id AS INTEGER) IS NOT NULL
                     AND cm.id = CAST(:exclude_chat_message_id AS INTEGER))
                 OR NOT ({_FORGET_EXCLUDES})

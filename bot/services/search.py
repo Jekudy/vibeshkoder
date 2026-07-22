@@ -41,6 +41,8 @@ from typing import Literal
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.services.control_messages import control_message_excludes_sql_fragment
+
 logger = logging.getLogger(__name__)
 
 MAX_QUERY_LENGTH = 256
@@ -50,6 +52,7 @@ MAX_QUERY_LENGTH = 256
 # per T6-06_design.md §3 (Rank boost). A strong message match still beats a
 # weak card match — the boost lifts cards above message hits of similar rank.
 CARD_RANK_BOOST = 1.15
+_CONTROL_EXCLUDES = control_message_excludes_sql_fragment()
 
 
 @dataclass(frozen=True)
@@ -83,7 +86,7 @@ class SearchHit:
 # exact same SQL (modulo whitespace identical to the original) — the
 # byte-for-byte guarantee in PHASE6_PLAN.md §5.D / T6-06_design.md §2 holds
 # at the result-set level.
-_PHASE4_SQL = """
+_PHASE4_SQL = f"""
 WITH q AS (
     SELECT plainto_tsquery('russian', :query) AS tsq
 )
@@ -136,6 +139,7 @@ WHERE c.chat_id = :chat_id
     AND c.memory_policy = 'normal'
     AND c.is_redacted = FALSE
     AND mv.is_redacted = FALSE
+    AND {_CONTROL_EXCLUDES}
     AND (
         mv.search_tsv @@ q.tsq
         OR to_tsvector(
@@ -195,7 +199,7 @@ LIMIT :limit
 #   - Requires ALL sources to belong to ``:chat_id`` and aggregates their mvids
 #     into ``card_source_message_version_ids``
 #     so the renderer (T6-07) can list the full back-citation trace.
-_PHASE6_SQL = """
+_PHASE6_SQL = f"""
 WITH q AS (
     SELECT plainto_tsquery('russian', :query) AS tsq
 ),
@@ -266,6 +270,7 @@ message_hits AS (
         AND c.memory_policy = 'normal'
         AND c.is_redacted = FALSE
         AND mv.is_redacted = FALSE
+        AND {_CONTROL_EXCLUDES}
         AND (
             mv.search_tsv @@ q.tsq
             OR to_tsvector(
@@ -405,6 +410,7 @@ approved_card_hits AS (
                     c3.memory_policy <> 'normal'
                     OR c3.is_redacted = TRUE
                     OR mv3.is_redacted = TRUE
+                    OR NOT ({control_message_excludes_sql_fragment("mv3")})
                     OR c3.current_version_id IS DISTINCT FROM mv3.id
                 )
         )

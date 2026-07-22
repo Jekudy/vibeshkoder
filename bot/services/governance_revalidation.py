@@ -32,6 +32,8 @@ from typing import Any, Literal
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.services.control_messages import control_message_excludes_sql_fragment
+
 # Single statement that returns the FIRST blocking row for the given mvid, or
 # nothing if the source is clean. Short-circuiting at SQL level means one
 # round-trip per mvid even when multiple violations exist on the same row.
@@ -49,8 +51,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # advisory lock by adding a row-level read lock on the actual data rows.
 # ``FOR SHARE NOWAIT`` is NOT used — we want to wait for the cascade to
 # finish if it grabbed the row first, then re-read its final state.
+_CONTROL_MESSAGE_EXCLUDES = control_message_excludes_sql_fragment("mv")
+
 _REVALIDATE_SQL = text(
-    """
+    f"""
     WITH src AS (
         SELECT
             mv.id AS message_version_id,
@@ -61,7 +65,8 @@ _REVALIDATE_SQL = text(
             c.user_id AS user_id,
             c.current_version_id = mv.id AS is_current,
             c.memory_policy AS memory_policy,
-            c.is_redacted AS c_is_redacted
+            c.is_redacted AS c_is_redacted,
+            ({_CONTROL_MESSAGE_EXCLUDES}) AS is_content_eligible
         FROM message_versions AS mv
         JOIN chat_messages AS c ON c.id = mv.chat_message_id
         WHERE mv.id = :mvid
@@ -90,7 +95,8 @@ _REVALIDATE_SQL = text(
         src.is_current AS is_current,
         src.mv_is_redacted AS mv_is_redacted,
         src.c_is_redacted AS c_is_redacted,
-        src.memory_policy AS memory_policy
+        src.memory_policy AS memory_policy,
+        src.is_content_eligible AS is_content_eligible
     FROM src
     """
 )
@@ -107,7 +113,8 @@ async def revalidate_sources(
         ``("blocked", {...})`` with payload fields:
             * ``failure_reason``: ``forget_tombstone_match`` |
               ``source_redacted`` | ``source_memory_policy_not_normal`` |
-              ``source_not_current`` | ``source_missing``.
+              ``source_not_current`` | ``source_control_message`` |
+              ``source_missing``.
             * ``mvid``: the offending message_version_id.
             * ``forget_event_id`` (only on tombstone_match): the
               forget_events row id that fired the block.
@@ -141,6 +148,14 @@ async def revalidate_sources(
                 "blocked",
                 {
                     "failure_reason": "source_not_current",
+                    "mvid": int(row.mvid),
+                },
+            )
+        if not row.is_content_eligible:
+            return (
+                "blocked",
+                {
+                    "failure_reason": "source_control_message",
                     "mvid": int(row.mvid),
                 },
             )

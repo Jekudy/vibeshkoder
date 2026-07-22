@@ -1,17 +1,11 @@
-"""Phase 11 §5.3 — refusal / abstention cases for recall.
-
-R5.a/R5.b handler-layer tightening (8.5-C carryover):
-- R5.a: non-admin invokes /digest_approve → handler _is_admin gate → silent no-op
-  (no message.answer, no approve_digest service call).
-- R5.b: non-admin invokes /digest_reject → same silent no-op.
-"""
+"""Phase 11 §5.3 — refusal / abstention cases for recall."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import text
@@ -25,8 +19,10 @@ pytestmark = pytest.mark.asyncio(loop_scope="class")
 
 # Explicit non-community chat_ids used in R3b/R3c wrong-chat branch tests.
 # These must differ from SEED_CHAT_ID so the handler's community-id guard fires.
-NON_COMMUNITY_CHAT_ID_PRIVATE = 1099887766    # R3b: private chat wrong-chat path (positive: Telegram private chat IDs > 0)
-NON_COMMUNITY_CHAT_ID_GROUP = -1099887767    # R3c: supergroup wrong-chat + forbidden path
+NON_COMMUNITY_CHAT_ID_PRIVATE = (
+    1099887766  # R3b: private chat wrong-chat path (positive: Telegram private chat IDs > 0)
+)
+NON_COMMUNITY_CHAT_ID_GROUP = -1099887767  # R3c: supergroup wrong-chat + forbidden path
 
 CONTENT_TRUNCATE_SQL = text(
     "TRUNCATE TABLE qa_traces, message_versions, chat_messages, forget_events "
@@ -297,9 +293,9 @@ class TestRefusal:
         trace_create, run_qa, _persist = _patch_handler_db_edges(handler)
         handler.FeatureFlagRepo.get = AsyncMock(return_value=True)
         # UserRepo.get must NOT be called on the wrong-chat branch (returns early).
-        handler.UserRepo.get = AsyncMock(side_effect=AssertionError(
-            "UserRepo.get must not be reached on wrong-chat branch"
-        ))
+        handler.UserRepo.get = AsyncMock(
+            side_effect=AssertionError("UserRepo.get must not be reached on wrong-chat branch")
+        )
         message = _message(
             chat_id=NON_COMMUNITY_CHAT_ID_PRIVATE,
             chat_type="private",
@@ -309,9 +305,7 @@ class TestRefusal:
 
         await handler.recall_handler(message, _command("память"), AsyncMock())
 
-        message.reply.assert_awaited_once_with(
-            "Команда /recall работает только в community чате."
-        )
+        message.reply.assert_awaited_once_with("Команда /recall работает только в community чате.")
         run_qa.assert_not_awaited()
         trace_create.assert_awaited_once()
         assert trace_create.call_args.kwargs["abstained"] is True
@@ -329,9 +323,9 @@ class TestRefusal:
         handler = import_module("bot.handlers.qa")
         trace_create, run_qa, _persist = _patch_handler_db_edges(handler)
         handler.FeatureFlagRepo.get = AsyncMock(return_value=True)
-        handler.UserRepo.get = AsyncMock(side_effect=AssertionError(
-            "UserRepo.get must not be reached on wrong-chat branch"
-        ))
+        handler.UserRepo.get = AsyncMock(
+            side_effect=AssertionError("UserRepo.get must not be reached on wrong-chat branch")
+        )
         message = _message(
             chat_id=NON_COMMUNITY_CHAT_ID_GROUP,
             chat_type="supergroup",
@@ -373,79 +367,3 @@ class TestRefusal:
         assert trace_create.call_args.kwargs["query"] == ""
         assert trace_create.call_args.kwargs["abstained"] is True
         assert session.mock_calls == []
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# R5.a / R5.b — handler-layer tightening (8.5-C carryover)
-#
-# These tests verify the handler's _is_admin gate at the Telegram routing
-# layer. The service-layer invariants (no DB mutation) are covered by
-# test_digest_weekly_review_invariants.py::test_R5a_* / test_R5b_*.
-#
-# Handler contract: non-admin caller → immediate return, no message.answer,
-# no service call. Matches the "silent no-op" precedent for /stats /
-# /admin_extract (PHASE8_PLAN.md §3).
-# ────────────────────────────────────────────────────────────────────────────
-
-
-def _non_admin_message(user_id: int = 9_999_999_999) -> SimpleNamespace:
-    """Build a minimal Telegram Message mock for a non-admin user."""
-    return SimpleNamespace(
-        from_user=SimpleNamespace(id=user_id),
-        answer=AsyncMock(),
-    )
-
-
-def _command_object(args: str = "1") -> SimpleNamespace:
-    """Build a minimal CommandObject mock."""
-    return SimpleNamespace(args=args)
-
-
-@pytest.mark.usefixtures("eval_app_env")
-class TestR5HandlerLayer:
-    """R5.a/R5.b: handler-layer admin gate for digest review commands."""
-
-    async def test_r5a_non_admin_digest_approve_handler_silent_no_op(self) -> None:
-        """R5.a handler-layer: non-admin calls cmd_digest_approve → silent return,
-        no message.answer, approve_digest service NOT called."""
-        handler = import_module("bot.handlers.digest")
-        message = _non_admin_message()
-        bot = AsyncMock()
-        session = AsyncMock()
-        command = _command_object("1")
-
-        # Ensure the non-admin user is not in ADMIN_IDS.
-        from bot.config import settings
-        assert message.from_user.id not in set(settings.ADMIN_IDS), (
-            "R5.a precondition: test user must NOT be in ADMIN_IDS"
-        )
-
-        with patch.object(handler, "approve_digest", new_callable=AsyncMock) as mock_svc:
-            await handler.cmd_digest_approve(message, bot, session, command)
-
-        # Silent no-op: no answer sent.
-        message.answer.assert_not_called()
-        # Service layer never reached.
-        mock_svc.assert_not_awaited()
-
-    async def test_r5b_non_admin_digest_reject_handler_silent_no_op(self) -> None:
-        """R5.b handler-layer: non-admin calls cmd_digest_reject → silent return,
-        no message.answer, reject_digest service NOT called."""
-        handler = import_module("bot.handlers.digest")
-        message = _non_admin_message()
-        session = AsyncMock()
-        command = _command_object("1 причина")
-
-        # Ensure the non-admin user is not in ADMIN_IDS.
-        from bot.config import settings
-        assert message.from_user.id not in set(settings.ADMIN_IDS), (
-            "R5.b precondition: test user must NOT be in ADMIN_IDS"
-        )
-
-        with patch.object(handler, "reject_digest", new_callable=AsyncMock) as mock_svc:
-            await handler.cmd_digest_reject(message, session, command)
-
-        # Silent no-op: no answer sent.
-        message.answer.assert_not_called()
-        # Service layer never reached.
-        mock_svc.assert_not_awaited()
