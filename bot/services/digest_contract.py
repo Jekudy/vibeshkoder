@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from typing import Any
 
@@ -109,6 +109,16 @@ def parse_draft(answer_text: str, *, citation_tokens: Sequence[str]) -> dict[str
                     "citations": list(item["citations"]),
                 }
             )
+        if heading:
+            _validate_text(
+                heading,
+                list(
+                    dict.fromkeys(
+                        token for item in parsed_items for token in item["citations"]
+                    )
+                ),
+                allowed_tokens=allowed,
+            )
         parsed_sections.append({"heading": heading, "items": parsed_items})
 
     if layout == "flat":
@@ -135,7 +145,21 @@ def parse_draft(answer_text: str, *, citation_tokens: Sequence[str]) -> dict[str
 def factual_units(draft: Mapping[str, Any]) -> list[dict[str, Any]]:
     if not draft["publish"]:
         return []
-    units = [item for section in draft["sections"] for item in section["items"]]
+    units: list[dict[str, Any]] = []
+    for section_index, section in enumerate(draft["sections"]):
+        if section["heading"]:
+            units.append(
+                {
+                    "item_key": f"heading_{section_index}",
+                    "text": section["heading"],
+                    "citations": list(
+                        dict.fromkeys(
+                            token for item in section["items"] for token in item["citations"]
+                        )
+                    ),
+                }
+            )
+        units.extend(section["items"])
     return [*units, draft["closing"]]
 
 
@@ -223,6 +247,53 @@ def merge_digest(
     decisions: Sequence[Mapping[str, str]],
     edited_items: Sequence[Mapping[str, Any]],
 ) -> tuple[str, list[dict[str, Any]]]:
+    merged = _merged_digest(draft=draft, decisions=decisions, edited_items=edited_items)
+    return _render_digest(merged)
+
+
+def compact_weekly_digest(
+    *,
+    draft: Mapping[str, Any],
+    decisions: Sequence[Mapping[str, str]],
+    edited_items: Sequence[Mapping[str, Any]],
+    visible_length: Callable[[str], int],
+    visible_target: int,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Drop trailing whole items until a verified weekly digest fits."""
+    merged = _merged_digest(draft=draft, decisions=decisions, edited_items=edited_items)
+    heading_tokens = {
+        id(section): frozenset(
+            token for item in section["items"] for token in item["citations"]
+        )
+        for section in merged["sections"]
+    }
+    while True:
+        body, citations = _render_digest(merged)
+        if visible_length(body) <= visible_target:
+            return body, citations
+        for section in reversed(merged["sections"]):
+            if section["items"]:
+                section["items"].pop()
+                break
+        else:
+            raise DigestContractError("weekly digest cannot fit visible target")
+        merged["sections"] = [section for section in merged["sections"] if section["items"]]
+        if not merged["sections"]:
+            raise DigestContractError("weekly digest cannot fit visible target")
+        for section in merged["sections"]:
+            surviving_tokens = {
+                token for item in section["items"] for token in item["citations"]
+            }
+            if not heading_tokens[id(section)].issubset(surviving_tokens):
+                section["heading"] = ""
+
+
+def _merged_digest(
+    *,
+    draft: Mapping[str, Any],
+    decisions: Sequence[Mapping[str, str]],
+    edited_items: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
     units = factual_units(draft)
     if len(units) != len(decisions):
         raise DigestContractError("digest merge coverage mismatch")
@@ -235,13 +306,21 @@ def merge_digest(
     if set(edited_by_key) != expected_fix_keys:
         raise DigestContractError("digest editor coverage mismatch")
 
-    merged = deepcopy(draft)
+    merged: dict[str, Any] = deepcopy(draft)
     merged_units = factual_units(merged)
     for unit, decision in zip(merged_units, decisions, strict=True):
         if unit["item_key"] != decision["item_key"]:
             raise DigestContractError("digest merge identity mismatch")
         if decision["action"] == "fix":
-            unit["text"] = edited_by_key[unit["item_key"]]["text"]
+            text = edited_by_key[unit["item_key"]]["text"]
+            if unit["item_key"].startswith("heading_"):
+                merged["sections"][int(unit["item_key"].removeprefix("heading_"))]["heading"] = text
+            else:
+                unit["text"] = text
+    return merged
+
+
+def _render_digest(merged: Mapping[str, Any]) -> tuple[str, list[dict[str, Any]]]:
 
     lines: list[str] = []
     citations: list[dict[str, Any]] = []
@@ -278,6 +357,7 @@ def _citation_rows(tokens: Sequence[str], *, position: int) -> list[dict[str, An
 __all__ = [
     "DigestContractError",
     "VERIFIER_VERDICT_PAIRS",
+    "compact_weekly_digest",
     "factual_units",
     "merge_digest",
     "parse_draft",

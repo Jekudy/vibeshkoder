@@ -49,10 +49,30 @@ def _mask_bullets_in_body(body_markdown: str, *, bullet_indices: set[int]) -> st
     if not bullet_indices:
         return body_markdown
     lines = body_markdown.splitlines()
+    heading_lines_to_remove: set[int] = set()
+    current_heading_line: int | None = None
+    current_bullet_idx = -1
+    for line_index, line in enumerate(lines):
+        if line.startswith("## "):
+            current_heading_line = line_index
+        elif not line:
+            # Generated sections are separated by one blank line. A later
+            # section may have had its heading stripped during compaction, so
+            # its bullets must not inherit the preceding section's heading.
+            current_heading_line = None
+        if line.startswith("- ") or line.startswith("• "):
+            current_bullet_idx += 1
+            if current_bullet_idx in bullet_indices and current_heading_line is not None:
+                heading_lines_to_remove.add(current_heading_line)
+
     out: list[str] = []
     current_bullet_idx = -1
     skip_until_next_bullet = False
-    for line in lines:
+    for line_index, line in enumerate(lines):
+        if line_index in heading_lines_to_remove:
+            continue
+        if line.startswith("## "):
+            skip_until_next_bullet = False
         is_bullet_start = line.startswith("- ") or line.startswith("• ")
         if is_bullet_start:
             current_bullet_idx += 1

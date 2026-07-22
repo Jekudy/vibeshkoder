@@ -208,7 +208,42 @@ async def _digest_revalidate_citations(session: AsyncSession, *, digest: Digest)
     return True
 
 
+async def _digest_delivery_lock_scope(session: AsyncSession, *, digest: Digest):
+    """Return the established provenance lock scope for a digest send."""
+    from bot.services.advisory_locks import (
+        governed_message_lock_keys,
+        hold_session_advisory_locks,
+    )
+    from bot.services.forget_cascade import _p6_mvid_advisory_lock_id
+
+    provenance_ids = tuple(
+        int(citation["id"])
+        for citation in (digest.citations or [])
+        if citation.get("kind") == "message_version"
+    )
+    lock_keys = await governed_message_lock_keys(session, provenance_ids)
+    return hold_session_advisory_locks(
+        session,
+        (_p6_mvid_advisory_lock_id(value) for value in provenance_ids),
+        lock_keys=lock_keys,
+    )
+
+
 async def publish_digest(
+    session: AsyncSession,
+    *,
+    bot: Bot,
+    digest: Digest,
+    digest_config: DigestConfig,
+) -> Digest:
+    """Publish while holding provenance locks before any digest-row lock."""
+    async with await _digest_delivery_lock_scope(session, digest=digest):
+        return await _publish_digest_after_provenance_lock(
+            session, bot=bot, digest=digest, digest_config=digest_config
+        )
+
+
+async def _publish_digest_after_provenance_lock(
     session: AsyncSession,
     *,
     bot: Bot,
@@ -364,8 +399,13 @@ async def publish_digest(
     digest.updated_at = datetime.now(timezone.utc)
     await session.flush()
 
-    # Defense-in-depth revalidation — block tombstoned-source publish even
-    # if it slipped past gateway-side check.
+    return await _publish_posting_digest(session, bot=bot, digest=digest, digest_config=digest_config)
+
+
+async def _publish_posting_digest(
+    session: AsyncSession, *, bot: Bot, digest: Digest, digest_config: DigestConfig
+) -> Digest:
+    """Revalidate and deliver while the provenance locks are held."""
     if not await _digest_revalidate_citations(session, digest=digest):
         digest.status = "failed"
         digest.error_text = "citations_stale_at_publish"
@@ -374,19 +414,15 @@ async def publish_digest(
             DigestRun(
                 digest_id=digest.id,
                 status="failed",
-                error_text="citations_stale_at_publish",
+                error_text=digest.error_text,
                 finished_at=datetime.now(timezone.utc),
             )
         )
         await session.flush()
         await notify_admins_digest_failure(
-            bot,
-            digest_id=digest.id,
-            status="failed",
-            error_text="citations_stale_at_publish",
+            bot, digest_id=digest.id, status="failed", error_text=digest.error_text
         )
         return digest
-
     try:
         body_tokens = Counter(
             match.group(0) for match in _MESSAGE_CITATION_RE.finditer(digest.body_markdown or "")
@@ -424,9 +460,8 @@ async def publish_digest(
             bot, digest_id=digest.id, status="failed", error_text=digest.error_text
         )
         return digest
-    # At-most-once delivery boundary.  If the process dies after Telegram
-    # accepts the message, ``posting`` remains durable and no cron path sends
-    # the same digest again.  The stale reaper later marks it failed/uncertain.
+    # At-most-once delivery boundary. If Telegram accepts the message, posting
+    # remains durable and no cron path sends this digest again.
     await session.commit()
     try:
         sent = await bot.send_message(
@@ -474,9 +509,6 @@ async def publish_digest(
             error_text="bot_not_in_destination",
         )
         return digest
-
-    # Success: posting → posted (guarded by status='posting' to prevent
-    # racing with reaper).
     update_result = await session.execute(
         text(
             "UPDATE digests "
@@ -485,19 +517,10 @@ async def publish_digest(
             "WHERE id = :id AND status='posting' "
             "RETURNING id"
         ),
-        {
-            "id": digest.id,
-            "cid": digest_config.destination_chat_id,
-            "mid": sent.message_id,
-        },
+        {"id": digest.id, "cid": digest_config.destination_chat_id, "mid": sent.message_id},
     )
     if update_result.rowcount == 0:
-        logger.warning(
-            "publish_digest: posted-transition rowcount=0 digest_id=%s "
-            "(reaper or another worker moved the row)",
-            digest.id,
-        )
-        # The Telegram message is posted but DB rejected — admin must investigate.
+        logger.warning("publish_digest: posted-transition rowcount=0 digest_id=%s", digest.id)
         await notify_admins_digest_failure(
             bot,
             digest_id=digest.id,
@@ -505,13 +528,7 @@ async def publish_digest(
             error_text="posted_transition_rowcount_zero_after_send",
         )
         return digest
-    session.add(
-        DigestRun(
-            digest_id=digest.id,
-            status="finished",
-            finished_at=datetime.now(timezone.utc),
-        )
-    )
+    session.add(DigestRun(digest_id=digest.id, status="finished", finished_at=datetime.now(timezone.utc)))
     await session.flush()
     await session.refresh(digest)
     await session.commit()

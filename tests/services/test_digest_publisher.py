@@ -6,6 +6,7 @@ rendering), §5.H (forget cascade redactor + bullet masking).
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -151,6 +152,26 @@ def test_mask_bullets_empty_indices_returns_body_unchanged():
     assert _mask_bullets_in_body(body, bullet_indices=set()) == body
 
 
+def test_mask_bullets_removes_affected_section_heading_only():
+    from bot.services.digest_redactor import _mask_bullets_in_body
+
+    body = "## A\n- First [[mv:1]]\n\n## B\n- Second [[mv:2]]"
+    masked = _mask_bullets_in_body(body, bullet_indices={0})
+    assert "## A" not in masked
+    assert "## B" in masked
+
+
+def test_mask_bullets_in_unheaded_section_keeps_previous_heading():
+    from bot.services.digest_redactor import _mask_bullets_in_body
+
+    body = "## A\n- First [[mv:1]]\n\n- Second [[mv:2]]"
+    masked = _mask_bullets_in_body(body, bullet_indices={1})
+    assert "## A" in masked
+    assert "First [[mv:1]]" in masked
+    assert "Second [[mv:2]]" not in masked
+    assert masked.count("[REDACTED — забыто]") == 1
+
+
 # ── publisher tests (DB-light, mocked Bot) ───────────────────────────────────
 
 
@@ -207,6 +228,511 @@ async def test_publisher_rejects_non_draft_status(db_session):
     bot_mock = MagicMock()
     with pytest.raises(DigestPublisherInvalidState):
         await publish_digest(db_session, bot=bot_mock, digest=digest, digest_config=cfg)
+
+
+async def test_publisher_blocks_forget_until_telegram_send_finishes(
+    db_session, monkeypatch, postgres_engine
+):
+    """A message forget waits for the cited digest's blocked Telegram send."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from bot.db.models import ChatMessage, Digest, MessageVersion, User
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services import digest_publisher as publisher_module
+    from bot.services.digests import DigestConfig
+
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+    session_factory = async_sessionmaker(
+        bind=postgres_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    user_id = source_id = version_id = digest_id = None
+    tombstone_key = None
+    publish_task = forget_task = None
+
+    async def _blocked_send(**_kwargs):
+        send_started.set()
+        await release_send.wait()
+        return MagicMock(message_id=999)
+
+    bot = MagicMock()
+    bot.send_message = _blocked_send
+    try:
+        now = datetime.now(timezone.utc)
+        user = User(
+            id=_next_uid(), username="lock-test", first_name="Lock", last_name="Test"
+        )
+        user_id = user.id
+        db_session.add(user)
+        await db_session.flush()
+        source = ChatMessage(
+            message_id=987654,
+            chat_id=_next_chat_id(),
+            user_id=user.id,
+            text="Проверяем блокировку forget",
+            date=now,
+            raw_json={"text": "Проверяем блокировку forget"},
+            memory_policy="normal",
+            is_redacted=False,
+            message_kind="text",
+        )
+        db_session.add(source)
+        await db_session.flush()
+        source_id = source.id
+        version = MessageVersion(
+            chat_message_id=source.id,
+            version_seq=1,
+            text=source.text,
+            normalized_text=source.text,
+            entities_json=[],
+            content_hash="digest-publisher-lock-race",
+            is_redacted=False,
+        )
+        db_session.add(version)
+        await db_session.flush()
+        version_id = version.id
+        source.current_version_id = version.id
+        await db_session.flush()
+
+        digest = Digest(
+            type="weekly",
+            window_start=now - timedelta(days=7),
+            window_end=now,
+            body_markdown=f"- One [[mv:{version.id}]]\n\n— Close [[mv:{version.id}]]",
+            citations=[
+                {"kind": "message_version", "id": version.id, "position": 0},
+                {"kind": "message_version", "id": version.id, "position": 1},
+            ],
+            status="draft",
+        )
+        db_session.add(digest)
+        await db_session.flush()
+        digest_id = digest.id
+        monkeypatch.setattr(
+            publisher_module,
+            "resolve_digest_source_links",
+            AsyncMock(return_value={f"[[mv:{version.id}]]": "https://t.me/c/1/1"}),
+        )
+        publish_task = asyncio.create_task(
+            publisher_module.publish_digest(
+                db_session,
+                bot=bot,
+                digest=digest,
+                digest_config=DigestConfig(
+                    source_chat_id=source.chat_id,
+                    destination_chat_id=source.chat_id,
+                ),
+            )
+        )
+        await asyncio.wait_for(send_started.wait(), timeout=1)
+
+        tombstone_key = f"digest-publisher-send-race-{source_id}"
+        async with session_factory() as forget_session:
+            forget_task = asyncio.create_task(
+                ForgetEventRepo.create(
+                    forget_session,
+                    target_type="message",
+                    target_id=str(source_id),
+                    actor_user_id=None,
+                    authorized_by="system",
+                    tombstone_key=tombstone_key,
+                )
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(forget_task), timeout=0.5)
+
+            release_send.set()
+            result = await asyncio.wait_for(publish_task, timeout=3)
+            forget_event = await asyncio.wait_for(forget_task, timeout=3)
+            await forget_session.commit()
+
+        assert result.status == "posted", result.error_text
+        assert forget_event.target_id == str(source_id)
+    finally:
+        release_send.set()
+        tasks = [task for task in (publish_task, forget_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with session_factory() as cleanup_session:
+            if digest_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM digest_runs WHERE digest_id=:digest_id"),
+                    {"digest_id": digest_id},
+                )
+                await cleanup_session.execute(
+                    text("DELETE FROM digests WHERE id=:digest_id"),
+                    {"digest_id": digest_id},
+                )
+            if tombstone_key is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM forget_events WHERE tombstone_key=:tombstone_key"),
+                    {"tombstone_key": tombstone_key},
+                )
+            if source_id is not None:
+                await cleanup_session.execute(
+                    text("UPDATE chat_messages SET current_version_id=NULL WHERE id=:source_id"),
+                    {"source_id": source_id},
+                )
+            if version_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM message_versions WHERE id=:version_id"),
+                    {"version_id": version_id},
+                )
+            if source_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM chat_messages WHERE id=:source_id"),
+                    {"source_id": source_id},
+                )
+            if user_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM users WHERE id=:user_id"),
+                    {"user_id": user_id},
+                )
+            await cleanup_session.commit()
+
+
+async def test_publisher_revalidation_fails_when_committed_forget_wins_first(
+    postgres_engine, monkeypatch
+):
+    """A committed pending forget prevents delivery in a separate transaction."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from bot.db.models import ChatMessage, Digest, MessageVersion, User
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services import digest_publisher as publisher_module
+    from bot.services.digests import DigestConfig
+
+    session_factory = async_sessionmaker(
+        bind=postgres_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    user_id = source_id = version_id = digest_id = None
+    tombstone_key = None
+    try:
+        now = datetime.now(timezone.utc)
+        async with session_factory() as setup_session:
+            user = User(
+                id=_next_uid(), username="forget-first", first_name="Forget", last_name="First"
+            )
+            setup_session.add(user)
+            await setup_session.flush()
+            user_id = user.id
+            source = ChatMessage(
+                message_id=987655,
+                chat_id=_next_chat_id(),
+                user_id=user.id,
+                text="Forget must win before digest send",
+                date=now,
+                raw_json={"text": "Forget must win before digest send"},
+                memory_policy="normal",
+                is_redacted=False,
+                message_kind="text",
+            )
+            setup_session.add(source)
+            await setup_session.flush()
+            source_id = source.id
+            version = MessageVersion(
+                chat_message_id=source.id,
+                version_seq=1,
+                text=source.text,
+                normalized_text=source.text,
+                entities_json=[],
+                content_hash="digest-publisher-forget-wins-first",
+                is_redacted=False,
+            )
+            setup_session.add(version)
+            await setup_session.flush()
+            version_id = version.id
+            source.current_version_id = version.id
+            digest = Digest(
+                type="weekly",
+                window_start=now - timedelta(days=7),
+                window_end=now,
+                body_markdown=f"- One [[mv:{version.id}]]\n\n— Close [[mv:{version.id}]]",
+                citations=[
+                    {"kind": "message_version", "id": version.id, "position": 0},
+                    {"kind": "message_version", "id": version.id, "position": 1},
+                ],
+                status="draft",
+            )
+            setup_session.add(digest)
+            await setup_session.commit()
+            digest_id = digest.id
+            source_chat_id = source.chat_id
+
+        tombstone_key = f"digest-publisher-forget-first-{source_id}"
+        async with session_factory() as forget_session:
+            await ForgetEventRepo.create(
+                forget_session,
+                target_type="message",
+                target_id=str(source_id),
+                actor_user_id=None,
+                authorized_by="system",
+                tombstone_key=tombstone_key,
+            )
+            await forget_session.commit()
+
+        monkeypatch.setattr(
+            publisher_module,
+            "resolve_digest_source_links",
+            AsyncMock(return_value={f"[[mv:{version_id}]]": "https://t.me/c/1/1"}),
+        )
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        async with session_factory() as publish_session:
+            digest = await publish_session.get(Digest, digest_id)
+            assert digest is not None
+            result = await publisher_module.publish_digest(
+                publish_session,
+                bot=bot,
+                digest=digest,
+                digest_config=DigestConfig(
+                    source_chat_id=source_chat_id,
+                    destination_chat_id=source_chat_id,
+                ),
+            )
+            assert result.status == "failed"
+            assert result.error_text == "citations_stale_at_publish"
+            assert all(
+                call.kwargs.get("chat_id") != source_chat_id
+                for call in bot.send_message.await_args_list
+            )
+            await publish_session.rollback()
+    finally:
+        async with session_factory() as cleanup_session:
+            if digest_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM digest_runs WHERE digest_id=:digest_id"),
+                    {"digest_id": digest_id},
+                )
+                await cleanup_session.execute(
+                    text("DELETE FROM digests WHERE id=:digest_id"),
+                    {"digest_id": digest_id},
+                )
+            if tombstone_key is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM forget_events WHERE tombstone_key=:tombstone_key"),
+                    {"tombstone_key": tombstone_key},
+                )
+            if source_id is not None:
+                await cleanup_session.execute(
+                    text("UPDATE chat_messages SET current_version_id=NULL WHERE id=:source_id"),
+                    {"source_id": source_id},
+                )
+            if version_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM message_versions WHERE id=:version_id"),
+                    {"version_id": version_id},
+                )
+            if source_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM chat_messages WHERE id=:source_id"),
+                    {"source_id": source_id},
+                )
+            if user_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM users WHERE id=:user_id"),
+                    {"user_id": user_id},
+                )
+            await cleanup_session.commit()
+
+
+async def test_publisher_takes_provenance_lock_before_contended_digest_row(
+    postgres_engine, monkeypatch
+):
+    """Forget blocks while publisher retries a locked digest row.
+
+    This is an ordering regression test: the publisher cannot have reached a
+    ``FOR UPDATE NOWAIT`` retry yet unless it first acquired the provenance
+    advisory scope.  A forget of that provenance must therefore already wait.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from bot.db.models import ChatMessage, Digest, MessageVersion, User
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services import digest_publisher as publisher_module
+    from bot.services.digests import DigestConfig
+
+    session_factory = async_sessionmaker(
+        bind=postgres_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    user_id = source_id = version_id = digest_id = None
+    tombstone_key = None
+    publish_task = forget_task = None
+    release_retry = asyncio.Event()
+    release_failure_transition = asyncio.Event()
+    retry_started = asyncio.Event()
+    retries_exhausted = asyncio.Event()
+    try:
+        now = datetime.now(timezone.utc)
+        async with session_factory() as setup_session:
+            user = User(
+                id=_next_uid(), username="lock-order", first_name="Lock", last_name="Order"
+            )
+            setup_session.add(user)
+            await setup_session.flush()
+            user_id = user.id
+            source = ChatMessage(
+                message_id=987656,
+                chat_id=_next_chat_id(),
+                user_id=user.id,
+                text="Provenance must lock before digest row",
+                date=now,
+                raw_json={"text": "Provenance must lock before digest row"},
+                memory_policy="normal",
+                is_redacted=False,
+                message_kind="text",
+            )
+            setup_session.add(source)
+            await setup_session.flush()
+            source_id = source.id
+            version = MessageVersion(
+                chat_message_id=source.id,
+                version_seq=1,
+                text=source.text,
+                normalized_text=source.text,
+                entities_json=[],
+                content_hash="digest-publisher-lock-order",
+                is_redacted=False,
+            )
+            setup_session.add(version)
+            await setup_session.flush()
+            version_id = version.id
+            source.current_version_id = version.id
+            digest = Digest(
+                type="weekly",
+                window_start=now - timedelta(days=7),
+                window_end=now,
+                body_markdown=f"- One [[mv:{version.id}]]\n\n— Close [[mv:{version.id}]]",
+                citations=[
+                    {"kind": "message_version", "id": version.id, "position": 0},
+                    {"kind": "message_version", "id": version.id, "position": 1},
+                ],
+                status="draft",
+            )
+            setup_session.add(digest)
+            await setup_session.commit()
+            digest_id = digest.id
+            source_chat_id = source.chat_id
+
+        sleep_calls = 0
+
+        async def pause_after_first_nowait_failure(_delay: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 1:
+                retry_started.set()
+                await release_retry.wait()
+            elif sleep_calls == 3:
+                retries_exhausted.set()
+                await release_failure_transition.wait()
+
+        monkeypatch.setattr(
+            publisher_module.asyncio, "sleep", pause_after_first_nowait_failure
+        )
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        async with (
+            session_factory() as row_lock_session,
+            session_factory() as publish_session,
+            session_factory() as forget_session,
+        ):
+            await row_lock_session.execute(
+                text("SELECT id FROM digests WHERE id=:digest_id FOR UPDATE"),
+                {"digest_id": digest_id},
+            )
+            digest = await publish_session.get(Digest, digest_id)
+            assert digest is not None
+            publish_task = asyncio.create_task(
+                publisher_module.publish_digest(
+                    publish_session,
+                    bot=bot,
+                    digest=digest,
+                    digest_config=DigestConfig(
+                        source_chat_id=source_chat_id,
+                        destination_chat_id=source_chat_id,
+                    ),
+                )
+            )
+            await asyncio.wait_for(retry_started.wait(), timeout=3)
+
+            tombstone_key = f"digest-publisher-lock-order-{source_id}"
+            forget_task = asyncio.create_task(
+                ForgetEventRepo.create(
+                    forget_session,
+                    target_type="message",
+                    target_id=str(source_id),
+                    actor_user_id=None,
+                    authorized_by="system",
+                    tombstone_key=tombstone_key,
+                )
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(forget_task), timeout=0.5)
+
+            release_retry.set()
+            await asyncio.wait_for(retries_exhausted.wait(), timeout=3)
+            await row_lock_session.rollback()
+            release_failure_transition.set()
+            result = await asyncio.wait_for(publish_task, timeout=3)
+            assert result.status == "failed"
+            assert result.error_text == "publish_lock_timeout"
+            assert all(
+                call.kwargs.get("chat_id") != source_chat_id
+                for call in bot.send_message.await_args_list
+            )
+            await publish_session.rollback()
+            forget_event = await asyncio.wait_for(forget_task, timeout=3)
+            assert forget_event.target_id == str(source_id)
+            await forget_session.commit()
+    finally:
+        release_retry.set()
+        release_failure_transition.set()
+        tasks = [task for task in (publish_task, forget_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with session_factory() as cleanup_session:
+            if digest_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM digest_runs WHERE digest_id=:digest_id"),
+                    {"digest_id": digest_id},
+                )
+                await cleanup_session.execute(
+                    text("DELETE FROM digests WHERE id=:digest_id"),
+                    {"digest_id": digest_id},
+                )
+            if tombstone_key is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM forget_events WHERE tombstone_key=:tombstone_key"),
+                    {"tombstone_key": tombstone_key},
+                )
+            if source_id is not None:
+                await cleanup_session.execute(
+                    text("UPDATE chat_messages SET current_version_id=NULL WHERE id=:source_id"),
+                    {"source_id": source_id},
+                )
+            if version_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM message_versions WHERE id=:version_id"),
+                    {"version_id": version_id},
+                )
+            if source_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM chat_messages WHERE id=:source_id"),
+                    {"source_id": source_id},
+                )
+            if user_id is not None:
+                await cleanup_session.execute(
+                    text("DELETE FROM users WHERE id=:user_id"),
+                    {"user_id": user_id},
+                )
+            await cleanup_session.commit()
 
 
 async def test_publisher_nowait_contention_keeps_outer_transaction_usable(

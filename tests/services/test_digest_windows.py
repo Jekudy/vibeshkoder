@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -36,11 +36,28 @@ def test_daily_windows_change_exactly_at_05_msk(
     assert completed_daily_window(now) == (completed_start, completed_end)
 
 
-def test_weekly_window_is_seven_contiguous_daily_windows() -> None:
-    assert completed_weekly_window(datetime(2026, 7, 20, 2, 0, tzinfo=timezone.utc)) == (
-        datetime(2026, 7, 13, 2, 0, tzinfo=timezone.utc),
-        datetime(2026, 7, 20, 2, 0, tzinfo=timezone.utc),
-    )
+@pytest.mark.parametrize(
+    ("now", "expected_start", "expected_end"),
+    [
+        (
+            datetime(2026, 7, 23, 1, 59, tzinfo=timezone.utc),  # Thu 04:59 MSK
+            datetime(2026, 7, 9, 2, 0, tzinfo=timezone.utc),
+            datetime(2026, 7, 16, 2, 0, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 7, 23, 2, 0, tzinfo=timezone.utc),  # Thu 05:00 MSK
+            datetime(2026, 7, 16, 2, 0, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 2, 0, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_weekly_window_changes_exactly_at_thursday_05_msk(
+    now: datetime,
+    expected_start: datetime,
+    expected_end: datetime,
+) -> None:
+    assert completed_weekly_window(now) == (expected_start, expected_end)
+    assert expected_end - expected_start == timedelta(days=7)
 
 
 def test_window_helpers_reject_naive_reference_time() -> None:

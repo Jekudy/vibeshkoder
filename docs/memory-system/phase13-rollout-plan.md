@@ -15,8 +15,8 @@
    дайджесты.
 3. Картинки получают постоянную source-ссылку и LLM-описание; голосовые не
    транскрибируются.
-4. Daily и weekly дайджесты автоматически публикуются в исходный чат в 09:00
-   Europe/Moscow без approval.
+4. Weekly дайджест автоматически публикуется в исходный чат каждый четверг в
+   09:00 Europe/Moscow без approval; daily дайджест остаётся выключен.
 5. DeepSeek V4 Flash поддерживает текстовые LLM-вызовы; OpenAI используется для
    vision. Все вызовы проходят через cost ledger и budget guard.
 6. LLM поддерживает связанную Markdown-wiki в стиле Karpathy; статическая
@@ -49,8 +49,10 @@
   самих файлов вложений, поэтому старым фотографиям честно ставится
   `missing_source`; новые фотографии получают Telegram source-link и описание.
 - Голосовые сохраняются как сообщения, но не транскрибируются.
-- Тихий день или неделя всё равно создают короткий автоматический дайджест без
-  LLM-вызова. Любой содержательный дайджест публикуется без approval.
+- Weekly окно содержит семь полных дней: с предыдущего четверга 05:00 до
+  текущего четверга 05:00 Europe/Moscow.
+- Если за неделю не было содержательного обсуждения, дайджест не публикуется.
+  Любой содержательный дайджест публикуется без approval.
 - `recall` — это внутреннее извлечение подходящих фрагментов прошлого контекста.
   Публичной команды `/recall` нет: вопрос срабатывает только через mention/reply,
   сначала делает детерминированный поиск, а LLM формулирует ответ по найденным
@@ -88,16 +90,16 @@
 |---|---|---|---|
 | 1. Baseline и safety | Инвентаризация production, backup и restore drill, фиксация export | Известны production SHA/schema/counts; backup восстановлен в отдельную БД; до drill нет production-миграций | Restore-команда, schema/version и контрольные counts |
 | 2. Полная история | Миграции, HTML parser, dry-run и apply | Все 9 403 user-message records классифицированы; 107 exact `Shkoder` остаются raw-only; `Лиля Шкодер` сохранена; good/bad/good chunk не продвигает checkpoint; повторный apply даёт только объяснимые duplicates | Import report, reconciliation SQL, повторный dry-run |
-| 3. Live memory | Middleware, картинки, QA, анкета, daily/weekly | DB → raw → normalized порядок доказан; сообщения бота не входят в derived memory; новые фото получают safe link+description; 09:00 MSK daily и Monday weekly публикуются автоматически, включая тихое окно; QA member-only, mention/reply, 2 LLM/day; referral нормализован | Runtime tests, Telegram message ids, ledger/quota SQL |
+| 3. Live memory | Middleware, картинки, QA, анкета, weekly digest | DB → raw → normalized порядок доказан; сообщения бота не входят в derived memory; новые фото получают safe link+description; weekly публикуется автоматически по четвергам в 09:00 MSK, тихое окно не публикуется; daily остаётся выключен; QA member-only, mention/reply, 2 LLM/day; referral нормализован | Runtime tests, Telegram message ids, ledger/quota SQL |
 | 4. Extraction и backfill | Event-time окна, DeepSeek, auto-promotion | Только source chat; окна не пересекаются и возобновляются без повторного LLM; один сбой останавливает backfill; кандидаты атомарно становятся approved cards; invalid rows не создают starvation | PostgreSQL concurrency/resume tests, run/card counts, ledger reconciliation |
 | 5. LLM-wiki | Stable topic slugs, ревизии, citations, автоматическая сборка | Изменённая тема создаёт ровно одну новую ревизию; неизменённая не вызывает LLM; каждый факт имеет разрешённый source; redacted/stale source блокирует export; исчезновение последней automatic-page не оставляет старую публичную статью | Compiler/orchestrator tests, revision/source SQL |
 | 6. Статическая публикация | Export и Cloudflare Pages | Только HTML/CSS/JS/JSON; локальный поиск не вызывает VPS/БД/LLM; CSP запрещает внешние соединения; secret/network scanner green; включая zero-page generation, upload идемпотентен; public smoke совпадает с manifest | Static audit hash, Cloudflare deployment audit, ledger/VPS request delta = 0 при поиске |
-| 7. Production rollout | PR/CI, deploy GHCR через Coolify, flags и live acceptance | Release разрешён только после trusted push-CI; bot/web собраны из одного SHA и закреплены разными OCI digest; production на Alembic head; все flags включены явно; импорт/backfill завершены; оба digest smoke опубликованы; wiki доступна; QA и quota проверены; после 087 rollback делается flags-off/forward-fix, а возврат старого образа — только вместе с восстановлением pre-migration backup | GitHub run, OCI labels/digests, Coolify health/logs, Telegram/Cloudflare URLs, restore evidence |
+| 7. Production rollout | PR/CI, deploy GHCR через Coolify, flags и live acceptance | Release разрешён только после trusted push-CI; bot/web собраны из одного SHA и закреплены разными OCI digest; production на Alembic head; нужные flags выставлены явно, daily digest flag выключен; импорт/backfill завершены; weekly digest smoke опубликован; wiki доступна; QA и quota проверены; после 087 rollback делается flags-off/forward-fix, а возврат старого образа — только вместе с восстановлением pre-migration backup | GitHub run, OCI labels/digests, Coolify health/logs, Telegram/Cloudflare URLs, restore evidence |
 
 ## Критерий полного завершения
 
 Phase 13 закрывается только когда все тесты и CI зелёные, production работает на
 точном ожидаемом SHA и schema head, import reconciliation не имеет
-необъяснённых пропусков, оба дайджеста опубликованы, wiki доступна и ищется без
+необъяснённых пропусков, weekly дайджест опубликован, wiki доступна и ищется без
 LLM, Q&A соблюдает квоту/guardrails, новая анкета публикует нормализованный
 `@username`, а публичный трафик не создаёт запросов к VPS, БД и LLM ledger.

@@ -2,14 +2,14 @@
 
 Covers:
 - ``digest_weekly_job``: flag-OFF strict no-op
-- ``digest_weekly_job``: seven daily windows (last Mon 05:00 MSK → this Mon
+- ``digest_weekly_job``: seven daily windows (last Thu 05:00 MSK → this Thu
   05:00 MSK, stored as UTC)
 - ``digest_weekly_job``: draft → automatic publication, without review
 - ``digest_weekly_job``: idempotency-return non-draft statuses do NOT publish
 - ``digest_weekly_job``: ``failed``/``cost_exceeded`` paths fire admin DM
-- ``digest_weekly_job``: registered as Mon 09:00 MSK cron
+- ``digest_weekly_job``: registered as Thu 09:00 MSK cron
 
-PHASE8_PLAN.md §13 AC1.
+Current digest contract.
 """
 
 from __future__ import annotations
@@ -75,14 +75,14 @@ async def test_digest_weekly_job_skipped_when_flag_off(db_session, monkeypatch):
     )
 
 
-# ── digest_weekly_job: ISO week window ──────────────────────────────────────
+# ── digest_weekly_job: weekly window ────────────────────────────────────────
 
 
-async def test_digest_weekly_job_window_is_iso_mon_to_mon_msk(db_session, monkeypatch):
-    """window_start = last Mon 05:00 MSK; window_end = this Mon 05:00 MSK.
+async def test_digest_weekly_job_window_is_thursday_to_thursday_msk(db_session, monkeypatch):
+    """window_start = last Thu 05:00 MSK; window_end = this Thu 05:00 MSK.
 
     We pin ``datetime.now`` via a stub on ``bot.services.scheduler.datetime``
-    to a known Mon 09:15 MSK so the math is deterministic.
+    to a known Thu 09:15 MSK so the math is deterministic.
     """
     await _set_flag(db_session, "memory.digests.weekly.enabled", True)
     await db_session.flush()
@@ -91,11 +91,11 @@ async def test_digest_weekly_job_window_is_iso_mon_to_mon_msk(db_session, monkey
 
     monkeypatch.setattr(scheduler_mod, "async_session", _fake_session_ctx(db_session))
 
-    # Pin the scheduler's datetime.now() — Mon 2026-05-18 09:15 MSK.
+    # Pin the scheduler's datetime.now() — Thu 2026-05-21 09:15 MSK.
     from zoneinfo import ZoneInfo
 
     msk = ZoneInfo("Europe/Moscow")
-    pinned_now_msk = datetime(2026, 5, 18, 9, 15, 0, tzinfo=msk)
+    pinned_now_msk = datetime(2026, 5, 21, 9, 15, 0, tzinfo=msk)
 
     class _FakeDatetime(datetime):
         @classmethod
@@ -123,8 +123,8 @@ async def test_digest_weekly_job_window_is_iso_mon_to_mon_msk(db_session, monkey
     fake_bot = MagicMock()
     await scheduler_mod.digest_weekly_job(fake_bot)
 
-    expected_start = datetime(2026, 5, 11, 2, 0, 0, tzinfo=timezone.utc)
-    expected_end = datetime(2026, 5, 18, 2, 0, 0, tzinfo=timezone.utc)
+    expected_start = datetime(2026, 5, 14, 2, 0, 0, tzinfo=timezone.utc)
+    expected_end = datetime(2026, 5, 21, 2, 0, 0, tzinfo=timezone.utc)
     assert captured["type"] == "weekly"
     assert captured["window_start"] == expected_start, captured
     assert captured["window_end"] == expected_end, captured
@@ -170,6 +170,29 @@ async def test_digest_weekly_job_publishes_draft_without_review(db_session, monk
     assert call_kwargs["digest_config"].source_chat_id == (
         call_kwargs["digest_config"].destination_chat_id
     )
+
+
+async def test_digest_weekly_job_rechecks_flag_before_publish(db_session, monkeypatch):
+    """A flag disabled during synthesis leaves the draft unpublished."""
+    await _set_flag(db_session, "memory.digests.weekly.enabled", True)
+    await db_session.flush()
+
+    import bot.services.scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod, "async_session", _fake_session_ctx(db_session))
+    digest = MagicMock(id=4242, status="draft")
+
+    async def _disable_flag_and_return_draft(*_args, **_kwargs):
+        await _set_flag(db_session, "memory.digests.weekly.enabled", False)
+        return digest
+
+    monkeypatch.setattr("bot.services.digests.run_digest", _disable_flag_and_return_draft)
+    publish_mock = AsyncMock()
+    monkeypatch.setattr("bot.services.digest_publisher.publish_digest", publish_mock)
+
+    await scheduler_mod.digest_weekly_job(MagicMock())
+
+    publish_mock.assert_not_awaited()
 
 
 # ── digest_weekly_job: idempotency-return non-draft statuses ───────────────
@@ -251,11 +274,11 @@ async def test_digest_weekly_job_admin_dm_on_error_status(db_session, monkeypatc
 # ── digest_weekly_job: APScheduler cron registration ────────────────────────
 
 
-async def test_digest_weekly_job_registered_at_mon_09_00_msk():
-    """Weekly cron is registered at Monday 09:00 MSK.
+async def test_digest_weekly_job_registered_at_thu_09_00_msk():
+    """Weekly cron is registered at Thursday 09:00 MSK.
 
     Inspects the APScheduler registration via ``get_job``. The trigger is
-    a ``CronTrigger`` with fields ``day_of_week='mon'``, ``hour=9``,
+    a ``CronTrigger`` with fields ``day_of_week='thu'``, ``hour=9``,
     ``minute=0``, ``timezone=Europe/Moscow``.
     """
     from bot.services import scheduler as scheduler_mod
@@ -276,18 +299,16 @@ async def test_digest_weekly_job_registered_at_mon_09_00_msk():
         trigger = job.trigger
         # CronTrigger.fields is a list of Field instances with .name + .expressions.
         fields_by_name = {f.name: f for f in trigger.fields}
-        assert "Moscow" in str(trigger.timezone), (
-            f"expected Europe/Moscow timezone, got {trigger.timezone!r}"
-        )
+        assert str(trigger.timezone) == "Europe/Moscow"
 
-        # day_of_week='mon' is rendered by apscheduler as the field having
-        # 'mon' in its expression list. Compare via str(expressions[0]).
+        # day_of_week='thu' is rendered by apscheduler as the field having
+        # 'thu' in its expression list. Compare via str(expressions[0]).
         dow = fields_by_name["day_of_week"]
-        assert "mon" in str(dow).lower(), f"day_of_week field={dow!r}"
+        assert str(dow).lower() == "thu"
         hour = fields_by_name["hour"]
-        assert "9" in str(hour), f"hour field={hour!r}"
+        assert str(hour) == "9"
         minute = fields_by_name["minute"]
-        assert "0" in str(minute), f"minute field={minute!r}"
+        assert str(minute) == "0"
     finally:
         scheduler_mod.scheduler.start = real_start  # type: ignore[assignment]
         for jid in (

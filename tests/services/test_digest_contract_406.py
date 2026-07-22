@@ -8,6 +8,7 @@ import pytest
 from bot.services.digest_contract import (
     DigestContractError,
     VERIFIER_VERDICT_PAIRS,
+    compact_weekly_digest,
     factual_units,
     merge_digest,
     parse_draft,
@@ -15,7 +16,10 @@ from bot.services.digest_contract import (
     parse_verifier,
 )
 from bot.services.digest_renderer import render_digest_html
-from bot.services.llm_prompts.digest_v0_1_0 import verifier_response_schema
+from bot.services.llm_prompts.digest_v0_1_0 import (
+    draft_response_schema,
+    verifier_response_schema,
+)
 
 
 def _draft_payload(*, item_count: int = 1) -> str:
@@ -81,8 +85,12 @@ def test_sectioned_digest_appends_multiple_sources_and_single_final_hashtag() ->
         json.dumps(
             {
                 "items": [
-                    {"item_key": unit["item_key"], "verdict": "keep_ok"}
-                    for unit in units
+                    {"item_key": "heading_0", "verdict": "keep_ok"},
+                    *[
+                        {"item_key": unit["item_key"], "verdict": "keep_ok"}
+                        for unit in units
+                        if unit["item_key"] != "heading_0"
+                    ],
                 ]
             }
         ),
@@ -275,3 +283,142 @@ def test_editor_may_fix_text_but_cannot_change_citation_provenance() -> None:
         allowed_tokens=frozenset({"[[mv:1]]"}),
     )
     assert edited[0]["citations"] == ["[[mv:1]]"]
+
+
+def test_section_heading_is_a_verifier_unit_with_merged_citations() -> None:
+    payload = json.loads(_draft_payload())
+    payload["layout"] = "sectioned"
+    payload["sections"][0]["heading"] = "План недели"
+    payload["sections"][0]["items"].append(
+        {"text": "Маша оформила итог", "citations": ["[[mv:2]]"]}
+    )
+    draft = parse_draft(
+        json.dumps(payload, ensure_ascii=False),
+        citation_tokens=["[[mv:1]]", "[[mv:2]]"],
+    )
+    heading, item_1, item_2, closing = factual_units(draft)
+    assert heading == {
+        "item_key": "heading_0",
+        "text": "План недели",
+        "citations": ["[[mv:1]]", "[[mv:2]]"],
+    }
+    body, citations = merge_digest(
+        draft=draft,
+        decisions=[
+            {"item_key": heading["item_key"], "action": "fix", "reason": "fact"},
+            {"item_key": item_1["item_key"], "action": "keep", "reason": "ok"},
+            {"item_key": item_2["item_key"], "action": "keep", "reason": "ok"},
+            {"item_key": closing["item_key"], "action": "keep", "reason": "ok"},
+        ],
+        edited_items=[
+            {
+                "item_key": heading["item_key"],
+                "text": "Итог недели",
+                "citations": heading["citations"],
+            }
+        ],
+    )
+    assert body.startswith("## Итог недели\n")
+    assert [citation["position"] for citation in citations] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("heading", ["Пароль: sk-A1b2C3d4E5f6G7h8", "Звоните +7 999 123-45-67", "https://t.me/test"])
+def test_unsafe_section_heading_blocks_contract(heading: str) -> None:
+    payload = json.loads(_draft_payload())
+    payload["layout"] = "sectioned"
+    payload["sections"][0]["heading"] = heading
+    with pytest.raises(DigestContractError):
+        parse_draft(json.dumps(payload, ensure_ascii=False), citation_tokens=["[[mv:1]]"])
+
+
+def test_draft_schema_has_no_citation_enum_but_contract_rejects_unknown_token() -> None:
+    tokens = [f"[[mv:{index}]]" for index in range(1, 501)]
+    schema = draft_response_schema(tokens)
+    citation_items = schema["properties"]["sections"]["items"]["properties"]["items"]["items"]["properties"]["citations"]["items"]
+    assert citation_items == {"type": "string"}
+    payload = json.loads(_draft_payload())
+    payload["sections"][0]["items"][0]["citations"] = ["[[mv:501]]"]
+    with pytest.raises(DigestContractError, match="unknown citation"):
+        parse_draft(json.dumps(payload, ensure_ascii=False), citation_tokens=tokens)
+
+
+def test_weekly_compaction_drops_tail_items_but_keeps_closing() -> None:
+    draft = parse_draft(_draft_payload(item_count=2), citation_tokens=["[[mv:1]]", "[[mv:2]]"])
+    units = factual_units(draft)
+    body, citations = compact_weekly_digest(
+        draft=draft,
+        decisions=[
+            {"item_key": unit["item_key"], "action": "keep", "reason": "ok"}
+            for unit in units
+        ],
+        edited_items=[],
+        visible_length=len,
+        visible_target=80,
+    )
+    assert "тему 2" not in body
+    assert "К вечеру у чата появился план" in body
+    assert [citation["position"] for citation in citations] == [0, 1]
+
+
+def test_weekly_compaction_fails_closed_when_closing_cannot_fit() -> None:
+    draft = parse_draft(_draft_payload(), citation_tokens=["[[mv:1]]"])
+    units = factual_units(draft)
+    with pytest.raises(DigestContractError, match="cannot fit"):
+        compact_weekly_digest(
+            draft=draft,
+            decisions=[
+                {"item_key": unit["item_key"], "action": "keep", "reason": "ok"}
+                for unit in units
+            ],
+            edited_items=[],
+            visible_length=len,
+            visible_target=1,
+        )
+
+
+def test_weekly_compaction_removes_heading_when_tail_loses_its_only_evidence() -> None:
+    payload = json.loads(_draft_payload())
+    payload["layout"] = "sectioned"
+    payload["sections"][0]["heading"] = "Тема"
+    payload["sections"][0]["items"].append(
+        {"text": "Второй факт", "citations": ["[[mv:2]]"]}
+    )
+    draft = parse_draft(
+        json.dumps(payload, ensure_ascii=False),
+        citation_tokens=["[[mv:1]]", "[[mv:2]]"],
+    )
+    units = factual_units(draft)
+    body, _ = compact_weekly_digest(
+        draft=draft,
+        decisions=[
+            {"item_key": unit["item_key"], "action": "keep", "reason": "ok"}
+            for unit in units
+        ],
+        edited_items=[],
+        visible_length=len,
+        visible_target=80,
+    )
+    assert "## Тема" not in body
+    assert "Женя поднял тему 1" in body
+
+
+def test_weekly_compaction_keeps_heading_when_its_evidence_survives() -> None:
+    payload = json.loads(_draft_payload())
+    payload["layout"] = "sectioned"
+    payload["sections"][0]["heading"] = "Тема"
+    payload["sections"][0]["items"].append(
+        {"text": "Второй факт", "citations": ["[[mv:1]]"]}
+    )
+    draft = parse_draft(json.dumps(payload, ensure_ascii=False), citation_tokens=["[[mv:1]]"])
+    units = factual_units(draft)
+    body, _ = compact_weekly_digest(
+        draft=draft,
+        decisions=[
+            {"item_key": unit["item_key"], "action": "keep", "reason": "ok"}
+            for unit in units
+        ],
+        edited_items=[],
+        visible_length=len,
+        visible_target=80,
+    )
+    assert "## Тема" in body

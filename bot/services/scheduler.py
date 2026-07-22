@@ -753,11 +753,11 @@ async def digest_stale_posting_reaper_job() -> None:
 
 
 async def digest_weekly_job(bot: Bot) -> None:
-    """Weekly digest run trigger — fires Mon ``DIGEST_WEEKLY_HOUR_MSK`` MSK.
+    """Weekly digest run trigger — fires Thu ``DIGEST_WEEKLY_HOUR_MSK`` MSK.
 
-    Per PHASE8_PLAN.md §5.G. Strict no-op when ``memory.digests.weekly.enabled``
-    is OFF. Window is the most recently completed seven daily windows:
-    ``last_monday 05:00 MSK..this_monday 05:00 MSK`` (stored as UTC).
+    Strict no-op when ``memory.digests.weekly.enabled`` is OFF. Window is the
+    most recently completed seven daily windows:
+    ``last_thursday 05:00 MSK..this_thursday 05:00 MSK`` (stored as UTC).
 
     A fresh draft is published automatically. Idempotent re-runs do not
     republish rows that already advanced beyond ``draft``.
@@ -800,6 +800,12 @@ async def digest_weekly_job(bot: Bot) -> None:
 
                 # Fully automatic path: no admin review gate.
                 if digest.status == "draft":
+                    if not await FeatureFlagRepo.get(session, "memory.digests.weekly.enabled"):
+                        logger.info(
+                            "digest_weekly_job: flag disabled before publish, leaving draft id=%s",
+                            digest.id,
+                        )
+                        return
                     try:
                         from bot.services.digest_publisher import publish_digest
 
@@ -1182,7 +1188,7 @@ def start_scheduler(bot: Bot) -> None:
         coalesce=True,
         misfire_grace_time=60,
     )
-    # Weekly digest. Monday at 09:00 MSK, matching the product contract.
+    # Weekly digest. Thursday at 09:00 MSK, matching the product contract.
     # Gated by feature flag ``memory.digests.weekly.enabled`` (default OFF);
     # job body re-checks the flag and is a strict no-op when disabled.
     digest_weekly_hour_msk = int(getattr(settings, "DIGEST_WEEKLY_HOUR_MSK", 9))
@@ -1190,7 +1196,7 @@ def start_scheduler(bot: Bot) -> None:
     scheduler.add_job(
         digest_weekly_job,
         "cron",
-        day_of_week="mon",
+        day_of_week="thu",
         hour=digest_weekly_hour_msk,
         minute=digest_weekly_minute_msk,
         args=[bot],

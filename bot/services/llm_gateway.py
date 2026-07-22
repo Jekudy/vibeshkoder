@@ -3863,6 +3863,7 @@ async def synthesize_digest(
     """Run the strict draft → verifier → optional third-stage digest pipeline."""
     from bot.services.digest_contract import (
         DigestContractError,
+        compact_weekly_digest,
         factual_units,
         merge_digest,
         parse_draft,
@@ -3872,11 +3873,9 @@ async def synthesize_digest(
     from bot.services.llm_prompts.digest_v0_1_0 import (
         DRAFT_INSTRUCTIONS,
         EDITOR_INSTRUCTIONS,
-        FINALIZER_INSTRUCTIONS,
         VERIFIER_INSTRUCTIONS,
         build_draft_input,
         build_editor_input,
-        build_finalizer_input,
         build_verifier_input,
         draft_response_schema,
         editor_response_schema,
@@ -3954,12 +3953,6 @@ async def synthesize_digest(
     ]
     third_stage_cost = Decimal("0")
     if type == "weekly":
-        original_tokens = list(
-            dict.fromkeys(
-                token for unit in units for token in unit["citations"]
-            )
-        )
-
         def weekly_visible_length(body: str) -> int:
             return measure_digest_visible_length(
                 body,
@@ -3968,89 +3961,41 @@ async def synthesize_digest(
                 digest_type="weekly",
             )
 
-        needs_finalizer = bool(fix_items)
-        if not needs_finalizer:
-            try:
-                body_markdown, citations = merge_digest(
-                    draft=draft, decisions=decisions, edited_items=[]
-                )
-                needs_finalizer = (
-                    weekly_visible_length(body_markdown) > WEEKLY_DIGEST_VISIBLE_TARGET
-                )
-            except ValueError as exc:
-                raise DigestCitationValidationError(str(exc)) from None
+    edited_items: list[dict[str, Any]] = []
+    if fix_items:
+        editor_input = build_editor_input(fixes=fix_items, citation_evidence=citation_evidence)
+        edited_items, _editor_ledger_id, third_stage_cost = await _call_digest_stage(
+            session,
+            instructions=EDITOR_INSTRUCTIONS,
+            input_text=editor_input,
+            schema_name="digest_apply_fixes",
+            json_schema=editor_response_schema([item["item_key"] for item in fix_items]),
+            config=config,
+            ledger_repo=ledger_repo,
+            provider=provider,
+            digest_type=type,
+            parse_response=lambda answer: parse_editor(
+                answer,
+                fixes=fix_items,
+                allowed_tokens=frozenset(citation_tokens),
+            ),
+        )
 
-        if needs_finalizer:
-            finalizer_input = build_finalizer_input(
+    try:
+        if type == "weekly":
+            body_markdown, citations = compact_weekly_digest(
                 draft=draft,
                 decisions=decisions,
-                citation_evidence=citation_evidence,
+                edited_items=edited_items,
+                visible_length=weekly_visible_length,
                 visible_target=WEEKLY_DIGEST_VISIBLE_TARGET,
             )
-
-            def parse_finalizer(answer: str) -> dict[str, Any]:
-                finalized = parse_draft(answer, citation_tokens=original_tokens)
-                if not finalized["publish"]:
-                    raise DigestContractError("weekly finalizer cannot suppress publication")
-                return finalized
-
-            finalized_draft, _finalizer_ledger_id, third_stage_cost = (
-                await _call_digest_stage(
-                    session,
-                    instructions=FINALIZER_INSTRUCTIONS,
-                    input_text=finalizer_input,
-                    schema_name="digest_weekly_finalizer",
-                    json_schema=draft_response_schema(original_tokens),
-                    config=config,
-                    ledger_repo=ledger_repo,
-                    provider=provider,
-                    digest_type=type,
-                    parse_response=parse_finalizer,
-                )
-            )
-            finalized_units = factual_units(finalized_draft)
-            try:
-                body_markdown, citations = merge_digest(
-                    draft=finalized_draft,
-                    decisions=[
-                        {"item_key": unit["item_key"], "action": "keep", "reason": "ok"}
-                        for unit in finalized_units
-                    ],
-                    edited_items=[],
-                )
-                if weekly_visible_length(body_markdown) > WEEKLY_DIGEST_VISIBLE_TARGET:
-                    raise DigestContractError("weekly digest exceeds visible target")
-            except ValueError as exc:
-                raise DigestCitationValidationError(str(exc)) from None
-    else:
-        edited_items: list[dict[str, Any]] = []
-        if fix_items:
-            editor_input = build_editor_input(
-                fixes=fix_items, citation_evidence=citation_evidence
-            )
-            edited_items, _editor_ledger_id, third_stage_cost = await _call_digest_stage(
-                session,
-                instructions=EDITOR_INSTRUCTIONS,
-                input_text=editor_input,
-                schema_name="digest_apply_fixes",
-                json_schema=editor_response_schema([item["item_key"] for item in fix_items]),
-                config=config,
-                ledger_repo=ledger_repo,
-                provider=provider,
-                digest_type=type,
-                parse_response=lambda answer: parse_editor(
-                    answer,
-                    fixes=fix_items,
-                    allowed_tokens=frozenset(citation_tokens),
-                ),
-            )
-
-        try:
+        else:
             body_markdown, citations = merge_digest(
                 draft=draft, decisions=decisions, edited_items=edited_items
             )
-        except DigestContractError as exc:
-            raise DigestCitationValidationError(str(exc)) from None
+    except DigestContractError as exc:
+        raise DigestCitationValidationError(str(exc)) from None
 
     return SynthesizeDigestResult(
         publish=True,

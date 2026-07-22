@@ -168,37 +168,6 @@ async def _context(session, *, digest_type: str = "daily"):
     )
 
 
-async def _append_context_message(session, context, *, text: str) -> int:
-    from bot.services.digest_context import DigestContextMessage
-
-    message_id, version_id, telegram_message_id = await _make_message(
-        session,
-        chat_id=context.source_chat_id,
-        ts=context.window_start + timedelta(hours=5 + len(context.messages)),
-        text=text,
-    )
-    context.messages.append(
-        DigestContextMessage(
-            message_version_id=version_id,
-            chat_message_id=message_id,
-            telegram_message_id=telegram_message_id,
-            author_display="Женя Кудрявцев",
-            text=text,
-            caption=None,
-            message_kind="text",
-            reply_to_message_id=None,
-            message_thread_id=None,
-            media_kind=None,
-            media_description=None,
-            forward_origin_type=None,
-            forward_origin_display=None,
-            forward_origin_date=None,
-            ts=context.window_start + timedelta(hours=5 + len(context.messages)),
-        )
-    )
-    return version_id
-
-
 def _draft_at_weekly_visible_length(*, message_version_id: int, target: int) -> dict:
     from bot.services.digest_renderer import measure_digest_visible_length
 
@@ -342,20 +311,17 @@ async def test_weekly_clean_within_budget_uses_exactly_two_calls(db_session) -> 
     ]
 
 
-async def test_weekly_factual_fix_uses_full_finalizer_call(db_session) -> None:
+async def test_weekly_factual_fix_edits_only_fix_unit(db_session) -> None:
     from bot.db.repos.llm_usage_ledger import LedgerRepo
     from bot.services.llm_gateway import synthesize_digest
 
     context = await _context(db_session, digest_type="weekly")
     version_id = context.messages[0].message_version_id
-    token = f"[[mv:{version_id}]]"
-    finalized = _draft(message_version_id=version_id)
-    finalized["sections"][0]["items"][0]["text"] = "Женя сравнил версии 5.6 и 5.7"
     provider = _StructuredProvider(
         [
             _draft(message_version_id=version_id),
             _verifier(item_action="fix", item_reason="number"),
-            finalized,
+            {"items": [{"item_key": "item_1", "text": "Женя сравнил версии 5.6 и 5.7"}]},
         ]
     )
 
@@ -369,25 +335,36 @@ async def test_weekly_factual_fix_uses_full_finalizer_call(db_session) -> None:
     )
 
     assert len(provider.calls) == 3
-    assert provider.calls[2]["schema_name"] == "digest_weekly_finalizer"
-    finalizer_input = json.loads(provider.calls[2]["input_text"])
-    assert finalizer_input["visible_character_target"] == 3600
-    assert finalizer_input["verifier_decisions"][0]["action"] == "fix"
-    assert set(finalizer_input["cited_evidence"]) == {token}
+    assert provider.calls[2]["schema_name"] == "digest_apply_fixes"
+    editor_input = json.loads(provider.calls[2]["input_text"])
+    assert [item["item_key"] for item in editor_input["items"]] == ["item_1"]
     assert result.body_markdown is not None and "5.6 и 5.7" in result.body_markdown
 
 
-async def test_weekly_over_target_with_all_keep_uses_finalizer(db_session) -> None:
+async def test_weekly_over_target_compacts_without_another_llm_call(db_session) -> None:
     from bot.db.repos.llm_usage_ledger import LedgerRepo
     from bot.services.llm_gateway import synthesize_digest
 
     context = await _context(db_session, digest_type="weekly")
     version_id = context.messages[0].message_version_id
+    draft = _draft_at_weekly_visible_length(message_version_id=version_id, target=3601)
+    draft["sections"][0]["items"].insert(
+        0,
+        {
+            "text": "Женя сравнил две версии",
+            "citations": [f"[[mv:{version_id}]]"],
+        },
+    )
     provider = _StructuredProvider(
         [
-            _draft_at_weekly_visible_length(message_version_id=version_id, target=3601),
-            _verifier(),
-            _draft(message_version_id=version_id),
+            draft,
+            {
+                "items": [
+                    {"item_key": "item_1", "verdict": "keep_ok"},
+                    {"item_key": "item_2", "verdict": "keep_ok"},
+                    {"item_key": "closing", "verdict": "keep_ok"},
+                ]
+            },
         ]
     )
 
@@ -401,139 +378,9 @@ async def test_weekly_over_target_with_all_keep_uses_finalizer(db_session) -> No
     )
 
     assert result.publish is True
-    assert len(provider.calls) == 3
-    assert provider.calls[2]["schema_name"] == "digest_weekly_finalizer"
-
-
-@pytest.mark.parametrize(("visible_length", "should_fail"), [(3600, False), (3601, True)])
-async def test_weekly_finalizer_visible_target_is_fail_closed(
-    db_session, visible_length, should_fail
-) -> None:
-    from bot.db.repos.llm_usage_ledger import LedgerRepo
-    from bot.services.llm_gateway import DigestCitationValidationError, synthesize_digest
-
-    context = await _context(db_session, digest_type="weekly")
-    version_id = context.messages[0].message_version_id
-    provider = _StructuredProvider(
-        [
-            _draft(message_version_id=version_id),
-            _verifier(item_action="fix", item_reason="number"),
-            _draft_at_weekly_visible_length(
-                message_version_id=version_id, target=visible_length
-            ),
-        ]
-    )
-
-    call = synthesize_digest(
-        db_session,
-        context=context,
-        config=_gateway_config(),
-        ledger_repo=LedgerRepo(),
-        provider=provider,
-        type="weekly",
-    )
-    if should_fail:
-        with pytest.raises(DigestCitationValidationError, match="visible target"):
-            await call
-    else:
-        result = await call
-        assert result.publish is True
-    assert len(provider.calls) == 3
-
-
-async def test_weekly_finalizer_rejects_new_context_citation(db_session) -> None:
-    from bot.db.repos.llm_usage_ledger import LedgerRepo
-    from bot.services.llm_gateway import DigestCitationValidationError, synthesize_digest
-
-    context = await _context(db_session, digest_type="weekly")
-    original_id = context.messages[0].message_version_id
-    extra_id = await _append_context_message(db_session, context, text="Вторая тема")
-    provider = _StructuredProvider(
-        [
-            _draft(message_version_id=original_id),
-            _verifier(item_action="fix", item_reason="fact"),
-            _draft(message_version_id=extra_id),
-        ]
-    )
-
-    with pytest.raises(DigestCitationValidationError, match="unknown citation"):
-        await synthesize_digest(
-            db_session,
-            context=context,
-            config=_gateway_config(),
-            ledger_repo=LedgerRepo(),
-            provider=provider,
-            type="weekly",
-        )
-    assert len(provider.calls) == 3
-    finalizer_input = json.loads(provider.calls[2]["input_text"])
-    assert set(finalizer_input["cited_evidence"]) == {f"[[mv:{original_id}]]"}
-
-
-async def test_weekly_finalizer_can_merge_items_and_preserve_source_rows(db_session) -> None:
-    from bot.db.repos.llm_usage_ledger import LedgerRepo
-    from bot.services.llm_gateway import synthesize_digest
-
-    context = await _context(db_session, digest_type="weekly")
-    first_id = context.messages[0].message_version_id
-    second_id = await _append_context_message(db_session, context, text="Вторая тема")
-    first_token = f"[[mv:{first_id}]]"
-    second_token = f"[[mv:{second_id}]]"
-    original = {
-        "publish": True,
-        "layout": "flat",
-        "sections": [
-            {
-                "heading": "",
-                "items": [
-                    {"text": "Первая тема", "citations": [first_token]},
-                    {"text": "Вторая тема", "citations": [second_token]},
-                ],
-            }
-        ],
-        "closing": {"text": "Итог", "citations": [first_token]},
-    }
-    finalized = {
-        "publish": True,
-        "layout": "flat",
-        "sections": [
-            {
-                "heading": "",
-                "items": [
-                    {
-                        "text": "Объединили темы",
-                        "citations": [first_token, second_token],
-                    }
-                ],
-            }
-        ],
-        "closing": {"text": "Итог", "citations": [first_token]},
-    }
-    verifier = {
-        "items": [
-            {"item_key": "item_1", "verdict": "fix_fact"},
-            {"item_key": "item_2", "verdict": "keep_ok"},
-            {"item_key": "closing", "verdict": "keep_ok"},
-        ]
-    }
-    provider = _StructuredProvider([original, verifier, finalized])
-
-    result = await synthesize_digest(
-        db_session,
-        context=context,
-        config=_gateway_config(),
-        ledger_repo=LedgerRepo(),
-        provider=provider,
-        type="weekly",
-    )
-
-    assert result.body_markdown is not None
-    assert sum(line.startswith("- ") for line in result.body_markdown.splitlines()) == 1
-    assert result.citations == [
-        {"kind": "message_version", "id": first_id, "position": 0},
-        {"kind": "message_version", "id": second_id, "position": 0},
-        {"kind": "message_version", "id": first_id, "position": 1},
-    ]
+    assert len(provider.calls) == 2
+    assert result.body_markdown is not None and "Закрыли" in result.body_markdown
+    assert "x" * 20 not in result.body_markdown
 
 
 @pytest.mark.parametrize("digest_type", ["daily", "weekly"])

@@ -138,8 +138,7 @@ def build_draft_input(
 
 
 def _citation_schema(citation_tokens: Sequence[str]) -> dict[str, Any]:
-    allowed = list(citation_tokens) or ["__NO_CITATIONS_AVAILABLE__"]
-    return {"type": "string", "enum": allowed}
+    return {"type": "string"}
 
 
 def draft_response_schema(citation_tokens: Sequence[str]) -> dict[str, Any]:
