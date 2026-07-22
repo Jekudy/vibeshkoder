@@ -35,13 +35,15 @@ def completed_daily_window(now: datetime | None = None) -> tuple[datetime, datet
 
 
 def completed_weekly_window(now: datetime | None = None) -> tuple[datetime, datetime]:
-    """Return seven completed daily windows, Monday 05:00 to Monday 05:00."""
+    """Return seven completed daily windows, Thursday 05:00 to Thursday 05:00."""
     active_start_utc, _ = current_daily_window(now)
     active_start_local = active_start_utc.astimezone(MSK)
-    current_week_start = active_start_local - timedelta(days=active_start_local.weekday())
+    completed_week_end = active_start_local - timedelta(
+        days=(active_start_local.weekday() - 3) % 7
+    )
     return (
-        (current_week_start - timedelta(days=7)).astimezone(timezone.utc),
-        current_week_start.astimezone(timezone.utc),
+        (completed_week_end - timedelta(days=7)).astimezone(timezone.utc),
+        completed_week_end.astimezone(timezone.utc),
     )
 
 
