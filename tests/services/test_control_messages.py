@@ -13,7 +13,7 @@ async def _sql_allows(
     message_text: str | None = None,
 ) -> bool:
     result = await db_session.execute(
-        text(
+        text(  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- static in-code SQL/fragments; all runtime values are bound parameters.
             "SELECT "
             + control_message_excludes_sql_fragment("mv")
             + " AS allowed FROM (VALUES (CAST(:entities AS jsonb), NULL::text, "

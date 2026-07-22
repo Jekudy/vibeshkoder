@@ -606,7 +606,7 @@ async def search_messages(
         )
 
     if not include_cards:
-        stmt = text(_PHASE4_SQL)
+        stmt = text(_PHASE4_SQL)  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- static in-code SQL; all runtime values are bound parameters.
         result = await session.execute(
             stmt,
             {
@@ -631,7 +631,7 @@ async def search_messages(
             for row in result.mappings().all()
         ]
 
-    stmt = text(_PHASE6_SQL)
+    stmt = text(_PHASE6_SQL)  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- static in-code SQL; all runtime values are bound parameters.
     result = await session.execute(
         stmt,
         {

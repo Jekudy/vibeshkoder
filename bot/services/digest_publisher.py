@@ -124,7 +124,10 @@ async def resolve_digest_source_links(
             f"AND cm.is_redacted=FALSE AND mv.is_redacted=FALSE AND {_CONTROL_EXCLUDES}"
         )
         for source_id, chat_id, message_id in (
-            await session.execute(text(sql), {"ids": mv_ids, "chat_id": source_chat_id})
+            await session.execute(
+                text(sql),  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- static in-code SQL/fragments; all runtime values are bound parameters.
+                {"ids": mv_ids, "chat_id": source_chat_id},
+            )
         ).all():
             by_key[("message_version", source_id)] = telegram_source_message_url(
                 int(chat_id), int(message_id), username=None
@@ -151,7 +154,7 @@ async def _digest_revalidate_citations(session: AsyncSession, *, digest: Digest)
 
     if mv_ids:
         result = await session.execute(
-            text(
+            text(  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- static in-code SQL/fragments; all runtime values are bound parameters.
                 f"SELECT mv.id FROM message_versions mv "
                 "JOIN chat_messages cm ON cm.id = mv.chat_message_id "
                 "WHERE mv.id = ANY(:mv_ids) "
@@ -176,7 +179,7 @@ async def _digest_revalidate_citations(session: AsyncSession, *, digest: Digest)
             return False
     if cs_ids:
         result = await session.execute(
-            text(
+            text(  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- static in-code SQL/fragments; all runtime values are bound parameters.
                 f"SELECT cs.id::text FROM card_sources cs "
                 "JOIN knowledge_cards kc ON kc.id = cs.card_id "
                 "JOIN message_versions mv ON mv.id = cs.message_version_id "

@@ -53,7 +53,7 @@ from bot.services.control_messages import control_message_excludes_sql_fragment
 # finish if it grabbed the row first, then re-read its final state.
 _CONTROL_MESSAGE_EXCLUDES = control_message_excludes_sql_fragment("mv")
 
-_REVALIDATE_SQL = text(
+_REVALIDATE_SQL = text(  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- static in-code SQL/fragments; all runtime values are bound parameters.
     f"""
     WITH src AS (
         SELECT
