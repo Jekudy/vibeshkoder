@@ -1955,26 +1955,17 @@ class Digest(Base):
             "type IN ('daily','weekly')",
             name="ck_digests_type",
         ),
-        # T8-01 / Phase 8: status enum widened to 14 values. The 4 new entries
-        # (awaiting_review, approved_for_publish, rejected_by_admin,
-        # rejected_by_reaper) cover the weekly editorial review-gate state
-        # machine. See alembic migration 038.
         CheckConstraint(
             "status IN ("
             "'running','draft','posting','posted','failed','skipped',"
             "'cost_exceeded','skipped_no_destination','redacted',"
-            "'redacted_edit_failed',"
-            "'awaiting_review','approved_for_publish',"
-            "'rejected_by_admin','rejected_by_reaper'"
+            "'redacted_edit_failed'"
             ")",
             name="ck_digests_status",
         ),
-        # T8-01: body required across the audit-trail review statuses too.
         CheckConstraint(
             "status NOT IN ("
-            "'draft','posting','posted','redacted','redacted_edit_failed',"
-            "'awaiting_review','approved_for_publish','rejected_by_admin',"
-            "'rejected_by_reaper'"
+            "'draft','posting','posted','redacted','redacted_edit_failed'"
             ")"
             " OR body_markdown IS NOT NULL",
             name="ck_digests_body_markdown_not_null_for_visible_statuses",
@@ -1985,15 +1976,6 @@ class Digest(Base):
             " AND posted_message_id IS NOT NULL"
             " AND posted_at IS NOT NULL)",
             name="ck_digests_posted_fields_required",
-        ),
-        # Manual weekly approval requires attribution. Automatic weekly
-        # publishing moves draft → posting → posted without an admin.
-        CheckConstraint(
-            "status <> 'approved_for_publish'"
-            " OR type <> 'weekly'"
-            " OR (published_by_admin_id IS NOT NULL"
-            " AND approved_at IS NOT NULL)",
-            name="ck_digests_approved_audit",
         ),
         Index(
             "ix_digests_status_draft",
@@ -2010,12 +1992,6 @@ class Digest(Base):
             "ix_digests_posting_started_at",
             "posting_started_at",
             postgresql_where=text("status = 'posting'"),
-        ),
-        # T8-01: stale-review reaper drives off this partial index.
-        Index(
-            "ix_digests_status_awaiting_review",
-            "awaiting_review_at",
-            postgresql_where=text("status = 'awaiting_review'"),
         ),
     )
 
@@ -2048,13 +2024,6 @@ class Digest(Base):
         DateTime(timezone=True), nullable=True
     )
     error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # T8-01 / Phase 8: weekly review-gate workflow columns.
-    awaiting_review_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    published_by_admin_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -2075,16 +2044,10 @@ class DigestRun(Base):
 
     __tablename__ = "digest_runs"
     __table_args__ = (
-        # T8-01 / Phase 8: 5 new audit values cover the review-gate state
-        # transitions (awaiting_review, approved_for_publish, rejected_by_admin,
-        # rejected_by_reaper) plus operator regeneration audit
-        # (regenerated_by_admin). See alembic migration 038.
         CheckConstraint(
             "status IN ("
             "'running','finished','failed','skipped',"
-            "'cost_exceeded','skipped_no_destination',"
-            "'awaiting_review','approved_for_publish',"
-            "'rejected_by_admin','rejected_by_reaper','regenerated_by_admin'"
+            "'cost_exceeded','skipped_no_destination'"
             ")",
             name="ck_digest_runs_status",
         ),

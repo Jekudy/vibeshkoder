@@ -62,12 +62,12 @@ jobs:
           test "$cosine_distance" = "0"
 
           export DATABASE_URL=postgresql+asyncpg://vibe:smoke-only@127.0.0.1:55432/vibe_gatekeeper
-          alembic upgrade 089
-          alembic downgrade 088
+          alembic upgrade 090
+          alembic downgrade 089
           alembic upgrade head
           test "$(docker exec shkoder-postgres-smoke \
             psql -U vibe -d vibe_gatekeeper -Atqc \
-              "SELECT version_num FROM alembic_version")" = "089"
+              "SELECT version_num FROM alembic_version")" = "090"
           test "$(docker exec shkoder-postgres-smoke \
             psql -U vibe -d vibe_gatekeeper -Atqc \
               "SELECT count(*) FROM information_schema.columns \

@@ -214,6 +214,52 @@ async def test_governance_block_is_terminal_superseded(
     assert candidate.status == "superseded"
 
 
+@pytest.mark.parametrize(
+    ("entities_json", "imported_final", "normalized_text"),
+    [
+        ([{"type": "bot_command", "offset": 0, "length": 8}], False, "canonical source"),
+        ('[{"type":"bot_command","offset":0,"length":8}]', False, "canonical source"),
+        ({}, True, "/approve candidate"),
+    ],
+)
+async def test_promotion_blocks_control_message_candidate_and_keeps_raw_source(
+    db_session: AsyncSession,
+    entities_json: object,
+    imported_final: bool,
+    normalized_text: str,
+) -> None:
+    """Promotion refuses command sources without mutating their raw message version."""
+    from bot.db.models import ExtractionCandidate, MessageVersion
+    from bot.services.candidate_promotion import promote_candidate
+
+    actor_id, _, candidate_id = await _seed_candidate(db_session)
+    candidate = await db_session.get(ExtractionCandidate, candidate_id)
+    assert candidate is not None
+    source_mvid = int(candidate.source_message_version_ids[0])
+    await db_session.execute(
+        update(MessageVersion)
+        .where(MessageVersion.id == source_mvid)
+        .values(
+            entities_json=entities_json,
+            imported_final=imported_final,
+            normalized_text=normalized_text,
+        )
+    )
+
+    result = await promote_candidate(
+        db_session,
+        candidate_id=candidate_id,
+        actor_user_id=actor_id,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason == "source_control_message"
+    await db_session.refresh(candidate)
+    source = await db_session.get(MessageVersion, source_mvid)
+    assert candidate.status == "superseded"
+    assert source is not None and source.text == "canonical source"
+
+
 async def test_promotion_supersedes_candidate_after_source_edit(
     db_session: AsyncSession,
 ) -> None:

@@ -78,3 +78,13 @@ def test_estimate_cost_unknown_model_raises_key_error() -> None:
 
     with pytest.raises(KeyError):
         estimate_cost(model="nonexistent-model", tokens_in=10, tokens_out=10)
+
+
+def test_gpt_5_6_sol_uses_long_context_pricing_above_272k_input_tokens() -> None:
+    from bot.services.llm_pricing import estimate_cost
+
+    standard = estimate_cost(model="gpt-5.6-sol", tokens_in=272_000, tokens_out=1_000)
+    long_context = estimate_cost(model="gpt-5.6-sol", tokens_in=272_001, tokens_out=1_000)
+
+    assert standard == Decimal("1.390000")
+    assert long_context == Decimal("2.765010")

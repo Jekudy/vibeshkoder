@@ -196,9 +196,10 @@ async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str
     # + T12-06-fix C2 (076 butler_tool_invocations.posted_message_id).
     # + T12-07 (077 butler_undo_invocations table + status widened with 'undone').
     # + T12-07-fix C1 (078 butler_tool_invocations.inverse_op_payload column).
-    # + Phase 13 semantic Q&A retrieval/quota/provenance/audit schema (089).
+    # + Phase 13 semantic Q&A retrieval/quota/provenance/audit schema (089)
+    # + editorial-review removal (090).
     # Assert the current head explicitly; revisit when future migrations land.
-    assert current == "089"
+    assert current == "090"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(

@@ -76,7 +76,7 @@ def test_digest_context_uses_shared_predicate() -> None:
 
     Checks that the source file:
     1. Imports from bot.services.forget_predicate
-    2. Embeds _FORGET_EXCLUDES at least twice (cards query + raw fallback query)
+    2. Embeds _FORGET_EXCLUDES in the complete raw-message query
     """
     import inspect
 
@@ -88,12 +88,12 @@ def test_digest_context_uses_shared_predicate() -> None:
         "digest_context.py must import from bot.services.forget_predicate (#291). "
         "Replace inline NOT EXISTS clauses with the shared helper."
     )
-    # Must reference _FORGET_EXCLUDES at least twice in SQL f-strings
+    # Issue #406 removed the cards query: the full eligible message window is
+    # now the only authoritative digest input.
     count = source.count("{_FORGET_EXCLUDES}")
-    assert count >= 2, (
-        f"digest_context.py must reference {{_FORGET_EXCLUDES}} in SQL at least twice "
-        f"(cards query + raw fallback), found {count}. "
-        "Ensure both inline NOT EXISTS clauses are replaced."
+    assert count >= 1, (
+        "digest_context.py must reference {_FORGET_EXCLUDES} in its raw-message SQL, "
+        f"found {count}."
     )
 
 
@@ -102,7 +102,7 @@ def test_llm_gateway_uses_shared_predicate() -> None:
 
     Checks that the source file:
     1. Imports from bot.services.forget_predicate
-    2. Embeds _FORGET_EXCLUDES in both digest revalidation queries
+    2. Embeds _FORGET_EXCLUDES in digest message revalidation
     3. Calls forget_excludes_expression() in wiki Core revalidation queries
     """
     import inspect
@@ -115,12 +115,13 @@ def test_llm_gateway_uses_shared_predicate() -> None:
         "llm_gateway.py must import from bot.services.forget_predicate (#291). "
         "Replace inline NOT EXISTS clauses with the shared helper."
     )
-    # Must reference _FORGET_EXCLUDES at least twice in SQL f-strings
-    count = source.count("{_FORGET_EXCLUDES}")
-    assert count >= 2, (
-        f"llm_gateway.py must reference {{_FORGET_EXCLUDES}} in SQL at least twice "
-        f"(_DIGEST_REVALIDATE_MV_SQL + _DIGEST_REVALIDATE_CS_SQL), found {count}. "
-        "Ensure both inline NOT EXISTS clauses are replaced."
+    digest_revalidation = source[
+        source.index("_DIGEST_REVALIDATE_MV_SQL") : source.index(
+            "async def _digest_context_is_clean"
+        )
+    ]
+    assert "{_FORGET_EXCLUDES}" in digest_revalidation, (
+        "llm_gateway.py digest message revalidation must use {_FORGET_EXCLUDES}."
     )
     assert source.count("forget_excludes_expression()") >= 2, (
         "llm_gateway.py must use forget_excludes_expression() for both wiki "
