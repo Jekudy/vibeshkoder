@@ -10,17 +10,19 @@ from typing import Any
 
 from bot.services.digest_contract import VERIFIER_VERDICT_PAIRS
 
-PROMPT_VERSION = "digest-v0.4.0"
+PROMPT_VERSION = "digest-v0.5.0"
 
 DRAFT_INSTRUCTIONS = """Ты редактор приватного русскоязычного Telegram-чата.
 Составь короткое кликабельное оглавление того, что происходило в чате. Используй только
 предоставленные сообщения.
 
-Один item — один очень короткий конкретный ярлык темы или события, не мини-пересказ треда.
+Один item — пара: text — очень короткий конкретный ярлык темы или события, не мини-пересказ треда;
+details — более полное, но всё ещё редакторское описание в одну строку, 1–3 коротких предложения.
 Сохраняй имена, названия, модели, версии, цифры, ссылки и полезные детали. Если в сообщении
 есть author_username, называй участника как @username; иначе используй точный author_display.
-У каждого item должна быть ровно одна самая полезная citation. В text пиши только обычный текст
-без citation tokens и Telegram URLs.
+У каждого item должна быть ровно одна самая полезная citation, общая для text и details. В text и
+details пиши только обычный текст без citation tokens и Telegram URLs; оба поля должны опираться
+только на выбранную citation.
 
 При publish=true всегда верни layout=flat и ровно одну секцию с пустым heading.
 Жёсткого лимита пунктов нет, но не добавляй filler. Weekly должен читаться за 30–60 секунд:
@@ -58,9 +60,10 @@ action=keep не искажай. Можно объединять, переста
 весь пост уложился в visible_character_target; жёсткого лимита пунктов нет.
 
 Используй только факты из cited_evidence и только citation tokens, уже использованные в
-исходном draft. Не добавляй новые факты, источники или tokens. У каждого factual item и у
-короткой grounded closing должны остаться отдельные citations, а text должен быть без citation
-tokens и Telegram URLs. Приложение само добавит заголовок, source labels и #дайджест; их длина
+исходном draft. Не добавляй новые факты, источники или tokens. У каждого factual item должна
+остаться пара text/details с одной общей citation; у короткой grounded closing — отдельная citation.
+text и details должны быть без citation tokens и Telegram URLs. Приложение само добавит заголовок,
+source labels и #дайджест; их длина
 уже включена в target. Следуй JSON schema; никакого текста вне JSON.
 """
 
@@ -155,13 +158,18 @@ def draft_response_schema(citation_tokens: Sequence[str]) -> dict[str, Any]:
             "citations": citations,
         },
     }
+    item_content = {
+        **content,
+        "required": ["text", "details", "citations"],
+        "properties": {**content["properties"], "details": {"type": "string"}},
+    }
     section = {
         "type": "object",
         "additionalProperties": False,
         "required": ["heading", "items"],
         "properties": {
             "heading": {"type": "string"},
-            "items": {"type": "array", "items": content},
+            "items": {"type": "array", "items": item_content},
         },
     }
     return {

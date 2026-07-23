@@ -71,7 +71,7 @@ def _gateway_config():
         model="gpt-5.6-sol",
         daily_ceiling_usd=Decimal("100"),
         monthly_ceiling_usd=Decimal("1000"),
-        prompt_template_version="digest-v0.4.0",
+        prompt_template_version="digest-v0.5.0",
     )
 
 
@@ -127,7 +127,13 @@ def _draft(*, message_version_id: int, publish: bool = True) -> dict:
         "sections": [
             {
                 "heading": "",
-                "items": [{"text": "@zhenya сравнил две версии", "citations": [token]}],
+                "items": [
+                    {
+                        "text": "@zhenya сравнил две версии",
+                        "details": "@zhenya сравнил версии 5.6 и 5.7.",
+                        "citations": [token],
+                    }
+                ],
             }
         ],
         "closing": {
@@ -141,6 +147,7 @@ def _verifier(*, item_action="keep", item_reason="ok", closing_action="keep", cl
     return {
         "items": [
             {"item_key": "item_1", "verdict": f"{item_action}_{item_reason}"},
+            {"item_key": "item_1_details", "verdict": "keep_ok"},
             {"item_key": "closing", "verdict": f"{closing_action}_{closing_reason}"},
         ]
     }
@@ -191,7 +198,8 @@ def _draft_at_weekly_visible_length(*, message_version_id: int, target: int) -> 
 
     token = f"[[mv:{message_version_id}]]"
     closing = "Закрыли"
-    baseline = f"-  {token}\n\n— {closing} {token}"
+    details = "d"
+    baseline = f"-  {token}\n  {details}\n\n— {closing} {token}"
     baseline_length = measure_digest_visible_length(
         baseline,
         window_start_utc=datetime(2026, 7, 20, 2, tzinfo=timezone.utc),
@@ -200,6 +208,7 @@ def _draft_at_weekly_visible_length(*, message_version_id: int, target: int) -> 
     )
     draft = _draft(message_version_id=message_version_id)
     draft["sections"][0]["items"][0]["text"] = "x" * (target - baseline_length)
+    draft["sections"][0]["items"][0]["details"] = details
     draft["closing"] = {"text": closing, "citations": [token]}
     return draft
 
@@ -373,6 +382,7 @@ async def test_weekly_over_target_compacts_without_another_llm_call(db_session) 
         0,
         {
             "text": "Женя сравнил две версии",
+            "details": "Женя подробно сравнил две версии.",
             "citations": [f"[[mv:{version_id}]]"],
         },
     )
@@ -382,7 +392,9 @@ async def test_weekly_over_target_compacts_without_another_llm_call(db_session) 
             {
                 "items": [
                     {"item_key": "item_1", "verdict": "keep_ok"},
+                    {"item_key": "item_1_details", "verdict": "keep_ok"},
                     {"item_key": "item_2", "verdict": "keep_ok"},
+                    {"item_key": "item_2_details", "verdict": "keep_ok"},
                     {"item_key": "closing", "verdict": "keep_ok"},
                 ]
             },

@@ -110,23 +110,40 @@ def _build_digest_html(
         if body_tokens != set(source_links_by_citation):
             raise ValueError("digest source links do not match body citations")
         body_lines: list[str] = []
+        details: list[str] = []
         closing_seen = False
+        previous_was_item = False
         for line in lines:
             if not line:
                 body_lines.append("")
+                previous_was_item = False
             elif line.startswith("## "):
                 if closing_seen or _CITATION_TOKEN_RE.search(line):
                     raise ValueError("digest section heading is invalid")
                 body_lines.append(f"<b>{html_escape(line[3:])}</b>")
+                previous_was_item = False
             elif line.startswith("- "):
                 if closing_seen:
                     raise ValueError("digest item follows closing")
                 body_lines.append(f"- {_render_inline(line[2:], source_links_by_citation)}")
+                previous_was_item = True
+            elif line.startswith("  "):
+                if closing_seen or not previous_was_item or _CITATION_TOKEN_RE.search(line):
+                    raise ValueError("digest detail is invalid")
+                details.append(line[2:])
+                previous_was_item = False
             elif line.startswith("— "):
                 if closing_seen:
                     raise ValueError("digest has multiple closings")
                 closing_seen = True
+                if details:
+                    body_lines.append(
+                        "<blockquote expandable><b>Подробнее</b>\n"
+                        + "\n".join(f"- {html_escape(detail)}" for detail in details)
+                        + "</blockquote>"
+                    )
                 body_lines.append(f"<i>— {_render_inline(line[2:], source_links_by_citation)}</i>")
+                previous_was_item = False
             else:
                 raise ValueError("digest body has an unsupported line")
         if not closing_seen:

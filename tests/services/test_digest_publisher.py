@@ -138,6 +138,7 @@ def test_mask_bullets_replaces_indices():
     )
     masked = _mask_bullets_in_body(body, bullet_indices={0, 2})
     assert "First bullet" not in masked
+    assert "detail line" not in masked
     assert "Second bullet" in masked
     assert "Third bullet" not in masked
     assert "[REDACTED — забыто]" in masked
