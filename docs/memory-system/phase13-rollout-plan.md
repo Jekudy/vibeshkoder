@@ -22,8 +22,9 @@
 6. LLM поддерживает связанную Markdown-wiki в стиле Karpathy; статическая
    read-only версия и локальный поисковый индекс публикуются на Cloudflare Pages
    односторонней загрузкой, без runtime-доступа к VPS, БД или LLM.
-7. Вопрос к Шкодеру срабатывает только по mention или reply на сообщение бота,
-   доступен участникам сообщества и ограничен двумя LLM-вопросами в сутки.
+7. Вопрос к Шкодеру срабатывает только по точному mention; reply на сообщение
+   бота сам по себе не является trigger, а reply-контекст требует mention.
+   Q&A доступен участникам сообщества и ограничен двумя LLM-вопросами в сутки.
 8. В анкете источник знакомства принимается как `nickname`, `@nickname` или
    `t.me/nickname`, сохраняется и публикуется как `@nickname`.
 
@@ -54,9 +55,10 @@
 - Если за неделю не было содержательного обсуждения, дайджест не публикуется.
   Любой содержательный дайджест публикуется без approval.
 - `recall` — это внутреннее извлечение подходящих фрагментов прошлого контекста.
-  Публичной команды `/recall` нет: вопрос срабатывает только через mention/reply,
-  сначала делает детерминированный поиск, а LLM формулирует ответ по найденным
-  источникам. После двух LLM-вопросов за день тот же поиск отвечает без LLM.
+  Публичной команды `/recall` нет: вопрос срабатывает только через точный
+  mention; для reply-контекста mention обязателен. Сначала выполняется
+  детерминированный поиск, а LLM формулирует ответ по найденным источникам.
+  После двух LLM-вопросов за день тот же поиск отвечает без LLM.
 - Эмбеддинг — числовое представление смысла текста, полезное для поиска по
   близким формулировкам. В первом rollout отдельный embedding API не нужен:
   PostgreSQL Russian FTS и статический индекс wiki дают бесплатный поиск без
@@ -90,7 +92,7 @@
 |---|---|---|---|
 | 1. Baseline и safety | Инвентаризация production, backup и restore drill, фиксация export | Известны production SHA/schema/counts; backup восстановлен в отдельную БД; до drill нет production-миграций | Restore-команда, schema/version и контрольные counts |
 | 2. Полная история | Миграции, HTML parser, dry-run и apply | Все 9 403 user-message records классифицированы; 107 exact `Shkoder` остаются raw-only; `Лиля Шкодер` сохранена; good/bad/good chunk не продвигает checkpoint; повторный apply даёт только объяснимые duplicates | Import report, reconciliation SQL, повторный dry-run |
-| 3. Live memory | Middleware, картинки, QA, анкета, weekly digest | DB → raw → normalized порядок доказан; сообщения бота не входят в derived memory; новые фото получают safe link+description; weekly публикуется автоматически по четвергам в 09:00 MSK, тихое окно не публикуется; daily остаётся выключен; QA member-only, mention/reply, 2 LLM/day; referral нормализован | Runtime tests, Telegram message ids, ledger/quota SQL |
+| 3. Live memory | Middleware, картинки, QA, анкета, weekly digest | DB → raw → normalized порядок доказан; сообщения бота не входят в derived memory; новые фото получают safe link+description; weekly публикуется автоматически по четвергам в 09:00 MSK, тихое окно не публикуется; daily остаётся выключен; QA member-only, exact mention (включая reply+mention), 2 LLM/day; referral нормализован | Runtime tests, Telegram message ids, ledger/quota SQL |
 | 4. Extraction и backfill | Event-time окна, DeepSeek, auto-promotion | Только source chat; окна не пересекаются и возобновляются без повторного LLM; один сбой останавливает backfill; кандидаты атомарно становятся approved cards; invalid rows не создают starvation | PostgreSQL concurrency/resume tests, run/card counts, ledger reconciliation |
 | 5. LLM-wiki | Stable topic slugs, ревизии, citations, автоматическая сборка | Изменённая тема создаёт ровно одну новую ревизию; неизменённая не вызывает LLM; каждый факт имеет разрешённый source; redacted/stale source блокирует export; исчезновение последней automatic-page не оставляет старую публичную статью | Compiler/orchestrator tests, revision/source SQL |
 | 6. Статическая публикация | Export и Cloudflare Pages | Только HTML/CSS/JS/JSON; локальный поиск не вызывает VPS/БД/LLM; CSP запрещает внешние соединения; secret/network scanner green; включая zero-page generation, upload идемпотентен; public smoke совпадает с manifest | Static audit hash, Cloudflare deployment audit, ledger/VPS request delta = 0 при поиске |

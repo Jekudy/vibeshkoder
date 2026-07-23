@@ -191,7 +191,7 @@ async def main() -> None:
         butler.router,  # T12-05: /butler /butler_status /butler_cancel /butler_undo (DM-only, flag OFF)
         chat_events.router,
         edited_message.router,  # T1-14: edited_message handler (before chat_messages catch-all)
-        qa.router,  # Mention/reply Q&A only; runtime-gated by memory.qa.enabled
+        qa.router,  # Explicit-mention Q&A only; runtime-gated by memory.qa.enabled
         forward_lookup.router,
         chat_messages.router,  # lowest priority — catches all group messages
     )

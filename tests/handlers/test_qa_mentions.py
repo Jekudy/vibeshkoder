@@ -240,6 +240,20 @@ def test_five_source_footer_retains_clickable_links_with_worst_case_text() -> No
     assert rendered.count('<a href="https://t.me/c/1234567890/') == 5
 
 
+def test_bounded_footer_strips_fts_headline_markers_and_escapes_other_html() -> None:
+    handler = import_module("bot.handlers.qa")
+    bundle = _qa_result(snippet="<b>тетс</b> <script>").bundle
+
+    rendered = handler._format_bounded_mention_response("", bundle, {})
+
+    assert "тетс" in rendered
+    assert "&lt;b&gt;" not in rendered
+    assert "&lt;/b&gt;" not in rendered
+    assert "<script>" not in rendered
+    assert "&lt;script&gt;" in rendered
+    _assert_bounded_valid_html(rendered)
+
+
 def test_semantic_trace_binding_flattens_card_provenance() -> None:
     qa_service = import_module("bot.services.qa")
     from bot.services.evidence import EvidenceBundle, EvidenceItem
@@ -395,6 +409,8 @@ async def test_mention_question_runs_bounded_evidence_only_ai_path(monkeypatch) 
         chat_id=COMMUNITY_CHAT_ID,
         redact_query_in_audit=False,
         limit=handler.QA_EVIDENCE_LIMIT,
+        exclude_chat_message_id=8501,
+        human_only=True,
     )
     synthesize.assert_awaited_once()
     guarded_query = synthesize.call_args.kwargs["query"]
