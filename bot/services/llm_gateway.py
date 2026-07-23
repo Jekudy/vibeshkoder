@@ -1700,7 +1700,7 @@ def load_digest_gateway_config(
         prompt_template_version=(
             prompt_template_version
             if prompt_template_version is not None
-            else ("digest-weekly-v0.4.0" if digest_type == "weekly" else "digest-v0.4.0")
+            else ("digest-weekly-v0.5.0" if digest_type == "weekly" else "digest-v0.5.0")
         ),
     )
 

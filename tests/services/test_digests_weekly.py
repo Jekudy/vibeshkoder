@@ -12,13 +12,14 @@ pytestmark = pytest.mark.usefixtures("app_env")
 def test_weekly_prompt_is_short_flat_and_has_no_item_quota() -> None:
     from bot.services.llm_prompts import digest_weekly_v0_1_0 as weekly
 
-    assert weekly.PROMPT_VERSION == "digest-weekly-v0.4.0"
+    assert weekly.PROMPT_VERSION == "digest-weekly-v0.5.0"
     assert "Жёсткого лимита пунктов нет" in weekly.DRAFT_INSTRUCTIONS
     assert "layout=flat" in weekly.DRAFT_INSTRUCTIONS
     assert "30–60 секунд" in weekly.DRAFT_INSTRUCTIONS
     assert "author_username" in weekly.DRAFT_INSTRUCTIONS
     assert "fix_name" in weekly.VERIFIER_INSTRUCTIONS
     assert "ровно одна самая полезная citation" in weekly.DRAFT_INSTRUCTIONS
+    assert "text/details" in weekly.FINALIZER_INSTRUCTIONS
     assert "1-8" not in weekly.DRAFT_INSTRUCTIONS
 
 
@@ -38,7 +39,13 @@ def test_weekly_gateway_uses_isolated_sol_model_and_prompt_version() -> None:
     config = load_digest_gateway_config(digest_type="weekly")
     assert config.provider == "openai"
     assert config.model == "gpt-5.6-sol"
-    assert config.prompt_template_version == "digest-weekly-v0.4.0"
+    assert config.prompt_template_version == "digest-weekly-v0.5.0"
+
+
+def test_daily_gateway_defaults_to_new_prompt_version() -> None:
+    from bot.services.llm_gateway import load_digest_gateway_config
+
+    assert load_digest_gateway_config(digest_type="daily").prompt_template_version == "digest-v0.5.0"
 
 
 def test_weekly_incident_guard_defaults_are_not_editorial_budget() -> None:

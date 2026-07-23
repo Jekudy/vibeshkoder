@@ -97,7 +97,7 @@ def parse_draft(answer_text: str, *, citation_tokens: Sequence[str]) -> dict[str
             raise DigestContractError("digest section is invalid")
         parsed_items: list[dict[str, Any]] = []
         for item in items:
-            if not isinstance(item, dict) or set(item) != {"text", "citations"}:
+            if not isinstance(item, dict) or set(item) != {"text", "details", "citations"}:
                 raise DigestContractError("digest item is malformed")
             if not isinstance(item["citations"], list) or len(item["citations"]) != 1:
                 raise DigestContractError("digest content requires exactly one citation")
@@ -107,6 +107,9 @@ def parse_draft(answer_text: str, *, citation_tokens: Sequence[str]) -> dict[str
                     "item_key": f"item_{item_number}",
                     "text": _validate_text(
                         item["text"], item["citations"], allowed_tokens=allowed
+                    ),
+                    "details": _validate_text(
+                        item["details"], item["citations"], allowed_tokens=allowed
                     ),
                     "citations": list(item["citations"]),
                 }
@@ -150,7 +153,17 @@ def factual_units(draft: Mapping[str, Any]) -> list[dict[str, Any]]:
                     ),
                 }
             )
-        units.extend(section["items"])
+        for item in section["items"]:
+            units.extend(
+                [
+                    item,
+                    {
+                        "item_key": f"{item['item_key']}_details",
+                        "text": item["details"],
+                        "citations": list(item["citations"]),
+                    },
+                ]
+            )
     return [*units, draft["closing"]]
 
 
@@ -306,6 +319,11 @@ def _merged_digest(
             text = edited_by_key[unit["item_key"]]["text"]
             if unit["item_key"].startswith("heading_"):
                 merged["sections"][int(unit["item_key"].removeprefix("heading_"))]["heading"] = text
+            elif unit["item_key"].endswith("_details"):
+                item_number = int(
+                    unit["item_key"].removeprefix("item_").removesuffix("_details")
+                )
+                merged["sections"][0]["items"][item_number - 1]["details"] = text
             else:
                 unit["text"] = text
     return merged
@@ -323,6 +341,7 @@ def _render_digest(merged: Mapping[str, Any]) -> tuple[str, list[dict[str, Any]]
             lines.append(f"## {section['heading']}")
         for item in section["items"]:
             lines.append(f"- {item['text']} {' '.join(item['citations'])}")
+            lines.append(f"  {item['details']}")
             citations.extend(_citation_rows(item["citations"], position=position))
             position += 1
     lines.extend(
