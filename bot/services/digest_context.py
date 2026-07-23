@@ -54,6 +54,7 @@ class DigestContextMessage:
     author_display: str
     text: str
     ts: datetime
+    author_username: str | None = None
     telegram_message_id: int | None = None
     caption: str | None = None
     message_kind: str | None = None
@@ -106,6 +107,7 @@ async def build_digest_context(
             mv.chat_message_id,
             cm.message_id AS telegram_message_id,
             concat_ws(' ', u.first_name, u.last_name) AS author_display,
+            u.username AS author_username,
             COALESCE(mv.normalized_text, mv.text, '') AS text,
             mv.caption,
             cm.message_kind,
@@ -158,6 +160,7 @@ async def build_digest_context(
             chat_message_id=row["chat_message_id"],
             telegram_message_id=row["telegram_message_id"],
             author_display=row["author_display"],
+            author_username=row["author_username"],
             text=row["text"],
             caption=row["caption"],
             message_kind=row["message_kind"],

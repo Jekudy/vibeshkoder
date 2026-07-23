@@ -6,6 +6,7 @@ import itertools
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -70,8 +71,24 @@ def _gateway_config():
         model="gpt-5.6-sol",
         daily_ceiling_usd=Decimal("100"),
         monthly_ceiling_usd=Decimal("1000"),
-        prompt_template_version="digest-v0.3.0",
+        prompt_template_version="digest-v0.4.0",
     )
+
+
+def test_message_payload_keeps_absent_username_for_display_name_fallback() -> None:
+    from bot.services.llm_prompts.digest_v0_1_0 import message_payload
+
+    payload = message_payload(
+        SimpleNamespace(
+            message_version_id=1,
+            author_display="Женя Кудрявцев",
+            text="Сообщение",
+            ts=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        )
+    )
+
+    assert payload["author_display"] == "Женя Кудрявцев"
+    assert payload["author_username"] is None
 
 
 class _StructuredProvider:
@@ -110,7 +127,7 @@ def _draft(*, message_version_id: int, publish: bool = True) -> dict:
         "sections": [
             {
                 "heading": "",
-                "items": [{"text": "Женя сравнил две версии", "citations": [token]}],
+                "items": [{"text": "@zhenya сравнил две версии", "citations": [token]}],
             }
         ],
         "closing": {
@@ -152,6 +169,7 @@ async def _context(session, *, digest_type: str = "daily"):
                 chat_message_id=message_id,
                 telegram_message_id=telegram_message_id,
                 author_display="Женя Кудрявцев",
+                author_username="zhenya",
                 text="Сравнил версии 5.6 и 5.7",
                 caption="Таблица сравнения",
                 message_kind="photo",
@@ -251,6 +269,7 @@ async def test_clean_digest_uses_two_calls_and_preserves_full_input_metadata(db_
     assert draft_input["window"]["start"] == "2026-07-20T05:00:00+03:00"
     message = draft_input["messages"][0]
     assert message["author_display"] == "Женя Кудрявцев"
+    assert message["author_username"] == "zhenya"
     assert message["reply_to_message_id"] == 101
     assert message["message_thread_id"] == 202
     assert message["media_description"] == "Две колонки с результатами"
@@ -261,17 +280,19 @@ async def test_clean_digest_uses_two_calls_and_preserves_full_input_metadata(db_
     }
 
 
-async def test_fixable_factual_error_uses_exactly_three_calls(db_session) -> None:
+async def test_display_name_is_corrected_to_username_in_three_calls(db_session) -> None:
     from bot.db.repos.llm_usage_ledger import LedgerRepo
     from bot.services.llm_gateway import synthesize_digest
 
     context = await _context(db_session)
     version_id = context.messages[0].message_version_id
+    draft = _draft(message_version_id=version_id)
+    draft["sections"][0]["items"][0]["text"] = "Женя сравнил две версии"
     provider = _StructuredProvider(
         [
-            _draft(message_version_id=version_id),
-            _verifier(item_action="fix", item_reason="number"),
-            {"items": [{"item_key": "item_1", "text": "Женя сравнил версии 5.6 и 5.7"}]},
+            draft,
+            _verifier(item_action="fix", item_reason="name"),
+            {"items": [{"item_key": "item_1", "text": "@zhenya сравнил версии 5.6 и 5.7"}]},
         ]
     )
     result = await synthesize_digest(
@@ -284,7 +305,7 @@ async def test_fixable_factual_error_uses_exactly_three_calls(db_session) -> Non
     assert len(provider.calls) == 3
     assert provider.calls[2]["schema_name"] == "digest_apply_fixes"
     assert set(json.loads(provider.calls[2]["input_text"])) == {"items"}
-    assert result.body_markdown is not None and "5.6 и 5.7" in result.body_markdown
+    assert result.body_markdown is not None and "@zhenya" in result.body_markdown
 
 
 async def test_weekly_clean_within_budget_uses_exactly_two_calls(db_session) -> None:

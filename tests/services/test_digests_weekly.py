@@ -9,23 +9,26 @@ import pytest
 pytestmark = pytest.mark.usefixtures("app_env")
 
 
-def test_weekly_prompt_is_adaptive_and_has_no_item_quota() -> None:
+def test_weekly_prompt_is_short_flat_and_has_no_item_quota() -> None:
     from bot.services.llm_prompts import digest_weekly_v0_1_0 as weekly
 
-    assert weekly.PROMPT_VERSION == "digest-weekly-v0.3.0"
+    assert weekly.PROMPT_VERSION == "digest-weekly-v0.4.0"
     assert "Жёсткого лимита пунктов нет" in weekly.DRAFT_INSTRUCTIONS
-    assert "объединяй повторы в кластеры" in weekly.DRAFT_INSTRUCTIONS
-    assert "2–3 минуты" in weekly.DRAFT_INSTRUCTIONS
+    assert "layout=flat" in weekly.DRAFT_INSTRUCTIONS
+    assert "30–60 секунд" in weekly.DRAFT_INSTRUCTIONS
+    assert "author_username" in weekly.DRAFT_INSTRUCTIONS
+    assert "fix_name" in weekly.VERIFIER_INSTRUCTIONS
+    assert "ровно одна самая полезная citation" in weekly.DRAFT_INSTRUCTIONS
     assert "1-8" not in weekly.DRAFT_INSTRUCTIONS
 
 
-def test_weekly_structured_schema_has_no_max_items() -> None:
+def test_weekly_schema_allows_one_flat_section_and_unbounded_items() -> None:
     from bot.services.llm_prompts.digest_weekly_v0_1_0 import draft_response_schema
 
     schema = draft_response_schema(["[[mv:1]]"])
     sections = schema["properties"]["sections"]
     items = sections["items"]["properties"]["items"]
-    assert "maxItems" not in sections
+    assert sections["maxItems"] == 1
     assert "maxItems" not in items
 
 
@@ -35,7 +38,7 @@ def test_weekly_gateway_uses_isolated_sol_model_and_prompt_version() -> None:
     config = load_digest_gateway_config(digest_type="weekly")
     assert config.provider == "openai"
     assert config.model == "gpt-5.6-sol"
-    assert config.prompt_template_version == "digest-weekly-v0.3.0"
+    assert config.prompt_template_version == "digest-weekly-v0.4.0"
 
 
 def test_weekly_incident_guard_defaults_are_not_editorial_budget() -> None:

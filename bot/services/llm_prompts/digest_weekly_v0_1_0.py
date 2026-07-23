@@ -2,4 +2,4 @@
 
 from bot.services.llm_prompts.digest_v0_1_0 import *  # noqa: F403
 
-PROMPT_VERSION = "digest-weekly-v0.3.0"
+PROMPT_VERSION = "digest-weekly-v0.4.0"
