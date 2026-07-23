@@ -363,7 +363,10 @@ def _format_bounded_mention_response(
         author = _compact_author(
             users_by_id.get(item.user_id) if item.user_id is not None else None
         )
-        snippet = _escaped_text_with_budget(item.snippet, 120)
+        snippet = _escaped_text_with_budget(
+            item.snippet.replace("<b>", "").replace("</b>", ""),
+            120,
+        )
         link = f"https://t.me/c/{short_chat_id}/{item.message_id}"
         source_lines.append(
             f'[{idx}] <a href="{html.escape(link, quote=True)}">источник</a> · '
@@ -1920,7 +1923,7 @@ async def mention_question_handler(
     session: AsyncSession,
     raw_update: TelegramUpdate | None = None,
 ) -> None:
-    """Answer a member's mention/reply question through the evidence-only LLM path.
+    """Answer a member's explicit-mention question through the evidence-only LLM path.
 
     Trigger eligibility is enforced by :class:`ShkoderQuestionFilter` before
     this handler runs.  This handler still fails closed on sender/chat state so
@@ -1985,7 +1988,7 @@ async def mention_question_handler(
     if not query:
         await _reply_to_mention(
             message,
-            "Напиши вопрос после упоминания Шкодера или в ответе ему.",
+            "Напиши вопрос после упоминания Шкодера.",
         )
         await _write_trace(
             session,
@@ -2047,6 +2050,8 @@ async def mention_question_handler(
         chat_id=message.chat.id,
         redact_query_in_audit=query_redacted,
         limit=QA_EVIDENCE_LIMIT,
+        exclude_chat_message_id=persisted.chat_message.id,
+        human_only=True,
     )
     if any(contains_secret_like_data(item.snippet) for item in result.bundle.items):
         await _reply_to_mention(message, SENSITIVE_QA_REFUSAL)

@@ -416,7 +416,7 @@ DO UPDATE SET enabled=EXCLUDED.enabled, updated_at=clock_timestamp();
 должен быть ON: верхний handler gate проверяет его первым.
 
 4. Реальный участник задаёт боту перефразированный вопрос в production
-Telegram-группе через mention/reply surface.
+Telegram-группе через точный mention; для reply-контекста mention обязателен.
 5. Ответ должен быть коротким, grounded и содержать хотя бы одну кликабельную
 Telegram source-ссылку. Evidence должен относиться только к текущему чату.
 6. Выполнить ещё один успешный semantic вопрос, затем третий. Третий должен
