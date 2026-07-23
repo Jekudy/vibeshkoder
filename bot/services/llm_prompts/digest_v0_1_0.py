@@ -10,45 +10,46 @@ from typing import Any
 
 from bot.services.digest_contract import VERIFIER_VERDICT_PAIRS
 
-PROMPT_VERSION = "digest-v0.3.0"
+PROMPT_VERSION = "digest-v0.4.0"
 
 DRAFT_INSTRUCTIONS = """Ты редактор приватного русскоязычного Telegram-чата.
-Составь редакторский дайджест: коротко покажи, что происходило в чате и кто внёс
-существенный вклад. Используй только предоставленные сообщения.
+Составь короткое кликабельное оглавление того, что происходило в чате. Используй только
+предоставленные сообщения.
 
-Сохраняй точные Telegram display names, названия, модели, версии, цифры, ссылки и полезные
-детали. Краткий опыт, вывод или характерная цитата допустимы, если подтверждены evidence.
-Не пересказывай тред по порядку и не перечисляй все аргументы: покажи значимые темы,
-участников, вклад или результат и путь к источнику. Один пункт может объединять несколько
-вкладов. В text пиши только обычный текст без citation tokens и Telegram URLs. Подтверждающие
-tokens укажи отдельно в citations в порядке релевантности.
+Один item — один очень короткий конкретный ярлык темы или события, не мини-пересказ треда.
+Сохраняй имена, названия, модели, версии, цифры, ссылки и полезные детали. Если в сообщении
+есть author_username, называй участника как @username; иначе используй точный author_display.
+У каждого item должна быть ровно одна самая полезная citation. В text пиши только обычный текст
+без citation tokens и Telegram URLs.
 
-Для короткого окна выбери layout=flat и одну секцию с пустым heading. Для насыщенного —
-layout=sectioned и разговорные тематические headings. Жёсткого лимита пунктов нет. Weekly —
-самостоятельная карта недели: объединяй повторы в кластеры и держи цельный пост примерно на
-2–3 минуты чтения. Не добавляй filler ради объёма.
+При publish=true всегда верни layout=flat и ровно одну секцию с пустым heading.
+Жёсткого лимита пунктов нет, но не добавляй filler. Weekly должен читаться за 30–60 секунд:
+объединяй только очевидные повторы, сохраняй конкретику и не делай тематические секции.
 
-Для publish=true добавь короткую grounded closing-реплику или шутку с citations. Не выдумывай
-факты и не шути над участником. Не включай команды, телефоны, credentials или raw payloads.
-Не создавай заголовок поста, #дайджест или Telegram URLs источников — их добавит приложение.
-Если значимых кластеров нет, верни publish=false, layout=none, пустые sections и пустую closing.
-Следуй JSON schema; никакого текста вне JSON.
+Добавь короткую grounded closing-реплику или шутку с одной citation. Не выдумывай факты и не шути
+над участником. Не включай команды, телефоны, credentials или raw payloads. Не создавай заголовок
+поста, #дайджест или Telegram URLs источников — их добавит приложение. Если значимых тем нет,
+верни publish=false, layout=none, пустые sections и пустую closing. Следуй JSON schema; никакого
+текста вне JSON.
 """
 
 VERIFIER_INSTRUCTIONS = """Проверь каждый item и closing только по приложенному cited_evidence.
-Проверяй факты, Telegram display names, числа, версии, модальность и соответствие citations.
-Не оценивай стиль, порядок, рубрики, полноту или сходство с gold. Верни каждый item_key ровно
-один раз; порядок не важен. Для каждого выбери один verdict: keep_ok означает точное
-подтверждение; fix_* — текст можно исправить, не меняя citations; block_* — citations не
-позволяют безопасно исправить утверждение.
+Проверяй факты, Telegram author_username и display names, числа, версии, модальность и
+соответствие citations. Если cited_evidence содержит author_username, а item называет этого
+участника display name, без @username или с другим @username, обязательно верни fix_name.
+Не оценивай стиль, порядок, рубрики, полноту или сходство с gold.
+Верни каждый item_key ровно один раз; порядок не важен. Для каждого выбери один verdict:
+keep_ok означает точное подтверждение; fix_* — текст можно исправить, не меняя citations;
+block_* — citations не позволяют безопасно исправить утверждение.
 Следуй JSON schema; никакого текста вне JSON.
 """
 
 EDITOR_INSTRUCTIONS = """Исправь только переданные factual findings по cited_evidence.
 Не меняй структуру, item_key или citation provenance. В text верни только обычный текст без
-citation tokens и Telegram URLs; приложение сохранит citations само.
-Не добавляй новые факты, источники или внешние знания. Верни каждый item_key ровно один раз
-и в исходном порядке. Следуй JSON schema; никакого текста вне JSON.
+citation tokens и Telegram URLs; приложение сохранит citations само. Если cited_evidence
+содержит author_username, используй @username; иначе используй author_display. Не добавляй
+новые факты, источники или внешние знания. Верни каждый item_key ровно один раз и в исходном
+порядке. Следуй JSON schema; никакого текста вне JSON.
 """
 
 FINALIZER_INSTRUCTIONS = """Ты финальный редактор уже проверенного недельного дайджеста.
@@ -101,6 +102,7 @@ def message_payload(message: Any) -> dict[str, Any]:
         "citation": f"[[mv:{message.message_version_id}]]",
         "telegram_message_id": getattr(message, "telegram_message_id", None),
         "author_display": message.author_display,
+        "author_username": getattr(message, "author_username", None),
         "timestamp": message.ts.isoformat(),
         "text": message.text,
         "caption": getattr(message, "caption", None),
@@ -143,7 +145,7 @@ def _citation_schema(citation_tokens: Sequence[str]) -> dict[str, Any]:
 
 def draft_response_schema(citation_tokens: Sequence[str]) -> dict[str, Any]:
     citation = _citation_schema(citation_tokens)
-    citations = {"type": "array", "items": citation}
+    citations = {"type": "array", "items": citation, "maxItems": 1}
     content = {
         "type": "object",
         "additionalProperties": False,
@@ -168,8 +170,8 @@ def draft_response_schema(citation_tokens: Sequence[str]) -> dict[str, Any]:
         "required": ["publish", "layout", "sections", "closing"],
         "properties": {
             "publish": {"type": "boolean"},
-            "layout": {"type": "string", "enum": ["none", "flat", "sectioned"]},
-            "sections": {"type": "array", "items": section},
+            "layout": {"type": "string", "enum": ["none", "flat"]},
+            "sections": {"type": "array", "items": section, "maxItems": 1},
             "closing": content,
         },
     }

@@ -157,6 +157,8 @@ async def test_context_preserves_available_telegram_metadata_without_raw_payload
     assert message.message_version_id == version_id
     assert message.telegram_message_id == telegram_message_id
     assert message.author_display == "Женя Кудрявцев"
+    assert message.author_username is not None
+    assert message.author_username.startswith("u")
     assert message.caption == "Подпись к схеме"
     assert message.reply_to_message_id == 123
     assert message.message_thread_id == 456

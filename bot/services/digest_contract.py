@@ -1,4 +1,4 @@
-"""Validate and merge the adaptive structured digest contract."""
+"""Validate and merge the flat structured digest contract."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def parse_draft(answer_text: str, *, citation_tokens: Sequence[str]) -> dict[str
     layout = payload["layout"]
     sections = payload["sections"]
     closing = payload["closing"]
-    if not isinstance(publish, bool) or layout not in {"none", "flat", "sectioned"}:
+    if not isinstance(publish, bool) or layout not in {"none", "flat"}:
         raise DigestContractError("digest draft has invalid publication decision")
     if not isinstance(sections, list) or not isinstance(closing, dict):
         raise DigestContractError("digest draft has invalid structure")
@@ -75,8 +75,8 @@ def parse_draft(answer_text: str, *, citation_tokens: Sequence[str]) -> dict[str
         if layout != "none" or sections or closing != {"text": "", "citations": []}:
             raise DigestContractError("publish=false draft must be empty")
         return {"publish": False, "layout": "none", "sections": [], "closing": closing}
-    if layout == "none" or not sections:
-        raise DigestContractError("publish=true draft requires content")
+    if layout != "flat" or len(sections) != 1:
+        raise DigestContractError("publish=true draft requires one flat section")
 
     allowed = frozenset(citation_tokens)
     parsed_sections: list[dict[str, Any]] = []
@@ -99,6 +99,8 @@ def parse_draft(answer_text: str, *, citation_tokens: Sequence[str]) -> dict[str
         for item in items:
             if not isinstance(item, dict) or set(item) != {"text", "citations"}:
                 raise DigestContractError("digest item is malformed")
+            if not isinstance(item["citations"], list) or len(item["citations"]) != 1:
+                raise DigestContractError("digest content requires exactly one citation")
             item_number += 1
             parsed_items.append(
                 {
@@ -109,26 +111,15 @@ def parse_draft(answer_text: str, *, citation_tokens: Sequence[str]) -> dict[str
                     "citations": list(item["citations"]),
                 }
             )
-        if heading:
-            _validate_text(
-                heading,
-                list(
-                    dict.fromkeys(
-                        token for item in parsed_items for token in item["citations"]
-                    )
-                ),
-                allowed_tokens=allowed,
-            )
         parsed_sections.append({"heading": heading, "items": parsed_items})
 
-    if layout == "flat":
-        if len(parsed_sections) != 1 or parsed_sections[0]["heading"] != "":
-            raise DigestContractError("flat digest requires one unheaded section")
-    elif any(not section["heading"] for section in parsed_sections):
-        raise DigestContractError("sectioned digest requires every heading")
+    if parsed_sections[0]["heading"] != "":
+        raise DigestContractError("flat digest requires one unheaded section")
 
     if set(closing) != {"text", "citations"}:
         raise DigestContractError("digest closing is malformed")
+    if not isinstance(closing["citations"], list) or len(closing["citations"]) != 1:
+        raise DigestContractError("digest content requires exactly one citation")
     parsed_closing = {
         "item_key": "closing",
         "text": _validate_text(closing["text"], closing["citations"], allowed_tokens=allowed),
