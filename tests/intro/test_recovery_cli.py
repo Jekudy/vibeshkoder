@@ -24,24 +24,46 @@ def _input_sha256() -> str:
     return AUTHORIZED_INPUT_SHA256
 
 
-def _private_text_update(*, user_id: int, text: str) -> dict:
+def _private_text_update(*, user_id: int, text: str, sender_key: str = "from") -> dict:
     return {
         "message": {
-            "from": {"id": user_id},
+            sender_key: {"id": user_id},
             "chat": {"id": user_id, "type": "private"},
             "text": text,
         }
     }
 
 
-def _confirm_update(*, user_id: int, data: str = "confirm:yes") -> dict:
+def _confirm_update(*, user_id: int, data: str = "confirm:yes", sender_key: str = "from") -> dict:
     return {
         "callback_query": {
-            "from": {"id": user_id},
+            sender_key: {"id": user_id},
             "data": data,
             "message": {"chat": {"id": user_id, "type": "private"}},
         }
     }
+
+
+def test_raw_recovery_sender_fallback_never_overrides_present_canonical_from() -> None:
+    from bot.cli import (
+        IntroRawRecoveryError,
+        _private_text_from_raw,
+        _validate_confirm_raw,
+    )
+
+    message = _private_text_update(
+        user_id=USER_ID,
+        text="answer",
+        sender_key="from_user",
+    )
+    message["message"]["from"] = None
+    with pytest.raises(IntroRawRecoveryError):
+        _private_text_from_raw(message, user_id=USER_ID)
+
+    callback = _confirm_update(user_id=USER_ID, sender_key="from_user")
+    callback["callback_query"]["from"] = {"id": USER_ID + 1}
+    with pytest.raises(IntroRawRecoveryError):
+        _validate_confirm_raw(callback, user_id=USER_ID)
 
 
 async def _seed_predko_evidence(
@@ -56,15 +78,20 @@ async def _seed_predko_evidence(
     wrong_private_chat_row_id: int | None = None,
     non_private_callback_chat: bool = False,
     wrong_callback_chat_id: bool = False,
+    sender_key: str = "from",
 ) -> None:
     from bot.db.models import TelegramUpdate
 
     for row_id, (_, answer) in zip(ANSWER_ROW_IDS, PREDKO_ANSWERS, strict=True):
-        payload = _private_text_update(user_id=USER_ID, text=answer)
+        payload = _private_text_update(
+            user_id=USER_ID,
+            text=answer,
+            sender_key=sender_key,
+        )
         if row_id == non_private_row_id:
             payload["message"]["chat"]["type"] = "group"
         if row_id == wrong_answer_owner_row_id:
-            payload["message"]["from"]["id"] = USER_ID + 1
+            payload["message"][sender_key]["id"] = USER_ID + 1
         if row_id == wrong_private_chat_row_id:
             payload["message"]["chat"]["id"] = USER_ID + 1
         if row_id == altered_answer_row_id:
@@ -87,7 +114,9 @@ async def _seed_predko_evidence(
             )
         )
     callback_payload = _confirm_update(
-        user_id=USER_ID + int(wrong_callback_owner), data=callback_data
+        user_id=USER_ID + int(wrong_callback_owner),
+        data=callback_data,
+        sender_key=sender_key,
     )
     if non_private_callback_chat:
         callback_payload["callback_query"]["message"]["chat"]["type"] = "group"
@@ -230,15 +259,20 @@ def _session_factory(session: MagicMock):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operator_is_admin", [True, False], ids=["db-admin", "env-admin"])
+@pytest.mark.parametrize("sender_key", ["from", "from_user"])
 async def test_raw_recovery_creates_new_confirmed_refresh_and_standard_outbox_only(
-    app_env, db_session, monkeypatch: pytest.MonkeyPatch, operator_is_admin: bool
+    app_env,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    operator_is_admin: bool,
+    sender_key: str,
 ) -> None:
     from bot.cli import recover_intro_from_raw
     from bot.db.models import IntroEffectOutbox, QuestionnaireAnswer, User
 
     await _seed_legacy_application(db_session)
     await _seed_operator(db_session, is_admin=operator_is_admin)
-    await _seed_predko_evidence(db_session)
+    await _seed_predko_evidence(db_session, sender_key=sender_key)
     operator = await db_session.get(User, ADMIN_ID)
     assert operator is not None and operator.is_admin is operator_is_admin
     legacy_before = await _legacy_state(db_session)

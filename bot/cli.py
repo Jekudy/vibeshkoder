@@ -53,13 +53,19 @@ def _parse_recovery_answer_row_ids(value: str) -> tuple[int, ...]:
     return row_ids
 
 
+def _telegram_sender(payload: dict) -> object:
+    if "from" in payload:
+        return payload["from"]
+    return payload.get("from_user")
+
+
 def _private_text_from_raw(raw: object, *, user_id: int) -> str:
     if not isinstance(raw, dict):
         raise IntroRawRecoveryError("Answer evidence is missing raw JSON")
     message = raw.get("message")
     if not isinstance(message, dict):
         raise IntroRawRecoveryError("Answer evidence is not a message")
-    sender = message.get("from")
+    sender = _telegram_sender(message)
     chat = message.get("chat")
     text = message.get("text")
     if (
@@ -83,7 +89,7 @@ def _validate_confirm_raw(raw: object, *, user_id: int) -> None:
     callback = raw.get("callback_query")
     if not isinstance(callback, dict):
         raise IntroRawRecoveryError("Confirm evidence is not a callback")
-    sender = callback.get("from")
+    sender = _telegram_sender(callback)
     message = callback.get("message")
     chat = message.get("chat") if isinstance(message, dict) else None
     if (
