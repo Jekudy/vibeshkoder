@@ -14,6 +14,8 @@ class ReadyCallback(CallbackData, prefix="ready"):
 
 class ConfirmCallback(CallbackData, prefix="confirm"):
     action: str  # "yes" or "redo"
+    application_id: int
+    digest: str
 
 
 def vouch_keyboard(application_id: int) -> InlineKeyboardMarkup:
@@ -42,17 +44,21 @@ def ready_keyboard(application_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def confirm_keyboard() -> InlineKeyboardMarkup:
+def confirm_keyboard(application_id: int, digest: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text=CONFIRM_BUTTON,
-                    callback_data=ConfirmCallback(action="yes").pack(),
+                    callback_data=ConfirmCallback(
+                        action="yes", application_id=application_id, digest=digest
+                    ).pack(),
                 ),
                 InlineKeyboardButton(
                     text=REDO_BUTTON,
-                    callback_data=ConfirmCallback(action="redo").pack(),
+                    callback_data=ConfirmCallback(
+                        action="redo", application_id=application_id, digest=digest
+                    ).pack(),
                 ),
             ]
         ]

@@ -2,13 +2,42 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Intro, User
 
 
 class IntroRepo:
+    @staticmethod
+    async def get_for_update(session: AsyncSession, user_id: int) -> Intro | None:
+        result = await session.execute(
+            select(Intro).where(Intro.user_id == user_id).with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def promote_if_current(
+        session: AsyncSession,
+        *,
+        user_id: int,
+        base_application_id: int | None,
+        application_id: int,
+        intro_text: str,
+    ) -> bool:
+        pointer = (
+            Intro.application_id.is_(None)
+            if base_application_id is None
+            else Intro.application_id == base_application_id
+        )
+        result = await session.execute(
+            update(Intro)
+            .where(Intro.user_id == user_id, pointer)
+            .values(application_id=application_id, intro_text=intro_text)
+        )
+        await session.flush()
+        return bool(result.rowcount)
+
     @staticmethod
     async def upsert(
         session: AsyncSession,

@@ -2,9 +2,9 @@
 title: 'Versioned-флоу анкеты и интро'
 type: 'feature'
 created: '2026-07-24'
-status: 'ready-for-dev'
+status: 'in-review'
 baseline_revision: 'd9c2a21a6b23eb8057b285da18e9fb6c9073121a'
-review_loop_iteration: 1
+review_loop_iteration: 2
 followup_review_recommended: false
 context:
   - CLAUDE.md
@@ -93,6 +93,8 @@ resume и redo не могут заменить уже concrete referral.
 - Timeout, cancellation или потеря соединения после dispatch неоднозначны: effect
   становится `unknown` и автоматически не повторяется.
 - Telegram `BadRequest`/`Forbidden` терминальны: effect становится `failed`.
+- Frozen intro body ограничен 3260 символами: вместе с worst-case admission header
+  полный Telegram payload гарантированно остаётся в лимите 4096 символов.
 - Sheet projection идемпотентна: retry bounded; несовпавший current pointer даёт
   `stale`.
 - После Telegram success refresh promotion выполняется CAS: существующий
@@ -183,17 +185,17 @@ snapshot. Затем domain renderer создаёт новую refresh applicati
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `tests/intro/test_contract.py`, `tests/db/test_intro_flow_migration.py` -- first RED batch for catalog, snapshot, constraints and legacy cutover.
-- [ ] `bot/services/intro_contract.py`, `bot/db/models.py`, `alembic/versions/091_versioned_intro_flow.py` -- minimal schema/catalog GREEN without new dependencies.
-- [ ] `tests/intro/test_confirmation.py`, `tests/intro/test_referral_refresh.py` -- RED for owner/digest/immutability/resume/redo/referral.
-- [ ] `tests/intro/test_refresh_concurrency.py`, `tests/intro/test_legacy_member_flow.py` -- RED for concurrent `/refresh`, member without Intro and legacy Intro resume.
-- [ ] `bot/db/repos/application.py`, `bot/db/repos/questionnaire.py`, `bot/db/repos/intro_effect_outbox.py`, `bot/services/intro_workflow.py`, `bot/handlers/start.py`, `bot/handlers/questionnaire.py`, `bot/keyboards/inline.py` -- application-scoped workflow GREEN.
-- [ ] `tests/intro/test_admission_flow.py`, `tests/intro/test_refresh_flow.py`, `tests/intro/test_effect_worker.py`, `tests/intro/test_failure_safety.py` -- RED for downstream version binding and delivery safety.
-- [ ] `tests/intro/test_effect_reconciliation.py` -- RED for `unknown` `record-sent`/`retry-absent`, audit fields and forbidden transitions.
-- [ ] `bot/services/intro_effect_worker.py`, `bot/handlers/chat_events.py`, `bot/handlers/vouch.py`, `bot/services/scheduler.py`, `bot/db/repos/intro.py` -- transactional effect GREEN, completed refresh tracking and no direct canonical publication.
-- [ ] `tests/intro/test_sheet_projection.py`, `tests/intro/test_predko_regression.py` -- RED for one-way Sheet and full incident regression.
-- [ ] `bot/services/sheets.py`, `bot/texts.py`, `SPEC.md` -- delete inbound sync, derive surfaces from catalog and document Postgres ownership.
-- [ ] `tests/intro/test_recovery_cli.py`, `bot/cli.py` -- fail-closed standard-path recovery/reconcile for raw evidence; no direct Telegram/SQL publication.
+- [x] `tests/intro/test_contract.py`, `tests/db/test_intro_flow_migration.py` -- first RED batch for catalog, snapshot, constraints and legacy cutover.
+- [x] `bot/services/intro_contract.py`, `bot/db/models.py`, `alembic/versions/091_versioned_intro_flow.py` -- minimal schema/catalog GREEN without new dependencies.
+- [x] `tests/intro/test_questionnaire_workflow.py` -- RED for owner/digest/immutability/resume/redo/referral.
+- [x] `tests/intro/test_questionnaire_workflow.py`, `tests/intro/test_legacy_member_flow.py` -- RED for concurrent `/refresh`, member without Intro and legacy Intro resume.
+- [x] `bot/db/repos/application.py`, `bot/db/repos/questionnaire.py`, `bot/db/repos/intro_effect_outbox.py`, `bot/services/intro_workflow.py`, `bot/handlers/start.py`, `bot/handlers/questionnaire.py`, `bot/keyboards/inline.py` -- application-scoped workflow GREEN.
+- [x] `tests/intro/test_admission_flow.py`, `tests/intro/test_refresh_flow.py`, `tests/intro/test_effect_worker.py`, `tests/intro/test_failure_safety.py` -- RED for downstream version binding and delivery safety.
+- [x] `tests/intro/test_effect_reconciliation.py` -- RED for `unknown` `record-sent`/`retry-absent`, audit fields and forbidden transitions.
+- [x] `bot/services/intro_effect_worker.py`, `bot/handlers/chat_events.py`, `bot/handlers/vouch.py`, `bot/services/scheduler.py`, `bot/db/repos/intro.py` -- transactional effect GREEN, completed refresh tracking and no direct canonical publication.
+- [x] `tests/intro/test_sheet_projection.py`, `tests/intro/test_predko_regression.py` -- RED for one-way Sheet and full incident regression.
+- [x] `bot/services/sheets.py`, `bot/texts.py`, `SPEC.md` -- delete inbound sync, derive surfaces from catalog and document Postgres ownership.
+- [x] `tests/intro/test_recovery_cli.py`, `bot/cli.py` -- fail-closed standard-path recovery/reconcile for raw evidence; no direct Telegram/SQL publication.
 - [ ] `.github/workflows/ci.yml`, `tests/db/test_fts_schema.py`, `tests/db/test_digests_review_schema.py`, `tests/scripts/test_postgres_image_contract.py` -- update migration head; update PR #485 title/body and attach RED→GREEN evidence.
 - [ ] `docs/ops/db-backup-runbook.md`, `.github/workflows/release.yml` -- execute fresh backup, merge, main CI, Release Images, exact-SHA Coolify deploy, migration/health/single-instance/10-minute proof.
 - [ ] `bot/cli.py`, `bot/services/intro_workflow.py` -- execute @predko remediation: validate raw rows, create a new refresh version, standard confirm/outbox publish, verify Telegram identity/body, Intro pointer, Sheet projection and unchanged old message.
@@ -226,6 +228,14 @@ snapshot. Затем domain renderer создаёт новую refresh applicati
 
 - 2026-07-24: senior pre-dev gate PASS; все шесть блокеров закрыты, дополнительных
   сущностей и абстракций не требуется.
+- 2026-07-27: repair loop 1 закрыл stale membership, Sheet projection,
+  exact-application CAS, migration preflight, worst-case Telegram payload и
+  fail-closed recovery; targeted suite `236 passed`.
+- 2026-07-27: repair loop 2 закрыл stale ORM identity-map reread после join CAS;
+  PostgreSQL regression сначала воспроизвёл ошибочный kick, затем прошёл.
+- 2026-07-27: два независимых senior-review PASS, Ponytail full PASS; финальные
+  проверки: targeted `237 passed`, full suite `3235 passed, 6 skipped`, Ruff и
+  `git diff --check` зелёные.
 
 ## Design Notes
 

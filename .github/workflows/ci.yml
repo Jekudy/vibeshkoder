@@ -67,7 +67,7 @@ jobs:
           alembic upgrade head
           test "$(docker exec shkoder-postgres-smoke \
             psql -U vibe -d vibe_gatekeeper -Atqc \
-              "SELECT version_num FROM alembic_version")" = "090"
+              "SELECT version_num FROM alembic_version")" = "091"
           test "$(docker exec shkoder-postgres-smoke \
             psql -U vibe -d vibe_gatekeeper -Atqc \
               "SELECT count(*) FROM information_schema.columns \
@@ -123,6 +123,7 @@ jobs:
       ADMIN_IDS: '[149820031]'
       # Postgres service is reachable on localhost:5432 from the runner.
       DATABASE_URL: postgresql+asyncpg://vibe:changeme@localhost:5432/vibe_gatekeeper
+      TEST_DATABASE_URL: postgresql+asyncpg://vibe:changeme@localhost:5432/vibe_gatekeeper
       REDIS_URL: redis://redis:6379/0
       GOOGLE_SHEETS_CREDS_FILE: ""
       GOOGLE_SHEET_ID: ""
