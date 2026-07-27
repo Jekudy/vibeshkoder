@@ -267,16 +267,14 @@ For each member with intro older than 90 days:
 - Phase `every_2_days`: 3 more reminders
 - Phase `done`: stop until next cycle
 
-### 5.3 Google Sheets Sync (every 5 min)
+### 5.3 Google Sheets Projection
 
-- Read all rows, compare with local DB
-- Sheet edits → update local DB (sheet is source of truth)
-- New local intros → append to sheet
-- Update status column: "есть интро" / "нет интро"
+- Postgres is the canonical source of truth. Sheet is a one-way projection of
+  current published intros and never mutates `applications`, `questionnaire_answers`, or `intros`.
 
 ## 6. Google Sheets Structure
 
-| Telegram ID | Username | Имя | Локация | Откуда узнал | Опыт | Проекты | Самое сложное | Цели | Кто поручился | Статус |
+| Telegram ID | Username | 👤 Имя | 📍 Основная локация | 🔗 От кого узнал о чате | 💡 Опыт с вайб-кодингом | 🚀 Проекты и автоматизации | 🏋️ Самое сложное | 🎯 Цели | Кто поручился | Статус |
 
 ## 7. Web Interface
 
@@ -330,7 +328,7 @@ class Settings(BaseSettings):
 | 14 | Forward with no text | Error message |
 | 15 | Forward text not in DB | Error message |
 | 16 | Sheets API down | Log, retry next cycle |
-| 17 | Admin edits in Sheets | Sync picks up change |
+| 17 | Admin edits in Sheets | Sheet is output-only; canonical data does not change |
 | 18 | Bot restart mid-questionnaire | Redis FSM survives |
 
 ## 11. Callback Data

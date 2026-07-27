@@ -36,7 +36,7 @@ dev = [
     # aiosqlite is dev-only — used by tests/test_scheduler_deadlines.py for in-memory sqlite
     # isolation. Production runtime requires postgres (T0-02; see bot/db/engine.py).
     "aiosqlite>=0.20",
-    "ruff>=0.11",
+    "ruff>=0.11,<0.16",
     "mypy>=1.15",
     # PyYAML — dev-only — used by tests/evals/* to parse seed_meta.yaml baseline thresholds.
     "PyYAML>=6.0",

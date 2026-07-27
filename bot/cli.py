@@ -9,6 +9,8 @@ Currently supported subcommands:
     memory_backfill --chat-id ID  — bounded extraction + automatic promotion over history
     memory_reconcile_extraction   — explicitly resolve one ambiguous extraction attempt
     memory_reconcile_image        — explicitly resolve one ambiguous image description
+    intro_effect_reconcile        — explicitly resolve one unknown intro delivery effect
+    intro_recover_raw             — audited one-off recovery from raw Telegram evidence
 """
 
 from __future__ import annotations
@@ -27,6 +29,250 @@ from typing import Any, cast
 from sqlalchemy.exc import SQLAlchemyError
 
 logger = logging.getLogger(__name__)
+
+
+_PREDKO_USER_ID = 169_419_687
+_PREDKO_ANSWER_ROW_IDS = (19_231, 19_232, 19_233, 19_234, 19_235, 19_236, 19_237)
+_PREDKO_CONFIRM_ROW_ID = 19_238
+_PREDKO_INPUT_SHA256 = "5762b931895dc1837abf75209055a86a1b56e3bcdcd472b3346bf2d01b2b1fd5"
+
+
+class IntroRawRecoveryError(ValueError):
+    """Raw operator evidence does not satisfy the one-off recovery contract."""
+
+
+def _parse_recovery_answer_row_ids(value: str) -> tuple[int, ...]:
+    try:
+        row_ids = tuple(int(item) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "--answer-row-ids must be comma-separated integers"
+        ) from error
+    if not row_ids or any(row_id <= 0 for row_id in row_ids):
+        raise argparse.ArgumentTypeError("--answer-row-ids must contain positive integers")
+    return row_ids
+
+
+def _private_text_from_raw(raw: object, *, user_id: int) -> str:
+    if not isinstance(raw, dict):
+        raise IntroRawRecoveryError("Answer evidence is missing raw JSON")
+    message = raw.get("message")
+    if not isinstance(message, dict):
+        raise IntroRawRecoveryError("Answer evidence is not a message")
+    sender = message.get("from")
+    chat = message.get("chat")
+    text = message.get("text")
+    if (
+        not isinstance(sender, dict)
+        or type(sender.get("id")) is not int
+        or sender["id"] != user_id
+        or not isinstance(chat, dict)
+        or chat.get("type") != "private"
+        or type(chat.get("id")) is not int
+        or chat["id"] != user_id
+        or not isinstance(text, str)
+        or not text.strip()
+    ):
+        raise IntroRawRecoveryError("Answer evidence must be private text from the recovered user")
+    return text
+
+
+def _validate_confirm_raw(raw: object, *, user_id: int) -> None:
+    if not isinstance(raw, dict):
+        raise IntroRawRecoveryError("Confirm evidence is missing raw JSON")
+    callback = raw.get("callback_query")
+    if not isinstance(callback, dict):
+        raise IntroRawRecoveryError("Confirm evidence is not a callback")
+    sender = callback.get("from")
+    message = callback.get("message")
+    chat = message.get("chat") if isinstance(message, dict) else None
+    if (
+        not isinstance(sender, dict)
+        or type(sender.get("id")) is not int
+        or sender["id"] != user_id
+        or callback.get("data") != "confirm:yes"
+        or not isinstance(chat, dict)
+        or chat.get("type") != "private"
+        or type(chat.get("id")) is not int
+        or chat["id"] != user_id
+    ):
+        raise IntroRawRecoveryError("Confirm evidence is not the exact owner confirmation")
+
+
+async def recover_intro_from_raw(
+    session: Any,
+    *,
+    user_id: int,
+    answer_row_ids: tuple[int, ...],
+    source_confirm_row_id: int,
+    operator_user_id: int,
+    authorize_operator_remediation: bool,
+    expected_input_sha256: str,
+    reason: str,
+) -> Any:
+    """Create one confirmed refresh from the authorized raw Telegram evidence."""
+    from sqlalchemy import select
+
+    from bot.config import settings
+    from bot.db.models import Intro, TelegramUpdate, User
+    from bot.db.repos.application import ApplicationRepo
+    from bot.db.repos.questionnaire import QuestionnaireRepo
+    from bot.services.intro_contract import get_intro_catalog, intro_digest, render_intro_html
+    from bot.services.intro_workflow import IntroWorkflowError, confirm_application
+
+    if (
+        user_id != _PREDKO_USER_ID
+        or type(answer_row_ids) is not tuple
+        or answer_row_ids != _PREDKO_ANSWER_ROW_IDS
+        or source_confirm_row_id != _PREDKO_CONFIRM_ROW_ID
+        or not authorize_operator_remediation
+        or type(operator_user_id) is not int
+        or expected_input_sha256 != _PREDKO_INPUT_SHA256
+        or not isinstance(reason, str)
+    ):
+        raise IntroRawRecoveryError("Recovery arguments do not match the audited contract")
+    reason = reason.strip()
+    if not 1 <= len(reason) <= 500:
+        raise IntroRawRecoveryError("Recovery arguments do not match the audited contract")
+
+    operator = await session.get(User, operator_user_id)
+    if operator is None or (operator_user_id not in settings.ADMIN_IDS and not operator.is_admin):
+        raise IntroRawRecoveryError("Operator is not authorized for raw recovery")
+
+    result = await session.execute(
+        select(TelegramUpdate.id, TelegramUpdate.raw_json).where(
+            TelegramUpdate.id.in_((*answer_row_ids, source_confirm_row_id))
+        )
+    )
+    evidence = {row.id: row.raw_json for row in result}
+    if len(evidence) != len(answer_row_ids) + 1 or set(evidence) != {
+        *answer_row_ids,
+        source_confirm_row_id,
+    }:
+        raise IntroRawRecoveryError("Raw evidence rows are incomplete")
+
+    answers = [
+        _private_text_from_raw(evidence[row_id], user_id=user_id) for row_id in answer_row_ids
+    ]
+    _validate_confirm_raw(evidence[source_confirm_row_id], user_id=user_id)
+    actual_sha256 = hashlib.sha256("\n".join(answers).encode("utf-8")).hexdigest()
+    if actual_sha256 != _PREDKO_INPUT_SHA256:
+        raise IntroRawRecoveryError("Raw answer hash does not match the authorized evidence")
+
+    user = await session.get(User, user_id)
+    if user is None or not user.is_member:
+        raise IntroRawRecoveryError("Recovery requires a current member")
+
+    intro_pointer = await session.execute(
+        select(Intro.id, Intro.application_id).where(Intro.user_id == user_id)
+    )
+    current_intro = intro_pointer.one_or_none()
+    if current_intro is None:
+        raise IntroRawRecoveryError("Recovery requires an existing Intro pointer")
+
+    if await ApplicationRepo.get_active_refresh(session, user_id) is not None:
+        raise IntroRawRecoveryError("Recovery requires no active refresh")
+
+    catalog = get_intro_catalog("intro-v2")
+    application = await ApplicationRepo.create(
+        session,
+        user_id=user_id,
+        flow_kind="refresh",
+        base_application_id=current_intro.application_id,
+        catalog_version="intro-v2",
+    )
+    for index, (field, answer) in enumerate(zip(catalog, answers, strict=True)):
+        await QuestionnaireRepo.save_answer(
+            session,
+            user_id=user_id,
+            application_id=application.id,
+            field_id=field.field_id,
+            question_index=index,
+            question_text=field.question,
+            answer_text=answer,
+        )
+    snapshot = render_intro_html(
+        [(field.field_id, answer) for field, answer in zip(catalog, answers, strict=True)],
+        catalog_version="intro-v2",
+    )
+    try:
+        application = await confirm_application(
+            session,
+            user_id=user_id,
+            application_id=application.id,
+            digest=intro_digest(snapshot),
+        )
+    except IntroWorkflowError as error:
+        raise IntroRawRecoveryError("Recovery could not enter the standard refresh flow") from error
+
+    logger.info(
+        "intro raw recovery prepared application=%s user=%s operator=%s reason=%s",
+        application.id,
+        user_id,
+        operator_user_id,
+        reason,
+    )
+    return application
+
+
+def _cmd_intro_recover_raw(args: argparse.Namespace) -> int:
+    return asyncio.run(_cmd_intro_recover_raw_async(args))
+
+
+def _cmd_intro_effect_reconcile(args: argparse.Namespace) -> int:
+    return asyncio.run(_cmd_intro_effect_reconcile_async(args))
+
+
+async def _cmd_intro_effect_reconcile_async(args: argparse.Namespace) -> int:
+    import bot.db.engine as _db_engine
+    from bot.services.intro_effect_worker import (
+        IntroEffectReconcileError,
+        reconcile_intro_effect,
+    )
+
+    async with _db_engine.async_session() as session:
+        try:
+            effect = await reconcile_intro_effect(
+                session,
+                effect_id=args.effect_id,
+                action=args.action,
+                chat_id=args.chat_id,
+                message_id=args.message_id,
+                evidence_sha256=args.evidence_sha256,
+                operator_user_id=args.operator_user_id,
+                reason=args.reason,
+            )
+            await session.commit()
+        except IntroEffectReconcileError as error:
+            await session.rollback()
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+    print(f"reconciled effect_id={effect.id} action={args.action}")
+    return 0
+
+
+async def _cmd_intro_recover_raw_async(args: argparse.Namespace) -> int:
+    import bot.db.engine as _db_engine
+
+    async with _db_engine.async_session() as session:
+        try:
+            application = await recover_intro_from_raw(
+                session,
+                user_id=args.user_id,
+                answer_row_ids=args.answer_row_ids,
+                source_confirm_row_id=args.source_confirm_row_id,
+                operator_user_id=args.operator_user_id,
+                authorize_operator_remediation=args.authorize_operator_remediation,
+                expected_input_sha256=args.expected_input_sha256,
+                reason=args.reason,
+            )
+            await session.commit()
+        except IntroRawRecoveryError as error:
+            await session.rollback()
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+    print(f"recovered application_id={application.id} effect=refresh_intro")
+    return 0
 
 
 def _cmd_import_dry_run(args: argparse.Namespace) -> int:
@@ -1082,7 +1328,92 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_reconcile_image.set_defaults(func=_cmd_memory_reconcile_image)
 
+    p_intro_effect_reconcile = sub.add_parser(
+        "intro_effect_reconcile",
+        help="Resolve one unknown intro delivery effect with an audited operator action.",
+    )
+    p_intro_effect_reconcile.add_argument("--effect-id", type=int, required=True, dest="effect_id")
+    p_intro_effect_reconcile.add_argument(
+        "--action",
+        choices=("record-sent", "retry-absent"),
+        required=True,
+    )
+    p_intro_effect_reconcile.add_argument("--chat-id", type=int, default=None, dest="chat_id")
+    p_intro_effect_reconcile.add_argument("--message-id", type=int, default=None, dest="message_id")
+    p_intro_effect_reconcile.add_argument(
+        "--evidence-sha256",
+        default=None,
+        dest="evidence_sha256",
+        help="Lowercase SHA-256 of absence evidence required for retry-absent.",
+    )
+    p_intro_effect_reconcile.add_argument(
+        "--operator-user-id",
+        type=int,
+        required=True,
+        dest="operator_user_id",
+    )
+    p_intro_effect_reconcile.add_argument(
+        "--reason",
+        required=True,
+        help="Audited operator reason for the reconciliation.",
+    )
+    p_intro_effect_reconcile.set_defaults(func=_cmd_intro_effect_reconcile)
+
+    p_recover_raw = sub.add_parser(
+        "intro_recover_raw",
+        help="Create one audited refresh from the authorized raw Telegram evidence.",
+    )
+    p_recover_raw.add_argument("--user-id", type=int, required=True, dest="user_id")
+    p_recover_raw.add_argument(
+        "--answer-row-ids",
+        type=_parse_recovery_answer_row_ids,
+        required=True,
+        dest="answer_row_ids",
+        help="Exact comma-separated TelegramUpdate primary keys for the seven answers.",
+    )
+    p_recover_raw.add_argument(
+        "--source-confirm-row-id",
+        type=int,
+        required=True,
+        dest="source_confirm_row_id",
+    )
+    p_recover_raw.add_argument(
+        "--operator-user-id",
+        type=int,
+        required=True,
+        dest="operator_user_id",
+    )
+    p_recover_raw.add_argument(
+        "--authorize-operator-remediation",
+        action="store_true",
+        required=True,
+        dest="authorize_operator_remediation",
+        help="Required acknowledgement for this irreversible operator remediation.",
+    )
+    p_recover_raw.add_argument(
+        "--expected-input-sha256",
+        required=True,
+        dest="expected_input_sha256",
+        help="Lowercase SHA-256 of the seven raw text messages joined by LF.",
+    )
+    p_recover_raw.add_argument(
+        "--reason",
+        required=True,
+        help="Audited operator reason for the remediation.",
+    )
+    p_recover_raw.set_defaults(func=_cmd_intro_recover_raw)
+
     args = parser.parse_args(argv)
+    if args.cmd == "intro_effect_reconcile":
+        if args.action == "record-sent":
+            if args.chat_id is None:
+                p_intro_effect_reconcile.error("the following arguments are required: --chat-id")
+            if args.message_id is None:
+                p_intro_effect_reconcile.error("the following arguments are required: --message-id")
+        elif args.evidence_sha256 is None:
+            p_intro_effect_reconcile.error(
+                "the following arguments are required: --evidence-sha256"
+            )
     return args.func(args)
 
 

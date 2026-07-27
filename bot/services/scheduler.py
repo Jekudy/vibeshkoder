@@ -23,6 +23,7 @@ from bot.services.extractor import extraction_scheduler_tick
 from bot.services.graph_projector import default_projector_config, project_incremental
 from bot.services.graph_purge_worker import graph_purge_worker_tick
 from bot.services.image_memory import process_next_pending_photo
+from bot.services.intro_effect_worker import process_intro_effects
 from bot.services.invite_worker import process_invite_outbox
 from bot.services.llm_gateway import (
     LiveExtractCandidatesGateway,
@@ -280,18 +281,6 @@ async def check_intro_refresh(bot: Bot) -> None:
                     )
 
         await session.commit()
-
-
-async def sync_google_sheets() -> None:
-    """Sync intros with Google Sheets (full bi-directional sync)."""
-    try:
-        from bot.services.sheets import full_sync
-
-        await full_sync()
-    except ImportError:
-        logger.debug("gspread not installed — skipping Google Sheets sync")
-    except Exception:
-        logger.exception("Google Sheets sync failed")
 
 
 async def run_extraction_scheduler_tick() -> None:
@@ -1122,12 +1111,19 @@ def start_scheduler(bot: Bot) -> None:
         id="check_intro_refresh",
         replace_existing=True,
     )
+    from bot.services.sheets import _is_configured, project_intro_to_sheet
+
     scheduler.add_job(
-        sync_google_sheets,
+        process_intro_effects,
         "interval",
-        minutes=5,
-        id="sync_google_sheets",
+        seconds=30,
+        args=[bot],
+        kwargs={"project_sheet": project_intro_to_sheet if _is_configured() else None},
+        id="process_intro_effects",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
     # T6-03: Phase 6 extraction scheduler. Default OFF via flag
     # ``memory.extraction.scheduler.enabled`` (see bot/services/extractor.py).

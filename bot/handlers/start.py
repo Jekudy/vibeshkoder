@@ -10,16 +10,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.repos.application import ApplicationRepo
 from bot.db.repos.intro import IntroRepo
-from bot.db.repos.questionnaire import QuestionnaireRepo
 from bot.db.repos.user import UserRepo
 from bot.filters.chat_type import PrivateChatFilter
+from bot.services.intro_contract import get_intro_catalog, intro_digest
+from bot.services.intro_workflow import (
+    IntroWorkflowError,
+    next_field_id,
+    start_or_resume_refresh,
+)
 from bot.states.questionnaire import STATES_LIST, QuestionnaireForm
 from bot.texts import (
     ALREADY_HAS_INTRO,
     APPLICATION_PENDING,
     PRIVACY_BLOCK_MSG,
+    QUESTIONNAIRE_POSTED,
     REFRESH_NOT_MEMBER,
-    REFRESH_NO_INTRO,
+    REFRESH_SAVED,
     REFRESH_START,
     RESUME_QUESTIONNAIRE,
     VOUCHED_PENDING,
@@ -32,6 +38,7 @@ from bot.keyboards.inline import ready_keyboard
 logger = logging.getLogger(__name__)
 
 router = Router(name="start")
+FIELD_IDS = tuple(field.field_id for field in get_intro_catalog("intro-v2"))
 
 
 @router.message(CommandStart(), PrivateChatFilter())
@@ -69,25 +76,26 @@ async def cmd_start(
             )
             return
 
+        if active_app.status == "confirmed":
+            await message.answer(QUESTIONNAIRE_POSTED)
+            return
+
         if active_app.status == "filling":
-            # Resume from last answered question
-            last_idx = await QuestionnaireRepo.get_last_answered_index(
-                session, tg_user.id, active_app.id
-            )
-            if last_idx is not None and last_idx < len(QUESTIONS) - 1:
-                next_idx = last_idx + 1
+            try:
+                next_field = await next_field_id(
+                    session, user_id=tg_user.id, application_id=active_app.id
+                )
+            except IntroWorkflowError:
+                await message.answer("Анкета устарела. Запусти /start ещё раз.")
+                return
+            if next_field is not None:
+                next_idx = FIELD_IDS.index(next_field)
                 await state.update_data(application_id=active_app.id)
                 await state.set_state(STATES_LIST[next_idx])
                 await message.answer(RESUME_QUESTIONNAIRE.format(question=QUESTIONS[next_idx]))
-            elif last_idx is not None and last_idx == len(QUESTIONS) - 1:
-                # All questions answered, go to confirm
+            else:
                 await state.update_data(application_id=active_app.id)
                 await _show_confirm(message, state, session, tg_user.id, active_app.id)
-            else:
-                # No answers yet, start from beginning
-                await state.update_data(application_id=active_app.id)
-                await state.set_state(QuestionnaireForm.q1_name)
-                await message.answer(RESUME_QUESTIONNAIRE.format(question=QUESTIONS[0]))
             return
 
         if active_app.status == "vouched":
@@ -98,10 +106,18 @@ async def cmd_start(
     intro = await IntroRepo.get(session, tg_user.id)
 
     if user.is_member and intro is None:
-        app = await ApplicationRepo.create(session, tg_user.id)
-        await state.update_data(application_id=app.id, is_existing_member=True)
-        await state.set_state(QuestionnaireForm.q1_name)
-        await message.answer(WELCOME_EXISTING_MEMBER.format(question=QUESTIONS[0]))
+        app = await start_or_resume_refresh(session, user_id=tg_user.id)
+        if app.status == "confirmed":
+            await message.answer(REFRESH_SAVED)
+            return
+        first_field = await next_field_id(session, user_id=tg_user.id, application_id=app.id)
+        if first_field is None:
+            await _show_confirm(message, state, session, tg_user.id, app.id)
+            return
+        first_idx = FIELD_IDS.index(first_field)
+        await state.update_data(application_id=app.id)
+        await state.set_state(STATES_LIST[first_idx])
+        await message.answer(WELCOME_EXISTING_MEMBER.format(question=QUESTIONS[first_idx]))
         return
 
     if user.is_member and intro is not None:
@@ -111,8 +127,14 @@ async def cmd_start(
     # Check previously rejected → allow new application
     # (get_active already returned None, so no active app)
     # New applicant
-    app = await ApplicationRepo.create(session, tg_user.id)
-    await state.update_data(application_id=app.id, is_existing_member=False)
+    app = await ApplicationRepo.create(
+        session,
+        user_id=tg_user.id,
+        flow_kind="admission",
+        base_application_id=None,
+        catalog_version="intro-v2",
+    )
+    await state.update_data(application_id=app.id)
     await state.set_state(QuestionnaireForm.q1_name)
     await message.answer(WELCOME_NEW.format(question=QUESTIONS[0]))
 
@@ -140,24 +162,23 @@ async def cmd_refresh(
         await message.answer(REFRESH_NOT_MEMBER)
         return
 
-    intro = await IntroRepo.get(session, tg_user.id)
-    if intro is None:
-        await message.answer(REFRESH_NO_INTRO)
+    try:
+        app = await start_or_resume_refresh(session, user_id=tg_user.id)
+        if app.status == "confirmed":
+            await message.answer(REFRESH_SAVED)
+            return
+        first_field = await next_field_id(session, user_id=tg_user.id, application_id=app.id)
+    except IntroWorkflowError:
+        await message.answer(REFRESH_NOT_MEMBER)
         return
-
-    # Mark old questionnaire answers as not current
-    await QuestionnaireRepo.mark_not_current(session, tg_user.id)
-
-    # Create a new application for the refresh flow
-    app = await ApplicationRepo.create(session, tg_user.id)
+    if first_field is None:
+        await _show_confirm(message, state, session, tg_user.id, app.id)
+        return
+    first_idx = FIELD_IDS.index(first_field)
     await state.clear()
-    await state.update_data(
-        application_id=app.id,
-        is_existing_member=True,
-        is_refresh=True,
-    )
-    await state.set_state(QuestionnaireForm.q1_name)
-    await message.answer(REFRESH_START.format(question=QUESTIONS[0]))
+    await state.update_data(application_id=app.id)
+    await state.set_state(STATES_LIST[first_idx])
+    await message.answer(REFRESH_START.format(question=QUESTIONS[first_idx]))
 
 
 async def _show_confirm(
@@ -169,7 +190,9 @@ async def _show_confirm(
 ) -> None:
     from bot.handlers.questionnaire import build_intro_preview
 
-    answers = await QuestionnaireRepo.get_answers(session, user_id, application_id=application_id)
+    from bot.db.repos.questionnaire import QuestionnaireRepo
+
+    answers = await QuestionnaireRepo.get_by_application(session, application_id=application_id)
     intro_text = build_intro_preview(answers)
     from bot.texts import CONFIRM_PROMPT
     from bot.keyboards.inline import confirm_keyboard
@@ -177,5 +200,5 @@ async def _show_confirm(
     await state.set_state(QuestionnaireForm.confirm)
     await message.answer(
         CONFIRM_PROMPT.format(intro_text=intro_text),
-        reply_markup=confirm_keyboard(),
+        reply_markup=confirm_keyboard(application_id, intro_digest(intro_text)),
     )
