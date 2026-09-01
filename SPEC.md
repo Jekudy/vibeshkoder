@@ -164,11 +164,13 @@ Index: `(chat_id, message_id)` UNIQUE
 |---|---|---|---|
 | `id` | SERIAL | PK | |
 | `user_id` | BIGINT | FK → users.id | |
-| `cycle_started_at` | TIMESTAMPTZ | NOT NULL | |
-| `reminders_sent` | SMALLINT | DEFAULT 0 | |
-| `last_reminder_at` | TIMESTAMPTZ | NULLABLE | |
-| `phase` | VARCHAR(20) | NOT NULL | `daily`, `every_2_days`, `done` |
+| `cycle_started_at` | TIMESTAMPTZ | NOT NULL | Canonical shared wave timestamp |
+| `reminders_sent` | SMALLINT | DEFAULT 0 | `1` only after Telegram accepted the offer |
+| `last_reminder_at` | TIMESTAMPTZ | NULLABLE | Last successfully sent offer |
+| `phase` | VARCHAR(20) | NOT NULL | `claimed`, `offer_sent`, `send_failed`, `accepted`, `declined`, `started`, `cancelled` |
 | `completed` | BOOLEAN | DEFAULT false | |
+
+Unique constraint: `(user_id, cycle_started_at)`
 
 ### 2.7 Table: `vouch_log`
 
@@ -251,7 +253,7 @@ All messages in community chat → save to `chat_messages` (lowest priority hand
 
 - `/chatid` — reply with chat ID (group only)
 - `/stats` — funnel counts (private, admin only)
-- `/force_refresh` — trigger refresh cycle (admin only)
+- `/force_refresh` — process today's shared refresh wave (admin only)
 
 ## 5. Scheduled Jobs (APScheduler)
 
@@ -260,12 +262,15 @@ All messages in community chat → save to `chat_messages` (lowest priority hand
 - ≥72h pending → auto-reject, delete message, DM applicant
 - ≥48h pending (not yet notified) → DM admin + nudge newcomer
 
-### 5.2 Intro Refresh (daily at 10:00 UTC)
+### 5.2 Intro Refresh (1 March and 1 September at 10:00 Europe/Moscow)
 
-For each member with intro older than 90 days:
-- Phase `daily`: send reminder, up to 5 days
-- Phase `every_2_days`: 3 more reminders
-- Phase `done`: stop until next cycle
+- One shared wave date for all members; no catch-up between waves.
+- Eligible: current member with an intro, no active refresh, and at least five calendar months
+  since the last successfully sent offer. If no offer exists, use `intros.updated_at`.
+- Claim `(user_id, cycle_started_at)` before Telegram delivery. One delivery attempt per wave;
+  no reminders or retries.
+- The offer contains the folded current intro and Yes/No buttons. Yes opens block selection;
+  selected blocks are edited sequentially and unselected answers are copied into the durable draft.
 
 ### 5.3 Google Sheets Projection
 
@@ -305,7 +310,6 @@ class Settings(BaseSettings):
     WEB_BASE_URL: str
     VOUCH_TIMEOUT_HOURS: int = 72
     NUDGE_TIMEOUT_HOURS: int = 48
-    INTRO_REFRESH_DAYS: int = 90
 ```
 
 ## 10. Edge Cases

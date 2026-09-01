@@ -8,11 +8,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.db.models import Application
 from bot.db.repos.application import ApplicationRepo
 from bot.db.repos.intro import IntroRepo
 from bot.db.repos.user import UserRepo
 from bot.filters.chat_type import PrivateChatFilter
-from bot.services.intro_contract import get_intro_catalog, intro_digest
+from bot.services.intro_contract import get_intro_catalog
 from bot.services.intro_workflow import (
     IntroWorkflowError,
     next_field_id,
@@ -26,10 +27,8 @@ from bot.texts import (
     QUESTIONNAIRE_POSTED,
     REFRESH_NOT_MEMBER,
     REFRESH_SAVED,
-    REFRESH_START,
     RESUME_QUESTIONNAIRE,
     VOUCHED_PENDING,
-    WELCOME_EXISTING_MEMBER,
     WELCOME_NEW,
     QUESTIONS,
 )
@@ -102,25 +101,40 @@ async def cmd_start(
             await message.answer(VOUCHED_PENDING)
             return
 
+    active_refresh = await ApplicationRepo.get_active_refresh(session, tg_user.id)
+    if active_refresh is not None:
+        if not user.is_member:
+            await state.clear()
+            await message.answer(REFRESH_NOT_MEMBER)
+            return
+        await _resume_refresh(message, state, session, tg_user.id, active_refresh)
+        return
+
     # Check if member without intro → existing member flow
     intro = await IntroRepo.get(session, tg_user.id)
 
     if user.is_member and intro is None:
         app = await start_or_resume_refresh(session, user_id=tg_user.id)
-        if app.status == "confirmed":
-            await message.answer(REFRESH_SAVED)
-            return
-        first_field = await next_field_id(session, user_id=tg_user.id, application_id=app.id)
-        if first_field is None:
-            await _show_confirm(message, state, session, tg_user.id, app.id)
-            return
-        first_idx = FIELD_IDS.index(first_field)
-        await state.update_data(application_id=app.id)
-        await state.set_state(STATES_LIST[first_idx])
-        await message.answer(WELCOME_EXISTING_MEMBER.format(question=QUESTIONS[first_idx]))
+        await _resume_refresh(message, state, session, tg_user.id, app)
         return
 
     if user.is_member and intro is not None:
+        from bot.handlers.intro_refresh import (
+            pending_refresh_selection_context,
+            show_refresh_selection,
+        )
+
+        context = await pending_refresh_selection_context(session, tg_user.id)
+        if context is not None:
+            await state.clear()
+            await show_refresh_selection(
+                message,
+                session,
+                tg_user.id,
+                edit=False,
+                context=context,
+            )
+            return
         await message.answer(ALREADY_HAS_INTRO)
         return
 
@@ -163,22 +177,56 @@ async def cmd_refresh(
         return
 
     try:
-        app = await start_or_resume_refresh(session, user_id=tg_user.id)
-        if app.status == "confirmed":
-            await message.answer(REFRESH_SAVED)
+        active_refresh = await ApplicationRepo.get_active_refresh(session, tg_user.id)
+        if active_refresh is not None:
+            await _resume_refresh(message, state, session, tg_user.id, active_refresh)
             return
-        first_field = await next_field_id(session, user_id=tg_user.id, application_id=app.id)
+        intro = await IntroRepo.get(session, tg_user.id)
+        if intro is not None:
+            from bot.handlers.intro_refresh import (
+                pending_refresh_selection_context,
+                show_refresh_selection,
+            )
+
+            await state.clear()
+            await show_refresh_selection(
+                message,
+                session,
+                tg_user.id,
+                edit=False,
+                context=(await pending_refresh_selection_context(session, tg_user.id) or "manual"),
+            )
+            return
+        app = await start_or_resume_refresh(session, user_id=tg_user.id)
     except IntroWorkflowError:
         await message.answer(REFRESH_NOT_MEMBER)
         return
-    if first_field is None:
-        await _show_confirm(message, state, session, tg_user.id, app.id)
+    await _resume_refresh(message, state, session, tg_user.id, app)
+
+
+async def _resume_refresh(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    user_id: int,
+    application: Application,
+) -> None:
+    if application.status == "confirmed":
+        await message.answer(REFRESH_SAVED)
         return
-    first_idx = FIELD_IDS.index(first_field)
+    field_id = await next_field_id(session, user_id=user_id, application_id=application.id)
     await state.clear()
-    await state.update_data(application_id=app.id)
-    await state.set_state(STATES_LIST[first_idx])
-    await message.answer(REFRESH_START.format(question=QUESTIONS[first_idx]))
+    from bot.handlers.intro_refresh import show_refresh_step
+
+    await show_refresh_step(
+        message,
+        state,
+        session,
+        user_id=user_id,
+        application_id=application.id,
+        field_id=field_id,
+        edit=False,
+    )
 
 
 async def _show_confirm(
@@ -188,17 +236,13 @@ async def _show_confirm(
     user_id: int,
     application_id: int,
 ) -> None:
-    from bot.handlers.questionnaire import build_intro_preview
+    from bot.handlers.questionnaire import show_confirm
 
-    from bot.db.repos.questionnaire import QuestionnaireRepo
-
-    answers = await QuestionnaireRepo.get_by_application(session, application_id=application_id)
-    intro_text = build_intro_preview(answers)
-    from bot.texts import CONFIRM_PROMPT
-    from bot.keyboards.inline import confirm_keyboard
-
-    await state.set_state(QuestionnaireForm.confirm)
-    await message.answer(
-        CONFIRM_PROMPT.format(intro_text=intro_text),
-        reply_markup=confirm_keyboard(application_id, intro_digest(intro_text)),
+    await show_confirm(
+        message,
+        state,
+        session,
+        user_id,
+        application_id,
+        edit=False,
     )

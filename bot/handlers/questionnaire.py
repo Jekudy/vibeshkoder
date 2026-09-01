@@ -7,7 +7,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import QuestionnaireAnswer
+from bot.db.models import Application, QuestionnaireAnswer
+from bot.db.repos.application import ApplicationRepo
 from bot.db.repos.questionnaire import QuestionnaireRepo
 from bot.filters.chat_type import PrivateChatFilter
 from bot.keyboards.inline import (
@@ -19,7 +20,9 @@ from bot.services.intro_workflow import (
     IntroWorkflowError,
     InvalidReferralAnswer,
     confirm_application,
+    cancel_refresh,
     reset_draft,
+    verify_refresh_preview,
     write_answer,
 )
 from bot.states.questionnaire import STATES_LIST, QuestionnaireForm
@@ -30,6 +33,7 @@ from bot.texts import (
     NOT_TEXT_ERROR,
     QUESTIONS,
     QUESTIONNAIRE_POSTED,
+    REFRESH_CANCELLED,
     REFRESH_SAVED,
 )
 
@@ -131,19 +135,63 @@ async def handle_answer(
         return
 
     # Advance to next state or confirm
+    application = await session.get(Application, application_id)
     if next_field_id is not None:
+        if application is not None and application.flow_kind == "refresh":
+            from bot.handlers.intro_refresh import show_refresh_step
+
+            await show_refresh_step(
+                message,
+                state,
+                session,
+                user_id=message.from_user.id,
+                application_id=application_id,
+                field_id=next_field_id,
+                edit=False,
+            )
+            return
         next_idx = FIELD_IDS.index(next_field_id)
         await state.set_state(STATES_LIST[next_idx])
         await message.answer(NEXT_QUESTION.format(question=QUESTIONS[next_idx]))
     else:
-        # All questions answered → show confirmation
-        answers = await QuestionnaireRepo.get_by_application(session, application_id=application_id)
-        intro_text = build_intro_preview(answers)
-        await state.set_state(QuestionnaireForm.confirm)
-        await message.answer(
-            CONFIRM_PROMPT.format(intro_text=intro_text),
-            reply_markup=confirm_keyboard(application_id, intro_digest(intro_text)),
+        await show_confirm(
+            message,
+            state,
+            session,
+            message.from_user.id,
+            application_id,
+            edit=False,
         )
+
+
+async def show_confirm(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    user_id: int,
+    application_id: int,
+    *,
+    edit: bool,
+) -> None:
+    application = await ApplicationRepo.get(session, application_id)
+    if application is None or application.user_id != user_id:
+        raise IntroWorkflowError("Questionnaire is not owned by this user")
+    answers = await QuestionnaireRepo.get_by_application(session, application_id=application_id)
+    intro_text = build_intro_preview(answers)
+    await state.set_state(QuestionnaireForm.confirm)
+    markup = confirm_keyboard(
+        application_id,
+        intro_digest(intro_text),
+        redo_text=(
+            "Изменить выбор блоков" if application.flow_kind == "refresh" else "Заполнить заново 🔄"
+        ),
+        cancel_text="Отменить обновление" if application.flow_kind == "refresh" else None,
+    )
+    text = CONFIRM_PROMPT.format(intro_text=intro_text)
+    if edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
 
 
 # ── Non-text message error for question states ──────────────────────
@@ -194,7 +242,52 @@ async def handle_confirm(
     if callback.from_user is None or callback.message is None:
         return
 
+    if callback_data.action == "cancel":
+        try:
+            application = await verify_refresh_preview(
+                session,
+                user_id=callback.from_user.id,
+                application_id=callback_data.application_id,
+                digest=callback_data.digest,
+            )
+            await cancel_refresh(
+                session,
+                user_id=callback.from_user.id,
+                application_id=application.id,
+            )
+        except IntroWorkflowError:
+            await callback.answer("Эта анкета устарела. Запусти /refresh ещё раз.")
+            return
+        await state.clear()
+        await callback.message.edit_text(REFRESH_CANCELLED)
+        await callback.answer()
+        return
+
     if callback_data.action == "redo":
+        application = await ApplicationRepo.get(session, callback_data.application_id)
+        if application is not None and application.flow_kind == "refresh":
+            try:
+                await verify_refresh_preview(
+                    session,
+                    user_id=callback.from_user.id,
+                    application_id=callback_data.application_id,
+                    digest=callback_data.digest,
+                )
+                await state.clear()
+                from bot.handlers.intro_refresh import show_refresh_selection
+
+                await show_refresh_selection(
+                    callback.message,
+                    session,
+                    callback.from_user.id,
+                    edit=True,
+                    context=(f"a{callback_data.application_id}.{callback_data.digest}"),
+                )
+            except IntroWorkflowError:
+                await callback.answer("Эта анкета устарела. Запусти /refresh ещё раз.")
+                return
+            await callback.answer()
+            return
         try:
             next_field_id = await reset_draft(
                 session,

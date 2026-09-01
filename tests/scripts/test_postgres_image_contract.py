@@ -44,7 +44,7 @@ def test_ci_smokes_image_and_release_publishes_commit_bound_db_image() -> None:
         if step.get("name") == "Verify PostgreSQL and pgvector"
     )
     assert re.search(
-        r'"SELECT version_num FROM alembic_version"\)" = "091"',
+        r'"SELECT version_num FROM alembic_version"\)" = "092"',
         postgres_smoke_script,
     )
     assert "ck_semantic_attempts_state" in ci_text
