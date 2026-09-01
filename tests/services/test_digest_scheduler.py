@@ -311,6 +311,14 @@ async def test_digest_daily_job_registers_in_scheduler(monkeypatch):
         # Reaper also registered.
         reaper_job = scheduler_mod.scheduler.get_job("digest_stale_posting_reaper")
         assert reaper_job is not None
+        intro_job = scheduler_mod.scheduler.get_job("check_intro_refresh")
+        assert intro_job is not None
+        intro_fields = {field.name: str(field) for field in intro_job.trigger.fields}
+        assert str(intro_job.trigger.timezone) == "Europe/Moscow"
+        assert intro_fields["month"] == "3,9"
+        assert intro_fields["day"] == "1"
+        assert intro_fields["hour"] == "10"
+        assert intro_fields["minute"] == "0"
     finally:
         # Restore + clear registered jobs to avoid bleed into other tests.
         scheduler_mod.scheduler.start = real_start  # type: ignore[assignment]

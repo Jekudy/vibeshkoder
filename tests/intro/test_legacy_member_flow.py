@@ -68,6 +68,11 @@ def test_refresh_confirmed_application_acknowledges_queue_without_resuming_quest
     start_refresh = AsyncMock(return_value=_application(status="confirmed", flow_kind="refresh"))
     next_missing = AsyncMock()
     monkeypatch.setattr(handler.UserRepo, "upsert", AsyncMock(return_value=_user(is_member=True)))
+    monkeypatch.setattr(
+        handler.ApplicationRepo,
+        "get_active_refresh",
+        AsyncMock(return_value=_application(status="confirmed", flow_kind="refresh")),
+    )
     monkeypatch.setattr(handler, "start_or_resume_refresh", start_refresh)
     monkeypatch.setattr(handler, "next_field_id", next_missing)
 
@@ -90,6 +95,7 @@ def test_member_without_intro_confirmed_refresh_start_acknowledges_queue(
     next_missing = AsyncMock()
     monkeypatch.setattr(handler.UserRepo, "upsert", AsyncMock(return_value=_user(is_member=True)))
     monkeypatch.setattr(handler.ApplicationRepo, "get_active", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler.ApplicationRepo, "get_active_refresh", AsyncMock(return_value=None))
     monkeypatch.setattr(handler.IntroRepo, "get", AsyncMock(return_value=None))
     monkeypatch.setattr(handler, "start_or_resume_refresh", start_refresh)
     monkeypatch.setattr(handler, "next_field_id", next_missing)
@@ -98,6 +104,53 @@ def test_member_without_intro_confirmed_refresh_start_acknowledges_queue(
 
     message.answer.assert_awaited_once_with(texts.REFRESH_SAVED)
     next_missing.assert_not_awaited()
+
+
+def test_start_returns_to_pending_wave_selection(app_env, monkeypatch) -> None:
+    handler = import_module("bot.handlers.start")
+    refresh_handler = import_module("bot.handlers.intro_refresh")
+    message = _message()
+    state = AsyncMock()
+    session = AsyncMock()
+    monkeypatch.setattr(handler.UserRepo, "upsert", AsyncMock(return_value=_user(is_member=True)))
+    monkeypatch.setattr(handler.ApplicationRepo, "get_active", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler.ApplicationRepo, "get_active_refresh", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler.IntroRepo, "get", AsyncMock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(
+        refresh_handler,
+        "pending_refresh_selection_context",
+        AsyncMock(return_value="w20260901"),
+    )
+    show = AsyncMock()
+    monkeypatch.setattr(refresh_handler, "show_refresh_selection", show)
+
+    asyncio.run(handler.cmd_start(message, state, session))
+
+    state.clear.assert_awaited_once()
+    show.assert_awaited_once_with(message, session, 111, edit=False, context="w20260901")
+    message.answer.assert_not_awaited()
+
+
+def test_start_refuses_to_resume_refresh_after_membership_is_lost(app_env, monkeypatch) -> None:
+    handler = import_module("bot.handlers.start")
+    texts = import_module("bot.texts")
+    message = _message()
+    state = AsyncMock()
+    session = AsyncMock()
+    refresh = _application(status="filling", flow_kind="refresh")
+    monkeypatch.setattr(handler.UserRepo, "upsert", AsyncMock(return_value=_user(is_member=False)))
+    monkeypatch.setattr(handler.ApplicationRepo, "get_active", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        handler.ApplicationRepo, "get_active_refresh", AsyncMock(return_value=refresh)
+    )
+    resume = AsyncMock()
+    monkeypatch.setattr(handler, "_resume_refresh", resume)
+
+    asyncio.run(handler.cmd_start(message, state, session))
+
+    state.clear.assert_awaited_once()
+    message.answer.assert_awaited_once_with(texts.REFRESH_NOT_MEMBER)
+    resume.assert_not_awaited()
 
 
 @pytest.mark.parametrize("legacy", ["confirm:yes", "confirm:redo"])

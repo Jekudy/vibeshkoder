@@ -1167,13 +1167,18 @@ class SemanticRetrievalTrace(Base):
 
 class IntroRefreshTracking(Base):
     __tablename__ = "intro_refresh_tracking"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "cycle_started_at", name="uq_intro_refresh_tracking_user_cycle"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     cycle_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     reminders_sent: Mapped[int] = mapped_column(SmallInteger, default=0)
     last_reminder_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    phase: Mapped[str] = mapped_column(String(20))  # daily, every_2_days, done
+    phase: Mapped[str] = mapped_column(String(20))
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
 
 

@@ -113,7 +113,7 @@ async def test_head_clean_upgrade_removes_review_columns(migration_database_url:
     _alembic(migration_database_url, "upgrade", "head")
     conn = await _connect(migration_database_url)
     try:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "091"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "092"
         columns = await conn.fetch(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name='digests' AND column_name = ANY($1::text[])",
@@ -243,11 +243,11 @@ async def test_090_downgrade_restores_079_relaxed_approval_audit(
         await conn.close()
 
 
-async def test_alembic_head_is_091(migration_database_url: str) -> None:
+async def test_alembic_head_is_092(migration_database_url: str) -> None:
     _alembic(migration_database_url, "upgrade", "head")
     conn = await _connect(migration_database_url)
     try:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "091"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "092"
     finally:
         await conn.close()
 

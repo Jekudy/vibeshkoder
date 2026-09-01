@@ -21,6 +21,7 @@ from bot.handlers import (
     digest,
     edited_message,
     forward_lookup,
+    intro_refresh,
     questionnaire,
     qa,
     start,
@@ -180,6 +181,7 @@ async def main() -> None:
     # Include routers (order matters — more specific first)
     dp.include_routers(
         start.router,
+        intro_refresh.router,
         questionnaire.router,
         vouch.router,
         admin.router,

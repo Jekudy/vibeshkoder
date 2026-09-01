@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select
+from sqlalchemy import update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from bot.config import settings
@@ -19,11 +21,18 @@ from bot.db.repos.llm_usage_ledger import LedgerRepo
 from bot.db.repos.user import UserRepo
 from bot.html_escape import html_escape
 from bot.db.repos.butler_action import ButlerActionRepo
+from bot.keyboards.inline import intro_refresh_offer_keyboard
 from bot.services.extractor import extraction_scheduler_tick
 from bot.services.graph_projector import default_projector_config, project_incremental
 from bot.services.graph_purge_worker import graph_purge_worker_tick
 from bot.services.image_memory import process_next_pending_photo
 from bot.services.intro_effect_worker import process_intro_effects
+from bot.services.intro_refresh_wave import (
+    calendar_months_before,
+    split_expandable_template,
+    wave_started_at,
+    wave_token,
+)
 from bot.services.invite_worker import process_invite_outbox
 from bot.services.llm_gateway import (
     LiveExtractCandidatesGateway,
@@ -209,78 +218,87 @@ async def photo_description_worker_job(bot: Bot) -> None:
         )
 
 
-async def check_intro_refresh(bot: Bot) -> None:
-    """Daily job: remind members with stale intros to refresh."""
+async def check_intro_refresh(bot: Bot, *, now: datetime | None = None) -> int | None:
+    """Offer one refresh on the shared wave date; never retry that wave."""
+    current_time = now or datetime.now(timezone.utc)
+    wave = wave_started_at(current_time)
+    if wave is None:
+        return None
+
     async with async_session() as session:
-        stale_intros = await IntroRepo.get_stale_intros(session, settings.INTRO_REFRESH_DAYS)
-        now = datetime.now(timezone.utc)
-
-        for intro in stale_intros:
-            # Check if tracking record exists
-            result = await session.execute(
-                select(IntroRefreshTracking).where(
-                    IntroRefreshTracking.user_id == intro.user_id,
-                    IntroRefreshTracking.completed.is_(False),
+        intros = await IntroRepo.get_refresh_wave_candidates(
+            session, cutoff=calendar_months_before(wave, 5)
+        )
+        sent = 0
+        for intro in intros:
+            try:
+                claim = await session.execute(
+                    insert(IntroRefreshTracking)
+                    .values(
+                        user_id=intro.user_id,
+                        cycle_started_at=wave,
+                        reminders_sent=0,
+                        phase="claimed",
+                        completed=False,
+                    )
+                    .on_conflict_do_nothing(constraint="uq_intro_refresh_tracking_user_cycle")
+                    .returning(IntroRefreshTracking.id)
                 )
-            )
-            tracking = result.scalar_one_or_none()
-
-            if tracking is None:
-                # Start new cycle
-                tracking = IntroRefreshTracking(
-                    user_id=intro.user_id,
-                    cycle_started_at=now,
-                    reminders_sent=0,
-                    phase="daily",
-                    completed=False,
-                )
-                session.add(tracking)
-                await session.flush()
-
-            if tracking.completed:
-                continue
-
-            # Determine if we should send a reminder today
-            should_send = False
-
-            if tracking.phase == "daily":
-                if tracking.reminders_sent < 5:
-                    if (
-                        tracking.last_reminder_at is None
-                        or (now - tracking.last_reminder_at).days >= 1
-                    ):
-                        should_send = True
-                else:
-                    # Move to every_2_days
-                    tracking.phase = "every_2_days"
-                    await session.flush()
-
-            if tracking.phase == "every_2_days":
-                if tracking.reminders_sent < 8:  # 5 daily + 3 every_2_days
-                    if (
-                        tracking.last_reminder_at is None
-                        or (now - tracking.last_reminder_at).days >= 2
-                    ):
-                        should_send = True
-                else:
-                    tracking.phase = "done"
-                    tracking.completed = True
-                    await session.flush()
+                tracking_id = claim.scalar_one_or_none()
+                await session.commit()
+                if tracking_id is None:
                     continue
 
-            if should_send:
+                parts = split_expandable_template(REFRESH_PROMPT, intro.intro_text)
                 try:
-                    await bot.send_message(chat_id=intro.user_id, text=REFRESH_PROMPT)
-                    tracking.reminders_sent += 1
-                    tracking.last_reminder_at = now
-                    await session.flush()
-                except Exception:
-                    logger.warning(
-                        "Failed to send refresh reminder to user %s",
-                        intro.user_id,
+                    for index, text in enumerate(parts):
+                        await bot.send_message(
+                            chat_id=intro.user_id,
+                            text=text,
+                            reply_markup=(
+                                intro_refresh_offer_keyboard(wave_token(wave))
+                                if index == len(parts) - 1
+                                else None
+                            ),
+                        )
+                except TelegramAPIError as error:
+                    await session.execute(
+                        update(IntroRefreshTracking)
+                        .where(IntroRefreshTracking.id == tracking_id)
+                        .values(phase="send_failed", completed=True)
                     )
+                    await session.commit()
+                    logger.warning(
+                        "intro_refresh_wave_send_failed",
+                        extra={
+                            "user_id": intro.user_id,
+                            "error_class": type(error).__name__,
+                        },
+                    )
+                    continue
 
-        await session.commit()
+                await session.execute(
+                    update(IntroRefreshTracking)
+                    .where(IntroRefreshTracking.id == tracking_id)
+                    .values(
+                        reminders_sent=1,
+                        last_reminder_at=datetime.now(timezone.utc),
+                        phase="offer_sent",
+                        completed=True,
+                    )
+                )
+                await session.commit()
+                sent += 1
+            except SQLAlchemyError as error:
+                await session.rollback()
+                logger.error(
+                    "intro_refresh_wave_candidate_database_failed",
+                    extra={
+                        "user_id": intro.user_id,
+                        "error_class": type(error).__name__,
+                    },
+                )
+        return sent
 
 
 async def run_extraction_scheduler_tick() -> None:
@@ -1105,11 +1123,16 @@ def start_scheduler(bot: Bot) -> None:
     scheduler.add_job(
         check_intro_refresh,
         "cron",
+        month="3,9",
+        day=1,
         hour=10,
         minute=0,
+        timezone="Europe/Moscow",
         args=[bot],
         id="check_intro_refresh",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     from bot.services.sheets import _is_configured, project_intro_to_sheet
 

@@ -67,7 +67,7 @@ jobs:
           alembic upgrade head
           test "$(docker exec shkoder-postgres-smoke \
             psql -U vibe -d vibe_gatekeeper -Atqc \
-              "SELECT version_num FROM alembic_version")" = "091"
+              "SELECT version_num FROM alembic_version")" = "092"
           test "$(docker exec shkoder-postgres-smoke \
             psql -U vibe -d vibe_gatekeeper -Atqc \
               "SELECT count(*) FROM information_schema.columns \
