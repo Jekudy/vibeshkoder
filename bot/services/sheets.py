@@ -72,10 +72,9 @@ def _get_sheet() -> gspread.Worksheet | None:
 
 def _find_row_by_telegram_id(worksheet: gspread.Worksheet, user_id: int) -> int | None:
     """Return the 1-based row containing ``user_id``, if it exists."""
-    try:
-        return worksheet.find(str(user_id), in_column=1).row
-    except gspread.exceptions.CellNotFound:
-        return None
+    # gspread>=6: find() returns None instead of raising CellNotFound (#494)
+    cell = worksheet.find(str(user_id), in_column=1)
+    return cell.row if cell is not None else None
 
 
 def _project_row(

@@ -317,6 +317,17 @@ async def test_sheet_snapshot_uses_field_ids_not_shuffled_legacy_indexes(
     assert project_sheet.await_args.kwargs["answers_by_field_id"] == dict(PREDKO_ANSWERS)
 
 
+@pytest.mark.parametrize("found_row", [None, 7])
+def test_find_row_by_telegram_id_handles_gspread6_none(app_env, found_row) -> None:
+    """gspread>=6 ``find()`` returns ``None`` for a missing cell instead of raising (#494)."""
+    sheets = import_module("bot.services.sheets")
+    worksheet = MagicMock()
+    worksheet.find.return_value = None if found_row is None else MagicMock(row=found_row)
+
+    assert sheets._find_row_by_telegram_id(worksheet, 12345) == found_row
+    worksheet.find.assert_called_once_with("12345", in_column=1)
+
+
 @pytest.mark.parametrize("row_number", [None, 7])
 def test_sheet_writes_formula_like_values_as_raw_literals(app_env, monkeypatch, row_number) -> None:
     sheets = import_module("bot.services.sheets")
