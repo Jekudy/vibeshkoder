@@ -1,621 +1,460 @@
-"""Tests for bot/services/digests.py + synthesize_digest gateway extension.
-
-T7-02 / Phase 7 Wave 1. Covers:
-- load_digest_config env-var parsing
-- citation token parsing (drop card, drop hallucinated)
-- bullet-level citation invariant
-- run_digest idempotency
-- run_digest empty-window skip
-- run_digest cost ceiling (separate Phase 7 bucket)
-- run_digest happy path
-- run_digest rejects weekly
-- synthesize_digest EMPTY_WINDOW handling
-- synthesize_digest hallucinated drop + bullet invariant raise
-"""
+"""Issue #406 orchestration and 1–3-call structured pipeline tests."""
 
 from __future__ import annotations
 
 import itertools
-import uuid
-from datetime import datetime, timezone, timedelta
+import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 pytestmark = pytest.mark.usefixtures("app_env")
 
-COMMUNITY_CHAT_ID = -1001234567890
-
-_user_counter = itertools.count(start=8_300_000_000)
-_msg_counter = itertools.count(start=830_000)
-_chat_counter = itertools.count(start=8300)
+_users = itertools.count(8_300_000_000)
+_messages = itertools.count(830_000)
+_chats = itertools.count(8300)
 
 
-def _next_uid() -> int:
-    return next(_user_counter)
+def _chat_id() -> int:
+    return -1_000_000_000_000 - next(_chats)
 
 
-def _next_msg_id() -> int:
-    return next(_msg_counter)
-
-
-def _next_chat_id() -> int:
-    return -1_000_000_000_000 - next(_chat_counter)
-
-
-# ── helpers ──────────────────────────────────────────────────────────────────
-
-
-async def _make_user(db_session) -> int:
+async def _make_message(session, *, chat_id: int, ts: datetime, text: str) -> tuple[int, int, int]:
+    from bot.db.models import ChatMessage, MessageVersion
     from bot.db.repos.user import UserRepo
 
-    uid = _next_uid()
+    user_id = next(_users)
     await UserRepo.upsert(
-        db_session,
-        telegram_id=uid,
-        username=f"u{uid}",
-        first_name="T",
-        last_name=None,
+        session,
+        telegram_id=user_id,
+        username=f"u{user_id}",
+        first_name="Женя",
+        last_name="Кудрявцев",
     )
-    return uid
-
-
-async def _make_msg_and_version(
-    db_session,
-    *,
-    chat_id: int,
-    ts: datetime,
-    text: str = "hello",
-    memory_policy: str = "normal",
-    is_redacted: bool = False,
-) -> tuple[int, int]:
-    from bot.db.models import ChatMessage, MessageVersion
-
-    uid = await _make_user(db_session)
-    msg_id = _next_msg_id()
-    msg = ChatMessage(
-        message_id=msg_id,
+    telegram_message_id = next(_messages)
+    message = ChatMessage(
+        message_id=telegram_message_id,
         chat_id=chat_id,
-        user_id=uid,
+        user_id=user_id,
         text=text,
         date=ts,
         raw_json={"text": text},
-        memory_policy=memory_policy,
+        memory_policy="normal",
         is_redacted=False,
+        message_kind="text",
     )
-    db_session.add(msg)
-    await db_session.flush()
-    mv = MessageVersion(
-        chat_message_id=msg.id,
+    session.add(message)
+    await session.flush()
+    version = MessageVersion(
+        chat_message_id=message.id,
         version_seq=1,
         text=text,
         normalized_text=text,
         entities_json={"entities": []},
-        content_hash=f"hash-{msg_id}",
-        is_redacted=is_redacted,
+        content_hash=f"digest-run-{telegram_message_id}",
+        is_redacted=False,
     )
-    db_session.add(mv)
-    await db_session.flush()
-    msg.current_version_id = mv.id
-    await db_session.flush()
-    return msg.id, mv.id
+    session.add(version)
+    await session.flush()
+    message.current_version_id = version.id
+    await session.flush()
+    return message.id, version.id, telegram_message_id
 
 
-async def _make_approved_card(db_session, *, mv_ids: list[int]) -> uuid.UUID:
-    from bot.db.models import KnowledgeCard, CardSource
-
-    uid = await _make_user(db_session)
-    card = KnowledgeCard(
-        title="Test Card",
-        body_markdown="card body",
-        card_status="approved",
-        approved_by_user_id=uid,
-        approved_at=datetime.now(timezone.utc),
-    )
-    db_session.add(card)
-    await db_session.flush()
-    for mv_id in mv_ids:
-        cs = CardSource(card_id=card.id, message_version_id=mv_id)
-        db_session.add(cs)
-    await db_session.flush()
-    return card.id
-
-
-def _make_gateway_config() -> "LLMGatewayConfig":  # noqa: F821
+def _gateway_config():
     from bot.services.llm_gateway import LLMGatewayConfig
 
     return LLMGatewayConfig(
-        provider="anthropic",
-        model="claude-haiku-4-5-20251001",
-        daily_ceiling_usd=Decimal("10.00"),
-        monthly_ceiling_usd=Decimal("100.00"),
-        prompt_template_version="digest-v0.1.0",
+        provider="openai",
+        model="gpt-5.6-sol",
+        daily_ceiling_usd=Decimal("100"),
+        monthly_ceiling_usd=Decimal("1000"),
+        prompt_template_version="digest-v0.5.0",
     )
 
 
-def _make_digest_config(**overrides) -> "DigestConfig":  # noqa: F821
-    from bot.services.digests import DigestConfig
+def test_message_payload_keeps_absent_username_for_display_name_fallback() -> None:
+    from bot.services.llm_prompts.digest_v0_1_0 import message_payload
 
-    defaults = {
-        "daily_cost_ceiling_usd": Decimal("1.00"),
-        "monthly_cost_ceiling_usd": Decimal("10.00"),
-        "source_chat_id": 0,
-        "destination_chat_id": None,
-        "hour_msk": 9,
-        "min_cards_threshold": 3,
-        "raw_message_top_n": 15,
-        "token_budget_input": 8000,
-    }
-    defaults.update(overrides)
-    return DigestConfig(**defaults)
+    payload = message_payload(
+        SimpleNamespace(
+            message_version_id=1,
+            author_display="Женя Кудрявцев",
+            text="Сообщение",
+            ts=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        )
+    )
+
+    assert payload["author_display"] == "Женя Кудрявцев"
+    assert payload["author_username"] is None
 
 
-class _StubProvider:
-    """Test provider — returns canned answer_text."""
+class _StructuredProvider:
+    def __init__(self, responses: list[dict] | None = None) -> None:
+        self.responses = responses or []
+        self.calls: list[dict] = []
 
-    def __init__(
-        self,
-        *,
-        answer_text: str,
-        tokens_in: int = 100,
-        tokens_out: int = 50,
-        raise_on_call: Exception | None = None,
-    ):
-        self.answer_text = answer_text
-        self.tokens_in = tokens_in
-        self.tokens_out = tokens_out
-        self.raise_on_call = raise_on_call
-        self.calls = 0
-
-    async def call(self, *, prompt: str, model: str):
+    async def call_structured(self, **kwargs):
         from bot.services.llm_providers import ProviderResult
 
-        self.calls += 1
-        if self.raise_on_call is not None:
-            raise self.raise_on_call
+        self.calls.append(kwargs)
+        if len(self.calls) > len(self.responses):
+            raise AssertionError("unexpected digest provider call")
         return ProviderResult(
-            answer_text=self.answer_text,
+            answer_text=json.dumps(self.responses[len(self.calls) - 1], ensure_ascii=False),
             citation_ids=(),
-            tokens_in=self.tokens_in,
-            tokens_out=self.tokens_out,
-            request_id=f"req-{self.calls}",
-            raw_latency_ms=10,
+            tokens_in=200,
+            tokens_out=100,
+            request_id=f"digest-{len(self.calls)}",
+            raw_latency_ms=1,
         )
 
 
-# ── unit tests ───────────────────────────────────────────────────────────────
+def _draft(*, message_version_id: int, publish: bool = True) -> dict:
+    if not publish:
+        return {
+            "publish": False,
+            "layout": "none",
+            "sections": [],
+            "closing": {"text": "", "citations": []},
+        }
+    token = f"[[mv:{message_version_id}]]"
+    return {
+        "publish": True,
+        "layout": "flat",
+        "sections": [
+            {
+                "heading": "",
+                "items": [
+                    {
+                        "text": "@zhenya сравнил две версии",
+                        "details": "@zhenya сравнил версии 5.6 и 5.7.",
+                        "citations": [token],
+                    }
+                ],
+            }
+        ],
+        "closing": {
+            "text": "У версий наконец появился повод познакомиться",
+            "citations": [token],
+        },
+    }
 
 
-def test_load_digest_config_reads_env_vars(monkeypatch):
-    monkeypatch.setenv("DIGEST_DAILY_USD_CEILING", "2.50")
-    monkeypatch.setenv("DIGEST_MONTHLY_USD_CEILING", "25.00")
-    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", str(COMMUNITY_CHAT_ID))
-    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", str(COMMUNITY_CHAT_ID))
-    monkeypatch.setenv("DIGEST_HOUR_MSK", "11")
-    monkeypatch.setenv("DIGEST_MIN_CARDS_THRESHOLD", "5")
-    monkeypatch.setenv("DIGEST_RAW_MESSAGE_TOP_N", "20")
-    monkeypatch.setenv("DIGEST_TOKEN_BUDGET_INPUT", "4000")
-
-    from bot.services.digests import load_digest_config
-
-    cfg = load_digest_config()
-    assert cfg.daily_cost_ceiling_usd == Decimal("2.50")
-    assert cfg.monthly_cost_ceiling_usd == Decimal("25.00")
-    assert cfg.source_chat_id == COMMUNITY_CHAT_ID
-    assert cfg.destination_chat_id == COMMUNITY_CHAT_ID
-    assert cfg.hour_msk == 11
-    assert cfg.min_cards_threshold == 5
-    assert cfg.raw_message_top_n == 20
-    assert cfg.token_budget_input == 4000
+def _verifier(*, item_action="keep", item_reason="ok", closing_action="keep", closing_reason="ok"):
+    return {
+        "items": [
+            {"item_key": "item_1", "verdict": f"{item_action}_{item_reason}"},
+            {"item_key": "item_1_details", "verdict": "keep_ok"},
+            {"item_key": "closing", "verdict": f"{closing_action}_{closing_reason}"},
+        ]
+    }
 
 
-def test_load_digest_config_allows_community_as_src_and_dst(monkeypatch):
-    """The configured community is both source and publication chat."""
-    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", str(COMMUNITY_CHAT_ID))
-    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", str(COMMUNITY_CHAT_ID))
+async def _context(session, *, digest_type: str = "daily"):
+    from bot.services.digest_context import DigestContext, DigestContextMessage
 
-    from bot.services.digests import load_digest_config
-
-    config = load_digest_config()
-
-    assert config.source_chat_id == COMMUNITY_CHAT_ID
-    assert config.destination_chat_id == COMMUNITY_CHAT_ID
-
-
-def test_load_digest_config_rejects_equal_non_community_route(monkeypatch):
-    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", "-1009999999999")
-    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", "-1009999999999")
-
-    from bot.services.digests import load_digest_config
-
-    with pytest.raises(ValueError, match="COMMUNITY_CHAT_ID"):
-        load_digest_config()
-
-
-def test_load_digest_config_requires_both_chat_ids(monkeypatch):
-    from bot.services.digests import load_digest_config
-
-    monkeypatch.delenv("DIGEST_SOURCE_CHAT_ID", raising=False)
-    monkeypatch.delenv("DIGEST_DESTINATION_CHAT_ID", raising=False)
-
-    with pytest.raises(ValueError, match="DIGEST_SOURCE_CHAT_ID"):
-        load_digest_config()
-
-
-@pytest.mark.parametrize(
-    ("source", "destination", "error"),
-    [
-        ("0", "0", "negative"),
-        ("12345", "12345", "negative"),
-        ("-12345", "-67890", "same chat"),
-    ],
-)
-def test_load_digest_config_rejects_unsafe_chat_routes(
-    monkeypatch,
-    source: str,
-    destination: str,
-    error: str,
-):
-    from bot.services.digests import load_digest_config
-
-    monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", source)
-    monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", destination)
-
-    with pytest.raises(ValueError, match=error):
-        load_digest_config()
-
-
-def test_parse_citations_drops_card_kind_token():
-    from bot.services.llm_gateway import _parse_digest_citations
-
-    body = "TL;DR\n\n- Topic [[card:abc-uuid]] body"
-    citations, dropped = _parse_digest_citations(
-        body, valid_card_source_ids=frozenset(), valid_mv_ids=frozenset()
+    chat_id = _chat_id()
+    start = datetime(2026, 7, 20, 2, tzinfo=timezone.utc)
+    message_id, version_id, telegram_message_id = await _make_message(
+        session,
+        chat_id=chat_id,
+        ts=start + timedelta(hours=4),
+        text="Сравнил версии 5.6 и 5.7",
     )
-    assert citations == []
-    assert "[[card:abc-uuid]]" in dropped
-
-
-def test_parse_citations_drops_hallucinated_mv():
-    from bot.services.llm_gateway import _parse_digest_citations
-
-    body = "- Topic [[mv:99999]] something"
-    citations, dropped = _parse_digest_citations(
-        body, valid_card_source_ids=frozenset(), valid_mv_ids=frozenset({123})
-    )
-    assert citations == []
-    assert "[[mv:99999]]" in dropped
-
-
-def test_parse_citations_keeps_valid_mv():
-    from bot.services.llm_gateway import _parse_digest_citations
-
-    body = "- Topic [[mv:123]]"
-    citations, _dropped = _parse_digest_citations(
-        body, valid_card_source_ids=frozenset(), valid_mv_ids=frozenset({123})
-    )
-    assert len(citations) == 1
-    assert citations[0]["kind"] == "message_version"
-    assert citations[0]["id"] == 123
-
-
-def test_parse_citations_preserves_duplicate_positions():
-    """F3: same source cited in two bullets must produce two citation entries with
-    distinct positions — dedup by (kind, id) is a privacy gap for the redactor."""
-    from bot.services.llm_gateway import _parse_digest_citations
-
-    # Same mv:123 cited in two different bullets (positions 0 and 1)
-    body = (
-        "TL;DR text.\n\n- Bullet A [[mv:123]] first mention\n- Bullet B [[mv:123]] second mention\n"
-    )
-    citations, dropped = _parse_digest_citations(
-        body, valid_card_source_ids=frozenset(), valid_mv_ids=frozenset({123})
-    )
-    assert dropped == [], f"unexpected drops: {dropped}"
-    assert len(citations) == 2, (
-        f"Expected 2 citations (one per bullet), got {len(citations)}: {citations}"
-    )
-    positions = {c["position"] for c in citations}
-    assert len(positions) == 2, f"Both citations must have distinct positions: {citations}"
-
-
-def test_validate_every_bullet_has_citation_raises_on_empty():
-    from bot.services.llm_gateway import (
-        DigestCitationValidationError,
-        _validate_every_bullet_has_citation,
-    )
-
-    body = "TL;DR\n\n- Bullet without citation"
-    with pytest.raises(DigestCitationValidationError):
-        _validate_every_bullet_has_citation(body, valid_citation_tokens=set())
-
-
-def test_validate_every_bullet_has_citation_passes_when_all_covered():
-    from bot.services.llm_gateway import _validate_every_bullet_has_citation
-
-    body = "TL;DR\n\n- One [[mv:1]] a\n- Two [[mv:2]] b"
-    _validate_every_bullet_has_citation(
-        body, valid_citation_tokens={"[[mv:1]]", "[[mv:2]]"}
-    )  # no raise
-
-
-# ── DB-dependent tests ───────────────────────────────────────────────────────
-
-
-async def test_run_digest_rejects_unknown_type(db_session):
-    """T8-02 widening: run_digest now accepts both 'daily' and 'weekly'.
-    Other type values are still rejected with a clear ValueError."""
-    from bot.services.digests import run_digest
-
-    cfg = _make_gateway_config()
-    dcfg = _make_digest_config()
-    with pytest.raises(ValueError, match="unsupported digest type"):
-        await run_digest(
-            db_session,
-            type="monthly",  # type: ignore[arg-type]
-            window_start=datetime.now(timezone.utc) - timedelta(days=1),
-            window_end=datetime.now(timezone.utc),
-            ledger_repo=None,
-            provider=None,
-            config=cfg,
-            digest_config=dcfg,
-        )
-
-
-async def test_run_digest_empty_window_creates_zero_cost_quiet_draft(db_session):
-    from bot.services.digests import run_digest
-
-    chat_id = _next_chat_id()
-    dcfg = _make_digest_config(source_chat_id=chat_id)
-    cfg = _make_gateway_config()
-    now = datetime.now(timezone.utc)
-    digest = await run_digest(
-        db_session,
-        type="daily",
-        window_start=now - timedelta(days=1),
-        window_end=now,
-        ledger_repo=None,  # not reached
-        provider=None,  # not reached
-        config=cfg,
-        digest_config=dcfg,
-    )
-    assert digest.status == "draft"
-    assert digest.body_markdown == "За прошедший день новых обсуждений не было."
-    assert digest.llm_usage_ledger_id is None
-
-
-async def test_run_digest_idempotency(db_session):
-    """Two invocations with same window return the same digest row."""
-    from bot.services.digests import run_digest
-
-    chat_id = _next_chat_id()
-    dcfg = _make_digest_config(source_chat_id=chat_id)
-    cfg = _make_gateway_config()
-    now = datetime.now(timezone.utc)
-    ws = now - timedelta(days=1)
-    we = now
-
-    d1 = await run_digest(
-        db_session,
-        type="daily",
-        window_start=ws,
-        window_end=we,
-        ledger_repo=None,
-        provider=None,
-        config=cfg,
-        digest_config=dcfg,
-    )
-    await db_session.flush()
-    d2 = await run_digest(
-        db_session,
-        type="daily",
-        window_start=ws,
-        window_end=we,
-        ledger_repo=None,
-        provider=None,
-        config=cfg,
-        digest_config=dcfg,
-    )
-    assert d1.id == d2.id
-    assert d2.status == "draft"  # both resolve to the same quiet-window draft
-
-
-async def test_run_digest_cost_ceiling_separate_bucket(db_session):
-    """Phase 7 separate bucket: ledger rows linked to digests must trip the ceiling
-    independently of Phase 5 shared bucket."""
-    from bot.db.models import Digest, LlmUsageLedger
-    from bot.services.digests import run_digest
-
-    chat_id = _next_chat_id()
-    # Pre-insert a digest + a ledger row whose cost == ceiling
-    ledger = LlmUsageLedger(
-        provider="anthropic",
-        model="haiku",
-        prompt_hash="x" * 64,
-        response_hash="y" * 64,
-        tokens_in=100,
-        tokens_out=50,
-        cost_usd=Decimal("1.50"),  # > 1.00 ceiling
-        latency_ms=10,
-        request_id="r1",
-        cache_hit=False,
-        error=None,
-    )
-    db_session.add(ledger)
-    await db_session.flush()
-    prior_digest = Digest(
-        type="daily",
-        window_start=datetime.now(timezone.utc) - timedelta(days=2),
-        window_end=datetime.now(timezone.utc) - timedelta(days=1),
-        body_markdown="prior",
-        citations=[],
-        status="draft",
-        llm_usage_ledger_id=ledger.id,
-    )
-    db_session.add(prior_digest)
-    await db_session.flush()
-
-    dcfg = _make_digest_config(source_chat_id=chat_id, daily_cost_ceiling_usd=Decimal("1.00"))
-    cfg = _make_gateway_config()
-    now = datetime.now(timezone.utc)
-    digest = await run_digest(
-        db_session,
-        type="daily",
-        window_start=now - timedelta(hours=12),
-        window_end=now,
-        ledger_repo=None,  # not reached — ceiling pre-check fires first
-        provider=None,
-        config=cfg,
-        digest_config=dcfg,
-    )
-    assert digest.status == "cost_exceeded"
-    assert digest.error_text == "daily digest budget exceeded"
-
-
-async def test_run_digest_happy_path(db_session):
-    """Insert cards, mock provider, assert status='draft' with valid citations."""
-    from bot.db.repos.llm_usage_ledger import LedgerRepo
-    from bot.services.digests import run_digest
-
-    chat_id = _next_chat_id()
-    now = datetime.now(timezone.utc)
-    ws = now - timedelta(days=1)
-    we = now
-    # Insert one message + approved card
-    _cm_id, mv_id = await _make_msg_and_version(
-        db_session, chat_id=chat_id, ts=now - timedelta(hours=6), text="meaningful content"
-    )
-    card_id = await _make_approved_card(db_session, mv_ids=[mv_id])
-    await db_session.flush()
-    # Fetch card_source.id for use in canned response
-    from sqlalchemy import text as _t
-
-    cs_row = (
-        await db_session.execute(
-            _t("SELECT id FROM card_sources WHERE card_id = :cid LIMIT 1"),
-            {"cid": str(card_id)},
-        )
-    ).scalar_one()
-    cs_id_str = str(cs_row)
-
-    body = (
-        "TL;DR прозой первая фраза. Вторая. Третья.\n"
-        "\n"
-        f"- Topic about something [[cs:{cs_id_str}]] summary line\n"
-    )
-    provider = _StubProvider(answer_text=body)
-
-    dcfg = _make_digest_config(
+    return DigestContext(
+        type=digest_type,
+        window_start=start,
+        window_end=start + timedelta(days=7 if digest_type == "weekly" else 1),
         source_chat_id=chat_id,
-        min_cards_threshold=1,  # 1 card is enough — fall back to raw only when 0
-        daily_cost_ceiling_usd=Decimal("1.00"),
+        cards=[],
+        messages=[
+            DigestContextMessage(
+                message_version_id=version_id,
+                chat_message_id=message_id,
+                telegram_message_id=telegram_message_id,
+                author_display="Женя Кудрявцев",
+                author_username="zhenya",
+                text="Сравнил версии 5.6 и 5.7",
+                caption="Таблица сравнения",
+                message_kind="photo",
+                reply_to_message_id=101,
+                message_thread_id=202,
+                media_kind="photo",
+                media_description="Две колонки с результатами",
+                forward_origin_type="user",
+                forward_origin_display="Анна Петрова",
+                forward_origin_date="2026-07-20T04:00:00+00:00",
+                ts=start + timedelta(hours=4),
+            )
+        ],
     )
-    cfg = _make_gateway_config()
-    digest = await run_digest(
-        db_session,
+
+
+def _draft_at_weekly_visible_length(*, message_version_id: int, target: int) -> dict:
+    from bot.services.digest_renderer import measure_digest_visible_length
+
+    token = f"[[mv:{message_version_id}]]"
+    closing = "Закрыли"
+    details = "d"
+    baseline = f"-  {token}\n  {details}\n\n— {closing} {token}"
+    baseline_length = measure_digest_visible_length(
+        baseline,
+        window_start_utc=datetime(2026, 7, 20, 2, tzinfo=timezone.utc),
+        window_end_utc=datetime(2026, 7, 27, 2, tzinfo=timezone.utc),
+        digest_type="weekly",
+    )
+    draft = _draft(message_version_id=message_version_id)
+    draft["sections"][0]["items"][0]["text"] = "x" * (target - baseline_length)
+    draft["sections"][0]["items"][0]["details"] = details
+    draft["closing"] = {"text": closing, "citations": [token]}
+    return draft
+
+
+async def test_empty_window_skips_before_gold_or_provider(db_session) -> None:
+    from bot.services.digest_context import DigestContext
+    from bot.services.llm_gateway import DigestEmptyWindowError, synthesize_digest
+
+    context = DigestContext(
         type="daily",
-        window_start=ws,
-        window_end=we,
+        window_start=datetime.now(timezone.utc) - timedelta(days=1),
+        window_end=datetime.now(timezone.utc),
+        source_chat_id=_chat_id(),
+        cards=[],
+        messages=[],
+    )
+    provider = _StructuredProvider()
+    with pytest.raises(DigestEmptyWindowError):
+        await synthesize_digest(
+            db_session,
+            context=context,
+            config=_gateway_config(),
+            ledger_repo=object(),
+            provider=provider,
+        )
+    assert provider.calls == []
+
+
+async def test_semantically_quiet_window_uses_exactly_one_call(db_session) -> None:
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import synthesize_digest
+
+    context = await _context(db_session)
+    provider = _StructuredProvider([_draft(message_version_id=1, publish=False)])
+    result = await synthesize_digest(
+        db_session,
+        context=context,
+        config=_gateway_config(),
         ledger_repo=LedgerRepo(),
         provider=provider,
-        config=cfg,
-        digest_config=dcfg,
     )
-    assert digest.status == "draft", f"got {digest.status} error={digest.error_text}"
-    assert digest.body_markdown == body
-    assert len(digest.citations) == 1
-    assert digest.citations[0]["kind"] == "card_source"
-    assert digest.citations[0]["id"] == cs_id_str
-    assert digest.llm_usage_ledger_id is not None
-    assert provider.calls == 1
+    assert result.publish is False
+    assert result.body_markdown is None
+    assert len(provider.calls) == 1
 
 
-async def test_synthesize_digest_empty_window_with_nonempty_input_fails(db_session):
-    """Provider returns EMPTY_WINDOW sentinel against non-empty input → DigestProviderError."""
+async def test_clean_digest_uses_two_calls_and_preserves_full_input_metadata(db_session) -> None:
     from bot.db.repos.llm_usage_ledger import LedgerRepo
-    from bot.services.digest_context import DigestContext, DigestContextMessage
-    from bot.services.llm_gateway import (
-        DigestProviderError,
-        synthesize_digest,
+    from bot.services.llm_gateway import synthesize_digest
+
+    context = await _context(db_session)
+    version_id = context.messages[0].message_version_id
+    provider = _StructuredProvider([_draft(message_version_id=version_id), _verifier()])
+    result = await synthesize_digest(
+        db_session,
+        context=context,
+        config=_gateway_config(),
+        ledger_repo=LedgerRepo(),
+        provider=provider,
+    )
+    assert result.publish is True
+    assert result.body_markdown is not None and "— " in result.body_markdown
+    assert len(provider.calls) == 2
+    assert all(call["model"] == "gpt-5.6-sol" for call in provider.calls)
+    assert all(call["reasoning_effort"] == "medium" for call in provider.calls)
+    draft_input = json.loads(provider.calls[0]["input_text"])
+    assert draft_input["window"]["start"] == "2026-07-20T05:00:00+03:00"
+    message = draft_input["messages"][0]
+    assert message["author_display"] == "Женя Кудрявцев"
+    assert message["author_username"] == "zhenya"
+    assert message["reply_to_message_id"] == 101
+    assert message["message_thread_id"] == 202
+    assert message["media_description"] == "Две колонки с результатами"
+    assert message["forward_origin"] == {
+        "type": "user",
+        "display": "Анна Петрова",
+        "date": "2026-07-20T04:00:00+00:00",
+    }
+
+
+async def test_display_name_is_corrected_to_username_in_three_calls(db_session) -> None:
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import synthesize_digest
+
+    context = await _context(db_session)
+    version_id = context.messages[0].message_version_id
+    draft = _draft(message_version_id=version_id)
+    draft["sections"][0]["items"][0]["text"] = "Женя сравнил две версии"
+    provider = _StructuredProvider(
+        [
+            draft,
+            _verifier(item_action="fix", item_reason="name"),
+            {"items": [{"item_key": "item_1", "text": "@zhenya сравнил версии 5.6 и 5.7"}]},
+        ]
+    )
+    result = await synthesize_digest(
+        db_session,
+        context=context,
+        config=_gateway_config(),
+        ledger_repo=LedgerRepo(),
+        provider=provider,
+    )
+    assert len(provider.calls) == 3
+    assert provider.calls[2]["schema_name"] == "digest_apply_fixes"
+    assert set(json.loads(provider.calls[2]["input_text"])) == {"items"}
+    assert result.body_markdown is not None and "@zhenya" in result.body_markdown
+
+
+async def test_weekly_clean_within_budget_uses_exactly_two_calls(db_session) -> None:
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import synthesize_digest
+
+    context = await _context(db_session, digest_type="weekly")
+    version_id = context.messages[0].message_version_id
+    provider = _StructuredProvider([_draft(message_version_id=version_id), _verifier()])
+
+    result = await synthesize_digest(
+        db_session,
+        context=context,
+        config=_gateway_config(),
+        ledger_repo=LedgerRepo(),
+        provider=provider,
+        type="weekly",
     )
 
-    chat_id = _next_chat_id()
-    _cm_id, mv_id = await _make_msg_and_version(
-        db_session, chat_id=chat_id, ts=datetime.now(timezone.utc) - timedelta(hours=6)
-    )
-    await db_session.flush()
-    now = datetime.now(timezone.utc)
-    ctx = DigestContext(
-        type="daily",
-        window_start=now - timedelta(days=1),
-        window_end=now,
-        source_chat_id=chat_id,
-        cards=[],
-        messages=[
-            DigestContextMessage(
-                message_version_id=mv_id,
-                chat_message_id=_cm_id,
-                author_display="Test",
-                text="hello",
-                ts=now - timedelta(hours=6),
-            )
-        ],
-    )
-    provider = _StubProvider(answer_text="EMPTY_WINDOW")
-    cfg = _make_gateway_config()
+    assert result.publish is True
+    assert [call["schema_name"] for call in provider.calls] == [
+        "digest_draft",
+        "digest_factual_verifier",
+    ]
 
-    with pytest.raises(DigestProviderError):
+
+async def test_weekly_factual_fix_edits_only_fix_unit(db_session) -> None:
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import synthesize_digest
+
+    context = await _context(db_session, digest_type="weekly")
+    version_id = context.messages[0].message_version_id
+    provider = _StructuredProvider(
+        [
+            _draft(message_version_id=version_id),
+            _verifier(item_action="fix", item_reason="number"),
+            {"items": [{"item_key": "item_1", "text": "Женя сравнил версии 5.6 и 5.7"}]},
+        ]
+    )
+
+    result = await synthesize_digest(
+        db_session,
+        context=context,
+        config=_gateway_config(),
+        ledger_repo=LedgerRepo(),
+        provider=provider,
+        type="weekly",
+    )
+
+    assert len(provider.calls) == 3
+    assert provider.calls[2]["schema_name"] == "digest_apply_fixes"
+    editor_input = json.loads(provider.calls[2]["input_text"])
+    assert [item["item_key"] for item in editor_input["items"]] == ["item_1"]
+    assert result.body_markdown is not None and "5.6 и 5.7" in result.body_markdown
+
+
+async def test_weekly_over_target_compacts_without_another_llm_call(db_session) -> None:
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import synthesize_digest
+
+    context = await _context(db_session, digest_type="weekly")
+    version_id = context.messages[0].message_version_id
+    draft = _draft_at_weekly_visible_length(message_version_id=version_id, target=3601)
+    draft["sections"][0]["items"].insert(
+        0,
+        {
+            "text": "Женя сравнил две версии",
+            "details": "Женя подробно сравнил две версии.",
+            "citations": [f"[[mv:{version_id}]]"],
+        },
+    )
+    provider = _StructuredProvider(
+        [
+            draft,
+            {
+                "items": [
+                    {"item_key": "item_1", "verdict": "keep_ok"},
+                    {"item_key": "item_1_details", "verdict": "keep_ok"},
+                    {"item_key": "item_2", "verdict": "keep_ok"},
+                    {"item_key": "item_2_details", "verdict": "keep_ok"},
+                    {"item_key": "closing", "verdict": "keep_ok"},
+                ]
+            },
+        ]
+    )
+
+    result = await synthesize_digest(
+        db_session,
+        context=context,
+        config=_gateway_config(),
+        ledger_repo=LedgerRepo(),
+        provider=provider,
+        type="weekly",
+    )
+
+    assert result.publish is True
+    assert len(provider.calls) == 2
+    assert result.body_markdown is not None and "Закрыли" in result.body_markdown
+    assert "x" * 20 not in result.body_markdown
+
+
+@pytest.mark.parametrize("digest_type", ["daily", "weekly"])
+async def test_unfixable_citation_mismatch_blocks_after_two_calls(
+    db_session, digest_type
+) -> None:
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import DigestCitationValidationError, synthesize_digest
+
+    context = await _context(db_session, digest_type=digest_type)
+    version_id = context.messages[0].message_version_id
+    provider = _StructuredProvider(
+        [_draft(message_version_id=version_id), _verifier(item_action="block", item_reason="citations")]
+    )
+    with pytest.raises(DigestCitationValidationError, match="blocked"):
         await synthesize_digest(
             db_session,
-            context=ctx,
-            config=cfg,
+            context=context,
+            config=_gateway_config(),
             ledger_repo=LedgerRepo(),
             provider=provider,
+            type=digest_type,
         )
+    assert len(provider.calls) == 2
 
 
-async def test_synthesize_digest_raises_on_bullet_without_citations(db_session):
-    """Provider returns body with bullet that has only a hallucinated id →
-    after drop, bullet has 0 citations → DigestCitationValidationError."""
-    from bot.db.repos.llm_usage_ledger import LedgerRepo
-    from bot.services.digest_context import DigestContext, DigestContextMessage
-    from bot.services.llm_gateway import (
-        DigestCitationValidationError,
-        synthesize_digest,
-    )
+def test_digest_gateway_config_is_isolated_from_shared_llm(monkeypatch) -> None:
+    from bot.services.llm_gateway import load_digest_gateway_config
 
-    chat_id = _next_chat_id()
-    _cm_id, mv_id = await _make_msg_and_version(
-        db_session, chat_id=chat_id, ts=datetime.now(timezone.utc) - timedelta(hours=6)
-    )
-    await db_session.flush()
-    now = datetime.now(timezone.utc)
-    ctx = DigestContext(
-        type="daily",
-        window_start=now - timedelta(days=1),
-        window_end=now,
-        source_chat_id=chat_id,
-        cards=[],
-        messages=[
-            DigestContextMessage(
-                message_version_id=mv_id,
-                chat_message_id=_cm_id,
-                author_display="Test",
-                text="hello",
-                ts=now - timedelta(hours=6),
-            )
-        ],
-    )
-    # Bullet cites a hallucinated id (99999 is not in input).
-    body = "TL;DR text one. Two. Three.\n\n- Topic [[mv:99999]] hallucinated\n"
-    provider = _StubProvider(answer_text=body)
-    cfg = _make_gateway_config()
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-flash")
+    config = load_digest_gateway_config(digest_type="daily")
+    assert config.provider == "openai"
+    assert config.model == "gpt-5.6-sol"
 
-    with pytest.raises(DigestCitationValidationError):
-        await synthesize_digest(
-            db_session,
-            context=ctx,
-            config=cfg,
-            ledger_repo=LedgerRepo(),
-            provider=provider,
-        )
+
+def test_load_digest_config_ignores_removed_truncation_knobs(monkeypatch) -> None:
+    from bot.services.digests import load_digest_config
+
+    monkeypatch.setenv("DIGEST_RAW_MESSAGE_TOP_N", "1")
+    monkeypatch.setenv("DIGEST_TOKEN_BUDGET_INPUT", "1")
+    config = load_digest_config()
+    assert not hasattr(config, "raw_message_top_n")
+    assert not hasattr(config, "token_budget_input")

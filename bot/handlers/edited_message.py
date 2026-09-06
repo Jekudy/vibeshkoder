@@ -68,8 +68,6 @@ router = Router(name="edited_message")
 # (chat_message_id, content_hash). See ``handle_edited_message`` Step 6 for the inline
 # logic.
 
-
-
 async def _find_chat_message(
     session: AsyncSession,
     chat_id: int,

@@ -24,6 +24,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Literal
 
 from sqlalchemy import text
@@ -31,7 +32,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
 from bot.db.models import Digest, DigestRun
-from bot.services.digest_context import DigestConfig as _DigestCtxConfig
 from bot.services.digest_context import build_digest_context
 from bot.services.llm_gateway import (
     DigestCitationValidationError,
@@ -43,17 +43,11 @@ from bot.services.llm_gateway import (
     LedgerRepoProtocol,
     synthesize_digest,
 )
-from bot.services.llm_providers import LLMProvider
+from bot.services.llm_providers import DigestLLMProvider
 
 logger = logging.getLogger(__name__)
 
 DIGEST_LOCK_NAMESPACE = "phase7:digest_idempotency"
-
-_QUIET_WINDOW_BODY = {
-    "daily": "За прошедший день новых обсуждений не было.",
-    "weekly": "За прошедшую неделю новых обсуждений не было.",
-}
-
 
 @dataclass(frozen=True)
 class DigestConfig:
@@ -67,41 +61,15 @@ class DigestConfig:
     """
 
     # Phase 7 (unchanged)
-    daily_cost_ceiling_usd: Decimal = Decimal("1.00")
-    monthly_cost_ceiling_usd: Decimal = Decimal("10.00")
+    daily_cost_ceiling_usd: Decimal = Decimal("100.00")
+    monthly_cost_ceiling_usd: Decimal = Decimal("1000.00")
     source_chat_id: int = 0
     destination_chat_id: int | None = None
     hour_msk: int = 9
-    min_cards_threshold: int = 3
-    raw_message_top_n: int = 15
-    token_budget_input: int = 8000
     # Phase 8 additions — weekly digest tunables. Independent of daily; see
     # PHASE8_PLAN.md §5.B and §6 Q7.
-    weekly_cost_ceiling_usd: Decimal = Decimal("5.00")
-    weekly_monthly_cost_ceiling_usd: Decimal = Decimal("20.00")
-    # L5: weekly min-cards-threshold bumped to 8 (vs daily 3) — weekly window
-    # is 7× larger but admin-approved cards over the full week are a
-    # higher-quality cohort, so 8 is the empirical middle between daily-3 and
-    # linearly-scaled 21.
-    weekly_min_cards_threshold: int = 8
-    weekly_raw_message_top_n: int = 60
-    weekly_token_budget_input: int = 24000
-
-    def to_context_config(self) -> _DigestCtxConfig:
-        # FHR HIGH-4 fix: forward weekly tunables so operator env-var overrides
-        # (``DIGEST_WEEKLY_TOKEN_BUDGET`` / ``DIGEST_WEEKLY_MIN_CARDS_THRESHOLD``
-        # / ``DIGEST_WEEKLY_RAW_MESSAGE_TOP_N``) actually reach
-        # ``_weekly_overrides`` in ``digest_context.py``. Before the fix only
-        # daily fields were forwarded, so weekly overrides were silently
-        # ignored and the dataclass defaults always won.
-        return _DigestCtxConfig(
-            min_cards_threshold=self.min_cards_threshold,
-            raw_message_top_n=self.raw_message_top_n,
-            token_budget_input=self.token_budget_input,
-            weekly_min_cards_threshold=self.weekly_min_cards_threshold,
-            weekly_raw_message_top_n=self.weekly_raw_message_top_n,
-            weekly_token_budget_input=self.weekly_token_budget_input,
-        )
+    weekly_cost_ceiling_usd: Decimal = Decimal("200.00")
+    weekly_monthly_cost_ceiling_usd: Decimal = Decimal("2000.00")
 
 
 def load_digest_config() -> DigestConfig:
@@ -127,23 +95,22 @@ def load_digest_config() -> DigestConfig:
         raise ValueError(
             "DIGEST_SOURCE_CHAT_ID and DIGEST_DESTINATION_CHAT_ID must both equal COMMUNITY_CHAT_ID"
         )
+    gold_path_raw = os.environ.get("DIGEST_GOLD_EXAMPLES_PATH")
+    if gold_path_raw is None or not gold_path_raw.strip():
+        raise ValueError("DIGEST_GOLD_EXAMPLES_PATH is required")
+    gold_path = Path(gold_path_raw).expanduser()
+    if not gold_path.is_file() or gold_path.is_symlink():
+        raise ValueError("DIGEST_GOLD_EXAMPLES_PATH must be a regular file")
     return DigestConfig(
-        daily_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_DAILY_USD_CEILING", "1.00")),
-        monthly_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_MONTHLY_USD_CEILING", "10.00")),
+        daily_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_DAILY_USD_CEILING", "100.00")),
+        monthly_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_MONTHLY_USD_CEILING", "1000.00")),
         source_chat_id=src,
         destination_chat_id=dst,
         hour_msk=int(os.environ.get("DIGEST_HOUR_MSK", "9")),
-        min_cards_threshold=int(os.environ.get("DIGEST_MIN_CARDS_THRESHOLD", "3")),
-        raw_message_top_n=int(os.environ.get("DIGEST_RAW_MESSAGE_TOP_N", "15")),
-        token_budget_input=int(os.environ.get("DIGEST_TOKEN_BUDGET_INPUT", "8000")),
-        # Phase 8 weekly knobs — independent of daily.
-        weekly_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_WEEKLY_USD_CEILING", "5.00")),
+        weekly_cost_ceiling_usd=Decimal(os.environ.get("DIGEST_WEEKLY_USD_CEILING", "200.00")),
         weekly_monthly_cost_ceiling_usd=Decimal(
-            os.environ.get("DIGEST_WEEKLY_MONTHLY_USD_CEILING", "20.00")
+            os.environ.get("DIGEST_WEEKLY_MONTHLY_USD_CEILING", "2000.00")
         ),
-        weekly_token_budget_input=int(os.environ.get("DIGEST_WEEKLY_TOKEN_BUDGET", "24000")),
-        weekly_min_cards_threshold=int(os.environ.get("DIGEST_WEEKLY_MIN_CARDS_THRESHOLD", "8")),
-        weekly_raw_message_top_n=int(os.environ.get("DIGEST_WEEKLY_RAW_MESSAGE_TOP_N", "60")),
     )
 
 
@@ -155,9 +122,9 @@ async def _cost_ceiling_breached(
 ) -> bool:
     """Type-aware separate cost bucket per PHASE8_PLAN.md §5.B (H6).
 
-    SUM(cost_usd) from llm_usage_ledger JOIN digests, filtered by
-    ``WHERE d.type = :type`` so daily and weekly costs accumulate to
-    INDEPENDENT monthly buckets. Phase 7 callsite uses the default
+    SUM(cost_usd) from every ledger stage filtered by digest ``call_type``
+    so daily and weekly costs accumulate to INDEPENDENT monthly buckets.
+    Phase 7 callsite uses the default
     ``type='daily'`` (back-compat); Phase 8 weekly callsite passes
     ``type='weekly'``.
 
@@ -175,30 +142,31 @@ async def _cost_ceiling_breached(
     else:
         daily_ceiling = digest_config.daily_cost_ceiling_usd
         monthly_ceiling = digest_config.monthly_cost_ceiling_usd
+    call_type = f"digest_{type}"
     sql_daily = text(
         """
         SELECT COALESCE(SUM(l.cost_usd), 0)
         FROM llm_usage_ledger l
-        JOIN digests d ON d.llm_usage_ledger_id = l.id
-        WHERE d.type = :type
-          AND d.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+        WHERE l.call_type = :call_type
+          AND l.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
         """
     )
-    daily = (await session.execute(sql_daily, {"type": type})).scalar_one_or_none() or Decimal("0")
+    daily = (
+        await session.execute(sql_daily, {"call_type": call_type})
+    ).scalar_one_or_none() or Decimal("0")
     if Decimal(str(daily)) >= daily_ceiling:
         return True
     sql_monthly = text(
         """
         SELECT COALESCE(SUM(l.cost_usd), 0)
         FROM llm_usage_ledger l
-        JOIN digests d ON d.llm_usage_ledger_id = l.id
-        WHERE d.type = :type
-          AND d.created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+        WHERE l.call_type = :call_type
+          AND l.created_at >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
         """
     )
-    monthly = (await session.execute(sql_monthly, {"type": type})).scalar_one_or_none() or Decimal(
-        "0"
-    )
+    monthly = (
+        await session.execute(sql_monthly, {"call_type": call_type})
+    ).scalar_one_or_none() or Decimal("0")
     if Decimal(str(monthly)) >= monthly_ceiling:
         return True
     return False
@@ -238,7 +206,7 @@ async def run_digest(
     window_start: datetime,
     window_end: datetime,
     ledger_repo: LedgerRepoProtocol,
-    provider: LLMProvider,
+    provider: DigestLLMProvider,
     config: LLMGatewayConfig,
     digest_config: DigestConfig,
 ) -> Digest:
@@ -330,7 +298,6 @@ async def run_digest(
             window_start=window_start,
             window_end=window_end,
             source_chat_id=digest_config.source_chat_id,
-            digest_config=digest_config.to_context_config(),
         )
     except Exception as exc:
         digest.status = "failed"
@@ -343,18 +310,7 @@ async def run_digest(
         await session.flush()
         return digest
 
-    # Step 6 — a scheduled digest is still delivered for a quiet window.
-    # This path is deterministic and spends no LLM tokens.
-    if not ctx.cards and not ctx.messages:
-        digest.body_markdown = _QUIET_WINDOW_BODY[type]
-        digest.status = "draft"
-        run.status = "finished"
-        run.finished_at = datetime.now(timezone.utc)
-        await session.flush()
-        return digest
-
-    # Step 7 — synthesize. Type-aware routing into the correct prompt template
-    # module happens inside ``synthesize_digest`` (§5.F).
+    # Step 6 — draft decides publish=false for quiet or insignificant windows.
     try:
         result = await synthesize_digest(
             session,
@@ -404,7 +360,17 @@ async def run_digest(
         await session.flush()
         return digest
 
-    # Step 8 — success.
+    if not result.publish:
+        digest.status = "skipped"
+        digest.body_markdown = None
+        digest.citations = []
+        digest.llm_usage_ledger_id = result.llm_usage_ledger_id
+        run.status = "skipped"
+        run.finished_at = datetime.now(timezone.utc)
+        await session.flush()
+        return digest
+
+    # Step 7 — validated non-quiet draft.
     digest.body_markdown = result.body_markdown
     digest.citations = result.citations
     digest.llm_usage_ledger_id = result.llm_usage_ledger_id

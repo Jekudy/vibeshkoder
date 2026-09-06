@@ -66,6 +66,7 @@ from sqlalchemy import and_, bindparam, func, select, text, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.services.control_messages import control_message_excludes_sql_fragment
 from bot.services.evidence import EvidenceBundle, EvidenceItem
 from bot.services.extraction_schema import (
     CandidateValidationError,
@@ -76,6 +77,7 @@ from bot.services.extraction_schema import (
 )
 from bot.services.forget_predicate import forget_excludes_expression, forget_excludes_sql_fragment
 from bot.services.llm_providers import (
+    DigestLLMProvider,
     LLMProvider,
     ProviderResult,
     ProviderStructuralError,
@@ -86,6 +88,7 @@ from bot.services.qa_guardrails import contains_secret_like_data, limit_answer_t
 # Shared forget-event exclusion predicate — sourced from forget_predicate.py (#291).
 # Do NOT change this inline; update bot/services/forget_predicate.py instead.
 _FORGET_EXCLUDES = forget_excludes_sql_fragment()
+_CONTROL_EXCLUDES = control_message_excludes_sql_fragment()
 
 logger = logging.getLogger(__name__)
 
@@ -1667,6 +1670,47 @@ def resolve_provider(
             json_output=deepseek_json_output,
         )
     raise ValueError(f"unknown provider: {provider_name}")
+
+
+def load_digest_gateway_config(
+    *,
+    digest_type: Literal["daily", "weekly"],
+    prompt_template_version: str | None = None,
+) -> LLMGatewayConfig:
+    """Load the isolated OpenAI Sol config without changing shared LLM defaults."""
+    if digest_type not in ("daily", "weekly"):
+        raise ValueError("digest_type must be daily or weekly")
+    provider = os.environ.get("DIGEST_LLM_PROVIDER", "openai")
+    if provider != "openai":
+        raise ValueError("DIGEST_LLM_PROVIDER must be openai")
+    model = os.environ.get("DIGEST_LLM_MODEL", "gpt-5.6-sol")
+    if model != "gpt-5.6-sol":
+        raise ValueError("DIGEST_LLM_MODEL must be gpt-5.6-sol")
+    if digest_type == "weekly":
+        daily = Decimal(os.environ.get("DIGEST_WEEKLY_USD_CEILING", "200.00"))
+        monthly = Decimal(os.environ.get("DIGEST_WEEKLY_MONTHLY_USD_CEILING", "2000.00"))
+    else:
+        daily = Decimal(os.environ.get("DIGEST_DAILY_USD_CEILING", "100.00"))
+        monthly = Decimal(os.environ.get("DIGEST_MONTHLY_USD_CEILING", "1000.00"))
+    return LLMGatewayConfig(
+        provider=provider,
+        model=model,
+        daily_ceiling_usd=daily,
+        monthly_ceiling_usd=monthly,
+        prompt_template_version=(
+            prompt_template_version
+            if prompt_template_version is not None
+            else ("digest-weekly-v0.5.0" if digest_type == "weekly" else "digest-v0.5.0")
+        ),
+    )
+
+
+def resolve_digest_provider() -> "DigestLLMProvider":
+    """Return the only supported digest provider; there is no fallback."""
+    from bot.services.llm_providers.openai import OpenAIProvider
+
+    provider: DigestLLMProvider = OpenAIProvider()
+    return provider
 
 
 def load_embedding_gateway_config() -> EmbeddingGatewayConfig:
@@ -3647,12 +3691,11 @@ class DigestContextStaleError(DigestGatewayError):
 
 
 class DigestEmptyWindowError(DigestGatewayError):
-    """Provider returned ``EMPTY_WINDOW`` sentinel against empty context.
-    Orchestrator marks digest as ``skipped`` (not failed)."""
+    """The eligible source window is empty; the orchestrator skips it."""
 
 
 class DigestProviderError(DigestGatewayError):
-    """Provider misbehaved (e.g. EMPTY_WINDOW with non-empty input)."""
+    """The digest provider failed or returned an unusable response."""
 
 
 class DigestCitationValidationError(DigestGatewayError):
@@ -3665,140 +3708,11 @@ class LLMBudgetExceededError(DigestGatewayError):
 
 @dataclass(frozen=True)
 class SynthesizeDigestResult:
-    body_markdown: str
+    publish: bool
+    body_markdown: str | None
     citations: list[dict[str, Any]]
     llm_usage_ledger_id: int | None
     cost_usd: Decimal
-
-
-_CITATION_TOKEN_RE = re.compile(r"\[\[(cs|mv|card):([^\]]+)\]\]")
-
-# §5.F: section header pattern for weekly digests. Matches lines of the form
-# `## Раздел: <title>` at line-start; title is captured.
-_SECTION_HEADER_RE = re.compile(r"^##\s+Раздел:\s+(.+)$", re.MULTILINE)
-
-
-def _extract_sections(body_markdown: str) -> list[tuple[str, list[str]]]:
-    """Parse `## Раздел: <name>` section headers + their bullets.
-
-    Returns a list of `(section_title, bullet_lines)` tuples in document
-    order. ``bullet_lines`` collects raw ``- `` / ``• `` line-start lines
-    appearing between this header and the next header (or end of body).
-    Lines that are not bullets and not headers are ignored.
-
-    Used by the weekly digest renderer (T8-06) and by the M1 section title
-    allowlist soft-validator in `synthesize_digest`. Returns an empty list
-    for bodies with no `## Раздел: …` headers.
-    """
-    lines = body_markdown.splitlines()
-    sections: list[tuple[str, list[str]]] = []
-    current_title: str | None = None
-    current_bullets: list[str] = []
-    for line in lines:
-        m = _SECTION_HEADER_RE.match(line)
-        if m is not None:
-            if current_title is not None:
-                sections.append((current_title, current_bullets))
-            current_title = m.group(1).strip()
-            current_bullets = []
-            continue
-        if line.startswith("- ") or line.startswith("• "):
-            if current_title is not None:
-                current_bullets.append(line)
-    if current_title is not None:
-        sections.append((current_title, current_bullets))
-    return sections
-
-
-def _bullet_index_at_offset(body_markdown: str, char_offset: int) -> int:
-    """Return the 0-based index of the bullet that contains ``char_offset``.
-
-    A bullet starts at a line beginning with ``- `` or ``• ``. Text before
-    the first bullet (TL;DR) is indexed as -1. Used by digest renderer +
-    redactor to align citations to bullets (Phase 7.5 issue #295 fix).
-    """
-    idx = -1
-    pos = 0
-    for line in body_markdown.splitlines(keepends=True):
-        line_start = pos
-        line_end = pos + len(line)
-        if line.startswith("- ") or line.startswith("• "):
-            idx += 1
-        if line_start <= char_offset < line_end:
-            return idx
-        pos = line_end
-    return idx
-
-
-def _parse_digest_citations(
-    body_markdown: str,
-    *,
-    valid_card_source_ids: frozenset[str],
-    valid_mv_ids: frozenset[int],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Parse citation tokens; return (valid_citations, dropped_tokens).
-
-    Each citation's ``position`` is the 0-based BULLET INDEX where the
-    token appears (Phase 7.5 fix per issue #295). The redactor needs this
-    to mask the correct bullet on forget cascade.
-
-    Reject ``[[card:UUID]]`` as malformed (cards must be cited via
-    card_source ids per plan §5.D). Drop hallucinated ids.
-    """
-    citations: list[dict[str, Any]] = []
-    dropped: list[str] = []
-    # No dedup by (kind, id): the same source may appear in multiple bullets, each
-    # occurrence must produce its own entry with the correct bullet position so the
-    # redactor can mask every affected bullet on forget cascade.
-    for match in _CITATION_TOKEN_RE.finditer(body_markdown):
-        kind_raw, id_raw = match.group(1), match.group(2)
-        token = match.group(0)
-        bullet_idx = _bullet_index_at_offset(body_markdown, match.start())
-        if kind_raw == "card":
-            dropped.append(token)
-            continue
-        if kind_raw == "cs":
-            if id_raw not in valid_card_source_ids:
-                dropped.append(token)
-                continue
-            citations.append({"kind": "card_source", "id": id_raw, "position": bullet_idx})
-        elif kind_raw == "mv":
-            try:
-                mv_int = int(id_raw)
-            except ValueError:
-                dropped.append(token)
-                continue
-            if mv_int not in valid_mv_ids:
-                dropped.append(token)
-                continue
-            citations.append({"kind": "message_version", "id": mv_int, "position": bullet_idx})
-    return citations, dropped
-
-
-def _validate_every_bullet_has_citation(
-    body_markdown: str,
-    valid_citation_tokens: set[str],
-) -> None:
-    """Raise DigestCitationValidationError if any bullet has 0 valid tokens.
-
-    A bullet starts with ``- `` or ``• `` at line start; spans until the
-    next bullet (or end of body).
-    """
-    lines = body_markdown.splitlines()
-    current: list[str] = []
-    bullets: list[str] = []
-    for line in lines:
-        if line.startswith("- ") or line.startswith("• "):
-            if current:
-                bullets.append("\n".join(current))
-            current = [line]
-        elif current:
-            current.append(line)
-    if current:
-        bullets.append("\n".join(current))
-    for idx, bullet in enumerate(bullets):
-        if not any(tok in bullet for tok in valid_citation_tokens):
-            raise DigestCitationValidationError(f"bullet {idx} has zero valid citation tokens")
 
 
 # Revalidation SQL — forget-event exclusion via the shared helper (#291).
@@ -3811,19 +3725,7 @@ _DIGEST_REVALIDATE_MV_SQL = text(f"""
     WHERE mv.id = ANY(:mv_ids)
       AND cm.memory_policy = 'normal'
       AND mv.is_redacted = FALSE
-      AND {_FORGET_EXCLUDES}
-""")
-
-# nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- _FORGET_EXCLUDES is a module-level constant SQL fragment from forget_predicate.py; no user input flows in.
-_DIGEST_REVALIDATE_CS_SQL = text(f"""
-    SELECT cs.id::text FROM card_sources cs
-    JOIN knowledge_cards kc ON kc.id = cs.card_id
-    JOIN message_versions mv ON mv.id = cs.message_version_id
-    JOIN chat_messages cm ON cm.id = mv.chat_message_id
-    WHERE cs.id::text = ANY(:cs_ids)
-      AND kc.card_status = 'approved'
-      AND cm.memory_policy = 'normal'
-      AND mv.is_redacted = FALSE
+      AND {_CONTROL_EXCLUDES}
       AND {_FORGET_EXCLUDES}
 """)
 
@@ -3831,7 +3733,6 @@ _DIGEST_REVALIDATE_CS_SQL = text(f"""
 async def _digest_context_is_clean(
     session: AsyncSession,
     *,
-    cards: list,
     messages: list,
 ) -> None:
     """Pre-provider revalidation. Raise DigestContextStaleError on any failure.
@@ -3847,20 +3748,107 @@ async def _digest_context_is_clean(
         missing = set(mv_ids) - row_ids
         if missing:
             raise DigestContextStaleError(f"{len(missing)} message_version(s) failed revalidation")
-    if cards:
-        cs_ids: list[str] = []
-        for c in cards:
-            cs_ids.extend(str(s) for s in c.card_source_ids)
-        if cs_ids:
-            row_ids = {
-                r[0]
-                for r in (
-                    await session.execute(_DIGEST_REVALIDATE_CS_SQL, {"cs_ids": cs_ids})
-                ).all()
-            }
-            missing = set(cs_ids) - row_ids
-            if missing:
-                raise DigestContextStaleError(f"{len(missing)} card_source(s) failed revalidation")
+
+
+async def _call_digest_stage(
+    session: AsyncSession,
+    *,
+    instructions: str,
+    input_text: str,
+    schema_name: str,
+    json_schema: Mapping[str, Any],
+    config: LLMGatewayConfig,
+    ledger_repo: LedgerRepoProtocol,
+    provider: DigestLLMProvider,
+    digest_type: Literal["daily", "weekly"],
+    parse_response: Callable[[str], Any],
+) -> tuple[Any, int, Decimal]:
+    """Make one strict metered Responses call without shared semantic budget gating."""
+    from bot.services.digest_contract import DigestContractError
+
+    prompt_hash = _prompt_hash(
+        f"{instructions}\0{input_text}\0"
+        + json.dumps(json_schema, ensure_ascii=False, sort_keys=True)
+    )
+    call_type = f"digest_{digest_type}"
+    placeholder_row = await ledger_repo.record(
+        session,
+        qa_trace_id=None,
+        provider=config.provider,
+        model=config.model,
+        prompt_hash=prompt_hash,
+        response_hash=None,
+        tokens_in=0,
+        tokens_out=0,
+        cost_usd=Decimal("0"),
+        latency_ms=0,
+        request_id=None,
+        cache_hit=False,
+        error=None,
+        call_type=call_type,
+    )
+
+    started = time.monotonic()
+    try:
+        provider_result = await provider.call_structured(
+            instructions=instructions,
+            input_text=input_text,
+            model=config.model,
+            schema_name=schema_name,
+            json_schema=json_schema,
+            reasoning_effort="medium",
+        )
+    except Exception as exc:
+        latency_ms = int((time.monotonic() - started) * 1000)
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=Decimal("0"),
+            response_hash=None,
+            tokens_in=0,
+            tokens_out=0,
+            request_id=None,
+            latency_ms=latency_ms,
+            error=exc.__class__.__name__,
+        )
+        if isinstance(exc, (ProviderStructuralError, ProviderTransientError)):
+            raise DigestProviderError(f"digest provider failure: {exc.subtype}") from None
+        raise DigestProviderError(f"digest provider failure: {exc.__class__.__name__}") from None
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    answer_text = provider_result.answer_text or ""
+    cost_usd = _estimate_cost(
+        config=config,
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+    )
+    try:
+        parsed = parse_response(answer_text)
+    except DigestContractError as exc:
+        await ledger_repo.update_placeholder(
+            session,
+            llm_call_id=placeholder_row.id,
+            cost_usd=cost_usd,
+            response_hash=_response_hash(answer_text),
+            tokens_in=provider_result.tokens_in,
+            tokens_out=provider_result.tokens_out,
+            request_id=provider_result.request_id,
+            latency_ms=latency_ms,
+            error="digest_contract_validation_failed",
+        )
+        raise DigestCitationValidationError(str(exc)) from None
+    await ledger_repo.update_placeholder(
+        session,
+        llm_call_id=placeholder_row.id,
+        cost_usd=cost_usd,
+        response_hash=_response_hash(answer_text),
+        tokens_in=provider_result.tokens_in,
+        tokens_out=provider_result.tokens_out,
+        request_id=provider_result.request_id,
+        latency_ms=latency_ms,
+        error=None,
+    )
+    return parsed, placeholder_row.id, cost_usd
 
 
 async def synthesize_digest(
@@ -3869,219 +3857,152 @@ async def synthesize_digest(
     context: Any,
     config: LLMGatewayConfig,
     ledger_repo: LedgerRepoProtocol,
-    provider: LLMProvider,
+    provider: DigestLLMProvider,
     type: Literal["daily", "weekly"] = "daily",
 ) -> SynthesizeDigestResult:
-    """Synthesize a digest body via the LLM gateway.
-
-    Routes by ``type`` (PHASE8_PLAN.md §5.F):
-      - ``daily``  → ``digest_v0_1_0`` (Phase 7 / T7-02 — unchanged).
-      - ``weekly`` → ``digest_weekly_v0_1_0`` (Phase 8 / T8-02 — section-aware
-        editorial recap with five-name section title allowlist as a soft contract).
-
-    Pre-provider revalidation (`_digest_context_is_clean`) and bullet-level
-    citation invariant are identical across both paths. Section headers
-    `## Раздел: …` are inert at parse-time — the bullet tokenizer counts
-    only ``- `` / ``• `` line-starts.
-
-    Soft contract (M1): when the body returned by the provider contains a
-    `## Раздел: …` header whose title is NOT in the weekly module's
-    ``SECTION_NAME_ALLOWLIST``, a structured warning is logged but the run
-    is NOT failed. Hard enforcement is Phase 8.5 backlog.
-    """
-    await _digest_context_is_clean(session, cards=context.cards, messages=context.messages)
-
-    if type == "weekly":
-        from bot.services.llm_prompts.digest_weekly_v0_1_0 import (
-            PROMPT_VERSION,
-            SECTION_NAME_ALLOWLIST,
-            SYSTEM_PROMPT,
-            build_user_prompt,
-        )
-    else:
-        from bot.services.llm_prompts.digest_v0_1_0 import (
-            PROMPT_VERSION,
-            SYSTEM_PROMPT,
-            build_user_prompt,
-        )
-
-        SECTION_NAME_ALLOWLIST = None  # daily path has no allowlist; warning skipped
-
-    user_prompt = build_user_prompt(
-        window_start_msk=context.window_start.isoformat(),
-        window_end_msk=context.window_end.isoformat(),
-        cards=list(context.cards),
-        messages=list(context.messages),
+    """Run the strict draft → verifier → optional third-stage digest pipeline."""
+    from bot.services.digest_contract import (
+        DigestContractError,
+        compact_weekly_digest,
+        factual_units,
+        merge_digest,
+        parse_draft,
+        parse_editor,
+        parse_verifier,
     )
-    full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
-    prompt_hash = _prompt_hash(full_prompt)
-    # PROMPT_VERSION is module-level — keep available for downstream ledger
-    # logging if the gateway grows a template-version field later.
-    _ = PROMPT_VERSION
-
-    valid_card_source_ids: frozenset[str] = frozenset(
-        str(s) for c in context.cards for s in c.card_source_ids
+    from bot.services.llm_prompts.digest_v0_1_0 import (
+        DRAFT_INSTRUCTIONS,
+        EDITOR_INSTRUCTIONS,
+        VERIFIER_INSTRUCTIONS,
+        build_draft_input,
+        build_editor_input,
+        build_verifier_input,
+        draft_response_schema,
+        editor_response_schema,
+        load_private_gold_examples,
+        message_payload,
+        verifier_response_schema,
     )
-    valid_mv_ids: frozenset[int] = frozenset(int(m.message_version_id) for m in context.messages)
-
-    placeholder_row: Any
-    try:
-        await session.execute(_BUDGET_LOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID})
-        over_budget = await _budget_check(session, config, ledger_repo)
-        # digest call_type: 'digest_daily' or 'digest_weekly' based on `type` param.
-        digest_call_type = f"digest_{type}"
-        if over_budget:
-            row = await ledger_repo.record(
-                session,
-                qa_trace_id=None,
-                provider=config.provider,
-                model=config.model,
-                prompt_hash=prompt_hash,
-                response_hash=None,
-                tokens_in=0,
-                tokens_out=0,
-                cost_usd=Decimal("0"),
-                latency_ms=0,
-                request_id=None,
-                cache_hit=False,
-                error="budget_exceeded",
-                call_type=digest_call_type,
-            )
-            raise LLMBudgetExceededError(f"gateway budget exceeded; ledger_id={row.id}")
-        placeholder_row = await ledger_repo.record(
-            session,
-            qa_trace_id=None,
-            provider=config.provider,
-            model=config.model,
-            prompt_hash=prompt_hash,
-            response_hash=None,
-            tokens_in=0,
-            tokens_out=0,
-            cost_usd=Decimal("0"),
-            latency_ms=0,
-            request_id=None,
-            cache_hit=False,
-            error=None,
-            call_type=digest_call_type,
-        )
-    finally:
-        await session.execute(_BUDGET_UNLOCK_SESSION_SQL, {"lock_id": LLM_BUDGET_LOCK_ID})
-
-    started = time.monotonic()
-    try:
-        provider_result = await provider.call(prompt=full_prompt, model=config.model)
-    except Exception as exc:
-        latency = int((time.monotonic() - started) * 1000)
-        # FHR HIGH-1 fix: ``type`` is a kwarg in this function ('daily'|'weekly')
-        # — it shadows the builtin, so ``type(exc).__name__`` raises
-        # ``TypeError: 'str' object is not callable`` and masks the real provider
-        # error AND skips the ledger placeholder update. Use ``exc.__class__``
-        # to avoid the shadow (same pattern as ``run_digest`` in ``digests.py``).
-        await ledger_repo.update_placeholder(
-            session,
-            llm_call_id=placeholder_row.id,
-            cost_usd=Decimal("0"),
-            response_hash=None,
-            tokens_in=0,
-            tokens_out=0,
-            request_id=None,
-            latency_ms=latency,
-            error=f"{exc.__class__.__name__}",
-        )
-        raise
-
-    latency_ms = int((time.monotonic() - started) * 1000)
-    body_text = provider_result.answer_text or ""
-    cost_usd = _estimate_cost(
-        config=config,
-        tokens_in=provider_result.tokens_in,
-        tokens_out=provider_result.tokens_out,
+    from bot.services.digest_renderer import (
+        WEEKLY_DIGEST_VISIBLE_TARGET,
+        measure_digest_visible_length,
     )
+    from zoneinfo import ZoneInfo
 
-    if body_text.strip() == "EMPTY_WINDOW":
-        await ledger_repo.update_placeholder(
-            session,
-            llm_call_id=placeholder_row.id,
-            cost_usd=cost_usd,
-            response_hash=_response_hash(body_text),
-            tokens_in=provider_result.tokens_in,
-            tokens_out=provider_result.tokens_out,
-            request_id=provider_result.request_id,
-            latency_ms=latency_ms,
-            error=None,
-        )
-        if not context.cards and not context.messages:
-            raise DigestEmptyWindowError("provider returned EMPTY_WINDOW on empty context")
-        raise DigestProviderError("empty_window_echo_with_nonempty_context")
-
-    citations, dropped = _parse_digest_citations(
-        body_text,
-        valid_card_source_ids=valid_card_source_ids,
-        valid_mv_ids=valid_mv_ids,
+    messages = list(context.messages)
+    if not messages:
+        raise DigestEmptyWindowError("digest window contains no eligible messages")
+    await _digest_context_is_clean(session, messages=messages)
+    citation_evidence = {
+        f"[[mv:{message.message_version_id}]]": message_payload(message) for message in messages
+    }
+    citation_tokens = list(citation_evidence)
+    draft_input = build_draft_input(
+        digest_type=type,
+        window_start_msk=context.window_start.astimezone(
+            ZoneInfo("Europe/Moscow")
+        ).isoformat(),
+        window_end_msk=context.window_end.astimezone(ZoneInfo("Europe/Moscow")).isoformat(),
+        messages=messages,
+        gold_examples=load_private_gold_examples(),
     )
-    if dropped:
-        logger.warning(
-            "synthesize_digest: dropped %d hallucinated/malformed citation tokens "
-            "(prompt_hash=%s, ledger_id=%d)",
-            len(dropped),
-            prompt_hash[:12],
-            placeholder_row.id,
-        )
-
-    # §5.F M1 — section title allowlist soft check (weekly only). The five-name
-    # allowlist is a soft contract on the LLM prompt; any off-allowlist title
-    # logs a structured warning but does NOT fail the run. Phase 8.5 backlog
-    # item: hard-enforce if drift is observed.
-    if SECTION_NAME_ALLOWLIST is not None:
-        for section_title, _bullets in _extract_sections(body_text):
-            if section_title not in SECTION_NAME_ALLOWLIST:
-                logger.warning(
-                    "synthesize_digest: off-allowlist section title %r "
-                    "(prompt_hash=%s, ledger_id=%d)",
-                    section_title,
-                    prompt_hash[:12],
-                    placeholder_row.id,
-                )
-
-    valid_tokens: set[str] = set()
-    for cit in citations:
-        if cit["kind"] == "card_source":
-            valid_tokens.add(f"[[cs:{cit['id']}]]")
-        else:
-            valid_tokens.add(f"[[mv:{cit['id']}]]")
-    try:
-        _validate_every_bullet_has_citation(body_text, valid_tokens)
-    except DigestCitationValidationError:
-        await ledger_repo.update_placeholder(
-            session,
-            llm_call_id=placeholder_row.id,
-            cost_usd=cost_usd,
-            response_hash=_response_hash(body_text),
-            tokens_in=provider_result.tokens_in,
-            tokens_out=provider_result.tokens_out,
-            request_id=provider_result.request_id,
-            latency_ms=latency_ms,
-            error="citation_validation_failed",
-        )
-        raise
-
-    await ledger_repo.update_placeholder(
+    draft, draft_ledger_id, draft_cost = await _call_digest_stage(
         session,
-        llm_call_id=placeholder_row.id,
-        cost_usd=cost_usd,
-        response_hash=_response_hash(body_text),
-        tokens_in=provider_result.tokens_in,
-        tokens_out=provider_result.tokens_out,
-        request_id=provider_result.request_id,
-        latency_ms=latency_ms,
-        error=None,
+        instructions=DRAFT_INSTRUCTIONS,
+        input_text=draft_input,
+        schema_name="digest_draft",
+        json_schema=draft_response_schema(citation_tokens),
+        config=config,
+        ledger_repo=ledger_repo,
+        provider=provider,
+        digest_type=type,
+        parse_response=lambda answer: parse_draft(answer, citation_tokens=citation_tokens),
     )
+    if not draft["publish"]:
+        return SynthesizeDigestResult(
+            publish=False,
+            body_markdown=None,
+            citations=[],
+            llm_usage_ledger_id=draft_ledger_id,
+            cost_usd=draft_cost,
+        )
+
+    units = factual_units(draft)
+    verifier_input = build_verifier_input(
+        items=units, citation_evidence=citation_evidence
+    )
+    decisions, _verifier_ledger_id, verifier_cost = await _call_digest_stage(
+        session,
+        instructions=VERIFIER_INSTRUCTIONS,
+        input_text=verifier_input,
+        schema_name="digest_factual_verifier",
+        json_schema=verifier_response_schema([unit["item_key"] for unit in units]),
+        config=config,
+        ledger_repo=ledger_repo,
+        provider=provider,
+        digest_type=type,
+        parse_response=lambda answer: parse_verifier(answer, units=units),
+    )
+    if any(decision["action"] == "block" for decision in decisions):
+        raise DigestCitationValidationError("digest factual verifier blocked publication")
+
+    fix_items: list[dict[str, Any]] = [
+        {**unit, "reason": decision["reason"]}
+        for unit, decision in zip(units, decisions, strict=True)
+        if decision["action"] == "fix"
+    ]
+    third_stage_cost = Decimal("0")
+    if type == "weekly":
+        def weekly_visible_length(body: str) -> int:
+            return measure_digest_visible_length(
+                body,
+                window_start_utc=context.window_start,
+                window_end_utc=context.window_end,
+                digest_type="weekly",
+            )
+
+    edited_items: list[dict[str, Any]] = []
+    if fix_items:
+        editor_input = build_editor_input(fixes=fix_items, citation_evidence=citation_evidence)
+        edited_items, _editor_ledger_id, third_stage_cost = await _call_digest_stage(
+            session,
+            instructions=EDITOR_INSTRUCTIONS,
+            input_text=editor_input,
+            schema_name="digest_apply_fixes",
+            json_schema=editor_response_schema([item["item_key"] for item in fix_items]),
+            config=config,
+            ledger_repo=ledger_repo,
+            provider=provider,
+            digest_type=type,
+            parse_response=lambda answer: parse_editor(
+                answer,
+                fixes=fix_items,
+                allowed_tokens=frozenset(citation_tokens),
+            ),
+        )
+
+    try:
+        if type == "weekly":
+            body_markdown, citations = compact_weekly_digest(
+                draft=draft,
+                decisions=decisions,
+                edited_items=edited_items,
+                visible_length=weekly_visible_length,
+                visible_target=WEEKLY_DIGEST_VISIBLE_TARGET,
+            )
+        else:
+            body_markdown, citations = merge_digest(
+                draft=draft, decisions=decisions, edited_items=edited_items
+            )
+    except DigestContractError as exc:
+        raise DigestCitationValidationError(str(exc)) from None
 
     return SynthesizeDigestResult(
-        body_markdown=body_text,
+        publish=True,
+        body_markdown=body_markdown,
         citations=citations,
-        llm_usage_ledger_id=placeholder_row.id,
-        cost_usd=cost_usd,
+        llm_usage_ledger_id=draft_ledger_id,
+        cost_usd=draft_cost + verifier_cost + third_stage_cost,
     )
 
 

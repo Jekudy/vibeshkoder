@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select
+from sqlalchemy import update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from bot.config import settings
@@ -19,16 +21,26 @@ from bot.db.repos.llm_usage_ledger import LedgerRepo
 from bot.db.repos.user import UserRepo
 from bot.html_escape import html_escape
 from bot.db.repos.butler_action import ButlerActionRepo
+from bot.keyboards.inline import intro_refresh_offer_keyboard
 from bot.services.extractor import extraction_scheduler_tick
 from bot.services.graph_projector import default_projector_config, project_incremental
 from bot.services.graph_purge_worker import graph_purge_worker_tick
 from bot.services.image_memory import process_next_pending_photo
+from bot.services.intro_effect_worker import process_intro_effects
+from bot.services.intro_refresh_wave import (
+    calendar_months_before,
+    split_expandable_template,
+    wave_started_at,
+    wave_token,
+)
 from bot.services.invite_worker import process_invite_outbox
 from bot.services.llm_gateway import (
     LiveExtractCandidatesGateway,
     LiveWikiCompilerGateway,
     WikiGatewayResponseContractError,
+    load_digest_gateway_config,
     load_gateway_config,
+    resolve_digest_provider,
     resolve_provider,
 )
 from bot.texts import (
@@ -206,90 +218,87 @@ async def photo_description_worker_job(bot: Bot) -> None:
         )
 
 
-async def check_intro_refresh(bot: Bot) -> None:
-    """Daily job: remind members with stale intros to refresh."""
+async def check_intro_refresh(bot: Bot, *, now: datetime | None = None) -> int | None:
+    """Offer one refresh on the shared wave date; never retry that wave."""
+    current_time = now or datetime.now(timezone.utc)
+    wave = wave_started_at(current_time)
+    if wave is None:
+        return None
+
     async with async_session() as session:
-        stale_intros = await IntroRepo.get_stale_intros(session, settings.INTRO_REFRESH_DAYS)
-        now = datetime.now(timezone.utc)
-
-        for intro in stale_intros:
-            # Check if tracking record exists
-            result = await session.execute(
-                select(IntroRefreshTracking).where(
-                    IntroRefreshTracking.user_id == intro.user_id,
-                    IntroRefreshTracking.completed.is_(False),
+        intros = await IntroRepo.get_refresh_wave_candidates(
+            session, cutoff=calendar_months_before(wave, 5)
+        )
+        sent = 0
+        for intro in intros:
+            try:
+                claim = await session.execute(
+                    insert(IntroRefreshTracking)
+                    .values(
+                        user_id=intro.user_id,
+                        cycle_started_at=wave,
+                        reminders_sent=0,
+                        phase="claimed",
+                        completed=False,
+                    )
+                    .on_conflict_do_nothing(constraint="uq_intro_refresh_tracking_user_cycle")
+                    .returning(IntroRefreshTracking.id)
                 )
-            )
-            tracking = result.scalar_one_or_none()
-
-            if tracking is None:
-                # Start new cycle
-                tracking = IntroRefreshTracking(
-                    user_id=intro.user_id,
-                    cycle_started_at=now,
-                    reminders_sent=0,
-                    phase="daily",
-                    completed=False,
-                )
-                session.add(tracking)
-                await session.flush()
-
-            if tracking.completed:
-                continue
-
-            # Determine if we should send a reminder today
-            should_send = False
-
-            if tracking.phase == "daily":
-                if tracking.reminders_sent < 5:
-                    if (
-                        tracking.last_reminder_at is None
-                        or (now - tracking.last_reminder_at).days >= 1
-                    ):
-                        should_send = True
-                else:
-                    # Move to every_2_days
-                    tracking.phase = "every_2_days"
-                    await session.flush()
-
-            if tracking.phase == "every_2_days":
-                if tracking.reminders_sent < 8:  # 5 daily + 3 every_2_days
-                    if (
-                        tracking.last_reminder_at is None
-                        or (now - tracking.last_reminder_at).days >= 2
-                    ):
-                        should_send = True
-                else:
-                    tracking.phase = "done"
-                    tracking.completed = True
-                    await session.flush()
+                tracking_id = claim.scalar_one_or_none()
+                await session.commit()
+                if tracking_id is None:
                     continue
 
-            if should_send:
+                parts = split_expandable_template(REFRESH_PROMPT, intro.intro_text)
                 try:
-                    await bot.send_message(chat_id=intro.user_id, text=REFRESH_PROMPT)
-                    tracking.reminders_sent += 1
-                    tracking.last_reminder_at = now
-                    await session.flush()
-                except Exception:
-                    logger.warning(
-                        "Failed to send refresh reminder to user %s",
-                        intro.user_id,
+                    for index, text in enumerate(parts):
+                        await bot.send_message(
+                            chat_id=intro.user_id,
+                            text=text,
+                            reply_markup=(
+                                intro_refresh_offer_keyboard(wave_token(wave))
+                                if index == len(parts) - 1
+                                else None
+                            ),
+                        )
+                except TelegramAPIError as error:
+                    await session.execute(
+                        update(IntroRefreshTracking)
+                        .where(IntroRefreshTracking.id == tracking_id)
+                        .values(phase="send_failed", completed=True)
                     )
+                    await session.commit()
+                    logger.warning(
+                        "intro_refresh_wave_send_failed",
+                        extra={
+                            "user_id": intro.user_id,
+                            "error_class": type(error).__name__,
+                        },
+                    )
+                    continue
 
-        await session.commit()
-
-
-async def sync_google_sheets() -> None:
-    """Sync intros with Google Sheets (full bi-directional sync)."""
-    try:
-        from bot.services.sheets import full_sync
-
-        await full_sync()
-    except ImportError:
-        logger.debug("gspread not installed — skipping Google Sheets sync")
-    except Exception:
-        logger.exception("Google Sheets sync failed")
+                await session.execute(
+                    update(IntroRefreshTracking)
+                    .where(IntroRefreshTracking.id == tracking_id)
+                    .values(
+                        reminders_sent=1,
+                        last_reminder_at=datetime.now(timezone.utc),
+                        phase="offer_sent",
+                        completed=True,
+                    )
+                )
+                await session.commit()
+                sent += 1
+            except SQLAlchemyError as error:
+                await session.rollback()
+                logger.error(
+                    "intro_refresh_wave_candidate_database_failed",
+                    extra={
+                        "user_id": intro.user_id,
+                        "error_class": type(error).__name__,
+                    },
+                )
+        return sent
 
 
 async def run_extraction_scheduler_tick() -> None:
@@ -627,7 +636,7 @@ async def digest_daily_job(bot: Bot) -> None:
     """Daily digest run trigger — fires at ``DIGEST_HOUR_MSK`` (Europe/Moscow).
 
     Strict no-op when the ``memory.digests.daily.enabled`` feature flag is
-    OFF. Window is yesterday 00:00 MSK..today 00:00 MSK (stored as UTC).
+    OFF. Window is the most recently completed 05:00 MSK daily window.
 
     Wraps the synthesis pipeline in try/except so apscheduler never stops
     firing — orchestrator output is persisted to ``digests``/``digest_runs``
@@ -642,23 +651,13 @@ async def digest_daily_job(bot: Bot) -> None:
                 logger.info("digest_daily_job: flag disabled, skipping")
                 return
 
-            # Compute window from MSK midnight boundaries — stored as UTC.
-            from zoneinfo import ZoneInfo
-
+            from bot.services.digest_windows import completed_daily_window
             from bot.services.digests import load_digest_config, run_digest
 
-            msk = ZoneInfo("Europe/Moscow")
-            now_msk = datetime.now(tz=msk)
-            today_msk_midnight = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-            yesterday_msk_midnight = today_msk_midnight.replace(day=today_msk_midnight.day)
-            from datetime import timedelta as _td
-
-            yesterday_msk_midnight = today_msk_midnight - _td(days=1)
-            window_start = yesterday_msk_midnight.astimezone(timezone.utc)
-            window_end = today_msk_midnight.astimezone(timezone.utc)
+            window_start, window_end = completed_daily_window(datetime.now(timezone.utc))
 
             digest_config = load_digest_config()
-            gateway_config = load_gateway_config()
+            gateway_config = load_digest_gateway_config(digest_type="daily")
             try:
                 digest = await run_digest(
                     session,
@@ -666,10 +665,7 @@ async def digest_daily_job(bot: Bot) -> None:
                     window_start=window_start,
                     window_end=window_end,
                     ledger_repo=LedgerRepo(),
-                    provider=resolve_provider(
-                        gateway_config.provider,
-                        deepseek_max_tokens=DEEPSEEK_DIGEST_MAX_TOKENS,
-                    ),
+                    provider=resolve_digest_provider(),
                     config=gateway_config,
                     digest_config=digest_config,
                 )
@@ -715,30 +711,7 @@ async def digest_daily_job(bot: Bot) -> None:
 async def digest_stale_posting_reaper_job() -> None:
     """Reap orphan ``digests.status='posting'`` rows from publisher crashes.
 
-    Runs every 5 minutes (NOT gated by feature flag — even after a flag
-    flip-OFF, any in-flight ``posting`` / ``approved_for_publish`` rows
-    must still be cleaned up).
-
-    Two reaping branches in a single UPDATE (PHASE8_PLAN.md §5.G stale-approved
-    reaper extension — kept in this single job rather than a new scheduler
-    entry):
-
-    1. ``status='posting'`` rows older than ``posting_started_at`` + 2 min
-       (Phase 7 §5.K baseline — publisher crash window between row-lock
-       acquisition and ``bot.send_message`` completion).
-    2. ``status='approved_for_publish'`` rows older than ``approved_at`` +
-       5 min (FHR HIGH-2 / Phase 8 §5.G — orchestrator crash window between
-       ``approve_digest`` commit and ``publish_digest`` dispatch). Without
-       this branch, the weekly digest is stuck forever and admin
-       ``/digest_approve <id>`` retries are blocked by the pre-flight guard.
-
-    The 5-min approved threshold is wider than posting's 2-min because the
-    approve-then-publish sequence normally completes in <30s; 5 min handles
-    network hiccups + Telegram retries.
-
-    Per row, ``error_text`` is set to ``delivery_uncertain_no_auto_retry`` or
-    ``stale_approved_reaper`` depending on the source status (the RETURNING
-    branch reads it back).
+    Runs every 5 minutes (not feature-gated) to bound an interrupted send.
     """
     try:
         from sqlalchemy import text as _text
@@ -748,19 +721,11 @@ async def digest_stale_posting_reaper_job() -> None:
                 _text("""
                     UPDATE digests
                     SET status='failed',
-                        error_text=CASE
-                          WHEN status='posting' THEN 'delivery_uncertain_no_auto_retry'
-                          WHEN status='approved_for_publish'
-                              THEN 'stale_approved_reaper'
-                        END,
+                        error_text='delivery_uncertain_no_auto_retry',
                         posting_started_at=NULL,
                         updated_at=now()
-                    WHERE
-                        (status='posting'
-                         AND posting_started_at < now() - interval '2 minutes')
-                        OR
-                        (status='approved_for_publish'
-                         AND approved_at < now() - interval '5 minutes')
+                    WHERE status='posting'
+                      AND posting_started_at < now() - interval '2 minutes'
                     RETURNING id, error_text
                 """)
             )
@@ -795,11 +760,11 @@ async def digest_stale_posting_reaper_job() -> None:
 
 
 async def digest_weekly_job(bot: Bot) -> None:
-    """Weekly digest run trigger — fires Mon ``DIGEST_WEEKLY_HOUR_MSK`` MSK.
+    """Weekly digest run trigger — fires Thu ``DIGEST_WEEKLY_HOUR_MSK`` MSK.
 
-    Per PHASE8_PLAN.md §5.G. Strict no-op when ``memory.digests.weekly.enabled``
-    is OFF. Window is the most recently completed ISO week:
-    ``last_monday 00:00 MSK..this_monday 00:00 MSK`` (stored as UTC).
+    Strict no-op when ``memory.digests.weekly.enabled`` is OFF. Window is the
+    most recently completed seven daily windows:
+    ``last_thursday 05:00 MSK..this_thursday 05:00 MSK`` (stored as UTC).
 
     A fresh draft is published automatically. Idempotent re-runs do not
     republish rows that already advanced beyond ``draft``.
@@ -813,25 +778,13 @@ async def digest_weekly_job(bot: Bot) -> None:
                 logger.info("digest_weekly_job: flag disabled, skipping")
                 return
 
-            from zoneinfo import ZoneInfo
-
+            from bot.services.digest_windows import completed_weekly_window
             from bot.services.digests import load_digest_config, run_digest
 
-            msk = ZoneInfo("Europe/Moscow")
-            now_msk = datetime.now(tz=msk)
-            today_msk_midnight = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-            # ISO: Mon=1, Tue=2, ..., Sun=7. days_since_monday=0 when cron
-            # fires on Mon. The "most recent Monday 00:00 MSK" is therefore
-            # ``today_msk_midnight - timedelta(days=days_since_monday)``.
-            days_since_monday = today_msk_midnight.isoweekday() - 1
-            this_monday_msk = today_msk_midnight - timedelta(days=days_since_monday)
-            last_monday_msk = this_monday_msk - timedelta(days=7)
-
-            window_start = last_monday_msk.astimezone(timezone.utc)
-            window_end = this_monday_msk.astimezone(timezone.utc)
+            window_start, window_end = completed_weekly_window(datetime.now(timezone.utc))
 
             digest_config = load_digest_config()
-            gateway_config = load_gateway_config()
+            gateway_config = load_digest_gateway_config(digest_type="weekly")
             try:
                 digest = await run_digest(
                     session,
@@ -839,10 +792,7 @@ async def digest_weekly_job(bot: Bot) -> None:
                     window_start=window_start,
                     window_end=window_end,
                     ledger_repo=LedgerRepo(),
-                    provider=resolve_provider(
-                        gateway_config.provider,
-                        deepseek_max_tokens=DEEPSEEK_DIGEST_MAX_TOKENS,
-                    ),
+                    provider=resolve_digest_provider(),
                     config=gateway_config,
                     digest_config=digest_config,
                 )
@@ -857,6 +807,12 @@ async def digest_weekly_job(bot: Bot) -> None:
 
                 # Fully automatic path: no admin review gate.
                 if digest.status == "draft":
+                    if not await FeatureFlagRepo.get(session, "memory.digests.weekly.enabled"):
+                        logger.info(
+                            "digest_weekly_job: flag disabled before publish, leaving draft id=%s",
+                            digest.id,
+                        )
+                        return
                     try:
                         from bot.services.digest_publisher import publish_digest
 
@@ -873,27 +829,13 @@ async def digest_weekly_job(bot: Bot) -> None:
                         except Exception:
                             logger.exception("digest_weekly_job: publish rollback failed")
                         logger.exception("digest_weekly_job: publish_digest failed")
-                elif digest.status in (
-                    "awaiting_review",
-                    "approved_for_publish",
-                    "posting",
-                    "posted",
-                ):
+                elif digest.status in ("posting", "posted"):
                     # Idempotency hit: prior cycle already advanced this
                     # window. No-op — admin is already in the loop.
                     logger.info(
                         "digest_weekly_job: existing %s row id=%s, no-op",
                         digest.status,
                         digest.id,
-                    )
-                elif digest.status in ("rejected_by_admin", "rejected_by_reaper"):
-                    # Cron does NOT auto-regenerate. Admin must run
-                    # /digest_now weekly --regenerate.
-                    logger.info(
-                        "digest_weekly_job: window has rejected run id=%s "
-                        "status=%s, awaiting admin /digest_now weekly --regenerate",
-                        digest.id,
-                        digest.status,
                     )
                 elif digest.status in ("failed", "cost_exceeded"):
                     # Surface to admin DM.
@@ -941,147 +883,6 @@ async def digest_weekly_job(bot: Bot) -> None:
         # Catch-all — apscheduler must never see an exception or it would
         # mark the job as failed and stop firing.
         logger.exception("digest_weekly_job: session setup failed")
-
-
-async def digest_stale_review_reaper_job(bot: Bot) -> None:
-    """48h DM + 7d auto-reject for ``awaiting_review`` weekly digests.
-
-    Per PHASE8_PLAN.md §5.G + §13 AC7. Runs every 30 min, NOT flag-gated —
-    even after a flag flip-OFF, any rows already in ``awaiting_review`` must
-    still be reaped to bound queue size.
-
-    Two passes per tick:
-
-    1. **7d auto-reject pass FIRST.** Guarded UPDATE transitions
-       ``awaiting_review`` rows older than 7 days to ``rejected_by_reaper``.
-       Audit row inserted with ``error_text='review_deadline_exceeded'``.
-       Admin DM fires with ``error_text='review_7d_auto_rejected'``. Doing
-       the 7d pass FIRST means an 8d row terminates this tick rather than
-       getting a 48h DM (which would then be terminated next tick).
-
-    2. **48h DM pass.** M4 guarded UPDATE: SELECT candidate rows where
-       ``awaiting_review_at < now() - 48h`` AND the ``[48h_notified]`` marker
-       is absent from ``review_notes``. For each, attempt a guarded UPDATE
-       gated on ``status='awaiting_review'`` — rowcount=0 means an admin
-       advanced the state between SELECT and UPDATE; skip the DM cleanly.
-       Rowcount=1 → DM fires AFTER the marker landed, guaranteeing at-most-
-       once notification per row.
-
-    The wrapping try/except so a reaper crash does not disrupt other
-    scheduler jobs.
-    """
-    try:
-        from sqlalchemy import text as _text
-
-        async with async_session() as session:
-            # Step 1: 7d auto-reject pass. Guarded UPDATE — type + status +
-            # age all enforced in WHERE; rowcount drives audit insert and
-            # admin DM.
-            seven_d_rows = (
-                await session.execute(
-                    _text(
-                        """
-                        UPDATE digests
-                        SET status='rejected_by_reaper',
-                            review_notes=COALESCE(review_notes,'') || '[stale_7d]',
-                            updated_at=now()
-                        WHERE type='weekly'
-                          AND status='awaiting_review'
-                          AND awaiting_review_at < now() - interval '7 days'
-                        RETURNING id
-                        """
-                    )
-                )
-            ).fetchall()
-            seven_d_ids = [row.id for row in seven_d_rows]
-            for digest_id in seven_d_ids:
-                await session.execute(
-                    _text(
-                        "INSERT INTO digest_runs (digest_id, status, "
-                        "error_text, started_at, finished_at) "
-                        "VALUES (:id, 'rejected_by_reaper', "
-                        "'review_deadline_exceeded', now(), now())"
-                    ),
-                    {"id": digest_id},
-                )
-                logger.warning("digest_stale_review_reaper: rejected digest_id=%s", digest_id)
-            await session.commit()
-            # 7d-pass admin DMs — dispatched after commit so the row is durable
-            # before the side-effect.
-            if seven_d_ids:
-                from bot.services.digest_admin_notify import (
-                    notify_admins_digest_failure,
-                )
-
-                for digest_id in seven_d_ids:
-                    await notify_admins_digest_failure(
-                        bot,
-                        digest_id=digest_id,
-                        status="rejected_by_reaper",
-                        error_text="review_7d_auto_rejected",
-                    )
-
-            # Step 2: 48h notify pass — DM at most once per row via marker.
-            candidate_rows = (
-                await session.execute(
-                    _text(
-                        """
-                        SELECT id
-                        FROM digests
-                        WHERE type='weekly'
-                          AND status='awaiting_review'
-                          AND awaiting_review_at < now() - interval '48 hours'
-                          AND (review_notes IS NULL
-                               OR review_notes NOT LIKE '%[48h_notified]%')
-                        """
-                    )
-                )
-            ).fetchall()
-
-            notified_ids: list[int] = []
-            for row in candidate_rows:
-                # M4: guarded UPDATE — admin may have approved / rejected
-                # between SELECT and UPDATE. Marker must only land on rows
-                # STILL in awaiting_review. rowcount=0 → log + skip DM.
-                update_result = await session.execute(
-                    _text(
-                        "UPDATE digests SET "
-                        "review_notes=COALESCE(review_notes,'') "
-                        "|| '[48h_notified]', "
-                        "updated_at=now() "
-                        "WHERE id=:id AND status='awaiting_review' "
-                        "RETURNING id"
-                    ),
-                    {"id": row.id},
-                )
-                if update_result.rowcount == 0:
-                    logger.info(
-                        "digest_stale_review_reaper: digest_id=%s no longer "
-                        "awaiting_review, skipping 48h DM (state advanced)",
-                        row.id,
-                    )
-                    continue
-                notified_ids.append(row.id)
-            await session.commit()
-
-            if notified_ids:
-                from bot.services.digest_admin_notify import (
-                    notify_admins_digest_failure,
-                )
-
-                for digest_id in notified_ids:
-                    # DM AFTER successful guarded marker — order guarantees
-                    # at-most-once notification per row.
-                    await notify_admins_digest_failure(
-                        bot,
-                        digest_id=digest_id,
-                        status="awaiting_review",
-                        error_text="review_48h_reminder",
-                    )
-    except Exception:
-        # Reaper crash must NEVER propagate — apscheduler would stop firing
-        # the job. Log + continue.
-        logger.exception("digest_stale_review_reaper crashed")
 
 
 # ─── T10-07: Phase 10 graph scheduler jobs ──────────────────────────────────
@@ -1322,18 +1123,30 @@ def start_scheduler(bot: Bot) -> None:
     scheduler.add_job(
         check_intro_refresh,
         "cron",
+        month="3,9",
+        day=1,
         hour=10,
         minute=0,
+        timezone="Europe/Moscow",
         args=[bot],
         id="check_intro_refresh",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
+    from bot.services.sheets import _is_configured, project_intro_to_sheet
+
     scheduler.add_job(
-        sync_google_sheets,
+        process_intro_effects,
         "interval",
-        minutes=5,
-        id="sync_google_sheets",
+        seconds=30,
+        args=[bot],
+        kwargs={"project_sheet": project_intro_to_sheet if _is_configured() else None},
+        id="process_intro_effects",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
     # T6-03: Phase 6 extraction scheduler. Default OFF via flag
     # ``memory.extraction.scheduler.enabled`` (see bot/services/extractor.py).
@@ -1394,7 +1207,7 @@ def start_scheduler(bot: Bot) -> None:
         coalesce=True,
         misfire_grace_time=60,
     )
-    # Weekly digest. Monday at 09:00 MSK, matching the product contract.
+    # Weekly digest. Thursday at 09:00 MSK, matching the product contract.
     # Gated by feature flag ``memory.digests.weekly.enabled`` (default OFF);
     # job body re-checks the flag and is a strict no-op when disabled.
     digest_weekly_hour_msk = int(getattr(settings, "DIGEST_WEEKLY_HOUR_MSK", 9))
@@ -1402,7 +1215,7 @@ def start_scheduler(bot: Bot) -> None:
     scheduler.add_job(
         digest_weekly_job,
         "cron",
-        day_of_week="mon",
+        day_of_week="thu",
         hour=digest_weekly_hour_msk,
         minute=digest_weekly_minute_msk,
         args=[bot],
@@ -1426,20 +1239,6 @@ def start_scheduler(bot: Bot) -> None:
         coalesce=True,
         misfire_grace_time=1800,
         timezone=msk,
-    )
-    # T8-05: Phase 8 stale-review reaper. Every 30 min, no flag gate —
-    # rows already in awaiting_review must still be bounded even after a
-    # flag flip-OFF. Two passes per tick: 7d auto-reject + 48h DM.
-    scheduler.add_job(
-        digest_stale_review_reaper_job,
-        "interval",
-        minutes=30,
-        args=[bot],
-        id="digest_stale_review_reaper",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=300,
     )
     # T10-07: Phase 10 graph projection nightly job. Cron 03:30 MSK = 00:30 UTC.
     # Gated by feature flag ``memory.graph.projection.enabled`` (default OFF);

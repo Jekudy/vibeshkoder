@@ -1,14 +1,43 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import Intro, User
+from bot.db.models import Application, Intro, IntroRefreshTracking, User
 
 
 class IntroRepo:
+    @staticmethod
+    async def get_for_update(session: AsyncSession, user_id: int) -> Intro | None:
+        result = await session.execute(
+            select(Intro).where(Intro.user_id == user_id).with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def promote_if_current(
+        session: AsyncSession,
+        *,
+        user_id: int,
+        base_application_id: int | None,
+        application_id: int,
+        intro_text: str,
+    ) -> bool:
+        pointer = (
+            Intro.application_id.is_(None)
+            if base_application_id is None
+            else Intro.application_id == base_application_id
+        )
+        result = await session.execute(
+            update(Intro)
+            .where(Intro.user_id == user_id, pointer)
+            .values(application_id=application_id, intro_text=intro_text)
+        )
+        await session.flush()
+        return bool(result.rowcount)
+
     @staticmethod
     async def upsert(
         session: AsyncSession,
@@ -60,7 +89,32 @@ class IntroRepo:
         return list(result.scalars().all())
 
     @staticmethod
-    async def get_stale_intros(session: AsyncSession, days: int) -> list[Intro]:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        result = await session.execute(select(Intro).where(Intro.updated_at < cutoff))
+    async def get_refresh_wave_candidates(
+        session: AsyncSession, *, cutoff: datetime
+    ) -> list[Intro]:
+        last_prompt = (
+            select(
+                IntroRefreshTracking.user_id,
+                func.max(IntroRefreshTracking.last_reminder_at).label("last_prompt_at"),
+            )
+            .where(IntroRefreshTracking.last_reminder_at.is_not(None))
+            .group_by(IntroRefreshTracking.user_id)
+            .subquery()
+        )
+        active_refresh = select(Application.id).where(
+            Application.user_id == Intro.user_id,
+            Application.flow_kind == "refresh",
+            Application.status.in_(("filling", "confirmed")),
+        )
+        result = await session.execute(
+            select(Intro)
+            .join(User, User.id == Intro.user_id)
+            .outerjoin(last_prompt, last_prompt.c.user_id == Intro.user_id)
+            .where(
+                User.is_member.is_(True),
+                ~active_refresh.exists(),
+                func.coalesce(last_prompt.c.last_prompt_at, Intro.updated_at) <= cutoff,
+            )
+            .order_by(Intro.user_id)
+        )
         return list(result.scalars().all())

@@ -2230,6 +2230,19 @@ def test_rrf_deduplicates_and_enforces_author_and_card_diversity() -> None:
     assert ranks["message:1"] == {"vector": 1, "fts": 1}
 
 
+def test_rrf_allows_three_messages_per_author_but_excludes_the_fourth() -> None:
+    same_author = [_hit(version_id=index, author_id=77) for index in range(1, 5)]
+    other_authors = [_hit(version_id=index, author_id=100 + index) for index in range(5, 7)]
+
+    selected, _ = reciprocal_rank_fusion(
+        vector_hits=[*same_author, *other_authors],
+        fts_hits=[],
+        limit=5,
+    )
+
+    assert [hit.message_version_id for hit in selected] == [1, 2, 3, 5, 6]
+
+
 def test_rrf_caps_explicit_telegram_topic_without_collapsing_non_topic_chat() -> None:
     topic_hits = [
         _hit(version_id=index, author_id=100 + index, message_thread_id=9001)

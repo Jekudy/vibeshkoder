@@ -1,57 +1,53 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import settings
-from bot.db.models import QuestionnaireAnswer
+from bot.db.models import Application, QuestionnaireAnswer
 from bot.db.repos.application import ApplicationRepo
-from bot.db.repos.intro import IntroRepo
 from bot.db.repos.questionnaire import QuestionnaireRepo
-from bot.db.repos.user import UserRepo
 from bot.filters.chat_type import PrivateChatFilter
-from bot.html_escape import html_escape
 from bot.keyboards.inline import (
     ConfirmCallback,
     confirm_keyboard,
-    vouch_keyboard,
 )
-from bot.services.referral_username import (
-    InvalidReferralUsername,
-    normalize_referral_username,
+from bot.services.intro_contract import get_intro_catalog, intro_digest, render_intro_html
+from bot.services.intro_workflow import (
+    IntroWorkflowError,
+    InvalidReferralAnswer,
+    confirm_application,
+    cancel_refresh,
+    reset_draft,
+    verify_refresh_preview,
+    write_answer,
 )
 from bot.states.questionnaire import STATES_LIST, QuestionnaireForm
 from bot.texts import (
     CONFIRM_PROMPT,
-    INTRO_TEMPLATE,
     INVALID_REFERRAL_USERNAME,
     NEXT_QUESTION,
     NOT_TEXT_ERROR,
     QUESTIONS,
     QUESTIONNAIRE_POSTED,
+    REFRESH_CANCELLED,
+    REFRESH_SAVED,
 )
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="questionnaire")
+FIELD_IDS = tuple(field.field_id for field in get_intro_catalog("intro-v2"))
 
 
 def build_intro_preview(answers: list[QuestionnaireAnswer]) -> str:
     """Build formatted intro text from questionnaire answers."""
-    answers_by_idx = {a.question_index: a.answer_text for a in answers}
-    return INTRO_TEMPLATE.format(
-        name=html_escape(answers_by_idx.get(0, "—")),
-        location=html_escape(answers_by_idx.get(1, "—")),
-        source=html_escape(answers_by_idx.get(2, "—")),
-        experience=html_escape(answers_by_idx.get(3, "—")),
-        projects=html_escape(answers_by_idx.get(4, "—")),
-        hardest=html_escape(answers_by_idx.get(5, "—")),
-        goals=html_escape(answers_by_idx.get(6, "—")),
+    return render_intro_html(
+        [(answer.field_id, answer.answer_text) for answer in answers],
+        catalog_version="intro-v2",
     )
 
 
@@ -122,42 +118,80 @@ async def handle_answer(
     if application_id is None:
         return
 
-    answer_text = message.text
-    if idx == 2:
-        try:
-            answer_text = normalize_referral_username(answer_text)
-        except InvalidReferralUsername:
-            await message.answer(INVALID_REFERRAL_USERNAME)
-            return
-
-    # Save answer
-    await QuestionnaireRepo.save_answer(
-        session,
-        user_id=message.from_user.id,
-        application_id=application_id,
-        question_index=idx,
-        question_text=QUESTIONS[idx],
-        answer_text=answer_text,
-    )
+    field_id = FIELD_IDS[idx]
+    try:
+        next_field_id = await write_answer(
+            session,
+            user_id=message.from_user.id,
+            application_id=application_id,
+            field_id=field_id,
+            answer_text=message.text,
+        )
+    except InvalidReferralAnswer:
+        await message.answer(INVALID_REFERRAL_USERNAME)
+        return
+    except IntroWorkflowError:
+        await message.answer("Анкета устарела. Запусти /start ещё раз.")
+        return
 
     # Advance to next state or confirm
-    if idx < len(QUESTIONS) - 1:
-        next_idx = idx + 1
+    application = await session.get(Application, application_id)
+    if next_field_id is not None:
+        if application is not None and application.flow_kind == "refresh":
+            from bot.handlers.intro_refresh import show_refresh_step
+
+            await show_refresh_step(
+                message,
+                state,
+                session,
+                user_id=message.from_user.id,
+                application_id=application_id,
+                field_id=next_field_id,
+                edit=False,
+            )
+            return
+        next_idx = FIELD_IDS.index(next_field_id)
         await state.set_state(STATES_LIST[next_idx])
         await message.answer(NEXT_QUESTION.format(question=QUESTIONS[next_idx]))
     else:
-        # All questions answered → show confirmation
-        answers = await QuestionnaireRepo.get_answers(
+        await show_confirm(
+            message,
+            state,
             session,
             message.from_user.id,
-            application_id=application_id,
+            application_id,
+            edit=False,
         )
-        intro_text = build_intro_preview(answers)
-        await state.set_state(QuestionnaireForm.confirm)
-        await message.answer(
-            CONFIRM_PROMPT.format(intro_text=intro_text),
-            reply_markup=confirm_keyboard(),
-        )
+
+
+async def show_confirm(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    user_id: int,
+    application_id: int,
+    *,
+    edit: bool,
+) -> None:
+    application = await ApplicationRepo.get(session, application_id)
+    if application is None or application.user_id != user_id:
+        raise IntroWorkflowError("Questionnaire is not owned by this user")
+    answers = await QuestionnaireRepo.get_by_application(session, application_id=application_id)
+    intro_text = build_intro_preview(answers)
+    await state.set_state(QuestionnaireForm.confirm)
+    markup = confirm_keyboard(
+        application_id,
+        intro_digest(intro_text),
+        redo_text=(
+            "Изменить выбор блоков" if application.flow_kind == "refresh" else "Заполнить заново 🔄"
+        ),
+        cancel_text="Отменить обновление" if application.flow_kind == "refresh" else None,
+    )
+    text = CONFIRM_PROMPT.format(intro_text=intro_text)
+    if edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
 
 
 # ── Non-text message error for question states ──────────────────────
@@ -208,99 +242,97 @@ async def handle_confirm(
     if callback.from_user is None or callback.message is None:
         return
 
-    data = await state.get_data()
-    application_id = data.get("application_id")
-    is_existing_member = data.get("is_existing_member", False)
+    if callback_data.action == "cancel":
+        try:
+            application = await verify_refresh_preview(
+                session,
+                user_id=callback.from_user.id,
+                application_id=callback_data.application_id,
+                digest=callback_data.digest,
+            )
+            await cancel_refresh(
+                session,
+                user_id=callback.from_user.id,
+                application_id=application.id,
+            )
+        except IntroWorkflowError:
+            await callback.answer("Эта анкета устарела. Запусти /refresh ещё раз.")
+            return
+        await state.clear()
+        await callback.message.edit_text(REFRESH_CANCELLED)
+        await callback.answer()
+        return
 
     if callback_data.action == "redo":
-        # Delete answers and restart
-        if application_id is not None:
-            await QuestionnaireRepo.delete_answers(
+        application = await ApplicationRepo.get(session, callback_data.application_id)
+        if application is not None and application.flow_kind == "refresh":
+            try:
+                await verify_refresh_preview(
+                    session,
+                    user_id=callback.from_user.id,
+                    application_id=callback_data.application_id,
+                    digest=callback_data.digest,
+                )
+                await state.clear()
+                from bot.handlers.intro_refresh import show_refresh_selection
+
+                await show_refresh_selection(
+                    callback.message,
+                    session,
+                    callback.from_user.id,
+                    edit=True,
+                    context=(f"a{callback_data.application_id}.{callback_data.digest}"),
+                )
+            except IntroWorkflowError:
+                await callback.answer("Эта анкета устарела. Запусти /refresh ещё раз.")
+                return
+            await callback.answer()
+            return
+        try:
+            next_field_id = await reset_draft(
                 session,
-                callback.from_user.id,
-                application_id=application_id,
+                user_id=callback.from_user.id,
+                application_id=callback_data.application_id,
+                digest=callback_data.digest,
             )
-        await state.set_state(QuestionnaireForm.q1_name)
-        await callback.message.edit_text(NEXT_QUESTION.format(question=QUESTIONS[0]))
+        except IntroWorkflowError:
+            await callback.answer("Эта анкета устарела. Запусти /start ещё раз.")
+            return
+        if next_field_id is None:
+            await callback.answer("Анкета уже заполнена.")
+            return
+        next_idx = FIELD_IDS.index(next_field_id)
+        await state.update_data(application_id=callback_data.application_id)
+        await state.set_state(STATES_LIST[next_idx])
+        await callback.message.edit_text(NEXT_QUESTION.format(question=QUESTIONS[next_idx]))
         await callback.answer()
         return
 
     if callback_data.action == "yes":
-        if application_id is None:
-            await callback.answer("Ошибка: заявка не найдена.")
-            return
-
-        answers = await QuestionnaireRepo.get_answers(
-            session,
-            callback.from_user.id,
-            application_id=application_id,
-        )
-        intro_text = build_intro_preview(answers)
-
-        user = await UserRepo.get(session, callback.from_user.id)
-        user_display = user.first_name if user else callback.from_user.first_name
-        username = user.username if user else callback.from_user.username
-
-        if is_existing_member:
-            is_refresh = data.get("is_refresh", False)
-
-            if is_refresh:
-                # Refresh: preserve vouched_by_name from existing intro
-                existing_intro = await IntroRepo.get(session, callback.from_user.id)
-                vouched_by_name = (
-                    existing_intro.vouched_by_name if existing_intro else "времена до бота"
-                )
-            else:
-                vouched_by_name = "времена до бота"
-
-            await IntroRepo.upsert(
+        try:
+            application = await confirm_application(
                 session,
                 user_id=callback.from_user.id,
-                intro_text=intro_text,
-                vouched_by_name=vouched_by_name,
+                application_id=callback_data.application_id,
+                digest=callback_data.digest,
             )
-            await ApplicationRepo.update_status(session, application_id, "added")
-            await state.clear()
+        except IntroWorkflowError:
+            await callback.answer("Предпросмотр устарел. Заполни анкету заново.")
+            return
 
-            # Post intro in community chat (without vouch button)
-            header = f"📋 Интро: {html_escape(user_display)}"
-            if username:
-                header += f" (@{html_escape(username)})"
-            header += "\n\n"
-            try:
-                await callback.bot.send_message(
-                    chat_id=settings.COMMUNITY_CHAT_ID,
-                    text=header + intro_text,
-                )
-            except Exception:
-                pass
-
-            if is_refresh:
-                from bot.texts import REFRESH_SAVED
-
-                await callback.message.edit_text(REFRESH_SAVED)
-            else:
-                await callback.message.edit_text("Интро сохранено! Спасибо.")
-        else:
-            # New applicant: post to community chat
-            header = f"📋 Новая анкета от {html_escape(user_display)}"
-            if username:
-                header += f" (@{html_escape(username)})"
-            header += "\n\n"
-
-            msg = await callback.bot.send_message(
-                chat_id=settings.COMMUNITY_CHAT_ID,
-                text=header + intro_text,
-                reply_markup=vouch_keyboard(application_id),
-            )
-            await ApplicationRepo.update_status(
-                session,
-                application_id,
-                "pending",
-                questionnaire_message_id=msg.message_id,
-                submitted_at=datetime.now(timezone.utc),
-            )
-            await state.clear()
-            await callback.message.edit_text(QUESTIONNAIRE_POSTED)
+        await state.clear()
+        await callback.message.edit_text(
+            REFRESH_SAVED if application.flow_kind == "refresh" else QUESTIONNAIRE_POSTED
+        )
 
         await callback.answer()
+        return
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({"confirm:yes", "confirm:redo"}))
+async def handle_legacy_confirm(callback: CallbackQuery) -> None:
+    await callback.answer(
+        "Эта кнопка устарела. Запусти /start или /refresh ещё раз.", show_alert=True
+    )

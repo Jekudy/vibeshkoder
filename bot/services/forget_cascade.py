@@ -1072,19 +1072,13 @@ async def _cascade_digests(session: AsyncSession, event) -> int:
     )
     affected_cs_ids = {r[0] for r in cs_rows}
 
-    # JSONB scan for digests citing either kind.
-    # T8-04 / Phase 8 §5.D — status filter widened to include the four new
-    # review-gate statuses (awaiting_review, approved_for_publish,
-    # rejected_by_admin) so the cascade reaches drafts under admin review.
-    # MUST mirror digest_redactor._REDACTOR_ELIGIBLE_STATUSES — both must
-    # be widened together (§5.K C1 fix: cascade-only widening leaves a
-    # silent privacy regression).
+    # JSONB scan for digests citing either kind. Keep this list in sync with
+    # digest_redactor._REDACTOR_ELIGIBLE_STATUSES.
     digest_rows = await session.execute(
         text(
             "SELECT d.id FROM digests d "
             "WHERE d.status IN "
-            "('draft','awaiting_review','approved_for_publish','posting',"
-            " 'posted','redacted','redacted_edit_failed','rejected_by_admin') "
+            "('draft','posting','posted','redacted','redacted_edit_failed') "
             "  AND EXISTS ("
             "      SELECT 1 FROM jsonb_array_elements(d.citations) AS elem "
             "      WHERE ("

@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "aiogram>=3.25",
+    "aiohttp>=3.14.3",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.30",
     "pgvector>=0.4.1,<0.5",
@@ -36,7 +37,7 @@ dev = [
     # aiosqlite is dev-only — used by tests/test_scheduler_deadlines.py for in-memory sqlite
     # isolation. Production runtime requires postgres (T0-02; see bot/db/engine.py).
     "aiosqlite>=0.20",
-    "ruff>=0.11",
+    "ruff>=0.11,<0.16",
     "mypy>=1.15",
     # PyYAML — dev-only — used by tests/evals/* to parse seed_meta.yaml baseline thresholds.
     "PyYAML>=6.0",
@@ -47,7 +48,7 @@ ops = [
     "telethon>=1.39",
 ]
 healing = [
-    "cryptography>=48.0.1",
+    "cryptography>=50.0.0",
     "psycopg[binary]>=3.2",
 ]
 

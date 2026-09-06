@@ -9,10 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
 from bot.db.repos.application import ApplicationRepo
+from bot.db.repos.intro_effect_outbox import IntroEffectOutboxRepo
 from bot.db.repos.intro import IntroRepo
-from bot.db.repos.questionnaire import QuestionnaireRepo
 from bot.db.repos.user import UserRepo
-from bot.handlers.questionnaire import build_intro_preview
 from bot.html_escape import html_escape
 
 logger = logging.getLogger(__name__)
@@ -41,7 +40,7 @@ def _is_leave(update: ChatMemberUpdated) -> bool:
 def _admission_rejection_reason(active_app, user_id: int) -> str | None:
     if active_app is None:
         return "no active application"
-    if active_app.status != "vouched":
+    if active_app.status not in {"vouched", "added"}:
         return f"application {active_app.id} status={active_app.status!r}"
     if active_app.invite_user_id != user_id:
         return f"application {active_app.id} invite_user_id={active_app.invite_user_id!r}"
@@ -139,7 +138,9 @@ async def _handle_join(
 ) -> None:
     now = datetime.now(timezone.utc)
 
-    # Upsert user before admission decisions so the reject path can track kicks.
+    # Capture membership before upsert so an old added admission cannot admit a former member.
+    existing_user = await UserRepo.get(session, tg_user.id)
+    was_member = bool(existing_user is not None and getattr(existing_user, "is_member", False))
     await UserRepo.upsert(
         session,
         telegram_id=tg_user.id,
@@ -155,60 +156,52 @@ async def _handle_join(
     if is_admin:
         logger.info("Admin user %s joined without gatekeeper admission", tg_user.id)
     else:
-        # Check for active vouched application with a user-bound invite.
-        active_app = await ApplicationRepo.get_active(session, tg_user.id)
+        # The added state is an idempotent duplicate join for this exact admission.
+        active_app = await ApplicationRepo.get_active(session, tg_user.id, include_added=was_member)
         rejection_reason = _admission_rejection_reason(active_app, tg_user.id)
 
         if rejection_reason is not None:
             await _reject_join(event, session, tg_user, now, rejection_reason)
             return
 
-    await UserRepo.set_member(session, tg_user.id, is_member=True, joined_at=now)
+    if is_admin:
+        await UserRepo.set_member(session, tg_user.id, is_member=True, joined_at=now)
+        return
 
-    # Check if user already has an intro (don't overwrite)
+    enqueue_intro = False
+    if active_app.status == "vouched":
+        application_id = active_app.id
+        added = await ApplicationRepo.update_status_if(
+            session,
+            application_id,
+            expected_from="vouched",
+            new_status="added",
+            added_at=now,
+        )
+        if not added:
+            active_app = await ApplicationRepo.get(session, application_id)
+            if (
+                active_app is None
+                or active_app.id != application_id
+                or active_app.status != "added"
+                or _admission_rejection_reason(active_app, tg_user.id) is not None
+            ):
+                await _reject_join(event, session, tg_user, now, "admission CAS lost")
+                return
+        else:
+            enqueue_intro = True
+
+    await UserRepo.set_member(session, tg_user.id, is_member=True, joined_at=now)
     existing_intro = await IntroRepo.get(session, tg_user.id)
     if existing_intro is not None:
         logger.info("User %s already has intro, skipping intro creation on join", tg_user.id)
         return
-
-    if is_admin:
-        return
-
-    await ApplicationRepo.update_status(session, active_app.id, "added", added_at=now)
-
-    # Build and save intro
-    answers = await QuestionnaireRepo.get_answers(session, tg_user.id, application_id=active_app.id)
-    if answers:
-        intro_text = build_intro_preview(answers)
-
-        # Get voucher @username
-        vouched_by_name = "—"
-        if active_app.vouched_by:
-            voucher = await UserRepo.get(session, active_app.vouched_by)
-            if voucher:
-                vouched_by_name = f"@{voucher.username}" if voucher.username else voucher.first_name
-        vouched_by_display = html_escape(vouched_by_name)
-
-        await IntroRepo.upsert(
+    if enqueue_intro:
+        await IntroEffectOutboxRepo.enqueue_once(
             session,
-            user_id=tg_user.id,
-            intro_text=intro_text,
-            vouched_by_name=vouched_by_name,
+            application_id=active_app.id,
+            effect_kind="admission_intro",
         )
-
-        # Post intro in community chat
-        header = f"🎉 Новый участник: {html_escape(tg_user.first_name)}"
-        if tg_user.username:
-            header += f" (@{html_escape(tg_user.username)})"
-        header += f"\nПоручился: {vouched_by_display}\n\n"
-
-        try:
-            await event.bot.send_message(
-                chat_id=settings.COMMUNITY_CHAT_ID,
-                text=header + intro_text,
-            )
-        except Exception:
-            logger.exception("Failed to post intro for user %s", tg_user.id)
 
 
 @router.message(F.new_chat_members)

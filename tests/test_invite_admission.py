@@ -73,15 +73,10 @@ def _patch_join_dependencies(
         "get_active",
         AsyncMock(return_value=active_app),
     )
-    monkeypatch.setattr(handler.ApplicationRepo, "update_status", AsyncMock())
-    monkeypatch.setattr(
-        handler.QuestionnaireRepo,
-        "get_answers",
-        AsyncMock(return_value=[]),
-    )
-    monkeypatch.setattr(handler.IntroRepo, "upsert", AsyncMock())
+    monkeypatch.setattr(handler.ApplicationRepo, "update_status_if", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler.IntroEffectOutboxRepo, "enqueue_once", AsyncMock())
 
-    return user_set_member, handler.ApplicationRepo.update_status
+    return user_set_member, handler.ApplicationRepo.update_status_if
 
 
 def test_filling_user_using_forwarded_invite_rejected(app_env, monkeypatch, caplog) -> None:
@@ -124,8 +119,7 @@ def test_handle_join_legit_returning_member_with_valid_vouch_passes(app_env, mon
     event.bot.unban_chat_member.assert_not_called()
     user_set_member.assert_awaited_once_with(session, 222, is_member=True, joined_at=ANY)
     handler.IntroRepo.get.assert_awaited_once_with(session, 222)
-    handler.IntroRepo.upsert.assert_not_called()
-    update_status.assert_not_called()
+    update_status.assert_awaited_once()
 
 
 def test_handle_join_ex_member_with_intro_no_vouch_rejected(app_env, monkeypatch, caplog) -> None:
@@ -148,7 +142,6 @@ def test_handle_join_ex_member_with_intro_no_vouch_rejected(app_env, monkeypatch
     event.bot.unban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
     user_set_member.assert_awaited_once_with(session, 222, is_member=False, left_at=ANY)
     handler.IntroRepo.get.assert_not_called()
-    handler.IntroRepo.upsert.assert_not_called()
     update_status.assert_not_called()
     assert "status='rejected'" in caplog.text
 
@@ -173,7 +166,6 @@ def test_handle_join_forwarded_invite_ex_member_blocked(app_env, monkeypatch, ca
     event.bot.unban_chat_member.assert_awaited_once_with(COMMUNITY_CHAT_ID, 222)
     user_set_member.assert_awaited_once_with(session, 222, is_member=False, left_at=ANY)
     handler.IntroRepo.get.assert_not_called()
-    handler.IntroRepo.upsert.assert_not_called()
     update_status.assert_not_called()
     assert "no active application" in caplog.text
 
@@ -214,7 +206,9 @@ def test_vouched_user_join_accepted(app_env, monkeypatch) -> None:
     update_status.assert_awaited_once()
     args = update_status.await_args.args
     kwargs = update_status.await_args.kwargs
-    assert args == (session, 555, "added")
+    assert args == (session, 555)
+    assert kwargs["expected_from"] == "vouched"
+    assert kwargs["new_status"] == "added"
     assert "added_at" in kwargs
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 from collections.abc import AsyncIterator, Iterator
@@ -26,11 +27,26 @@ DEFAULT_LOCAL_POSTGRES_URL = (
 
 
 @pytest.fixture()
-def app_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def app_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     monkeypatch.setenv("BOT_TOKEN", "123456:test-token")
     monkeypatch.setenv("COMMUNITY_CHAT_ID", "-1001234567890")
     monkeypatch.setenv("DIGEST_SOURCE_CHAT_ID", "-1001234567890")
     monkeypatch.setenv("DIGEST_DESTINATION_CHAT_ID", "-1001234567890")
+    monkeypatch.setenv("DIGEST_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("DIGEST_LLM_MODEL", "gpt-5.6-sol")
+    gold_path = tmp_path / "digest-gold-examples.json"
+    gold_path.write_text(
+        json.dumps(
+            {
+                "examples": [
+                    {"activity": "short", "input": {}, "output": {}},
+                    {"activity": "busy", "input": {}, "output": {}},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DIGEST_GOLD_EXAMPLES_PATH", str(gold_path))
     monkeypatch.setenv("ADMIN_IDS", "[149820031]")
     # Set DATABASE_URL ONLY if it is not already set externally. CI provides the postgres-
     # service URL via env (`localhost:5432`); overriding it here would route DB-backed tests
