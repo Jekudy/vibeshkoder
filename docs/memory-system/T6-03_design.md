@@ -556,7 +556,7 @@ Phase 5's `_load_gateway_config` (`bot/handlers/qa.py:103-133`) reads `LLM_PROVI
 
 ### Reviewer split
 
-Mirror PHASE6_PLAN.md §6 reviewer pattern. T6-03 is Phase 6 Wave 1 — `parallel_wave_prs` mode, `governance_mode='critical'` per phase classification.
+Mirror PHASE6_PLAN.md §6 reviewer pattern. T6-03 is Phase 6 Wave 1, where parallel sprint PRs and critical governance apply.
 
 - **Claude product reviewer** (`subagent_type: standard-product-reviewer` or `deep-product-reviewer` if governance escalation is required): spec compliance (PHASE6_PLAN.md §7 T6-03 checklist + T6-02 addendum), `T6-04 hand-off completeness` (does T6-03 leave the right surface for `/approve` work in T6-04?), `extraction_runs` durable audit invariant (every gateway call ⇒ ledger row).
 - **Codex technical reviewer** (`$TIMEOUT_CMD 600 codex exec review --base main -m gpt-5.5 -c model_reasoning_effort=high --ephemeral`): correctness (placeholder ledger row lifecycle, budget guard race-window vs Phase 5 placeholder pattern), Protocol conformance (does `LiveExtractCandidatesGateway` actually implement `ExtractCandidatesGateway` from T6-02 byte-for-byte?), ledger atomicity (rollback semantics under SAVEPOINT), citation hallucination handling.

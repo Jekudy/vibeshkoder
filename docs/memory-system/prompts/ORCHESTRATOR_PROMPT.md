@@ -80,7 +80,7 @@ For each merged stream:
 - Verifier verdict + key evidence
 - Confirmation: no LLM imports
 
-After all targeted streams ship: trigger Final Holistic Review per Rule 9 of `~/.claude/rules/superflow-enforcement.md` (≥4 sprints with parallel execution → FHR mandatory).
+After all targeted streams ship: trigger Final Holistic Review for any phase with at least 4 sprints or parallel execution.
 
 ## End of orchestrator prompt
 ```
@@ -90,7 +90,7 @@ After all targeted streams ship: trigger Final Holistic Review per Rule 9 of `~/
 ## Reading-order companion
 
 When using this orchestrator, also load:
-- `~/.claude/rules/superflow-enforcement.md` — hard rules on PR workflow, no-admin merges, dual-model reviews.
+- repository `AGENTS.md` and `CLAUDE.md` — PR workflow, no-admin merges, and review gates.
 - `~/.claude/rules/codex-routing.md` — why every Codex call goes through `codex:codex-rescue`.
 - `docs/memory-system/HANDOFF.md` §1 invariants (verbatim) — the six rules that shape every decision.
 - `docs/memory-system/PHASE4_PLAN.md` §0 — current Phase 4 implementation state.

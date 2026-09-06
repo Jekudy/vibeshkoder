@@ -3,7 +3,7 @@
 **Status:** RATIFIED 2026-05-16. Authorized for implementation.
 **Predecessors:** Phase 4 (FTS + evidence, CLOSED 2026-04-30), Phase 5 (`llm_gateway` + ledger, CLOSED 2026-05-11), Phase 6 (cards + admin review, CLOSED 2026-05-12), Phase 7 (daily digest, CLOSED 2026-05-15), Phase 8 (weekly digest, CLOSED 2026-05-15), Phase 11 (privacy binding suite, ACTIVE 42/42).
 **Owner:** Orchestrator B.
-**Charter:** governance_mode = critical (Neo4j is new infrastructure; public wiki leak adjacency risk per HANDOFF §16). git_workflow_mode = sprint_pr_queue. Per-PR PAR (dual-model: Claude product + Codex technical). FHR mandatory after T10-09.
+**Execution policy:** critical governance because Neo4j is new infrastructure and public wiki leak adjacency is a risk per HANDOFF §16. One queued PR per sprint. Per-PR PAR (dual-model: Claude product + Codex technical). FHR mandatory after T10-09.
 **Supersedes:** `docs/memory-system/prompts/PHASE10_PLAN_DRAFT.md` (open questions resolved at ratification 2026-05-16).
 
 ---
@@ -1351,7 +1351,7 @@ Stop Phase 10 immediately and surface to the human team lead if ANY of these occ
 
 ## §9. PR-Required Checks
 
-Each PR in the sprint_pr_queue must pass before merge:
+Each queued sprint PR must pass before merge:
 
 - `pytest tests/db/test_graph_schema.py` green (schema PRs)
 - `pytest tests/services/test_graph_*.py tests/services/test_extract_graph_triples.py` green
@@ -1566,7 +1566,7 @@ Settings registered in `bot/config.py` following the same env-var parsing patter
 ## §16. Codex Audit Revision Log (2026-05-16)
 
 Applied to PHASE10_PLAN.md as revision following Codex independent technical audit.
-Source: `.superflow/p9_p10_ratification/codex_p10_audit.md`.
+Source: historical Codex technical audit summarized below; the raw audit artifact was not retained.
 
 | Finding | Severity | Change | Section(s) |
 |---|---|---|---|

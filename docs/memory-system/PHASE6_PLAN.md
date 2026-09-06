@@ -644,14 +644,14 @@ Wave 3 (optional):     E
 
 ## §9. PR Workflow
 
-Standard `parallel_wave_prs`.
+Parallel sprint PRs by wave.
 
 - Pre-Wave 1: one PR for T6-00 (must merge first).
 - One PR per Wave 1 stream (A + B in parallel).
 - One PR per Wave 2 stream (C + D in parallel).
 - Wave 3 PR only if Phase 5 web scaffolding exists.
 - PAR review (Claude `standard-product-reviewer` + Codex technical) before each PR.
-- Final Holistic Review (Rule 9) **required** — `parallel_wave_prs` mode + 5+ sprints + governance_mode=critical.
+- Final Holistic Review **required** — parallel work across 5+ sprints with critical governance.
 - T6-03 sub-gate: Phase 11 leakage binding test green before merge.
 
 Sprint 0 ratification commit (this PR) closes the design gate.
@@ -688,5 +688,3 @@ Sprint 0 ratification commit (this PR) closes the design gate.
 | **R3** | `/approve` re-validation is **deterministic SQL only** (no LLM re-prompt). Re-runs governance filter on each candidate `message_version_id`; BLOCKS promotion with explicit error if any source is no longer eligible. |
 
 END of document.
-
-<!-- updated-by-superflow:2026-05-12 -->

@@ -4,7 +4,6 @@
 .env.local
 .env.dev
 .env.dev.real
-.superflow-state.json
 .par-evidence.json
 .worktrees/
 _bmad/config.user.toml

@@ -632,5 +632,3 @@ To move Phase 12 from design to execution, the following must happen (NONE of wh
 5. The first execution PR honours every binding contract in `PHASE12_PLAN §11.4` row 1-9.
 
 Until then, this document is a tombstone for the boundary — exactly as `HANDOFF.md §3` Phase 12 row prescribes.
-
-<!-- updated-by-superflow:2026-05-22 -->

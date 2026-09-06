@@ -631,7 +631,7 @@ A stream MUST stop and surface the issue as a PR comment / draft PR description 
 
 ## §9. PR Workflow
 
-Standard `sprint_pr_queue`.
+One queued PR per sprint.
 
 - One PR per Wave unless schema and renderer need separate migration review.
 - Branch pattern: `feat/p9-NN-slug`.

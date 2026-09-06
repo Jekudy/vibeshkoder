@@ -362,5 +362,3 @@ error printed to stderr.
 - **Apply-time stats (rows inserted, ghost users created, runs reused).** Those
   are produced by the apply path itself (#103). Pre-flight DB-aware dry-run
   stats (#99 / T2-02) are covered in the *DB-aware mode* section above.
-
-<!-- updated-by-superflow:2026-04-28 -->

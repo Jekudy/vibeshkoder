@@ -210,5 +210,3 @@ Tracked for future cleanup:
   service layer; handler layer is already shipped in T8-06).
 
 These are NOT blockers — Phase 8 ships as ratified.
-
-<!-- updated-by-superflow:2026-05-15 -->
