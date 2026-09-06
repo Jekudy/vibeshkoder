@@ -11,6 +11,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: release-images-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   IMAGE_BOT: ghcr.io/jekudy/vibe-gatekeeper-bot
@@ -80,3 +84,79 @@ jobs:
           tags: |
             ${{ env.IMAGE_DB }}:${{ steps.meta.outputs.sha_tag }}
             ${{ env.IMAGE_DB }}:main
+
+  deploy-bot:
+    needs: build-and-push
+    runs-on: [self-hosted, shkoder-vps]
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      COOLIFY_BASE_URL: ${{ vars.COOLIFY_BASE_URL }}
+      COOLIFY_APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
+      COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+      IMAGE_TAG: sha-${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Deploy exact bot image to Coolify
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${COOLIFY_BASE_URL:?missing COOLIFY_BASE_URL}"
+          : "${COOLIFY_APP_UUID:?missing COOLIFY_APP_UUID}"
+          : "${COOLIFY_API_TOKEN:?missing COOLIFY_API_TOKEN}"
+
+          api="${COOLIFY_BASE_URL%/}/api/v1"
+          auth_header="Authorization: Bearer ${COOLIFY_API_TOKEN}"
+          patch_body="$(jq -cn --arg tag "$IMAGE_TAG" '{docker_registry_image_tag: $tag}')"
+          deploy_body="$(jq -cn --arg uuid "$COOLIFY_APP_UUID" '{uuid: $uuid}')"
+
+          coolify() {
+            curl --fail-with-body --silent --show-error \
+              --header "$auth_header" \
+              --header "Content-Type: application/json" \
+              "$@"
+          }
+
+          coolify --request PATCH --data "$patch_body" \
+            "$api/applications/$COOLIFY_APP_UUID" >/dev/null
+
+          deployment_uuid="$(
+            coolify --request POST --data "$deploy_body" "$api/deploy" \
+              | jq -er '.deployments[0].deployment_uuid'
+          )"
+          echo "Coolify deployment queued: $deployment_uuid"
+
+          # 240 x 5s = 20 min: a throttled VPS took 27 min once; 10 min produced false timeouts
+          for _ in {1..240}; do
+            status="$(
+              coolify "$api/deployments/$deployment_uuid" | jq -er '.status'
+            )"
+            case "$status" in
+              finished)
+                actual_tag="$(
+                  coolify "$api/applications/$COOLIFY_APP_UUID" \
+                    | jq -er '.docker_registry_image_tag'
+                )"
+                if [[ "$actual_tag" != "$IMAGE_TAG" ]]; then
+                  echo "::error::Coolify finished with tag $actual_tag instead of $IMAGE_TAG"
+                  exit 1
+                fi
+                echo "Coolify deployed $IMAGE_TAG"
+                exit 0
+                ;;
+              queued|in_progress)
+                sleep 5
+                ;;
+              failed|cancelled|cancelled-by-user)
+                echo "::error::Coolify deployment $deployment_uuid ended with status $status"
+                exit 1
+                ;;
+              *)
+                echo "::error::Unexpected Coolify deployment status: $status"
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "::error::Coolify deployment $deployment_uuid timed out"
+          exit 1
