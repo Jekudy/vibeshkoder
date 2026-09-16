@@ -1,0 +1,57 @@
+# Issue #521: standalone ingress; no Coolify or Docker API access.
+name: vps-proxy
+services:
+  proxy:
+    image: traefik@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    command:
+      - --api=false
+      - --providers.file.filename=/etc/traefik/proxy-dynamic.yaml
+      - --providers.file.watch=true
+      - --entrypoints.http.address=:80
+      - --entrypoints.http.http.redirections.entrypoint.to=https
+      - --entrypoints.http.http.redirections.entrypoint.scheme=https
+      - --entrypoints.https.address=:443
+      - --entrypoints.ping.address=127.0.0.1:8082
+      - --ping=true
+      - --ping.entrypoint=ping
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=http
+      - --certificatesresolvers.letsencrypt.acme.storage=/acme/acme.json
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    volumes:
+      - type: bind
+        source: ./proxy-dynamic.yaml
+        target: /etc/traefik/proxy-dynamic.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/edge-proxy/acme
+        target: /acme
+        bind:
+          create_host_path: false
+    networks:
+      - coolify
+    healthcheck:
+      test: [CMD, traefik, healthcheck, --ping, --ping.entrypoint=ping, --entrypoints.ping.address=127.0.0.1:8082]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+networks:
+  coolify:
+    external: true
