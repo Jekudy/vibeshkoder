@@ -29,7 +29,7 @@ from tests.conftest import import_module
 
 def _make_client(session_cookie: str | None = None) -> TestClient:
     web_app = import_module("web.app")
-    client = TestClient(web_app.create_app(), raise_server_exceptions=True)
+    client = TestClient(web_app.create_app(), base_url="https://testserver", raise_server_exceptions=True)
     if session_cookie:
         client.cookies.set("session", session_cookie)
     return client
@@ -107,6 +107,13 @@ def test_login_with_admin_password_sets_admin_role(two_pw_env) -> None:
     payload = _decode_cookie(response.cookies["session"])
     assert payload.get("role") == "admin"
     assert payload.get("authenticated") is True
+
+    cookie = next(c for c in response.cookies.jar if c.name == "session")
+    assert cookie.secure
+    assert cookie.has_nonstandard_attr("HttpOnly")
+    assert cookie.get_nonstandard_attr("SameSite") == "lax"
+    assert client.get("/", follow_redirects=False).headers["location"] == "/dashboard"
+    assert client.get("http://testserver/", follow_redirects=False).headers["location"] == "/login"
 
 
 # ── Test 2: member password → role='member' ───────────────────────────────────
@@ -209,16 +216,12 @@ def test_legacy_cookie_without_role_treated_as_admin(app_env, monkeypatch) -> No
     legacy_cookie = _make_legacy_cookie()
     client = _make_client(session_cookie=legacy_cookie)
 
-    response = client.get("/dashboard", follow_redirects=False)
-
-    # Request must succeed (not redirect to /login)
-    # Note: /dashboard may return 200 or redirect to another page, but NOT 302 to /login
-    assert response.status_code != 302 or response.headers.get("location") != "/login"
-
-    # New cookie with role='admin' must be set on the response
-    if "session" in response.cookies:
-        payload = _decode_cookie(response.cookies["session"])
-        assert payload.get("role") == "admin"
+    response = client.get("/", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"] == "/dashboard"
+    payload = _decode_cookie(response.cookies["session"])
+    assert payload.get("role") == "admin"
+    assert next(c for c in response.cookies.jar if c.name == "session").secure
 
 
 # ── Test 6: I7d.b — expired legacy cookie → redirect to /login ───────────────
