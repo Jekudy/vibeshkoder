@@ -48,7 +48,7 @@ http:
     security-headers:
       headers:
         contentTypeNosniff: true
-        # Enable stsSeconds: 86400 only after validating the public certificate.
+        stsSeconds: 86400
         # Do not use includeSubDomains or preload on the shared sslip.io domain.
 tls:
   options:
