@@ -4,11 +4,45 @@ Telegram + web gatekeeper for community onboarding, applications, vouching, intr
 
 ## Deployment Standard
 
-The target deployment path for this project is:
+The production deployment path is:
 
-`develop anywhere -> push to GitHub -> GitHub Actions test -> build immutable images -> push to GHCR -> Coolify deploys pre-built images`
+`develop anywhere -> push to GitHub -> GitHub Actions test -> build immutable images -> push to GHCR -> VPS runner deploys with Docker Compose`
 
-The VPS is not the source of truth anymore.
+GitHub is the source of truth. `ops/compose/deploy.py` deploys SHA-pinned bot/web
+images and restores their previous image pins on failed readiness checks. It never
+restores database data automatically.
+
+## VPS Operations (#521)
+
+Production manifests live in `ops/vps/`; each runtime directory contains
+`compose.yaml` (the proxy uses `proxy.compose.yaml`), private service env files
+and application `.env` files with image pins:
+
+| Runtime directory | Service |
+| --- | --- |
+| `/srv/shkoder` | Gatekeeper bot, web, PostgreSQL and Redis |
+| `/srv/foodzy` | Foodzy bot and PostgreSQL |
+| `/srv/harry` | Harry and its dependencies |
+| `/srv/otp` | Shared OTP bot |
+| `/srv/edge-proxy` | Independent HTTPS proxy |
+
+The existing external Docker network retains the name `coolify`; that name does not
+require the Coolify panel. Host cron and systemd jobs remain outside Compose.
+Existing database volumes and bind mounts are preserved. Secrets never belong in git.
+
+On the VPS, check the private bot database endpoint:
+
+```bash
+docker compose -f /srv/shkoder/compose.yaml exec -T bot python -c 'from urllib.request import urlopen; print(urlopen("http://127.0.0.1:3000/healthz/db", timeout=10).read().decode())'
+```
+
+Bot `/healthz` also uses private port 3000; web is public only through HTTPS.
+The scheduled health workflow checks app/DB/Telegram health on the VPS and public
+HTTPS independently from a GitHub-hosted runner (`PUBLIC_HEALTH_URL` repository
+variable). Retain old stopped containers and configuration snapshots for rollback;
+stop their replacements before restarting them. This is container/image rollback,
+not a database restore. See [issue #521](https://github.com/Jekudy/vibeshkoder/issues/521)
+for current cutover and verification evidence.
 
 ## Development Workflow
 
@@ -107,5 +141,8 @@ This repo publishes two GHCR images:
 
 ## Production Safety
 
-- The current legacy VPS runtime remains the live path during bootstrap.
-- Production bot-token cutover is a separate controlled step because polling bots cannot safely run two prod consumers at once.
+- Stop the old production polling bot before starting its replacement.
+- Keep retained containers and external volumes until migration checks and rollback
+  verification are complete; never start two database containers on the same volume.
+- Never use `docker compose down -v`, prune user data, delete retained volumes or
+  restore database backups without a verified backup and explicit user approval.
