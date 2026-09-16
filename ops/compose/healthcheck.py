@@ -4,8 +4,6 @@ import json
 import os
 import subprocess
 from datetime import UTC, datetime
-from urllib.error import URLError
-from urllib.request import urlopen
 
 COMPOSE = [
     "docker",
@@ -63,11 +61,16 @@ raise SystemExit(not (payload['ok'] is True and result['url'] == '' and result['
     except subprocess.TimeoutExpired:
         checks["telegram"] = False
     try:
-        with urlopen(public_url, timeout=15) as response:
-            checks["public_https"] = (
-                response.status == 200 and json.load(response)["status"] == "ok"
-            )
-    except (URLError, TimeoutError, ValueError, KeyError):
+        response = subprocess.run(
+            ["curl", "--fail", "--silent", "--show-error", "--proto", "=https",
+             "--connect-timeout", "10", "--max-time", "15", public_url],
+            capture_output=True,
+            timeout=20,
+        )
+        checks["public_https"] = (
+            response.returncode == 0 and json.loads(response.stdout)["status"] == "ok"
+        )
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError):
         checks["public_https"] = False
     report = {
         "generated_at": datetime.now(UTC).isoformat(),

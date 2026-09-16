@@ -84,13 +84,29 @@ class ComposeDeployTest(unittest.TestCase):
             )
             with patch("urllib.request.urlopen", return_value=io.BytesIO(payload)):
                 with self.assertRaises(SystemExit) as exited:
-                    exec(code, {})
+                    # Only repository-generated local_checks code, never external input.
+                    exec(code, {})  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected
                 return exited.exception.code == 0
 
         with patch.object(healthcheck, "container_check", side_effect=check):
             self.assertTrue(all(healthcheck.local_checks().values()))
         with patch.object(healthcheck, "container_check", side_effect=[True, False, True]):
             self.assertFalse(all(healthcheck.local_checks().values()))
+
+    def test_public_health_uses_https_only_and_fails_closed(self):
+        for returncode, payload, expected in ((0, b'{"status":"ok"}', 0), (0, b'bad', 1), (22, b'', 1)):
+            with (
+                patch.dict(os.environ, PUBLIC_HEALTH_URL="https://example.com/healthz"),
+                patch.object(healthcheck, "local_checks", return_value={"db": True}),
+                patch.object(healthcheck, "container_check", return_value=True),
+                patch.object(healthcheck.subprocess, "run") as run,
+                patch("builtins.print"),
+            ):
+                run.return_value.returncode = returncode
+                run.return_value.stdout = payload
+                self.assertEqual(healthcheck.main(), expected)
+                args = run.call_args.args[0]
+                self.assertEqual(args[args.index("--proto") + 1], "=https")
 
 
 if __name__ == "__main__":
