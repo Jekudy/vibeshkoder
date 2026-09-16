@@ -114,6 +114,7 @@ def create_app() -> FastAPI:
                 value=refreshed,
                 max_age=7 * 24 * 60 * 60,
                 httponly=True,
+                secure=True,
                 samesite="lax",
             )
 
