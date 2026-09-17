@@ -12,7 +12,8 @@
 set -euo pipefail
 
 B2_REMOTE="${B2_REMOTE:-b2}"
-B2_BUCKET="${B2_BUCKET:-vibe-backups}"
+# `vibe-backups` is taken by another B2 account — bucket names are globally unique.
+B2_BUCKET="${B2_BUCKET:-jekudy-vibe-backups}"
 RETAIN_DAYS="${RETAIN_DAYS:-30}"
 ENV_FILE="${BACKUP_ENV_FILE:-/srv/secrets/backup.env}"
 
@@ -33,7 +34,13 @@ HARRY_SQLITE_FILES=(state.db kanban.db cron/executions.db mcp_sessions/telegram_
 HARRY_PLAIN_FILES=(auth.json .env channel_directory.json)
 
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
-die() { local code="$1"; shift; log "ERROR: $*" >&2; exit "$code"; }
+
+# `exit` does not fire an ERR trap, so a die() would otherwise skip the alert
+# entirely. The reason is stashed here and reported from the EXIT trap, which
+# runs on every exit path — planned or not.
+FAIL_MSG=""
+FAIL_LINE=""
+die() { local code="$1"; shift; FAIL_MSG="$*"; log "ERROR: $*" >&2; exit "$code"; }
 
 # Object names. Shkoder derives its name from the source dump so that re-running
 # the script on the same dump overwrites one object instead of piling up copies.
@@ -66,16 +73,28 @@ sqlite_backup_cmd() {
   printf '%s\n' sqlite3 "${1:?source required}" ".backup '${2:?destination required}'"
 }
 
-# Symmetric AES256. The passphrase is read from a file, never passed in argv —
-# command-line arguments are world-readable through `ps` on a shared host.
+# Asymmetric: only the public half of the key pair lives here. A symmetric mode
+# would require the passphrase on this host, i.e. the key sitting next to the data
+# it protects — which is exactly the failure mode these backups exist to prevent.
 gpg_encrypt_cmd() {
-  printf '%s\n' gpg --batch --yes --quiet --symmetric --cipher-algo AES256 \
-    --passphrase-file "${1:?passphrase file required}" \
+  printf '%s\n' gpg --batch --yes --quiet --encrypt \
+    --recipient "${1:?recipient fingerprint required}" --trust-model always \
     --output "${3:?output path required}" "${2:?input path required}"
+}
+
+# rclone's B2 backend happily creates a missing bucket during `copyto`, so a wrong
+# B2_BUCKET would look like a successful backup while the data lands nowhere useful.
+# Verify the destination exists instead of trusting the upload to fail.
+bucket_exists_cmd() {
+  printf '%s\n' rclone lsf "${B2_REMOTE}:" --dirs-only
 }
 
 notify_failure() {
   local message="$1"
+  if [[ -z "${TELEGRAM_DEV_BOT_TOKEN:-}" || -z "${ADMIN_TELEGRAM_ID:-}" ]]; then
+    log "ERROR: cannot alert — Telegram credentials were never loaded" >&2
+    return
+  fi
   if ! curl --fail --show-error --silent --max-time 10 -X POST \
       "https://api.telegram.org/bot${TELEGRAM_DEV_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${ADMIN_TELEGRAM_ID}" \
@@ -84,20 +103,23 @@ notify_failure() {
   fi
 }
 
-on_error() {
-  local code=$? line="$1"
-  log "backup failed at line ${line} (exit ${code})" >&2
-  notify_failure "backup-to-b2.sh ${SERVICE} failed at line ${line} (exit ${code})"
-  exit "$code"
+on_exit() {
+  local code=$?
+  if [[ -n "${WORKDIR:-}" ]]; then
+    rm -rf "$WORKDIR"
+  fi
+  if [[ "$code" -ne 0 ]]; then
+    local reason="${FAIL_MSG:-unexpected failure at line ${FAIL_LINE:-unknown}}"
+    log "FAILED ${SERVICE:-?}: ${reason} (exit ${code})" >&2
+    notify_failure "${SERVICE:-?}: ${reason} (exit ${code})"
+  fi
 }
 
 load_env() {
   [[ -r "$ENV_FILE" ]] || die 1 "env file not readable: ${ENV_FILE}"
   # shellcheck source=/dev/null
   source "$ENV_FILE"
-  [[ -n "${BACKUP_PASSPHRASE_FILE:-}" ]]  || die 1 "BACKUP_PASSPHRASE_FILE missing in ${ENV_FILE}"
-  [[ -r "$BACKUP_PASSPHRASE_FILE" ]]     || die 1 "passphrase file not readable: ${BACKUP_PASSPHRASE_FILE}"
-  [[ -s "$BACKUP_PASSPHRASE_FILE" ]]     || die 1 "passphrase file is empty: ${BACKUP_PASSPHRASE_FILE}"
+  [[ -n "${GPG_RECIPIENT:-}" ]]          || die 1 "GPG_RECIPIENT missing in ${ENV_FILE}"
   [[ -n "${TELEGRAM_DEV_BOT_TOKEN:-}" ]]  || die 1 "TELEGRAM_DEV_BOT_TOKEN missing in ${ENV_FILE}"
   [[ -n "${ADMIN_TELEGRAM_ID:-}" ]]       || die 1 "ADMIN_TELEGRAM_ID missing in ${ENV_FILE}"
 }
@@ -107,8 +129,15 @@ publish() {
   local service="$1" plain="$2" object="$3"
   local encrypted="${WORKDIR}/${object}"
 
+  local -a check
+  local buckets
+  mapfile -t check < <(bucket_exists_cmd)
+  buckets=$("${check[@]}") || die 4 "cannot list buckets on ${B2_REMOTE}:"
+  grep -qx "${B2_BUCKET}/" <<<"$buckets" \
+    || die 4 "destination bucket does not exist: ${B2_REMOTE}:${B2_BUCKET} (refusing to create it)"
+
   local -a encrypt
-  mapfile -t encrypt < <(gpg_encrypt_cmd "$BACKUP_PASSPHRASE_FILE" "$plain" "$encrypted")
+  mapfile -t encrypt < <(gpg_encrypt_cmd "$GPG_RECIPIENT" "$plain" "$encrypted")
   "${encrypt[@]}" || die 3 "gpg encryption failed for ${object}"
 
   local size sha
@@ -205,12 +234,15 @@ main() {
     *) printf 'usage: %s shkoder|harry\n' "$0" >&2; exit 1 ;;
   esac
 
-  load_env
-  trap 'on_error $LINENO' ERR
+  # Installed before load_env so a configuration error is reported too — the
+  # alert itself degrades to a log line when credentials are the thing missing.
+  trap 'FAIL_LINE=$LINENO' ERR
+  trap on_exit EXIT
 
-  WORKDIR=$(mktemp -d /var/tmp/vibe-b2-backup.XXXXXX)
+  load_env
+
   # Intermediate copies never accumulate: the VPS has ~9.7 GB free at 80% usage.
-  trap 'rm -rf "$WORKDIR"' EXIT
+  WORKDIR=$(mktemp -d /var/tmp/vibe-b2-backup.XXXXXX)
 
   log "START ${SERVICE} → ${B2_REMOTE}:${B2_BUCKET}/${SERVICE}/"
   "backup_${SERVICE}"
