@@ -58,16 +58,6 @@ FAIL_MSG=""
 FAIL_LINE=""
 die() { local code="$1"; shift; FAIL_MSG="$*"; log "ERROR: $*" >&2; exit "$code"; }
 
-# Object names. Shkoder derives its name from the source dump so that re-running
-# the script on the same dump overwrites one object instead of piling up copies.
-object_name() {
-  case "${1:-}" in
-    shkoder) printf '%s.gpg\n' "$(basename "${2:?source dump path required}")" ;;
-    harry)   printf 'harry-%s.tar.gz.gpg\n' "${2:?run timestamp required}" ;;
-    *)       printf 'unknown service: %s\n' "${1:-}" >&2; return 2 ;;
-  esac
-}
-
 # Retention arguments, one per line — read_args() collects them into an array so
 # the --include glob is never expanded by the local shell.
 #
@@ -85,29 +75,11 @@ retention_args() {
   esac
 }
 
-sqlite_backup_cmd() {
-  printf '%s\n' sqlite3 "${1:?source required}" ".backup '${2:?destination required}'"
-}
-
-# Asymmetric: only the public half of the key pair lives here. A symmetric mode
-# would require the passphrase on this host, i.e. the key sitting next to the data
-# it protects — which is exactly the failure mode these backups exist to prevent.
-gpg_encrypt_cmd() {
-  printf '%s\n' gpg --batch --yes --quiet --encrypt \
-    --recipient "${1:?recipient fingerprint required}" --trust-model always \
-    --output "${3:?output path required}" "${2:?input path required}"
-}
-
 # rclone's B2 backend happily creates a missing bucket during `copyto`, so a wrong
 # B2_BUCKET would look like a successful backup while the data lands nowhere useful.
 # Verify the destination exists instead of trusting the upload to fail.
-bucket_exists_cmd() {
-  printf '%s\n' rclone lsf "${B2_REMOTE}:" --dirs-only
-}
-
 bucket_exists() {
-  read_args < <(bucket_exists_cmd)
-  "${ARGS[@]}" | grep -qx "${B2_BUCKET}/"
+  rclone lsf "${B2_REMOTE}:" --dirs-only | grep -qx "${B2_BUCKET}/"
 }
 
 notify_failure() {
@@ -157,8 +129,11 @@ publish() {
 
   bucket_exists || die 4 "destination bucket does not exist: ${B2_REMOTE}:${B2_BUCKET} (refusing to create it)"
 
-  read_args < <(gpg_encrypt_cmd "$GPG_RECIPIENT" "$plain" "$encrypted")
-  "${ARGS[@]}" || die 3 "gpg encryption failed for ${object}"
+  # Asymmetric: only the public half of the key pair lives here. Symmetric mode
+  # would require the passphrase on this host — the key sitting next to the data
+  # it protects, which is the failure mode these backups exist to prevent.
+  gpg --batch --yes --quiet --encrypt --recipient "$GPG_RECIPIENT" --trust-model always \
+    --output "$encrypted" "$plain" || die 3 "gpg encryption failed for ${object}"
 
   local size sha
   size=$(stat -c%s "$encrypted")
@@ -195,7 +170,9 @@ backup_shkoder() {
     || die 2 "dump too small (${size} bytes < ${SHKODER_MIN_BYTES}): ${dump}"
 
   log "source dump ${dump} (${size} bytes, $(( age_seconds / 60 ))m old)"
-  publish shkoder "$dump" "$(object_name shkoder "$dump")"
+  # Object name follows the source dump, so re-running on the same dump overwrites
+  # one object instead of piling up copies.
+  publish shkoder "$dump" "$(basename "$dump").gpg"
 }
 
 backup_harry() {
@@ -217,8 +194,7 @@ backup_harry() {
     src="${data}/${relative}"
     [[ -f "$src" ]] || die 2 "expected SQLite file missing: ${src}"
     destination="${stage}/sqlite/$(basename "$relative")"
-    read_args < <(sqlite_backup_cmd "$src" "$destination")
-    "${ARGS[@]}" || die 2 "sqlite .backup failed for ${src}"
+    sqlite3 "$src" ".backup '${destination}'" || die 2 "sqlite .backup failed for ${src}"
   done
 
   for relative in "${HARRY_PLAIN_FILES[@]}"; do
@@ -241,7 +217,7 @@ backup_harry() {
     || die 2 "archive too small (${size} bytes < ${HARRY_MIN_BYTES}): ${archive}"
   log "archive ${archive} (${size} bytes)"
 
-  publish harry "$archive" "$(object_name harry "$ts")"
+  publish harry "$archive" "harry-${ts}.tar.gz.gpg"
 }
 
 main() {
