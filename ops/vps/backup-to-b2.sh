@@ -11,22 +11,26 @@
 # Exit codes: 0 ok | 1 config error | 2 source unusable | 3 encryption failed | 4 upload/retention failed
 set -euo pipefail
 
-B2_REMOTE="${B2_REMOTE:-b2}"
+readonly B2_REMOTE=b2
 # `vibe-backups` is taken by another B2 account — bucket names are globally unique.
+# B2_BUCKET, SHKODER_DUMP_DIR and BACKUP_ENV_FILE stay overridable: the negative-path
+# checks in the runbook drive them from the environment.
 B2_BUCKET="${B2_BUCKET:-jekudy-vibe-backups}"
-RETAIN_DAYS="${RETAIN_DAYS:-30}"
+readonly RETAIN_DAYS=30
 ENV_FILE="${BACKUP_ENV_FILE:-/srv/secrets/backup.env}"
 
 SHKODER_DUMP_DIR="${SHKODER_DUMP_DIR:-/data/coolify/backups/shkoder-postgres}"
-SHKODER_MAX_AGE_HOURS="${SHKODER_MAX_AGE_HOURS:-24}"
-SHKODER_MIN_BYTES="${SHKODER_MIN_BYTES:-102400}"
+readonly SHKODER_MAX_AGE_HOURS=24
+readonly SHKODER_MIN_BYTES=102400
 
+# Overridable like B2_BUCKET and SHKODER_DUMP_DIR: the runbook's negative-path
+# check drives it from the environment to prove the failure path really fails.
 HARRY_DB_CONTAINER="${HARRY_DB_CONTAINER:-harry-honcho-db}"
-HARRY_DB_USER="${HARRY_DB_USER:-postgres}"
-HARRY_DB_NAME="${HARRY_DB_NAME:-postgres}"
-HARRY_VOLUME="${HARRY_VOLUME:-vgtwjekx8w3aujw15ykkv8x4_harry-hermes-data}"
-HARRY_CONFIG_DIR="${HARRY_CONFIG_DIR:-/srv/harry/config}"
-HARRY_MIN_BYTES="${HARRY_MIN_BYTES:-10240}"
+readonly HARRY_DB_USER=postgres
+readonly HARRY_DB_NAME=postgres
+readonly HARRY_VOLUME=vgtwjekx8w3aujw15ykkv8x4_harry-hermes-data
+readonly HARRY_CONFIG_DIR=/srv/harry/config
+readonly HARRY_MIN_BYTES=10240
 
 # SQLite files are snapshotted via `sqlite3 .backup`; a plain cp while the WAL is
 # live yields a torn copy (spec invariant 9). Harry's processes never stop for us.
@@ -89,17 +93,28 @@ bucket_exists_cmd() {
   printf '%s\n' rclone lsf "${B2_REMOTE}:" --dirs-only
 }
 
+bucket_exists() {
+  local -a cmd
+  mapfile -t cmd < <(bucket_exists_cmd)
+  "${cmd[@]}" | grep -qx "${B2_BUCKET}/"
+}
+
 notify_failure() {
   local message="$1"
   if [[ -z "${TELEGRAM_DEV_BOT_TOKEN:-}" || -z "${ADMIN_TELEGRAM_ID:-}" ]]; then
     log "ERROR: cannot alert — Telegram credentials were never loaded" >&2
     return
   fi
-  if ! curl --fail --show-error --silent --max-time 10 -X POST \
+  # Log the delivery, not just the attempt: "no error printed" is not evidence
+  # that anyone was actually told the backup failed.
+  local response
+  if response=$(curl --fail --show-error --silent --max-time 10 -X POST \
       "https://api.telegram.org/bot${TELEGRAM_DEV_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${ADMIN_TELEGRAM_ID}" \
-      --data-urlencode "text=🔴 [${SERVICE} backup] FAILURE: ${message}" >/dev/null; then
-    log "ERROR: Telegram failure notification could not be delivered" >&2
+      --data-urlencode "text=🔴 [${SERVICE} backup] FAILURE: ${message}" 2>&1); then
+    log "alert delivered to Telegram (message_id=$(sed -n 's/.*"message_id":\([0-9]*\).*/\1/p' <<<"$response"))"
+  else
+    log "ERROR: Telegram failure notification could not be delivered: ${response}" >&2
   fi
 }
 
@@ -129,12 +144,7 @@ publish() {
   local service="$1" plain="$2" object="$3"
   local encrypted="${WORKDIR}/${object}"
 
-  local -a check
-  local buckets
-  mapfile -t check < <(bucket_exists_cmd)
-  buckets=$("${check[@]}") || die 4 "cannot list buckets on ${B2_REMOTE}:"
-  grep -qx "${B2_BUCKET}/" <<<"$buckets" \
-    || die 4 "destination bucket does not exist: ${B2_REMOTE}:${B2_BUCKET} (refusing to create it)"
+  bucket_exists || die 4 "destination bucket does not exist: ${B2_REMOTE}:${B2_BUCKET} (refusing to create it)"
 
   local -a encrypt
   mapfile -t encrypt < <(gpg_encrypt_cmd "$GPG_RECIPIENT" "$plain" "$encrypted")
@@ -194,20 +204,20 @@ backup_harry() {
     || die 2 "pg_dump failed for ${HARRY_DB_CONTAINER}"
   log "honcho dump: $(stat -c%s "${stage}/harry-honcho.dump") bytes"
 
-  local relative source destination
+  local relative src destination
   local -a snapshot
   for relative in "${HARRY_SQLITE_FILES[@]}"; do
-    source="${data}/${relative}"
-    [[ -f "$source" ]] || die 2 "expected SQLite file missing: ${source}"
+    src="${data}/${relative}"
+    [[ -f "$src" ]] || die 2 "expected SQLite file missing: ${src}"
     destination="${stage}/sqlite/$(basename "$relative")"
-    mapfile -t snapshot < <(sqlite_backup_cmd "$source" "$destination")
-    "${snapshot[@]}" || die 2 "sqlite .backup failed for ${source}"
+    mapfile -t snapshot < <(sqlite_backup_cmd "$src" "$destination")
+    "${snapshot[@]}" || die 2 "sqlite .backup failed for ${src}"
   done
 
   for relative in "${HARRY_PLAIN_FILES[@]}"; do
-    source="${data}/${relative}"
-    [[ -f "$source" ]] || die 2 "expected file missing: ${source}"
-    cp -a "$source" "${stage}/files/"
+    src="${data}/${relative}"
+    [[ -f "$src" ]] || die 2 "expected file missing: ${src}"
+    cp -a "$src" "${stage}/files/"
   done
 
   [[ -d "$HARRY_CONFIG_DIR" ]] || die 2 "config directory missing: ${HARRY_CONFIG_DIR}"
