@@ -107,6 +107,51 @@ else
   ok "unknown service is rejected by retention_args"
 fi
 
+# --- publish() wiring: order of operations, not just command syntax ---------
+# Every check above tests a command *generator*. None of them would notice if
+# publish() stopped calling the bucket check, swapped upload and retention, or
+# encrypted before verifying the destination. Stub the external commands and
+# assert the actual call sequence.
+set +e
+STUB_HOME=$(mktemp -d "${TMPDIR:-/tmp}/backup-to-b2-test.XXXXXX") || { echo "FAIL: mktemp" >&2; exit 1; }
+# shellcheck disable=SC2034  # read by publish() from the sourced script
+WORKDIR="$STUB_HOME"
+# shellcheck disable=SC2034  # read by publish() from the sourced script
+GPG_RECIPIENT=TESTKEY
+B2_BUCKET=test-bucket
+printf 'plaintext\n' > "$STUB_HOME/plain"
+
+# The bucket check runs inside a pipeline, i.e. in a subshell: an in-memory array
+# would silently lose that call. Journal to a file instead.
+CALLS="$STUB_HOME/calls"
+: > "$CALLS"
+# shellcheck disable=SC2329  # invoked indirectly: these shadow the external commands
+rclone() { echo "rclone:$1" >> "$CALLS"; [[ "$1" == lsf ]] && printf '%s/\n' "$B2_BUCKET"; return 0; }
+# shellcheck disable=SC2329
+gpg() {
+  echo gpg >> "$CALLS"
+  local out=""
+  while [[ $# -gt 0 ]]; do [[ "$1" == --output ]] && out="$2"; shift; done
+  printf 'ciphertext\n' > "$out"
+}
+
+publish shkoder "$STUB_HOME/plain" "obj.dump.gpg" >/dev/null 2>&1
+assert_eq "rclone:lsf gpg rclone:copyto rclone:delete" "$(tr '\n' ' ' < "$CALLS" | sed 's/ $//')" \
+  "publish verifies the bucket, then encrypts, then uploads, then prunes"
+
+# Destination missing: publish must abort with code 4 before encrypting anything.
+# shellcheck disable=SC2329
+rclone() { echo "rclone:$1" >> "$CALLS"; [[ "$1" == lsf ]] && printf 'some-other-bucket/\n'; return 0; }
+: > "$CALLS"
+( publish shkoder "$STUB_HOME/plain" "obj.dump.gpg" ) >/dev/null 2>&1
+assert_eq "4" "$?" "publish exits 4 when the destination bucket is absent"
+assert_not_contains "$(cat "$CALLS")" "gpg" "publish does not encrypt when the destination is absent"
+
+unset -f rclone gpg
+rm -rf "$STUB_HOME"
+unset WORKDIR GPG_RECIPIENT
+B2_BUCKET=jekudy-vibe-backups
+
 # --- no silent failures (invariant 6) --------------------------------------
 if grep -nE '\|\|[[:space:]]*true' "$SCRIPT" | grep -vE '^\s*[0-9]+:\s*#'; then
   fail "script contains '|| true' over an error path"
