@@ -237,7 +237,8 @@ def test_validator_binds_exact_release_sha_and_workflow_calls_it(tmp_path: Path)
 
     workflow_text = EVAL_WORKFLOW.read_text(encoding="utf-8")
     workflow = yaml.safe_load(workflow_text)
-    assert set(workflow[True]) == {"workflow_dispatch"}
+    assert set(workflow[True]) == {"workflow_dispatch", "schedule"}
+    assert workflow[True]["schedule"] == [{"cron": "15 3 * * *"}]
     assert "evals-gate" not in workflow["jobs"]
     assert "python -m scripts.evaluate_semantic_qa validate-report" in workflow_text
     assert "MIN_MACRO_RECALL_AT_5" not in workflow_text
