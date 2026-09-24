@@ -2236,14 +2236,30 @@ async def test_extraction_scheduler_tick_bounds_catchup_window_to_input_cap(
 
     # Six ~150-byte messages: the whole backlog exceeds the 400-byte cap.
     version_ids: list[int] = []
+    chat_message_ids: list[int] = []
     for _ in range(6):
-        _, ver_id, _, _ = await _make_chat_message(
+        cm_id, ver_id, _, _ = await _make_chat_message(
             db_session,
             chat_id=source_chat_id,
             when=enabled_at,
             text="x" * 150,
         )
         version_ids.append(ver_id)
+        chat_message_ids.append(cm_id)
+    # A ready image description is concatenated into normalized_text by the
+    # real selection but invisible to raw text/caption column sizes — the
+    # regression the bounder must not undercount.
+    from bot.db.models import MessageMedia
+
+    db_session.add(
+        MessageMedia(
+            chat_message_id=chat_message_ids[1],
+            media_kind="photo",
+            source_message_url="https://t.me/c/1/1",
+            description="y" * 150,
+            description_status="ready",
+        )
+    )
     # No ExtractionCursor row: the durable path upserts the cursor in its own
     # committed transaction, which would block on an uncommitted row here.
     # With no row the tick baseline starts at 0 and the whole backlog is
@@ -2270,3 +2286,22 @@ async def test_extraction_scheduler_tick_bounds_catchup_window_to_input_cap(
     assert run_row.cursor_end_message_version_id is not None
     assert run_row.cursor_end_message_version_id < version_ids[-1]
     assert run_row.cursor_end_message_version_id >= version_ids[0]
+    # Exactness check: the real selection for the dispatched bounds must
+    # serialize under the cap (raw-column estimates undercount captions and
+    # ready image descriptions).
+    from bot.services.extraction_schema import extraction_input_size_bytes
+    from bot.services.extractor import _select_eligible_sources
+
+    selected = await _select_eligible_sources(
+        db_session,
+        window_start=enabled_at - timedelta(hours=1),
+        window_end=enabled_at + timedelta(hours=2),
+        source_chat_id=source_chat_id,
+        force_include_chat_message_ids=None,
+        selection_mode="version_cursor",
+        after_message_version_id=0,
+        through_message_version_id=run_row.cursor_end_message_version_id,
+    )
+    payloads = [row.to_gateway_payload() for row in selected]
+    assert extraction_input_size_bytes(payloads) <= 400
+    assert len(payloads) >= 1

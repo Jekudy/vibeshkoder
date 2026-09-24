@@ -1508,6 +1508,8 @@ async def _auto_resolve_failed_cursor_run(
 async def _bounded_cursor_end(
     session: AsyncSession,
     *,
+    window_start: datetime,
+    window_end: datetime,
     source_chat_id: int,
     after_message_version_id: int,
     through_message_version_id: int,
@@ -1515,62 +1517,43 @@ async def _bounded_cursor_end(
     """Shrink ``through_message_version_id`` so the payload fits the input cap.
 
     Long catch-up windows (e.g. after a cursor stall) would exceed
-    ``MAX_EXTRACTION_INPUT_BYTES`` and fail every tick. Walking versions in
-    order and summing the canonical per-line size keeps each tick to one
-    bounded provider call. Governance filters are deliberately not applied:
-    the estimate is an upper bound because the pass may still exclude rows.
+    ``MAX_EXTRACTION_INPUT_BYTES`` and fail every tick. The bound must be
+    exact, not an estimate: ``_select_eligible_sources`` concatenates
+    ``normalized_text`` with captions and ready image descriptions, so raw
+    column sizes would undercount and the pass would still hit
+    ``input_size_exceeded`` — a failed run without semantic identity that no
+    unresolved-run check or ``reconcile_extraction_run`` can see. Walking
+    the real selected rows in cursor order and summing the canonical
+    per-line size keeps each tick to one provider-input-sized call.
 
     A single version larger than the cap still becomes a one-version window:
     ``run_extraction_pass`` then records a loud ``input_size_exceeded``
     failure instead of the cursor stalling silently.
     """
-    rows = (
-        await session.execute(
-            text(
-                """
-            SELECT mv.id, mv.text, mv.caption, mv.normalized_text
-            FROM message_versions AS mv
-            JOIN chat_messages AS c
-              ON c.id = mv.chat_message_id
-             AND c.current_version_id = mv.id
-            WHERE c.chat_id = :source_chat_id
-              AND mv.id > :after_message_version_id
-              AND mv.id <= :through_message_version_id
-            ORDER BY mv.id
-            """
-            ),
-            {
-                "source_chat_id": source_chat_id,
-                "after_message_version_id": after_message_version_id,
-                "through_message_version_id": through_message_version_id,
-            },
-        )
-    ).all()
-
+    rows = await _select_eligible_sources(
+        session,
+        window_start=window_start,
+        window_end=window_end,
+        source_chat_id=source_chat_id,
+        force_include_chat_message_ids=None,
+        selection_mode="version_cursor",
+        after_message_version_id=after_message_version_id,
+        through_message_version_id=through_message_version_id,
+    )
     total_bytes = 0
     bounded_end: int | None = None
-    for mv_id, row_text, caption, normalized_text in rows:
+    for row in sorted(rows, key=lambda source: source.message_version_id):
         line_bytes = len(
-            serialize_untrusted_source_versions(
-                [
-                    {
-                        "message_version_id": mv_id,
-                        "text": row_text,
-                        "caption": caption,
-                        "normalized_text": normalized_text,
-                    }
-                ]
-            ).encode("utf-8")
+            serialize_untrusted_source_versions([row.to_gateway_payload()]).encode("utf-8")
         )
         # JSONL joins lines with "\n" — one separator byte per extra row.
         next_total = total_bytes + line_bytes + (1 if bounded_end is not None else 0)
         if bounded_end is not None and next_total > MAX_EXTRACTION_INPUT_BYTES:
             break
         total_bytes = next_total
-        bounded_end = int(mv_id)
-    if bounded_end is None:
-        return int(rows[0][0]) if rows else through_message_version_id
-    return bounded_end
+        bounded_end = row.message_version_id
+    # ``rows`` empty → nothing eligible in the window; pass the bound through.
+    return bounded_end if bounded_end is not None else through_message_version_id
 
 
 async def extraction_scheduler_tick(
@@ -1618,6 +1601,13 @@ async def extraction_scheduler_tick(
 
     if now is None:
         now = datetime.now(tz=phase_6_enabled_at.tzinfo)
+
+    window_start = await _get_scheduler_window_start(
+        session,
+        enabled_at=phase_6_enabled_at,
+        window_end=now,
+        source_chat_id=source_chat_id,
+    )
 
     cursor_start = await _get_scheduler_cursor_start(
         session,
@@ -1676,6 +1666,8 @@ async def extraction_scheduler_tick(
             # so one tick stays within one provider-input-sized call.
             cursor_end = await _bounded_cursor_end(
                 session,
+                window_start=window_start,
+                window_end=now,
                 source_chat_id=source_chat_id,
                 after_message_version_id=cursor_start,
                 through_message_version_id=cursor_end,
@@ -1688,12 +1680,6 @@ async def extraction_scheduler_tick(
             )
         return SchedulerTickResult(skipped=True, reason="up_to_date")
 
-    window_start = await _get_scheduler_window_start(
-        session,
-        enabled_at=phase_6_enabled_at,
-        window_end=now,
-        source_chat_id=source_chat_id,
-    )
     if window_start >= now:
         return SchedulerTickResult(skipped=True, reason="up_to_date")
 
