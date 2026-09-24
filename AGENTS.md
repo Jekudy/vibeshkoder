@@ -9,9 +9,17 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 ## Runtime Standard
 
 - Source of truth is GitHub, not the VPS.
-- Production deploys from pre-built GHCR images.
-- Coolify is the target runtime manager for product apps.
-- Host-level operator services stay outside Coolify if they need direct VPS control.
+- Production uses Docker Compose at `/srv/shkoder/compose.yaml`; versioned manifests
+  live in `ops/vps/`. Coolify is not required for application operation or deployment.
+- GitHub Actions builds SHA-pinned GHCR images and runs `ops/compose/deploy.py` on the
+  VPS runner. Failed application deployments restore previous bot/web image pins,
+  never database data. Stop the old polling bot before starting its replacement.
+- Bot health is private on port 3000: `/healthz` and DB-only `/healthz/db`.
+  `HEALTHZ_PORT` overrides the bot port; keep the deployment checks aligned.
+- Web HTTPS is routed through the independent proxy; `ops/compose/healthcheck.py`
+  checks applications, DB, Telegram and public HTTPS without Coolify.
+- Runtime secrets stay in private service `.env` files outside git; image pins live
+  in `/srv/shkoder/.env`. Host cron/systemd operator services remain outside Compose.
 
 ## Environments
 
@@ -44,6 +52,14 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 
 ## Current Migration Rule
 
-- Coolify is the production runtime for bot and web deploys.
-- Legacy `/home/claw/vibe-gatekeeper` is retained only as rollback fallback until
-  `scripts/cleanup-legacy.sh` passes its A3, soak window, and disk preflights.
+- Issue #521 tracks the migration of Shkoder, Foodzy, Harry and shared OTP to
+  independent Compose projects. Check its latest evidence before assuming a service
+  has completed cutover and for verification evidence.
+- Preserve old stopped containers, their configuration snapshots and existing external
+  volumes until cutover and rollback checks are complete. Container/image rollback
+  does not restore a database; never run old and new consumers or database containers
+  against the same production data at once.
+- Never use `docker compose down -v`, prune user data, remove retained volumes or
+  restore database backups without a verified backup and explicit user approval.
+- Legacy `/home/claw/vibe-gatekeeper` remains retained; cleanup requires its existing
+  `scripts/cleanup-legacy.sh` preflights and the approval above.

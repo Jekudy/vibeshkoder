@@ -1,0 +1,58 @@
+# Issue #521: existing volume is external; never use down --volumes.
+name: foodzy
+services:
+  bot:
+    image: ${BOT_IMAGE:?BOT_IMAGE must be pinned}
+    container_name: foodzy-bot
+    command: [sh, -c, "python -m alembic -c migrations/alembic.ini upgrade head && python -m foodzy.main"]
+    env_file:
+      - path: bot.env
+        format: raw
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    cpu_shares: 1024
+    volumes:
+      - /opt/foodzy/conversations:/app/conversations
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, 'pgrep -f "foodzy.main" || exit 1']
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    networks: [coolify]
+  db:
+    image: ${DB_IMAGE:?DB_IMAGE must be pinned}
+    container_name: foodzy-db
+    env_file:
+      - path: db.env
+        format: raw
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.5
+    cpu_shares: 1024
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "psql -U foodzy -d foodzy -c 'SELECT 1' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      start_period: 5s
+      retries: 10
+    logging: *logging
+    networks: [coolify]
+volumes:
+  postgres-data:
+    external: true
+    name: postgres-data-soz3nzwr95a333arm9s8169k
+networks:
+  coolify:
+    external: true
