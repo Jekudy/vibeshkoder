@@ -31,6 +31,7 @@ is_allowed_path() {
   [[ "$path" == "tests/integration/test_phase4_hotfix_e2e.py" ]] && return 0
   [[ "$path" == "tests/services/test_governance_stub.py" ]] && return 0
   [[ "$path" == "tests/services/test_human_memory_policy.py" ]] && return 0
+  [[ "$path" == "tests/services/test_ingestion.py" ]] && return 0
   [[ "$path" == "tests/services/test_import_apply.py" ]] && return 0
   [[ "$path" == "tests/services/test_import_dry_run_stats.py" ]] && return 0
   [[ "$path" == "tests/services/test_import_html_apply.py" ]] && return 0

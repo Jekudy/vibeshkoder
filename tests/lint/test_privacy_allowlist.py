@@ -26,6 +26,7 @@ PHASE13_COMPLETE_HISTORY_PATHS = (
     "tests/integration/test_phase4_hotfix_e2e.py",
     "tests/services/test_governance_stub.py",
     "tests/services/test_human_memory_policy.py",
+    "tests/services/test_ingestion.py",
     "tests/services/test_import_apply.py",
     "tests/services/test_import_dry_run_stats.py",
     "tests/services/test_import_html_apply.py",

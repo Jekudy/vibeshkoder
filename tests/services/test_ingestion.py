@@ -292,3 +292,130 @@ def test_extract_chat_and_message_ids_from_message(app_env) -> None:
     )
     assert chat_id == -555
     assert message_id == 99
+
+
+# ─── callback_query coverage (issue #86) ──────────────────────────────────────
+
+
+def _make_callback_query_update(
+    update_id: int | None = None,
+    text: str | None = "tap",
+    data: str = "btn:1",
+    chat_id: int = -1_001_234_567_890,
+    message_id: int = 55,
+    user_id: int = 12345,
+    inaccessible: bool = False,
+):
+    """Build an aiogram ``Update`` carrying a CallbackQuery with an embedded message
+    snapshot — the shape inline-keyboard presses arrive in."""
+    from aiogram.types import (
+        CallbackQuery,
+        Chat,
+        InaccessibleMessage,
+        Message,
+        Update,
+        User,
+    )
+
+    when = datetime.now(timezone.utc)
+    chat = Chat(id=chat_id, type="supergroup", title="dev")
+    user = User(id=user_id, is_bot=False, first_name="Probe")
+    if inaccessible:
+        msg = InaccessibleMessage(chat=chat, message_id=message_id)
+    elif text is not None:
+        msg = Message(message_id=message_id, date=when, chat=chat, from_user=user, text=text)
+    else:
+        msg = None
+    cb = CallbackQuery(
+        id="cb-1",
+        from_user=user,
+        chat_instance="ci",
+        message=msg,
+        inline_message_id="imid" if msg is None else None,
+        data=data,
+    )
+    return Update(
+        update_id=update_id if update_id is not None else _next_update_id(),
+        callback_query=cb,
+    )
+
+
+def test_extract_text_and_caption_from_callback_query(app_env) -> None:
+    """Issue #86: policy detection must see the text inside ``callback_query.message`` —
+    the snapshot Telegram embeds on every inline-button press."""
+    from bot.services.ingestion import _extract_text_and_caption
+
+    update = _make_callback_query_update(update_id=1, text="hi #offrecord")
+    assert _extract_text_and_caption(update) == ("hi #offrecord", None)
+
+
+def test_extract_text_and_caption_callback_query_without_message(app_env) -> None:
+    """Inline-mode callbacks (``inline_message_id`` only) and inaccessible messages
+    carry no readable text — extraction returns (None, None) instead of crashing."""
+    from bot.services.ingestion import _extract_text_and_caption
+
+    assert _extract_text_and_caption(
+        _make_callback_query_update(update_id=2, text=None)
+    ) == (None, None)
+    assert _extract_text_and_caption(
+        _make_callback_query_update(update_id=3, inaccessible=True)
+    ) == (None, None)
+
+
+async def test_record_update_offrecord_callback_query_redacted(db_session, monkeypatch) -> None:
+    """Issue #86: a ``callback_query`` whose embedded message carries ``#offrecord``
+    must have the whole message snapshot scrubbed before ``raw_json`` is persisted.
+
+    Uses a spy detector emulating the real #offrecord detector so the live ordering
+    rule (detect → redact → insert) is exercised end-to-end through record_update.
+    """
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+    from bot.services import ingestion
+
+    await FeatureFlagRepo.set_enabled(db_session, ingestion.RAW_ARCHIVE_FLAG, enabled=True)
+
+    calls: list[tuple[str | None, str | None]] = []
+
+    def _spy_detect(text, caption):
+        calls.append((text, caption))
+        if (text and "#offrecord" in text) or (caption and "#offrecord" in caption):
+            return ("offrecord", {"marker": "#offrecord"})
+        return ("normal", None)
+
+    monkeypatch.setattr(ingestion, "detect_policy", _spy_detect)
+
+    update = _make_callback_query_update(update_id=_next_update_id(), text="tap #offrecord")
+    row = await ingestion.record_update(db_session, update)
+
+    assert row is not None
+    assert calls == [("tap #offrecord", None)]
+    assert row.is_redacted is True
+    assert row.redaction_reason == "offrecord"
+    assert "#offrecord" not in json.dumps(row.raw_json)
+    msg = row.raw_json["callback_query"]["message"]
+    assert "text" not in msg
+    assert "entities" not in msg
+    # Structural fields survive the redaction:
+    assert msg["message_id"] == 55
+    assert row.raw_json["callback_query"]["data"] == "btn:1"
+
+
+async def test_record_update_plain_callback_query_unchanged(db_session) -> None:
+    """A normal ``callback_query`` archives verbatim — the fix must not change the
+    default path (Phase 13 contract: no token → normal memory, full snapshot kept)."""
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+    from bot.services.ingestion import RAW_ARCHIVE_FLAG, record_update
+
+    await FeatureFlagRepo.set_enabled(db_session, RAW_ARCHIVE_FLAG, enabled=True)
+
+    update = _make_callback_query_update(update_id=_next_update_id(), text="plain tap")
+    row = await record_update(db_session, update)
+
+    assert row is not None
+    assert row.update_type == "callback_query"
+    assert row.is_redacted is False
+    assert row.redaction_reason is None
+    assert row.raw_json["callback_query"]["message"]["text"] == "plain tap"
+    assert row.raw_json["callback_query"]["data"] == "btn:1"
+    assert row.chat_id == -1_001_234_567_890
+    assert row.message_id == 55

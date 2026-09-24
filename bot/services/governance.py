@@ -41,11 +41,14 @@ def detect_policy(
 
 # Telegram update payload event fields that carry user content. The redactor walks each
 # of these (only one is typically present per update) and strips content fields.
+# ``callback_query`` is not message-shaped itself but embeds a full ``message`` snapshot,
+# scrubbed through the ``message`` entry of ``_NESTED_MESSAGE_FIELDS``.
 _EVENT_FIELDS: tuple[str, ...] = (
     "message",
     "edited_message",
     "channel_post",
     "edited_channel_post",
+    "callback_query",
 )
 _CONTENT_FIELDS_TO_DROP: tuple[str, ...] = (
     "text",
@@ -57,12 +60,14 @@ _CONTENT_FIELDS_TO_DROP: tuple[str, ...] = (
 # its own ``text``/``caption`` snapshot of a related message and must be scrubbed too —
 # without this, a user replying with ``#offrecord`` to a sensitive parent message would
 # still leak the parent content via ``message.reply_to_message.text``. Recursion handles
-# nested ``reply_to_message`` chains.
+# nested ``reply_to_message`` chains. ``message`` covers non-message events embedding a
+# full message snapshot (``callback_query.message``).
 _NESTED_MESSAGE_FIELDS: tuple[str, ...] = (
     "reply_to_message",
     "pinned_message",
     "external_reply",
     "quote",
+    "message",
 )
 
 
@@ -85,8 +90,8 @@ def redact_raw_for_offrecord(raw_json: dict | None) -> dict | None:
     Used by ``bot/services/ingestion.py`` when ``detect_policy`` returns ``"offrecord"``.
     Drops ``text``, ``caption``, ``entities``, ``caption_entities`` from each known
     event field AND from any nested message-shaped fields (``reply_to_message``,
-    ``pinned_message``, ``external_reply``, ``quote``). Keeps ids, timestamps, sender
-    info, hash, policy marker.
+    ``pinned_message``, ``external_reply``, ``quote``, ``message`` — the last covers
+    ``callback_query.message``). Keeps ids, timestamps, sender info, hash, policy marker.
 
     The function takes and returns a dict (not a SQLAlchemy row) so it can be unit-tested
     without a DB and re-used by the importer (T2-* tickets).
