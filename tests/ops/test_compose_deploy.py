@@ -80,7 +80,10 @@ class ComposeDeployTest(unittest.TestCase):
             import io
 
             payload = (
-                b'{"db":"ok"}' if "/healthz/db" in code else b'{"status":"ok","db":{"ok":true}}'
+                b'{"db":"ok"}'
+                if "/healthz/db" in code
+                else b'{"status":"ok","db":{"ok":true},"telegram_poll":{"ok":true},'
+                b'"last_telegram_poll_ok_age_seconds":3}'
             )
             with patch("urllib.request.urlopen", return_value=io.BytesIO(payload)):
                 with self.assertRaises(SystemExit) as exited:
@@ -92,6 +95,26 @@ class ComposeDeployTest(unittest.TestCase):
             self.assertTrue(all(healthcheck.local_checks().values()))
         with patch.object(healthcheck, "container_check", side_effect=[True, False, True]):
             self.assertFalse(all(healthcheck.local_checks().values()))
+
+    def test_bot_check_requires_telegram_poll_field(self):
+        """#541: a /healthz body without the polling liveness signal must fail."""
+        captured = []
+
+        def check(service, code):
+            if service == "bot" and "telegram_poll" in code:
+                captured.append(code)
+                import io
+
+                payload = io.BytesIO(b'{"status":"ok","db":{"ok":true}}')
+                with patch("urllib.request.urlopen", return_value=payload):
+                    with self.assertRaises(SystemExit) as exited:
+                        exec(code, {})  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected
+                return exited.exception.code == 0
+            return True
+
+        with patch.object(healthcheck, "container_check", side_effect=check):
+            self.assertFalse(all(healthcheck.local_checks().values()))
+        self.assertEqual(len(captured), 1)
 
     def test_public_health_uses_https_only_and_fails_closed(self):
         for returncode, payload, expected in ((0, b'{"status":"ok"}', 0), (0, b'bad', 1), (22, b'', 1)):

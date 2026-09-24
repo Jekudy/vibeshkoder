@@ -27,15 +27,28 @@ def container_check(service: str, code: str) -> bool:
 
 def local_checks() -> dict[str, bool]:
     checks = {}
-    for name, service, url, expected in (
-        ("bot", "bot", "http://127.0.0.1:3000/healthz", '{"status": "ok"}'),
-        ("db", "bot", "http://127.0.0.1:3000/healthz/db", '{"db": "ok"}'),
-        ("web", "web", "http://127.0.0.1:8080/healthz", '{"status": "ok"}'),
+    # The bot check additionally requires the telegram_poll liveness signal
+    # from issue #541: the check itself must be ok and the age field must be
+    # present (null only until the first successful getUpdates).
+    for name, service, url, expected, extra in (
+        (
+            "bot",
+            "bot",
+            "http://127.0.0.1:3000/healthz",
+            '{"status": "ok"}',
+            "payload.get('telegram_poll', {}).get('ok') is True "
+            "and 'last_telegram_poll_ok_age_seconds' in payload "
+            "and (payload['last_telegram_poll_ok_age_seconds'] is None "
+            "or payload['last_telegram_poll_ok_age_seconds'] >= 0)",
+        ),
+        ("db", "bot", "http://127.0.0.1:3000/healthz/db", '{"db": "ok"}', "True"),
+        ("web", "web", "http://127.0.0.1:8080/healthz", '{"status": "ok"}', "True"),
     ):
         code = (
             "import json; from urllib.request import urlopen; "
             f"payload=json.load(urlopen({url!r}, timeout=10)); "
-            f"raise SystemExit(not all(payload.get(k) == v for k, v in {expected}.items()))"
+            f"ok=all(payload.get(k) == v for k, v in {expected}.items()) and ({extra}); "
+            "raise SystemExit(not ok)"
         )
         try:
             checks[name] = container_check(service, code)
