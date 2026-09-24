@@ -41,7 +41,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import yaml
@@ -163,7 +163,8 @@ async def semantic_seed(eval_postgres_engine: Any) -> Any:
     rows = _load_jsonl(CHAT_HISTORY_PATH)
     user_ids = {int(row["user_id_local"]) for row in rows}
     id_map: dict[str, int] = {}
-    run_ids: set[int] = set()
+    run_id_floor = 0
+    report = None
     try:
         async with factory() as session:
             for row in rows:
@@ -171,13 +172,15 @@ async def semantic_seed(eval_postgres_engine: Any) -> Any:
                     session, row
                 )
             await session.commit()
+            run_id_floor = int(
+                await session.scalar(select(func.max(SemanticIndexRun.id))) or 0
+            )
             report = await backfill_semantic_index(
                 session,
                 config=EMBEDDING_CONFIG,
                 provider=provider,
                 chat_id=SEED_CHAT_ID,
             )
-            run_ids.add(report.run_id)
             assert report.failed == 0, f"semantic backfill failed: {report.reason_counts}"
             assert report.indexed > 0, "semantic backfill indexed nothing"
         yield SimpleNamespace(provider=provider, report=report, id_map=id_map)
@@ -199,10 +202,11 @@ async def semantic_seed(eval_postgres_engine: Any) -> Any:
                     SemanticRetrievalUnit.chat_id == SEED_CHAT_ID
                 )
             )
-            if run_ids:
-                await cleanup.execute(
-                    delete(SemanticIndexRun).where(SemanticIndexRun.id.in_(run_ids))
-                )
+            # Runs have no chat_id; remove every run created after the floor
+            # captured before backfill so a failed run row is cleaned too.
+            await cleanup.execute(
+                delete(SemanticIndexRun).where(SemanticIndexRun.id > run_id_floor)
+            )
             await cleanup.execute(
                 delete(ChatMessage).where(ChatMessage.chat_id == SEED_CHAT_ID)
             )
@@ -220,13 +224,13 @@ async def _measure_hybrid_query(
     provider: Any,
     query: QueryRow,
     seed_local_id_map: dict[str, int],
-) -> tuple[list[int], list[int], bool]:
+) -> tuple[list[int], list[int], bool, Any]:
     embedding = await provider.embed(
         inputs=[query.query],
         model=EMBEDDING_MODEL,
         dimensions=EMBEDDING_DIMENSIONS,
     )
-    bundle, _retrieval = await run_eval_recall_hybrid(
+    bundle, retrieval = await run_eval_recall_hybrid(
         session,
         query=query.query,
         query_embedding=embedding.vectors[0],
@@ -235,7 +239,7 @@ async def _measure_hybrid_query(
     )
     returned = list(bundle.evidence_ids)
     expected = resolve_expected_ids(query, seed_local_id_map) if not query.expected_abstain else []
-    return returned, expected, bundle.abstained
+    return returned, expected, bundle.abstained, retrieval
 
 
 class TestHybridRecall:
@@ -260,8 +264,17 @@ class TestHybridRecall:
         per_query: list[tuple[str, float, float]] = []
         abstain_count = 0
         for query in answerable:
-            returned, expected, abstained = await _measure_hybrid_query(
+            returned, expected, abstained, retrieval = await _measure_hybrid_query(
                 eval_db_session, semantic_seed.provider, query, semantic_seed.id_map
+            )
+            vector_ranks = [
+                ranks["vector"]
+                for ranks in retrieval.candidate_ranks.values()
+                if "vector" in ranks
+            ]
+            assert vector_ranks, (
+                f"query {query.query_id!r}: vector branch contributed no "
+                "candidates — suite would stay green with a dead vector_search"
             )
             unknown = set(returned) - known_mvids
             assert not unknown, (
@@ -296,6 +309,9 @@ class TestHybridRecall:
         assert observed_abstain_rate <= abstain_max, (
             f"hybrid abstain rate {observed_abstain_rate:.3f} above ceiling {abstain_max:.3f}"
         )
+        assert semantic_seed.provider.calls >= len(answerable), (
+            "embedding provider was not invoked for every answerable query"
+        )
 
     async def test_hybrid_abstain_query_stays_in_scope(
         self,
@@ -310,7 +326,7 @@ class TestHybridRecall:
 
         known_mvids = set(semantic_seed.id_map.values())
         for query in abstain_queries:
-            returned, _expected, _abstained = await _measure_hybrid_query(
+            returned, _expected, _abstained, _retrieval = await _measure_hybrid_query(
                 eval_db_session, semantic_seed.provider, query, semantic_seed.id_map
             )
             unknown = set(returned) - known_mvids
