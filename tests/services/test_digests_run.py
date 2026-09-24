@@ -102,8 +102,11 @@ class _StructuredProvider:
         self.calls.append(kwargs)
         if len(self.calls) > len(self.responses):
             raise AssertionError("unexpected digest provider call")
+        response = self.responses[len(self.calls) - 1]
+        if isinstance(response, Exception):
+            raise response
         return ProviderResult(
-            answer_text=json.dumps(self.responses[len(self.calls) - 1], ensure_ascii=False),
+            answer_text=json.dumps(response, ensure_ascii=False),
             citation_ids=(),
             tokens_in=200,
             tokens_out=100,
@@ -458,3 +461,85 @@ def test_load_digest_config_ignores_removed_truncation_knobs(monkeypatch) -> Non
     config = load_digest_config()
     assert not hasattr(config, "raw_message_top_n")
     assert not hasattr(config, "token_budget_input")
+
+
+async def test_digest_rate_limit_retries_once_and_completes(
+    db_session, monkeypatch
+) -> None:
+    """A pre-charge 429 gets one bounded retry in-stage (issue #537)."""
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import synthesize_digest
+    from bot.services.llm_providers import ProviderTransientError
+
+    monkeypatch.setattr(
+        "bot.services.llm_gateway._DIGEST_RATE_LIMIT_RETRY_DELAY_SECONDS", 0
+    )
+    context = await _context(db_session)
+    version_id = context.messages[0].message_version_id
+    provider = _StructuredProvider(
+        [
+            ProviderTransientError("rate_limit", message="429"),
+            _draft(message_version_id=version_id),
+            _verifier(),
+        ]
+    )
+    result = await synthesize_digest(
+        db_session,
+        context=context,
+        config=_gateway_config(),
+        ledger_repo=LedgerRepo(),
+        provider=provider,
+    )
+    assert result.publish is True
+    assert result.body_markdown is not None
+    assert len(provider.calls) == 3
+
+
+async def test_digest_rate_limit_second_failure_raises(db_session, monkeypatch) -> None:
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import DigestProviderError, synthesize_digest
+    from bot.services.llm_providers import ProviderTransientError
+
+    monkeypatch.setattr(
+        "bot.services.llm_gateway._DIGEST_RATE_LIMIT_RETRY_DELAY_SECONDS", 0
+    )
+    context = await _context(db_session)
+    provider = _StructuredProvider(
+        [
+            ProviderTransientError("rate_limit", message="429"),
+            ProviderTransientError("rate_limit", message="429 again"),
+        ]
+    )
+    with pytest.raises(DigestProviderError, match="rate_limit"):
+        await synthesize_digest(
+            db_session,
+            context=context,
+            config=_gateway_config(),
+            ledger_repo=LedgerRepo(),
+            provider=provider,
+        )
+    assert len(provider.calls) == 2
+
+
+async def test_digest_ambiguous_transient_is_not_retried(db_session, monkeypatch) -> None:
+    """timeout/5xx/connection_reset may have been charged — fail-closed, no retry."""
+    from bot.db.repos.llm_usage_ledger import LedgerRepo
+    from bot.services.llm_gateway import DigestProviderError, synthesize_digest
+    from bot.services.llm_providers import ProviderTransientError
+
+    monkeypatch.setattr(
+        "bot.services.llm_gateway._DIGEST_RATE_LIMIT_RETRY_DELAY_SECONDS", 0
+    )
+    context = await _context(db_session)
+    provider = _StructuredProvider(
+        [ProviderTransientError("timeout", message="ambiguous timeout")]
+    )
+    with pytest.raises(DigestProviderError, match="timeout"):
+        await synthesize_digest(
+            db_session,
+            context=context,
+            config=_gateway_config(),
+            ledger_repo=LedgerRepo(),
+            provider=provider,
+        )
+    assert len(provider.calls) == 1

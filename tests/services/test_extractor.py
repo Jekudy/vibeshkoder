@@ -1855,3 +1855,453 @@ async def test_run_extraction_pass_success_path_leaves_gateway_error_null(
     assert run_row is not None
     assert run_row.run_status == "completed"
     assert run_row.gateway_error is None
+
+
+# ─── Issue #531: bounded auto-retry of transiently failed cursor runs ────────
+
+
+async def _commit_rows(postgres_engine, *rows: Any) -> None:
+    """Commit rows on a separate connection so cross-session paths see them.
+
+    ``reconcile_extraction_run`` and the durable extraction path open their
+    own sessions; rows pending inside the test's outer transaction are
+    invisible to them.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    committed_session = async_sessionmaker(
+        bind=postgres_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    async with committed_session() as session:
+        for row in rows:
+            session.add(row)
+        await session.commit()
+
+
+def _committed_actor_user(actor: int) -> Any:
+    from bot.db.models import User
+
+    return User(
+        id=actor,
+        username=f"u{actor}",
+        first_name="Auto",
+        last_name=None,
+        is_member=False,
+        is_admin=False,
+    )
+
+
+def _failed_cursor_run(
+    *,
+    source_chat_id: int,
+    cursor_start: int,
+    cursor_end: int,
+    semantic_key: str,
+    source_snapshot_hash: str,
+    gateway_error: str = "provider_transient:5xx",
+    dispatch_state: str = "response_received",
+    attempt_no: int = 1,
+) -> Any:
+    from bot.db.models import ExtractionRun
+
+    return ExtractionRun(
+        ingestion_window_start=datetime(2001, 1, 1, tzinfo=timezone.utc),
+        ingestion_window_end=datetime(2001, 1, 2, tzinfo=timezone.utc),
+        candidate_count=0,
+        run_status="failed",
+        operator_user_id=None,
+        source_chat_id=source_chat_id,
+        semantic_key=semantic_key,
+        source_snapshot_hash=source_snapshot_hash,
+        prompt_template_version="v0.1.0",
+        provider="test-fake",
+        model="test-model",
+        selection_mode="version_cursor",
+        cursor_start_message_version_id=cursor_start,
+        cursor_end_message_version_id=cursor_end,
+        attempt_no=attempt_no,
+        dispatch_state=dispatch_state,
+        gateway_error=gateway_error,
+    )
+
+
+def _random_semantic_identity() -> tuple[str, str]:
+    import hashlib as _hashlib
+
+    return (
+        _hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+        _hashlib.sha256(b"snapshot").hexdigest(),
+    )
+
+
+async def _enable_extraction_flag_at(db_session, enabled_at: datetime) -> None:
+    from sqlalchemy import update
+
+    from bot.db.models import FeatureFlag
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+    from bot.services.extractor import MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG
+
+    await FeatureFlagRepo.set_enabled(
+        db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, True
+    )
+    await db_session.execute(
+        update(FeatureFlag)
+        .where(FeatureFlag.flag_key == MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG)
+        .values(updated_at=enabled_at)
+    )
+
+
+async def _resolution_for_run(db_session, run_id: Any) -> Any:
+    from sqlalchemy import select
+
+    from bot.db.models import ExtractionRunResolution
+
+    return await db_session.scalar(
+        select(ExtractionRunResolution).where(
+            ExtractionRunResolution.run_id == run_id
+        )
+    )
+
+
+async def test_extraction_scheduler_tick_auto_resolves_and_retries_failed_run(
+    db_session, postgres_engine, monkeypatch
+) -> None:
+    """A transiently failed cursor run must not block the tick forever.
+
+    Reproduces the 2026-07-24 production stall: a ``provider_transient:5xx``
+    failure at the cursor had no resolution row and every tick returned
+    ``unresolved_extraction_run``. The tick now records a bounded automatic
+    ``risk_accepted_retry`` resolution for ``response_received`` runs and
+    re-dispatches the exact same window in the same tick.
+    """
+    from sqlalchemy import select
+
+    from bot.db.models import ExtractionCursor, ExtractionRun
+    from bot.services.extraction_schema import EXTRACTION_PROMPT_TEMPLATE_VERSION
+    from bot.services.extractor import _semantic_identity, extraction_scheduler_tick
+
+    enabled_at = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    now = enabled_at + timedelta(hours=1)
+    source_chat_id = -(7_000_000_000_000 + uuid.uuid4().int % 1_000_000_000_000)
+    # Committed rows survive the test's outer-transaction rollback, so the
+    # actor id must be unique across runs (the sequential counter is not).
+    actor = 8_700_000_000 + uuid.uuid4().int % 1_000_000_000
+    monkeypatch.setenv("MEMORY_AUTOMATION_ACTOR_USER_ID", str(actor))
+
+    await _enable_extraction_flag_at(db_session, enabled_at)
+    _, ver_id, _, message_id = await _make_chat_message(
+        db_session, chat_id=source_chat_id, when=enabled_at, text="stuck source"
+    )
+    cursor_start = ver_id - 1
+
+    # The durable retry re-derives the semantic identity from the live
+    # payload, so the committed failed run must carry the matching key.
+    semantic_key, snapshot_hash = _semantic_identity(
+        source_payload=[
+            {
+                "chat_message_id": 0,
+                "message_version_id": ver_id,
+                "chat_id": source_chat_id,
+                "message_id": message_id,
+                "user_id": None,
+                "text": "stuck source",
+                "caption": None,
+                "normalized_text": "stuck source",
+            }
+        ],
+        source_chat_id=source_chat_id,
+        window_start=enabled_at,
+        window_end=now,
+        prompt_template_version=EXTRACTION_PROMPT_TEMPLATE_VERSION,
+        provider=FakeGateway.extraction_provider,
+        model=FakeGateway.extraction_model,
+        selection_mode="version_cursor",
+        cursor_start_message_version_id=cursor_start,
+        cursor_end_message_version_id=ver_id,
+    )
+    failed_run = _failed_cursor_run(
+        source_chat_id=source_chat_id,
+        cursor_start=cursor_start,
+        cursor_end=ver_id,
+        semantic_key=semantic_key,
+        source_snapshot_hash=snapshot_hash,
+    )
+    await _commit_rows(
+        postgres_engine,
+        _committed_actor_user(actor),
+        ExtractionCursor(
+            source_chat_id=source_chat_id, last_message_version_id=cursor_start
+        ),
+        failed_run,
+    )
+
+    gateway = FakeGateway(candidates_to_emit=[])
+    result = await extraction_scheduler_tick(
+        db_session,
+        gateway=gateway,
+        now=now,
+        source_chat_id=source_chat_id,
+    )
+
+    assert result.skipped is False
+    assert result.extraction_result is not None
+    assert result.extraction_result.run_status == "completed"
+    assert len(gateway.calls) == 1
+
+    resolution = await _resolution_for_run(db_session, failed_run.id)
+    assert resolution is not None
+    assert resolution.action == "risk_accepted_retry"
+    assert resolution.actor_user_id == actor
+    assert "provider_transient:5xx" in resolution.reason
+
+    retry_run = await db_session.get(
+        ExtractionRun, result.extraction_result.extraction_run_id
+    )
+    assert retry_run is not None
+    assert retry_run.attempt_no == 2
+    assert retry_run.retry_of_run_id == failed_run.id
+    assert retry_run.cursor_end_message_version_id == ver_id
+
+    cursor = await db_session.scalar(
+        select(ExtractionCursor).where(
+            ExtractionCursor.source_chat_id == source_chat_id
+        )
+    )
+    assert cursor is not None
+    assert cursor.last_message_version_id == ver_id
+
+
+async def test_extraction_scheduler_tick_failed_run_exhaustion_stays_blocked(
+    db_session, monkeypatch
+) -> None:
+    """At the attempt bound the cursor must stay blocked for an operator.
+
+    No resolution row is written — a resolution is append-only and would lock
+    out the manual ``reconcile_extraction_run`` escape hatch. The cursor is
+    never advanced past the unprocessed window.
+    """
+    from bot.db.models import ExtractionCursor
+    from bot.services.extractor import (
+        EXTRACTION_SCHEDULER_MAX_AUTO_ATTEMPTS,
+        extraction_scheduler_tick,
+    )
+
+    from bot.db.models import ExtractionRunResolution
+
+    enabled_at = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    source_chat_id = -(7_000_000_000_000 + uuid.uuid4().int % 1_000_000_000_000)
+    actor = await _make_user(db_session)
+    monkeypatch.setenv("MEMORY_AUTOMATION_ACTOR_USER_ID", str(actor))
+
+    await _enable_extraction_flag_at(db_session, enabled_at)
+    _, ver_id, _, _ = await _make_chat_message(
+        db_session, chat_id=source_chat_id, when=enabled_at, text="stuck source"
+    )
+    cursor_start = ver_id - 1
+    semantic_key, snapshot_hash = _random_semantic_identity()
+    db_session.add(
+        ExtractionCursor(
+            source_chat_id=source_chat_id, last_message_version_id=cursor_start
+        )
+    )
+    # A real retry chain: each earlier attempt was resolved for retry, the
+    # latest attempt hit the per-window dispatch budget and stays unresolved.
+    previous_run = None
+    for attempt in range(1, EXTRACTION_SCHEDULER_MAX_AUTO_ATTEMPTS):
+        failed_attempt = _failed_cursor_run(
+            source_chat_id=source_chat_id,
+            cursor_start=cursor_start,
+            cursor_end=ver_id,
+            semantic_key=semantic_key,
+            source_snapshot_hash=snapshot_hash,
+            attempt_no=attempt,
+        )
+        failed_attempt.retry_of_run_id = (
+            previous_run.id if previous_run is not None else None
+        )
+        db_session.add(failed_attempt)
+        await db_session.flush()
+        db_session.add(
+            ExtractionRunResolution(
+                run_id=failed_attempt.id,
+                action="risk_accepted_retry",
+                actor_user_id=actor,
+                reason=f"auto: retry {attempt}",
+                accept_memory_gap=False,
+            )
+        )
+        previous_run = failed_attempt
+    failed_run = _failed_cursor_run(
+        source_chat_id=source_chat_id,
+        cursor_start=cursor_start,
+        cursor_end=ver_id,
+        semantic_key=semantic_key,
+        source_snapshot_hash=snapshot_hash,
+        attempt_no=EXTRACTION_SCHEDULER_MAX_AUTO_ATTEMPTS,
+    )
+    failed_run.retry_of_run_id = previous_run.id
+    db_session.add(failed_run)
+    await db_session.flush()
+
+    gateway = FakeGateway(candidates_to_emit=[])
+    result = await extraction_scheduler_tick(
+        db_session,
+        gateway=gateway,
+        now=enabled_at + timedelta(hours=1),
+        source_chat_id=source_chat_id,
+    )
+
+    assert result.skipped is True
+    assert result.reason == "unresolved_extraction_run"
+    assert gateway.calls == []
+    assert await _resolution_for_run(db_session, failed_run.id) is None
+
+
+async def test_extraction_scheduler_tick_nontransient_failed_run_stays_blocked(
+    db_session, monkeypatch
+) -> None:
+    """Non-transient failures (structural/unknown) keep blocking — a retry
+    would fail identically, so the operator decision is still required."""
+    from bot.db.models import ExtractionCursor
+    from bot.services.extractor import extraction_scheduler_tick
+
+    enabled_at = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    source_chat_id = -(7_000_000_000_000 + uuid.uuid4().int % 1_000_000_000_000)
+    actor = _next_user()
+    monkeypatch.setenv("MEMORY_AUTOMATION_ACTOR_USER_ID", str(actor))
+
+    await _enable_extraction_flag_at(db_session, enabled_at)
+    _, ver_id, _, _ = await _make_chat_message(
+        db_session, chat_id=source_chat_id, when=enabled_at, text="stuck source"
+    )
+    cursor_start = ver_id - 1
+    semantic_key, snapshot_hash = _random_semantic_identity()
+    db_session.add(
+        ExtractionCursor(
+            source_chat_id=source_chat_id, last_message_version_id=cursor_start
+        )
+    )
+    failed_run = _failed_cursor_run(
+        source_chat_id=source_chat_id,
+        cursor_start=cursor_start,
+        cursor_end=ver_id,
+        semantic_key=semantic_key,
+        source_snapshot_hash=snapshot_hash,
+        gateway_error="provider_structural:invalid_json",
+    )
+    db_session.add(failed_run)
+    await db_session.flush()
+
+    gateway = FakeGateway(candidates_to_emit=[])
+    result = await extraction_scheduler_tick(
+        db_session,
+        gateway=gateway,
+        now=enabled_at + timedelta(hours=1),
+        source_chat_id=source_chat_id,
+    )
+
+    assert result.skipped is True
+    assert result.reason == "unresolved_extraction_run"
+    assert gateway.calls == []
+    assert await _resolution_for_run(db_session, failed_run.id) is None
+
+
+async def test_extraction_scheduler_tick_bounds_catchup_window_to_input_cap(
+    db_session, monkeypatch
+) -> None:
+    """A long backlog must be chunked: the cursor window is bounded so the
+    serialized source payload stays under ``MAX_EXTRACTION_INPUT_BYTES``
+    instead of failing ``input_size_exceeded`` on every tick."""
+    from sqlalchemy import update
+
+    from bot.db.models import ExtractionRun, FeatureFlag
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+    from bot.services.extractor import (
+        MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG,
+        extraction_scheduler_tick,
+    )
+
+    monkeypatch.setattr("bot.services.extractor.MAX_EXTRACTION_INPUT_BYTES", 400)
+    enabled_at = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    source_chat_id = -(7_000_000_000_000 + uuid.uuid4().int % 1_000_000_000_000)
+
+    await FeatureFlagRepo.set_enabled(
+        db_session, MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG, True
+    )
+    await db_session.execute(
+        update(FeatureFlag)
+        .where(FeatureFlag.flag_key == MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG)
+        .values(updated_at=enabled_at)
+    )
+
+    # Six ~150-byte messages: the whole backlog exceeds the 400-byte cap.
+    version_ids: list[int] = []
+    chat_message_ids: list[int] = []
+    for _ in range(6):
+        cm_id, ver_id, _, _ = await _make_chat_message(
+            db_session,
+            chat_id=source_chat_id,
+            when=enabled_at,
+            text="x" * 150,
+        )
+        version_ids.append(ver_id)
+        chat_message_ids.append(cm_id)
+    # A ready image description is concatenated into normalized_text by the
+    # real selection but invisible to raw text/caption column sizes — the
+    # regression the bounder must not undercount.
+    from bot.db.models import MessageMedia
+
+    db_session.add(
+        MessageMedia(
+            chat_message_id=chat_message_ids[1],
+            media_kind="photo",
+            source_message_url="https://t.me/c/1/1",
+            description="y" * 150,
+            description_status="ready",
+        )
+    )
+    # No ExtractionCursor row: the durable path upserts the cursor in its own
+    # committed transaction, which would block on an uncommitted row here.
+    # With no row the tick baseline starts at 0 and the whole backlog is
+    # eligible for bounding.
+    await db_session.flush()
+
+    gateway = FakeGateway(candidates_to_emit=[])
+    result = await extraction_scheduler_tick(
+        db_session,
+        gateway=gateway,
+        now=enabled_at + timedelta(hours=1),
+        source_chat_id=source_chat_id,
+    )
+
+    assert result.skipped is False
+    assert result.extraction_result is not None
+    assert result.extraction_result.run_status == "completed"
+    run_row = await db_session.get(
+        ExtractionRun, result.extraction_result.extraction_run_id
+    )
+    assert run_row is not None
+    # The dispatched window is a strict prefix of the backlog, not the
+    # unbounded high-water mark.
+    assert run_row.cursor_end_message_version_id is not None
+    assert run_row.cursor_end_message_version_id < version_ids[-1]
+    assert run_row.cursor_end_message_version_id >= version_ids[0]
+    # Exactness check: the real selection for the dispatched bounds must
+    # serialize under the cap (raw-column estimates undercount captions and
+    # ready image descriptions).
+    from bot.services.extraction_schema import extraction_input_size_bytes
+    from bot.services.extractor import _select_eligible_sources
+
+    selected = await _select_eligible_sources(
+        db_session,
+        window_start=enabled_at - timedelta(hours=1),
+        window_end=enabled_at + timedelta(hours=2),
+        source_chat_id=source_chat_id,
+        force_include_chat_message_ids=None,
+        selection_mode="version_cursor",
+        after_message_version_id=0,
+        through_message_version_id=run_row.cursor_end_message_version_id,
+    )
+    payloads = [row.to_gateway_payload() for row in selected]
+    assert extraction_input_size_bytes(payloads) <= 400
+    assert len(payloads) >= 1

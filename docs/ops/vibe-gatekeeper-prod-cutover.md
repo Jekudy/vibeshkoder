@@ -1,5 +1,9 @@
 # Vibe Gatekeeper Production Cutover Plan
 
+> **SUPERSEDED 2026-09-24 (#539).** This is an unfilled Coolify-era scaffold.
+> Production now runs Docker Compose at `/srv/shkoder/compose.yaml` (#521);
+> the current deploy/rollback path is `docs/runbook.md` "Rollback Procedure".
+
 Scaffold. Every `<filled by Spec C on <date>>` must be resolved before cutover.
 
 ## Data migration
