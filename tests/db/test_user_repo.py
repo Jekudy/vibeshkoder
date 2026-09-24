@@ -135,6 +135,34 @@ async def test_upsert_returns_row_after_update(db_session) -> None:
     assert updated.last_name == "Iteration"
 
 
+async def test_upsert_preserves_known_bot_classification_when_update_is_unknown(
+    db_session,
+) -> None:
+    """A partial event cannot erase explicit Telegram author evidence."""
+    from bot.db.repos.user import UserRepo
+
+    telegram_id = _random_test_id()
+    created = await UserRepo.upsert(
+        db_session,
+        telegram_id=telegram_id,
+        username="classified",
+        first_name="Classified",
+        last_name=None,
+        is_bot=False,
+    )
+    assert created.is_bot is False
+
+    updated = await UserRepo.upsert(
+        db_session,
+        telegram_id=telegram_id,
+        username="renamed",
+        first_name="Classified",
+        last_name=None,
+        is_bot=None,
+    )
+    assert updated.is_bot is False
+
+
 def test_engine_rejects_sqlite_url(monkeypatch) -> None:
     """Engine module must refuse a sqlite URL with a clear error pointing at T0-02."""
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///vibe_gatekeeper.db")

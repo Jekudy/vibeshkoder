@@ -7,10 +7,10 @@ paths that all read+write the same (chat_id, message_id) row.
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.services.advisory_locks import chat_message_advisory_key
 
-async def advisory_lock_chat_message(
-    session: AsyncSession, chat_id: int, message_id: int
-) -> None:
+
+async def advisory_lock_chat_message(session: AsyncSession, chat_id: int, message_id: int) -> None:
     """Acquire pg_advisory_xact_lock keyed by (chat_id, message_id).
 
     Releases automatically at end of transaction. Cooperative with ``with_for_update()``
@@ -18,5 +18,5 @@ async def advisory_lock_chat_message(
 
     Key format: ``chat_msg:{chat_id}:{message_id}``. All handlers MUST use this format.
     """
-    key = f"chat_msg:{chat_id}:{message_id}"
+    key = chat_message_advisory_key(chat_id, message_id)
     await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": key})

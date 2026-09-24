@@ -26,7 +26,7 @@ services:
     restart: unless-stopped
 
   db:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:0.8.2-pg16-bookworm@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
     volumes:
       - pgdata:/var/lib/postgresql/data
     environment:

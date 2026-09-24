@@ -434,7 +434,7 @@ Wave 3 (optional):     E
 
 ## §9. PR Workflow
 
-Standard `sprint_pr_queue`.
+One queued PR per sprint.
 
 - One PR per Wave.
 - Branch pattern: `feat/p6-NN-slug`.

@@ -44,7 +44,6 @@ class Settings(BaseSettings):
     WEB_BOT_USERNAME: str = ""
     VOUCH_TIMEOUT_HOURS: int = 72
     NUDGE_TIMEOUT_HOURS: int = 48
-    INTRO_REFRESH_DAYS: int = 90
     DIGEST_HOUR_MSK: int = 9
     DIGEST_WEEKLY_HOUR_MSK: int = 9
     DIGEST_WEEKLY_MINUTE_MSK: int = 0

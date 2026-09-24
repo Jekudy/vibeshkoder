@@ -3,7 +3,7 @@
 **Status:** RATIFIED 2026-05-15. Implementation authorized for Sprint 0 (`AUTHORIZED_SCOPE.md` update + this plan) + 8 sprints across 3 waves.
 **Predecessors:** Phase 4 (FTS + evidence, CLOSED 2026-04-30), Phase 5 (`llm_gateway` + ledger, CLOSED 2026-05-11), Phase 6 (cards + admin review, CLOSED 2026-05-12), Phase 7 (daily digest, CLOSED 2026-05-15), Phase 11 (privacy binding suite, ACTIVE 30/30 — see §10 for the verified per-file enumeration; Round 1 review correctly flagged that the 28/28 → 34/34 narrative was a math drift from earlier docs).
 **Owner:** Orchestrator A (sole orchestrator for Phase 5 → 6 → 7 → 8 synthesis chain).
-**Charter:** `.superflow/charter.md` (run `phase8-weekly-editorial-digest`).
+**Execution:** one PR per sprint, CI and dual review before merge, holistic review at phase end.
 **Supersedes:** `docs/memory-system/prompts/PHASE8_PLAN_DRAFT.md` (reflection/observations content re-scoped to Phase 9+).
 
 ---
@@ -1919,7 +1919,7 @@ Phase 8 closure (T8-08 completion + FHR APPROVE) requires all 8 ACs green:
 - **AC7.** Stale-review reaper runs every 30 min: 48h pass DMs first admin with a single notification per row (marker `[48h_notified]` in `review_notes` prevents repeats; **M4 guarded UPDATE WHERE status='awaiting_review' RETURNING id** ensures the DM only fires if the row hasn't advanced); 7d pass auto-rejects with `status='rejected_by_reaper'` terminal + audit insert + admin DM. Verified by T8-05 + T8-07 (R5 indirectly covers via state-machine assertions).
 - **AC8.** Phase 11 binding suite **30→42 green** (baseline math correction per L1+L2): existing 30 cases preserve regression-free (10 leakage + 8 citations + 6 refusal + 6 digest-leakage; see §0 + §10 for the verified enumeration), 12 new weekly cases pass (L8a, L8b, C7, I6a, I6b.1, I6b.2, I6b.3, I6c, R5.a, R5.b, R5.c, R5.d). Verified by T8-07.
 
-**Final Holistic Review (FHR) trigger:** required per Rule 9 of `~/.claude/rules/superflow-enforcement.md` — Phase 8 has 8 sprints (≥4) and binds new privacy invariants. Two reviewers (Claude deep-product + Codex deep-technical) on the full Phase 8 surface. Fix CRITICAL/HIGH before closure report.
+**Final Holistic Review (FHR) trigger:** required because Phase 8 has 8 sprints (≥4) and binds new privacy invariants. Two reviewers (Claude deep-product + Codex deep-technical) review the full Phase 8 surface. Fix CRITICAL/HIGH before closure report.
 
 ---
 
@@ -1977,5 +1977,3 @@ This document is the deliverable. To complete Sprint 0, the PR must:
 6. PR description: short summary + link to this file + reference to charter + summary of two-reviewer findings (this plan was reviewed by Codex + Claude standard-spec-reviewer 2026-05-15 before ratification).
 
 This unblocks Wave 1.
-
-<!-- updated-by-superflow:2026-05-15 -->

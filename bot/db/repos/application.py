@@ -2,32 +2,86 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Application
+from bot.services.intro_contract import IntroContractError, get_intro_catalog
 
 
 class ApplicationRepo:
     @staticmethod
-    async def create(session: AsyncSession, user_id: int) -> Application:
-        app = Application(user_id=user_id, status="filling")
+    async def create(
+        session: AsyncSession,
+        *,
+        user_id: int,
+        flow_kind: str,
+        base_application_id: int | None,
+        catalog_version: str,
+    ) -> Application:
+        if flow_kind not in {"admission", "refresh"}:
+            raise ValueError("Application flow kind must be admission or refresh")
+        if flow_kind == "admission" and base_application_id is not None:
+            raise ValueError("Admission application cannot have a base application")
+        try:
+            get_intro_catalog(catalog_version)
+        except IntroContractError as error:
+            raise ValueError("Unknown application catalog version") from error
+
+        app = Application(
+            user_id=user_id,
+            status="filling",
+            flow_kind=flow_kind,
+            base_application_id=base_application_id,
+            catalog_version=catalog_version,
+        )
         session.add(app)
         await session.flush()
         return app
 
     @staticmethod
     async def get(session: AsyncSession, app_id: int) -> Application | None:
-        result = await session.execute(select(Application).where(Application.id == app_id))
+        result = await session.execute(
+            select(Application)
+            .where(Application.id == app_id)
+            .execution_options(populate_existing=True)
+        )
         return result.scalar_one_or_none()
 
     @staticmethod
-    async def get_active(session: AsyncSession, user_id: int) -> Application | None:
+    async def get_active(
+        session: AsyncSession, user_id: int, *, include_added: bool = False
+    ) -> Application | None:
+        """Compatibility lookup for the admission lifecycle only."""
+        statuses = ["filling", "confirmed", "pending", "privacy_block", "vouched"]
+        lifecycle = and_(
+            Application.flow_kind == "admission",
+            Application.status.in_(statuses + (["added"] if include_added else [])),
+        )
+        if include_added:
+            lifecycle = or_(
+                lifecycle,
+                and_(Application.flow_kind.is_(None), Application.status == "added"),
+            )
         result = await session.execute(
             select(Application)
             .where(
                 Application.user_id == user_id,
-                Application.status.in_(("filling", "pending", "privacy_block", "vouched")),
+                lifecycle,
+            )
+            .order_by(Application.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_active_refresh(session: AsyncSession, user_id: int) -> Application | None:
+        result = await session.execute(
+            select(Application)
+            .where(
+                Application.user_id == user_id,
+                Application.flow_kind == "refresh",
+                Application.status.in_(("filling", "confirmed")),
             )
             .order_by(Application.created_at.desc())
             .limit(1)
@@ -46,14 +100,6 @@ class ApplicationRepo:
             .limit(1)
         )
         return result.scalar_one_or_none()
-
-    @staticmethod
-    async def update_status(
-        session: AsyncSession, app_id: int, status: str, **extra_fields
-    ) -> None:
-        values: dict = {"status": status, **extra_fields}
-        await session.execute(update(Application).where(Application.id == app_id).values(**values))
-        await session.flush()
 
     @staticmethod
     async def update_status_if(

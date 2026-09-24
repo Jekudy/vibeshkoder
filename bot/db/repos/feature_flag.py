@@ -19,6 +19,21 @@ from bot.db.models import FeatureFlag
 
 class FeatureFlagRepo:
     @staticmethod
+    async def any_enabled(session: AsyncSession, flag_key: str) -> bool:
+        """Return whether the flag is enabled globally or for any explicit scope."""
+
+        stmt = (
+            select(FeatureFlag.id)
+            .where(
+                FeatureFlag.flag_key == flag_key,
+                FeatureFlag.enabled.is_(True),
+            )
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none() is not None
+
+    @staticmethod
     async def get(
         session: AsyncSession,
         flag_key: str,

@@ -518,7 +518,7 @@ Use the Phase 4-style stream PR queue, adapted for Phase 8 authorization gates.
 Pattern:
 
 1. Keep one ticket per PR where possible.
-2. Maintain a `sprint_pr_queue` with ticket ID, stream, branch, PR, migration number, deps, CI
+2. Maintain a sprint PR queue with ticket ID, stream, branch, PR, migration number, deps, CI
    status, review status, and merge state.
 3. Queue Wave 1 PRs first, but merge schema before service code.
 4. Hold any PR with a migration until migration numbering is coordinated.

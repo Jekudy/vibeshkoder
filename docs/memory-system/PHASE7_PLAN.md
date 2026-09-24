@@ -3,7 +3,7 @@
 **Status:** RATIFIED 2026-05-13. Implementation authorized for Sprint 0 (AUTHORIZED_SCOPE.md update) + 8 sprints across 3 waves.
 **Predecessors:** Phase 4 (FTS + evidence, CLOSED 2026-04-30), Phase 5 (`llm_gateway` + ledger, CLOSED 2026-05-11), Phase 6 (cards + admin review, CLOSED 2026-05-12), Phase 11 (privacy binding suite, ACTIVE).
 **Owner:** Orchestrator A (sole orchestrator for Phase 5 → 6 → 7 → 8 synthesis chain).
-**Charter:** `.superflow/charter.md` (run `phase7-daily-summaries`).
+**Execution:** one PR per sprint, CI and dual review before merge, holistic review at phase end.
 
 ---
 
@@ -1024,7 +1024,7 @@ Sprint-PR-queue mode. One PR per ticket. Linear order:
 
 1. T7-S0 → main (docs-only authorization). Solo, no review parallel.
 2. T7-01 → main (Wave 1 schema). Reviewed by Codex + Claude product.
-3. T7-02 + T7-03 — Wave 1 implementation. **Can ship in EITHER order** but both must be on main before T7-04. Sequential PRs (sprint_pr_queue).
+3. T7-02 + T7-03 — Wave 1 implementation. **Can ship in EITHER order** but both must be on main before T7-04. Merge their PRs sequentially.
 4. T7-04 → main (Wave 2 scheduler).
 5. T7-05 → main (Wave 2 publisher + cascade). Largest PR. Likely split into 5A (publisher+renderer) and 5B (cascade+redactor+admin notify) if diff >400 lines.
 6. T7-06 → main (Wave 3 admin handlers).

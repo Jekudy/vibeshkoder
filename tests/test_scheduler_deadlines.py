@@ -33,6 +33,10 @@ async def _get_pending_ids(
     application_repo = import_module("bot.db.repos.application")
     app = models.Application(
         user_id=user_id,
+        flow_kind="admission",
+        base_application_id=None,
+        catalog_version="intro-v2",
+        confirmed_intro_html="frozen snapshot",
         status="pending",
         created_at=created_at,
         submitted_at=submitted_at,
@@ -59,6 +63,10 @@ async def _auto_reject_after_status_flip_to_vouched() -> tuple[bool, str]:
     now = datetime.now(timezone.utc)
     app = models.Application(
         user_id=2001,
+        flow_kind="admission",
+        base_application_id=None,
+        catalog_version="intro-v2",
+        confirmed_intro_html="frozen snapshot",
         status="pending",
         created_at=now - timedelta(hours=80),
         submitted_at=now - timedelta(hours=80),
@@ -104,6 +112,10 @@ async def _auto_reject_when_status_still_pending() -> tuple[bool, str, bool]:
     now = datetime.now(timezone.utc)
     app = models.Application(
         user_id=2002,
+        flow_kind="admission",
+        base_application_id=None,
+        catalog_version="intro-v2",
+        confirmed_intro_html="frozen snapshot",
         status="pending",
         created_at=now - timedelta(hours=80),
         submitted_at=now - timedelta(hours=80),
@@ -213,6 +225,28 @@ def test_auto_reject_side_effects_are_skipped_when_cas_loses(app_env, monkeypatc
     asyncio.run(run())
 
 
+def test_unconfigured_sheets_leave_projection_pending_without_blocking_telegram(
+    app_env, monkeypatch
+) -> None:
+    scheduler_module = import_module("bot.services.scheduler")
+    scheduled: list[tuple[object, dict]] = []
+
+    monkeypatch.setattr(
+        scheduler_module.scheduler,
+        "add_job",
+        lambda func, *_args, **kwargs: scheduled.append((func, kwargs)),
+    )
+    monkeypatch.setattr(scheduler_module.scheduler, "start", lambda: None)
+    monkeypatch.setattr("bot.services.sheets._is_configured", lambda: False)
+
+    scheduler_module.start_scheduler(SimpleNamespace())
+
+    job = next(
+        kwargs for func, kwargs in scheduled if func is scheduler_module.process_intro_effects
+    )
+    assert job["kwargs"]["project_sheet"] is None
+
+
 def test_pending_older_than_legacy_null_falls_back_to_created_at() -> None:
     now = datetime.now(timezone.utc)
     pending_ids = asyncio.run(
@@ -246,6 +280,10 @@ def test_check_vouch_deadlines_pending_app_nudged(app_env, monkeypatch) -> None:
         now = datetime.now(timezone.utc)
         app = models.Application(
             user_id=2004,
+            flow_kind="admission",
+            base_application_id=None,
+            catalog_version="intro-v2",
+            confirmed_intro_html="frozen snapshot",
             status="pending",
             created_at=now - timedelta(hours=50),
             submitted_at=now,
@@ -283,15 +321,17 @@ def test_check_vouch_deadlines_pending_app_nudged(app_env, monkeypatch) -> None:
     asyncio.run(run())
 
 
-def test_check_vouch_deadlines_concurrent_vouch_preserved(
-    app_env, monkeypatch, caplog
-) -> None:
+def test_check_vouch_deadlines_concurrent_vouch_preserved(app_env, monkeypatch, caplog) -> None:
     async def run() -> None:
         models = import_module("bot.db.models")
         scheduler = import_module("bot.services.scheduler")
         now = datetime.now(timezone.utc)
         app = models.Application(
             user_id=2005,
+            flow_kind="admission",
+            base_application_id=None,
+            catalog_version="intro-v2",
+            confirmed_intro_html="frozen snapshot",
             status="pending",
             created_at=now - timedelta(hours=50),
             submitted_at=now,
@@ -337,9 +377,7 @@ def test_check_vouch_deadlines_concurrent_vouch_preserved(
                 assert app.status == "vouched"
                 assert app.nudged_newcomer_at is None
                 records = [
-                    record
-                    for record in caplog.records
-                    if record.message == "scheduler.cas_lost"
+                    record for record in caplog.records if record.message == "scheduler.cas_lost"
                 ]
                 assert len(records) == 1
                 assert records[0].app_id == app.id
@@ -351,15 +389,17 @@ def test_check_vouch_deadlines_concurrent_vouch_preserved(
     asyncio.run(run())
 
 
-def test_check_vouch_deadlines_rejected_app_skipped(
-    app_env, monkeypatch, caplog
-) -> None:
+def test_check_vouch_deadlines_rejected_app_skipped(app_env, monkeypatch, caplog) -> None:
     async def run() -> None:
         models = import_module("bot.db.models")
         scheduler = import_module("bot.services.scheduler")
         now = datetime.now(timezone.utc)
         app = models.Application(
             user_id=2006,
+            flow_kind="admission",
+            base_application_id=None,
+            catalog_version="intro-v2",
+            confirmed_intro_html="frozen snapshot",
             status="pending",
             created_at=now - timedelta(hours=50),
             submitted_at=now,
@@ -405,9 +445,7 @@ def test_check_vouch_deadlines_rejected_app_skipped(
                 assert app.status == "rejected"
                 assert app.notified_admin_at is None
                 records = [
-                    record
-                    for record in caplog.records
-                    if record.message == "scheduler.cas_lost"
+                    record for record in caplog.records if record.message == "scheduler.cas_lost"
                 ]
                 assert len(records) == 1
                 assert records[0].app_id == app.id

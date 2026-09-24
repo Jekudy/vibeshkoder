@@ -1,0 +1,213 @@
+# Issue #521: preserve existing data; external volumes must never be deleted.
+name: harry
+services:
+  harry-hermes:
+    image: ${HARRY_HERMES_IMAGE:?HARRY_HERMES_IMAGE must be pinned}
+    pull_policy: never
+    container_name: harry-hermes
+    env_file:
+    - path: harry-hermes.env
+      format: raw
+    restart: unless-stopped
+    entrypoint:
+    - gosu
+    - hermes
+    - /opt/hermes/.venv/bin/hermes
+    command:
+    - gateway
+    - run
+    - --accept-hooks
+    working_dir: /opt/hermes
+    volumes:
+    - /srv/harry/hooks:/opt/data/hooks:ro
+    - /srv/harry/intro.md:/opt/data/intro.md:ro
+    - vgtwjekx8w3aujw15ykkv8x4_harry-hermes-data:/opt/data
+    - /srv/harry/config/SOUL.md:/opt/data/SOUL.md:ro
+    - /srv/harry/config/hermes-config.yaml:/opt/data/config.yaml:ro
+    - /srv/harry/config/honcho.json:/opt/data/honcho.json:ro
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - vgtwjekx8w3aujw15ykkv8x4
+    depends_on:
+      harry-honcho-api:
+        condition: service_healthy
+      harry-mcp-telegram:
+        condition: service_healthy
+  harry-honcho-deriver:
+    image: ${DERIVER_IMAGE:?DERIVER_IMAGE must be pinned}
+    pull_policy: never
+    container_name: harry-honcho-deriver
+    env_file:
+    - path: harry-honcho-deriver.env
+      format: raw
+    restart: unless-stopped
+    entrypoint:
+    - /app/.venv/bin/python
+    - -m
+    - src.deriver
+    user: app
+    working_dir: /app
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - vgtwjekx8w3aujw15ykkv8x4
+    depends_on:
+      harry-honcho-redis:
+        condition: service_healthy
+      harry-honcho-db:
+        condition: service_healthy
+    expose:
+    - 8000/tcp
+  harry-honcho-api:
+    image: ${API_IMAGE:?API_IMAGE must be pinned}
+    pull_policy: never
+    container_name: harry-honcho-api
+    env_file:
+    - path: harry-honcho-api.env
+      format: raw
+    restart: unless-stopped
+    entrypoint:
+    - sh
+    - docker/entrypoint.sh
+    user: app
+    working_dir: /app
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - python3 -c 'import urllib.request; urllib.request.urlopen("http://localhost:8000/health")' || exit 1
+      interval: 60000000000ns
+      timeout: 10000000000ns
+      start_period: 60000000000ns
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - vgtwjekx8w3aujw15ykkv8x4
+    depends_on:
+      harry-honcho-redis:
+        condition: service_healthy
+      harry-honcho-db:
+        condition: service_healthy
+    expose:
+    - 8000/tcp
+  harry-honcho-redis:
+    image: ${HARRY_HONCHO_REDIS_IMAGE:?HARRY_HONCHO_REDIS_IMAGE must be pinned}
+    pull_policy: never
+    container_name: harry-honcho-redis
+    env_file:
+    - path: harry-honcho-redis.env
+      format: raw
+    restart: unless-stopped
+    entrypoint:
+    - docker-entrypoint.sh
+    command:
+    - redis-server
+    working_dir: /data
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - redis-cli ping
+      interval: 60000000000ns
+      timeout: 10000000000ns
+      retries: 5
+    volumes:
+    - vgtwjekx8w3aujw15ykkv8x4_harry-honcho-redis-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - vgtwjekx8w3aujw15ykkv8x4
+    expose:
+    - 6379/tcp
+  harry-honcho-db:
+    image: ${HARRY_HONCHO_DB_IMAGE:?HARRY_HONCHO_DB_IMAGE must be pinned}
+    pull_policy: never
+    container_name: harry-honcho-db
+    env_file:
+    - path: harry-honcho-db.env
+      format: raw
+    restart: unless-stopped
+    entrypoint:
+    - docker-entrypoint.sh
+    command:
+    - postgres
+    - -c
+    - max_connections=200
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U postgres -d postgres
+      interval: 60000000000ns
+      timeout: 10000000000ns
+      retries: 5
+    volumes:
+    - vgtwjekx8w3aujw15ykkv8x4_harry-honcho-pgdata:/var/lib/postgresql/data
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - vgtwjekx8w3aujw15ykkv8x4
+    expose:
+    - 5432/tcp
+  harry-mcp-telegram:
+    image: ${HARRY_MCP_TELEGRAM_IMAGE:?HARRY_MCP_TELEGRAM_IMAGE must be pinned}
+    pull_policy: never
+    container_name: harry-mcp-telegram
+    env_file:
+    - path: harry-mcp-telegram.env
+      format: raw
+    restart: unless-stopped
+    command:
+    - sh
+    - -c
+    - "fast-mcp-telegram --mode HTTP_AUTH --host 0.0.0.0 --port 8000\n       --session-dir /sessions --api-id $$API_ID\
+      \ --api-hash $$API_HASH\n       --log-level INFO --max-active-sessions 5"
+    working_dir: /app
+    mem_limit: 268435456
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - python3 -c 'import urllib.request; urllib.request.urlopen("http://localhost:8000/health")'
+      interval: 60000000000ns
+      timeout: 10000000000ns
+      start_period: 60000000000ns
+      retries: 3
+    volumes:
+    - vgtwjekx8w3aujw15ykkv8x4_harry-mcp-sessions:/sessions
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - vgtwjekx8w3aujw15ykkv8x4
+volumes:
+  vgtwjekx8w3aujw15ykkv8x4_harry-hermes-data:
+    external: true
+    name: vgtwjekx8w3aujw15ykkv8x4_harry-hermes-data
+  vgtwjekx8w3aujw15ykkv8x4_harry-honcho-redis-data:
+    external: true
+    name: vgtwjekx8w3aujw15ykkv8x4_harry-honcho-redis-data
+  vgtwjekx8w3aujw15ykkv8x4_harry-honcho-pgdata:
+    external: true
+    name: vgtwjekx8w3aujw15ykkv8x4_harry-honcho-pgdata
+  vgtwjekx8w3aujw15ykkv8x4_harry-mcp-sessions:
+    external: true
+    name: vgtwjekx8w3aujw15ykkv8x4_harry-mcp-sessions
+networks:
+  vgtwjekx8w3aujw15ykkv8x4:
+    external: true

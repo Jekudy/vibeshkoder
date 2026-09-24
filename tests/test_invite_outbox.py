@@ -108,13 +108,17 @@ def test_ready_inserts_outbox_row_no_invite_sent(monkeypatch) -> None:
     app = SimpleNamespace(id=101, user_id=3002, status="privacy_block")
 
     monkeypatch.setattr(handler.ApplicationRepo, "get", AsyncMock(return_value=app))
-    monkeypatch.setattr(handler.ApplicationRepo, "update_status", AsyncMock())
+    monkeypatch.setattr(handler.ApplicationRepo, "update_status_if", AsyncMock(return_value=True))
     monkeypatch.setattr(handler.InviteOutboxRepo, "create_pending", AsyncMock())
 
     asyncio.run(handler.handle_ready(callback, callback_data, session))
 
-    handler.ApplicationRepo.update_status.assert_awaited_once_with(
-        session, 101, "vouched", invite_user_id=3002
+    handler.ApplicationRepo.update_status_if.assert_awaited_once_with(
+        session,
+        101,
+        expected_from="privacy_block",
+        new_status="vouched",
+        invite_user_id=3002,
     )
     handler.InviteOutboxRepo.create_pending.assert_awaited_once_with(
         session,
@@ -406,8 +410,16 @@ async def test_invite_outbox_unique_pending_per_application(db_session) -> None:
         first_name="T",
         last_name=None,
     )
-    app = await ApplicationRepo.create(db_session, user_id)
-    await ApplicationRepo.update_status(db_session, app.id, "pending")
+    app = await ApplicationRepo.create(
+        db_session,
+        user_id=user_id,
+        flow_kind="admission",
+        base_application_id=None,
+        catalog_version="intro-v2",
+    )
+    app.confirmed_intro_html = "confirmed intro"
+    app.status = "pending"
+    await db_session.flush()
 
     first = InviteOutbox(
         application_id=app.id,

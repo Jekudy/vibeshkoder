@@ -107,7 +107,7 @@ def test_runtime_lock_contains_static_wiki_dependencies() -> None:
 
 
 def test_recall_command_is_not_publicly_registered() -> None:
-    """Member Q&A is mention/reply-only; the legacy command is not a route."""
+    """Member Q&A is explicit-mention-only; the legacy command is not a route."""
 
     qa = import_module("bot.handlers.qa")
     callbacks = [handler.callback for handler in qa.router.message.handlers]

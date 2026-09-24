@@ -42,7 +42,7 @@ async def handle_vouch(
 
     # Load application
     app = await ApplicationRepo.get(session, app_id)
-    if app is None:
+    if app is None or (hasattr(app, "flow_kind") and app.flow_kind != "admission"):
         await callback.answer(ALREADY_PROCESSED, show_alert=True)
         return
 
@@ -60,7 +60,11 @@ async def handle_vouch(
     # Optimistic lock: UPDATE WHERE status='pending' RETURNING id
     result = await session.execute(
         update(Application)
-        .where(Application.id == app_id, Application.status == "pending")
+        .where(
+            Application.id == app_id,
+            Application.flow_kind == "admission",
+            Application.status == "pending",
+        )
         .values(
             status="vouched",
             vouched_by=voucher_id,
@@ -137,7 +141,16 @@ async def handle_ready(
         await callback.answer("Эта кнопка не для тебя.", show_alert=True)
         return
 
-    await ApplicationRepo.update_status(session, app_id, "vouched", invite_user_id=app.user_id)
+    updated = await ApplicationRepo.update_status_if(
+        session,
+        app_id,
+        expected_from="privacy_block",
+        new_status="vouched",
+        invite_user_id=app.user_id,
+    )
+    if not updated:
+        await callback.answer(ALREADY_PROCESSED, show_alert=True)
+        return
     await InviteOutboxRepo.create_pending(
         session,
         application_id=app_id,

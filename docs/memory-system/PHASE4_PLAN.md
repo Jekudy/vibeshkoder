@@ -626,7 +626,7 @@ A stream MUST stop and surface the issue as a PR comment / draft PR description 
 
 ## 9. PR Workflow (per stream)
 
-Per `~/.claude/rules/superflow-enforcement.md` Rule 3 + this project's CLAUDE.md:
+Per this project's review gate and `CLAUDE.md`:
 
 1. Create worktree: `git worktree add .worktrees/p4-stream-<X> -b feat/p4-<X>-<slug> main`.
 2. Implement (subagents do the code; orchestrator does state I/O).

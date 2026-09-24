@@ -15,25 +15,31 @@ class UserRepo:
         username: str | None,
         first_name: str,
         last_name: str | None,
+        is_bot: bool | None = None,
     ) -> User:
+        values = {
+            "id": telegram_id,
+            "username": username,
+            "first_name": first_name,
+            "last_name": last_name,
+            "is_imported_only": False,
+            "is_bot": is_bot,
+        }
+        update_values: dict[str, object] = {
+            "username": username,
+            "first_name": first_name,
+            "last_name": last_name,
+            "is_imported_only": False,
+        }
+        if is_bot is not None:
+            update_values["is_bot"] = is_bot
         # Use PostgreSQL ON CONFLICT for race-condition safety
         stmt = (
             pg_insert(User)
-            .values(
-                id=telegram_id,
-                username=username,
-                first_name=first_name,
-                last_name=last_name,
-                is_imported_only=False,
-            )
+            .values(**values)
             .on_conflict_do_update(
                 index_elements=[User.id],
-                set_={
-                    "username": username,
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "is_imported_only": False,
-                },
+                set_=update_values,
             )
         )
         await session.execute(stmt)

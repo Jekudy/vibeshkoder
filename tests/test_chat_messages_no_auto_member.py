@@ -81,6 +81,7 @@ def test_save_chat_message_does_not_auto_mark_member(app_env, monkeypatch) -> No
         username="not_member_yet",
         first_name="Alice",
         last_name="Example",
+        is_bot=False,
     )
     user_set_member.assert_not_called()
     # T1-09/10/11 added normalized kwargs to MessageRepo.save. T1-12 added

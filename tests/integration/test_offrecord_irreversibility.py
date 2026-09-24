@@ -284,7 +284,7 @@ def _make_aiogram_message(
     user_id: int,
     text: str | None = "hello",
     caption: str | None = None,
-    edit_date: datetime | None = None,
+    edit_date: int | None = None,
 ):
     """Build a SimpleNamespace mimicking an aiogram Message for handler tests."""
     from types import SimpleNamespace
@@ -303,7 +303,7 @@ def _make_aiogram_message(
         text=text,
         caption=caption,
         date=datetime.now(timezone.utc),
-        edit_date=edit_date or datetime.now(timezone.utc),
+        edit_date=edit_date if edit_date is not None else int(datetime.now(timezone.utc).timestamp()),
         message_thread_id=None,
         model_dump=Mock(return_value=raw_json),
         # Probes for classify_message_kind:

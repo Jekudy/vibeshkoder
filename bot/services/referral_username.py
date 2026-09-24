@@ -32,8 +32,22 @@ def normalize_referral_username(raw: str) -> str:
     return f"@{username.lower()}"
 
 
+def is_concrete_referral(value: str | None) -> bool:
+    """Return whether a stored referral is a valid Telegram username."""
+    if value is None or not value.strip():
+        return False
+    try:
+        normalize_referral_username(value)
+    except InvalidReferralUsername:
+        return False
+    return True
+
+
 def _username_from_url(value: str) -> str:
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError as error:
+        raise InvalidReferralUsername("Invalid Telegram profile URL") from error
     if parsed.scheme.lower() != "https" or parsed.netloc.lower() != "t.me":
         raise InvalidReferralUsername("Invalid Telegram profile URL")
 

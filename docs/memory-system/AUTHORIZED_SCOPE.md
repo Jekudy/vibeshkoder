@@ -357,8 +357,8 @@ Phase 7 implementation must:
 - Wave 1 (T7-01, T7-02, T7-03): schema + run_digest + context builder.
 - Wave 2 (T7-04, T7-05): scheduler + publisher + forget cascade.
 - Wave 3 (T7-06, T7-07, T7-08): admin handlers + binding tests + closure docs.
-- Final Holistic Review (FHR) required after T7-08 — 8 sprints + privacy
-  invariants binding triggers superflow Rule 9.
+- Final Holistic Review (FHR) required after T7-08 because the phase has 8 sprints
+  and binds privacy invariants.
 
 NOT in Phase 7 scope (defer to Phase 8+):
 - Weekly digest scheduler / handler / publisher (Phase 8). The `digests.type`
@@ -438,7 +438,7 @@ Authorized work in this cycle:
   I6b.1/.2/.3 + I6c + R5.a/b/c/d) → 30/30 baseline + 12 = **42/42 total**.
 - Closure docs (T8-08): `PHASE8_ROLLOUT.md` + `IMPLEMENTATION_STATUS.md` +
   `ROADMAP.md` row 8 update + `CLAUDE.md` Phase 8 closure block +
-  `AUTHORIZED_SCOPE.md` Phase 8 CLOSED marker + FHR per Rule 9.
+  `AUTHORIZED_SCOPE.md` Phase 8 CLOSED marker + mandatory phase-level FHR.
 
 Wave layout (per `PHASE8_PLAN.md` §7 + §14, parallelized per L6):
 - Sprint 0 (T8-S0): this PR — `PHASE8_PLAN.md` + scope authorization. No code.
@@ -447,7 +447,7 @@ Wave layout (per `PHASE8_PLAN.md` §7 + §14, parallelized per L6):
 - Wave 4 (T8-04 ∥ T8-05 parallel): review SM + cascade/redactor/publisher
   widening + scheduler/reaper.
 - Wave 5 (T8-06 ∥ T8-07 parallel): admin handlers + binding tests.
-- Wave 6 (T8-08): closure + FHR (Rule 9: 8+ sprints + privacy invariants).
+- Wave 6 (T8-08): closure + FHR (required for 8+ sprints and privacy invariants).
 
 NOT in Phase 8 scope (defer to Phase 8.5+ or Phase 9+):
 - Reflection / observations / `memory_events` / `memory_candidates` /
@@ -471,7 +471,7 @@ NOT in Phase 8 scope (defer to Phase 8.5+ or Phase 9+):
 ## Authorized: Phase 12 — Future Butler / Action Layer (2026-05-25) — **CLOSED 2026-05-30**
 
 **Status: CLOSED 2026-05-30.** All 10 sprints (T12-01..T12-10) merged. FHR APPROVE (Claude
-product + Claude technical per Rule 7, Codex companion stalled). 1 HIGH fixed (scheduler
+product + Claude technical under the independent-review fallback, Codex companion stalled). 1 HIGH fixed (scheduler
 savepoint in TTL worker) + 1 MEDIUM fixed (ORM CHECK drift in `ButlerActionConfirmation`).
 Phase 11 binding **102/102** green. All `memory.butler.*` flags default OFF — production
 rollout playbook in `docs/memory-system/PHASE12_ROLLOUT.md`. Phase 12 is the FINAL phase
@@ -731,5 +731,3 @@ By the end of the first sprint (this cycle):
 - Tests covering all of the above.
 
 Everything else is out of scope until phase gates pass.
-
-<!-- updated-by-superflow:2026-05-15 -->

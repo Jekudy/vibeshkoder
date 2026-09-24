@@ -1,0 +1,56 @@
+# Issue #521. Only the Shkoder web hostname is routed publicly.
+http:
+  routers:
+    shkoder-web:
+      rule: Host(`cexv50jspo5gl3kq6ojypw43.187.77.98.73.sslip.io`)
+      entryPoints: [https]
+      service: shkoder-web
+      middlewares: [general-limit, security-headers]
+      tls:
+        certResolver: letsencrypt
+    shkoder-login:
+      rule: Host(`cexv50jspo5gl3kq6ojypw43.187.77.98.73.sslip.io`) && Path(`/login`)
+      entryPoints: [https]
+      service: shkoder-web
+      middlewares: [general-limit, login-limit, security-headers]
+      tls:
+        certResolver: letsencrypt
+    shkoder-health:
+      rule: Host(`cexv50jspo5gl3kq6ojypw43.187.77.98.73.sslip.io`) && Path(`/healthz`)
+      entryPoints: [https]
+      service: shkoder-web
+      middlewares: [general-limit, health-limit, security-headers]
+      tls:
+        certResolver: letsencrypt
+  services:
+    shkoder-web:
+      loadBalancer:
+        servers:
+          - url: http://shkoder-web:8080
+  middlewares:
+    # Limits use the connection IP, not an untrusted X-Forwarded-For header.
+    # ponytail: one proxy has local buckets; revisit if ingress is replicated.
+    general-limit:
+      rateLimit:
+        average: 20
+        period: 1s
+        burst: 40
+    login-limit:
+      rateLimit:
+        average: 5
+        period: 1m
+        burst: 5
+    health-limit:
+      rateLimit:
+        average: 2
+        period: 1s
+        burst: 5
+    security-headers:
+      headers:
+        contentTypeNosniff: true
+        stsSeconds: 86400
+        # Do not use includeSubDomains or preload on the shared sslip.io domain.
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12

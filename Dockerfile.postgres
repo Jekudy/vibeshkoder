@@ -1,0 +1,30 @@
+# Production-compatible PostgreSQL 15 image with pgvector compiled on the
+# exact Alpine/musl base currently used by the Coolify database service.
+FROM postgres@sha256:1c52f5ad23db5d7648a63634444af76de48e63b860fccbe3e3a5458b2812eaed
+
+ARG PGVECTOR_VERSION=0.8.2
+ARG PGVECTOR_TARBALL_SHA256=69f4019389af05dc1c9548deb8628e62878e6e207c03907f2b8af2016472cdaa
+
+RUN set -eux; \
+    apk add --no-cache --virtual .pgvector-build \
+        build-base \
+        ca-certificates \
+        clang19 \
+        curl \
+        llvm19-dev; \
+    curl --fail --location --proto '=https' --tlsv1.2 \
+        --output /tmp/pgvector.tar.gz \
+        "https://github.com/pgvector/pgvector/archive/refs/tags/v${PGVECTOR_VERSION}.tar.gz"; \
+    echo "${PGVECTOR_TARBALL_SHA256}  /tmp/pgvector.tar.gz" | sha256sum -c -; \
+    mkdir /tmp/pgvector; \
+    tar --extract --gzip --file /tmp/pgvector.tar.gz \
+        --directory /tmp/pgvector --strip-components=1; \
+    make -C /tmp/pgvector clean; \
+    make -C /tmp/pgvector OPTFLAGS=""; \
+    make -C /tmp/pgvector install; \
+    mkdir -p /usr/share/doc/pgvector; \
+    cp /tmp/pgvector/LICENSE /tmp/pgvector/README.md /usr/share/doc/pgvector/; \
+    grep -F "default_version = '${PGVECTOR_VERSION}'" \
+        /usr/local/share/postgresql/extension/vector.control; \
+    rm -rf /tmp/pgvector /tmp/pgvector.tar.gz; \
+    apk del .pgvector-build

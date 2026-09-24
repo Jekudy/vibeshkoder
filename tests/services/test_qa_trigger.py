@@ -53,7 +53,7 @@ def test_mention_triggers_case_insensitively_and_is_removed() -> None:
     assert result.query == "что мы решили про дайджест?"
 
 
-def test_reply_to_this_bot_triggers_without_mention() -> None:
+def test_reply_to_this_bot_does_not_trigger_without_mention() -> None:
     trigger = import_module("bot.services.qa_trigger")
 
     result = trigger.extract_triggered_question(
@@ -63,9 +63,22 @@ def test_reply_to_this_bot_triggers_without_mention() -> None:
         bot_username=BOT_USERNAME,
     )
 
+    assert result is None
+
+
+def test_reply_to_this_bot_with_exact_mention_triggers() -> None:
+    trigger = import_module("bot.services.qa_trigger")
+
+    result = trigger.extract_triggered_question(
+        _message("@VibeShkoderBot А где первоисточник?", reply_user_id=BOT_ID),
+        expected_chat_id=COMMUNITY_CHAT_ID,
+        bot_id=BOT_ID,
+        bot_username=BOT_USERNAME,
+    )
+
     assert result is not None
     assert result.via_reply is True
-    assert result.via_mention is False
+    assert result.via_mention is True
     assert result.query == "А где первоисточник?"
 
 

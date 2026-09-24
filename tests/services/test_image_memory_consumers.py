@@ -80,7 +80,7 @@ async def test_ready_image_description_is_searchable_without_llm(db_session):
 
 
 async def test_ready_image_description_enters_digest_context(db_session):
-    from bot.services.digest_context import DigestConfig, build_digest_context
+    from bot.services.digest_context import build_digest_context
 
     chat_id = -100919002
     await _ready_image_memory(db_session, chat_id=chat_id)
@@ -92,12 +92,10 @@ async def test_ready_image_description_enters_digest_context(db_session):
         window_start=now - timedelta(hours=1),
         window_end=now + timedelta(hours=1),
         source_chat_id=chat_id,
-        digest_config=DigestConfig(min_cards_threshold=1),
     )
 
     assert len(context.messages) == 1
-    assert "[Описание изображения]" in context.messages[0].text
-    assert "флипчарт" in context.messages[0].text.casefold()
+    assert "флипчарт" in context.messages[0].media_description.casefold()
 
 
 async def test_ready_image_description_enters_extraction_source(db_session):

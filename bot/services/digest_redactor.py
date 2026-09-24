@@ -12,11 +12,13 @@ Bullet identification uses the ``citations[i].position`` bullet index that
 
 from __future__ import annotations
 
+import json
 import logging
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.digest_admin_notify import notify_admins_digest_failure
@@ -25,30 +27,15 @@ from bot.services.digest_renderer import render_digest_html
 logger = logging.getLogger(__name__)
 
 REDACTED_BULLET_TEMPLATE = "- [REDACTED — забыто]"
+REDACTED_DIGEST_BODY = "Часть дайджеста удалена по запросу автора."
 
-# T8-04 / Phase 8 §5.K — eligible-status allowlist for the redactor.
-#
-# Widened beyond the Phase 7 4-tuple to cover the four new review-gate
-# statuses introduced by migration 038:
-#   awaiting_review        — weekly draft DMed to admins, pending decision
-#   approved_for_publish   — admin approved; publisher transitions to posting
-#   rejected_by_admin      — admin rejected; still visible in /digest_review
-#
-# C1 binding privacy fix: without this widening the forget cascade scan at
-# forget_cascade.py:840 selects the row but the redactor short-circuits it
-# back out, leaving forgotten content visible. An admin /digest_approve
-# could then publish forgotten content to Telegram.
-#
-# MUST mirror forget_cascade._cascade_digests WHERE-status filter EXACTLY.
+# Keep this in sync with ``forget_cascade._cascade_digests``.
 _REDACTOR_ELIGIBLE_STATUSES: tuple[str, ...] = (
     "draft",
-    "awaiting_review",
-    "approved_for_publish",
     "posting",
     "posted",
     "redacted",
     "redacted_edit_failed",
-    "rejected_by_admin",
 )
 
 
@@ -62,10 +49,30 @@ def _mask_bullets_in_body(body_markdown: str, *, bullet_indices: set[int]) -> st
     if not bullet_indices:
         return body_markdown
     lines = body_markdown.splitlines()
+    heading_lines_to_remove: set[int] = set()
+    current_heading_line: int | None = None
+    current_bullet_idx = -1
+    for line_index, line in enumerate(lines):
+        if line.startswith("## "):
+            current_heading_line = line_index
+        elif not line:
+            # Generated sections are separated by one blank line. A later
+            # section may have had its heading stripped during compaction, so
+            # its bullets must not inherit the preceding section's heading.
+            current_heading_line = None
+        if line.startswith("- ") or line.startswith("• "):
+            current_bullet_idx += 1
+            if current_bullet_idx in bullet_indices and current_heading_line is not None:
+                heading_lines_to_remove.add(current_heading_line)
+
     out: list[str] = []
     current_bullet_idx = -1
     skip_until_next_bullet = False
-    for line in lines:
+    for line_index, line in enumerate(lines):
+        if line_index in heading_lines_to_remove:
+            continue
+        if line.startswith("## "):
+            skip_until_next_bullet = False
         is_bullet_start = line.startswith("- ") or line.startswith("• ")
         if is_bullet_start:
             current_bullet_idx += 1
@@ -103,36 +110,41 @@ async def redact_digest_for_forget(
        redacted_edit_failed.
     7. On TelegramForbiddenError → admin notify, no erratum.
     """
-    await session.execute(
-        text("SELECT set_config('statement_timeout', '5s', true)")
-    )
+    await session.execute(text("SELECT set_config('statement_timeout', '5s', true)"))
 
     try:
         digest_row = (
-            await session.execute(
-                text("SELECT * FROM digests WHERE id = :id FOR UPDATE"),
-                {"id": digest_id},
+            (
+                await session.execute(
+                    text("SELECT * FROM digests WHERE id = :id FOR UPDATE"),
+                    {"id": digest_id},
+                )
             )
-        ).mappings().one_or_none()
-    except Exception:
-        # statement_timeout fires here on stuck `posting` row. Per Codex
-        # round-3 fix: log + skip without raise (per-event isolation).
-        logger.warning(
-            "redact_digest_for_forget: FOR UPDATE timed out digest_id=%s",
+            .mappings()
+            .one_or_none()
+        )
+    except SQLAlchemyError:
+        logger.exception(
+            "redact_digest_for_forget: FOR UPDATE failed digest_id=%s",
             digest_id,
         )
-        return
+        raise
 
     if digest_row is None:
         return
 
     current_status = digest_row["status"]
     if current_status not in _REDACTOR_ELIGIBLE_STATUSES:
-        # Terminal-without-body states (skipped, failed, cost_exceeded,
-        # skipped_no_destination, rejected_by_reaper) — nothing to redact.
+        # Terminal-without-body states have nothing to redact.
         return
 
+    body_markdown = digest_row["body_markdown"] or ""
+    bullet_count = sum(
+        line.startswith("- ") or line.startswith("• ") for line in body_markdown.splitlines()
+    )
     citations = digest_row["citations"] or []
+    has_affected_citation = False
+    has_invalid_affected_position = False
     bullet_indices_to_mask: set[int] = set()
     surviving_citations: list[dict] = []
     for cit in citations:
@@ -148,40 +160,30 @@ async def redact_digest_for_forget(
         elif kind == "card_source":
             affected = str(cid) in affected_card_source_ids
         if affected:
-            if isinstance(position, int) and position >= 0:
+            has_affected_citation = True
+            if (
+                isinstance(position, int)
+                and not isinstance(position, bool)
+                and 0 <= position < bullet_count
+            ):
                 bullet_indices_to_mask.add(position)
+            else:
+                has_invalid_affected_position = True
         else:
             surviving_citations.append(cit)
 
-    if not bullet_indices_to_mask:
-        # Edge case: cited but position == -1 (TL;DR), or no citations matched.
-        # Still mark redacted to record event. WHERE clause mirrors
-        # _REDACTOR_ELIGIBLE_STATUSES exactly (T8-04 §5.K).
-        await session.execute(
-            text(
-                "UPDATE digests SET status='redacted', updated_at=now() "
-                "WHERE id = :id AND status IN "
-                "('draft','awaiting_review','approved_for_publish','posting',"
-                " 'posted','redacted','redacted_edit_failed','rejected_by_admin')"
-            ),
-            {"id": digest_id},
-        )
-        # T8-04 §5.D sub-step: admin-notify when an awaiting_review draft is
-        # silently redacted by the cascade — the draft disappears from
-        # /digest_review listing, so the admin needs to know.
-        if current_status == "awaiting_review" and bot is not None:
-            await notify_admins_digest_failure(
-                bot,
-                digest_id=digest_id,
-                status="redacted",
-                error_text="forget_redacted_during_review",
-            )
+    if not has_affected_citation:
         return
 
-    masked = _mask_bullets_in_body(
-        digest_row["body_markdown"] or "",
-        bullet_indices=bullet_indices_to_mask,
-    )
+    if has_invalid_affected_position:
+        redacted_body = REDACTED_DIGEST_BODY
+        redacted_citations: list[dict] = []
+    else:
+        redacted_body = _mask_bullets_in_body(
+            body_markdown,
+            bullet_indices=bullet_indices_to_mask,
+        )
+        redacted_citations = surviving_citations
 
     await session.execute(
         text(
@@ -194,28 +196,23 @@ async def redact_digest_for_forget(
         ),
         {
             "id": digest_id,
-            "body": masked,
-            "cits": __import__("json").dumps(surviving_citations),
+            "body": redacted_body,
+            "cits": json.dumps(redacted_citations),
         },
     )
-
-    # T8-04 §5.D sub-step: admin-notify when an awaiting_review draft is
-    # silently redacted by the cascade — same rationale as the no-bullet
-    # branch above; the draft disappears from /digest_review listing.
-    if current_status == "awaiting_review" and bot is not None:
-        await notify_admins_digest_failure(
-            bot,
-            digest_id=digest_id,
-            status="redacted",
-            error_text="forget_redacted_during_review",
-        )
 
     # Telegram side-effect — best effort.
     posted_message_id = digest_row.get("posted_message_id")
     posted_chat_id = digest_row.get("posted_chat_id")
     if posted_message_id and bot is not None:
+        # ponytail: fail-closed neutralization; re-resolve partial source links only if product asks.
         body_html = render_digest_html(
-            masked, window_start_utc=digest_row["window_start"]
+            REDACTED_DIGEST_BODY,
+            window_start_utc=digest_row["window_start"],
+            window_end_utc=digest_row["window_end"] if digest_row["type"] == "weekly" else None,
+            digest_type=digest_row["type"],
+            source_links_by_citation={},
+            quiet=True,
         )
         try:
             await bot.edit_message_text(
@@ -228,16 +225,13 @@ async def redact_digest_for_forget(
         except TelegramBadRequest as exc:
             # Edit refused (bot still in chat) — post erratum.
             await session.execute(
-                text(
-                    "UPDATE digests SET status='redacted_edit_failed' "
-                    "WHERE id = :id"
-                ),
+                text("UPDATE digests SET status='redacted_edit_failed' WHERE id = :id"),
                 {"id": digest_id},
             )
             erratum = (
                 f"Дайджест за {digest_row['window_start'].strftime('%d.%m.%Y')} "
                 "обновлён: цитата по запросу автора удалена. "
-                "Полный текст в /digest_history."
+                "Полный текст обновлён."
             )
             try:
                 await bot.send_message(
@@ -259,10 +253,7 @@ async def redact_digest_for_forget(
         except TelegramForbiddenError:
             # Bot kicked — no erratum possible. Privacy stop signal.
             await session.execute(
-                text(
-                    "UPDATE digests SET status='redacted_edit_failed' "
-                    "WHERE id = :id"
-                ),
+                text("UPDATE digests SET status='redacted_edit_failed' WHERE id = :id"),
                 {"id": digest_id},
             )
             await notify_admins_digest_failure(

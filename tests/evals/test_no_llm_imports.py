@@ -47,6 +47,7 @@ ALLOWED_LLM_IMPORT_FILES: frozenset[str] = frozenset(
         "bot/services/llm_providers/anthropic.py",
         "bot/services/llm_providers/deepseek.py",
         "bot/services/llm_providers/openai.py",
+        "bot/services/llm_providers/openai_embeddings.py",
         "bot/services/llm_providers/openai_vision.py",
     ]
 )
@@ -268,6 +269,7 @@ def test_no_llm_provider_urls_outside_gateway() -> None:
             "bot/services/llm_providers/anthropic.py",
             "bot/services/llm_providers/deepseek.py",
             "bot/services/llm_providers/openai.py",
+            "bot/services/llm_providers/openai_embeddings.py",
             "bot/services/llm_providers/openai_vision.py",
         ]
     )
@@ -307,6 +309,7 @@ def test_i3_allow_list_contract_documented() -> None:
             "bot/services/llm_providers/anthropic.py",
             "bot/services/llm_providers/deepseek.py",
             "bot/services/llm_providers/openai.py",
+            "bot/services/llm_providers/openai_embeddings.py",
             "bot/services/llm_providers/openai_vision.py",
         ]
     ), (

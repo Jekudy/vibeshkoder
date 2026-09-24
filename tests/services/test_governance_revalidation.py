@@ -71,6 +71,9 @@ async def _make_chat_message_with_version(
     is_redacted: bool = False,
     version_is_redacted: bool = False,
     content_hash: str | None = None,
+    entities_json: object = {},
+    imported_final: bool = False,
+    normalized_text: str | None = None,
 ) -> tuple[int, int, int, int, int, str]:
     """Returns (cm_id, mv_id, chat_id, message_id, user_id, mv_content_hash)."""
     from sqlalchemy import update as sa_update
@@ -99,10 +102,11 @@ async def _make_chat_message_with_version(
         chat_message_id=cm.id,
         version_seq=1,
         text=text,
-        normalized_text=text,
-        entities_json={},
+        normalized_text=normalized_text if normalized_text is not None else text,
+        entities_json=entities_json,
         content_hash=mv_ch,
         is_redacted=version_is_redacted,
+        imported_final=imported_final,
     )
     db_session.add(mv)
     await db_session.flush()
@@ -177,6 +181,36 @@ async def test_revalidate_sources_blocks_non_current_version(db_session) -> None
         "failure_reason": "source_not_current",
         "mvid": stale_mvid,
     }
+
+
+@pytest.mark.parametrize(
+    ("entities_json", "imported_final", "normalized_text"),
+    [
+        ([{"type": "bot_command", "offset": 0, "length": 8}], False, None),
+        ('[{"type":"bot_command","offset":0,"length":8}]', False, None),
+        ({}, True, "/approve candidate"),
+    ],
+)
+async def test_revalidate_sources_blocks_control_message_sources(
+    db_session,
+    entities_json: object,
+    imported_final: bool,
+    normalized_text: str | None,
+) -> None:
+    """The shared SQL predicate blocks direct, legacy, and import commands."""
+    from bot.services.governance_revalidation import revalidate_sources
+
+    _, mvid, _, _, _, _ = await _make_chat_message_with_version(
+        db_session,
+        entities_json=entities_json,
+        imported_final=imported_final,
+        normalized_text=normalized_text,
+    )
+
+    status, payload = await revalidate_sources(db_session, [mvid])
+
+    assert status == "blocked"
+    assert payload == {"failure_reason": "source_control_message", "mvid": mvid}
 
 
 # ─── revalidate_sources — forget_tombstone_match (3 keys) ────────────────────

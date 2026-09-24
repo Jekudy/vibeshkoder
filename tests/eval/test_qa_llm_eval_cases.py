@@ -129,6 +129,7 @@ async def _seed_user(db_session, user_id: int) -> None:
         username=f"llmeval_{user_id}",
         first_name=f"LLMEval {user_id}",
         last_name=None,
+        is_bot=False,
     )
 
 

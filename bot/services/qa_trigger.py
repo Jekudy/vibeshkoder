@@ -1,11 +1,11 @@
 """Trigger detection for conversational memory questions.
 
 The public Q&A surface deliberately has no command.  A message is eligible only
-when a human in the configured community chat either mentions this bot by its
-exact username or replies to a message authored by this bot.  Keeping this logic
-in an aiogram filter is important: non-triggering messages must continue to the
-lower-priority ``chat_messages`` router instead of being swallowed by a catch-all
-Q&A handler.
+when a human in the configured community chat mentions this bot by its exact
+username.  Reply metadata is retained for reply-plus-mention requests.  Keeping
+this logic in an aiogram filter is important: non-triggering messages must
+continue to the lower-priority ``chat_messages`` router instead of being
+swallowed by a catch-all Q&A handler.
 """
 
 from __future__ import annotations
@@ -107,7 +107,7 @@ def extract_triggered_question(
         and getattr(reply_sender, "id", None) == bot_id
         and bool(getattr(reply_sender, "is_bot", False))
     )
-    if not (via_mention or via_reply):
+    if not via_mention:
         return None
 
     without_trigger = pattern.sub(" ", text) if via_mention and pattern else text

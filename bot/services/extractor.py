@@ -56,6 +56,7 @@ from bot.db.models import (
     ExtractionRunResolution,
 )
 from bot.db.repos.feature_flag import FeatureFlagRepo
+from bot.services.control_messages import control_message_excludes_sql_fragment
 from bot.services.extraction_schema import (
     EXTRACTION_CANDIDATE_SCHEMA_VERSION,
     EXTRACTION_PROMPT_TEMPLATE_VERSION,
@@ -65,6 +66,8 @@ from bot.services.extraction_schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+_CONTROL_EXCLUDES = control_message_excludes_sql_fragment()
 
 
 # ─── Scheduler-tick advisory lock (Codex HIGH #4) ────────────────────────────
@@ -343,6 +346,7 @@ async def _select_eligible_sources(
         AND c.memory_policy = 'normal'
         AND c.is_redacted = FALSE
         AND mv.is_redacted = FALSE
+        AND {_CONTROL_EXCLUDES}
         {selection_predicate}
         {source_chat_predicate}
         AND NOT EXISTS (

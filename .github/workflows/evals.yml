@@ -2,36 +2,15 @@ name: Evals
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "15 3 * * *"
 
 jobs:
-  evals-gate:
-    runs-on: ubuntu-latest
-    outputs:
-      enabled: ${{ steps.gate.outputs.enabled }}
-    steps:
-      - name: Check eval harness gate
-        id: gate
-        shell: bash
-        env:
-          EVAL_HARNESS_ENABLED_SECRET: ${{ secrets.EVAL_HARNESS_ENABLED }}
-        run: |
-          if [ "$EVAL_HARNESS_ENABLED_SECRET" = "true" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
-
   evals:
-    needs: evals-gate
-    if: ${{ needs.evals-gate.outputs.enabled == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     services:
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:0.8.2-pg16-bookworm@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
         env:
           POSTGRES_USER: vibe
           POSTGRES_PASSWORD: changeme
@@ -85,19 +64,45 @@ jobs:
       - name: Run database migrations
         run: alembic upgrade head
 
-      - name: Run evals
+      - name: Run privacy and semantic eval contract tests
         shell: bash
         run: |
-          : > eval_results.jsonl
-          if [ ! -d tests/evals ] || [ -z "$(find tests/evals -name 'test_*.py' -print -quit)" ]; then
-            echo "tests/evals/ not yet populated — skipping eval run"
-            exit 0
-          fi
-          # NOTE: structured eval_results.jsonl emitter is a follow-up (see
-          # docs/memory-system/eval-results-schema.md). For now we run the
-          # privacy binding suite and fail the job on real pytest failure —
-          # NO `|| true` masking. CI green = privacy invariants hold.
-          EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 tests/evals/
+          set +e
+          EVAL_HARNESS_ENABLED=1 timeout 300 pytest -x --timeout=60 \
+            tests/evals/ \
+            tests/services/test_semantic_eval.py \
+            tests/scripts/test_evaluate_semantic_qa.py \
+            tests/scripts/test_run_semantic_qa_eval.py \
+            tests/scripts/test_postgres_image_contract.py
+          eval_status=$?
+          set -e
+          python - "$eval_status" <<'PY'
+          import json
+          import os
+          import sys
+
+          exit_code = int(sys.argv[1])
+          payload = {
+              "schema_version": 1,
+              "suite": "privacy-and-semantic-eval-contract-tests",
+              "status": "pass" if exit_code == 0 else "fail",
+              "exit_code": exit_code,
+              "commit_sha": os.environ.get("GITHUB_SHA", ""),
+              "contains_raw_text": False,
+          }
+          with open("eval_results.jsonl", "w", encoding="utf-8") as target:
+              target.write(json.dumps(payload, sort_keys=True) + "\n")
+          PY
+          exit "$eval_status"
+
+      - name: Validate sanitized private frozen eval report
+        shell: bash
+        env:
+          SEMANTIC_EVAL_REPORT_JSON: ${{ secrets.SEMANTIC_EVAL_REPORT_JSON }}
+        run: |
+          python -m scripts.evaluate_semantic_qa validate-report \
+            --expected-release-sha "$GITHUB_SHA" \
+            --artifact eval_results.jsonl
 
       - name: Upload eval results
         if: always()

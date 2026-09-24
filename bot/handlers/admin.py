@@ -61,7 +61,7 @@ async def cmd_force_refresh(
     message: Message,
     session: AsyncSession,
 ) -> None:
-    """Trigger intro refresh cycle for all stale intros (admin only)."""
+    """Run today's shared intro refresh wave (admin only)."""
     if message.from_user is None:
         return
 
@@ -70,5 +70,8 @@ async def cmd_force_refresh(
 
     from bot.services.scheduler import check_intro_refresh
 
-    await check_intro_refresh(message.bot)
-    await message.answer("Цикл обновления интро запущен.")
+    sent = await check_intro_refresh(message.bot)
+    if sent is None:
+        await message.answer("Сегодня нет общей волны обновления интро.")
+        return
+    await message.answer(f"Общая волна обработана. Отправлено: {sent}.")

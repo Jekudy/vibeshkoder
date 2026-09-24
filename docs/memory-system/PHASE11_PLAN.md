@@ -2,7 +2,7 @@
 
 **Status:** RATIFIED 2026-05-02. Authorized for implementation in parallel with Phase 5.
 **Owner:** Orchestrator C (`ORCHESTRATOR_REGISTRY.md §1`).
-**Charter:** `governance_mode = critical`, `git_workflow_mode = parallel_wave_prs`. Per-PR PAR (Claude product + Codex technical). FHR mandatory at end of phase.
+**Execution policy:** critical governance with parallel sprint PRs. Per-PR PAR (Claude product + Codex technical). FHR mandatory at end of phase.
 
 ---
 
@@ -315,7 +315,7 @@ Phase 11 touches the following shared files (per `ORCHESTRATOR_REGISTRY.md §2 S
 
 ## §9. PAR review protocol (per Sprint, per PR)
 
-Per `~/.claude/rules/superflow-enforcement.md` Rule 3 + REGISTRY §3.6:
+Per the project review gate and REGISTRY §3.6:
 
 1. **Claude product reviewer** (`subagent_type: standard-product-reviewer`) — checks scope match, invariants intact, no production wiring leak, seed manifests do not contain raw `#offrecord` text in positive positions.
 2. **Codex technical reviewer** via `Agent(subagent_type="codex:codex-rescue")` per `prompts/CODEX_DUAL_AGENT_PATTERN.md` — checks: no LLM imports, no migration, governance filter unchanged, eval runner does not write to production tables, CI workflow gated.
@@ -380,7 +380,7 @@ Phase 11 has **no production rollback** (no production wiring exists to roll bac
 
 ## §13. Definition of Done — Phase 11
 
-Phase 11 is closed (per Paranoid Mode Rule 5) only when ALL of:
+Phase 11 is closed only when ALL of the following hold:
 
 - [ ] All T11-* GitHub issues CLOSED.
 - [ ] All Phase 11 PRs MERGED via `--rebase --delete-branch`. Never `--admin`.

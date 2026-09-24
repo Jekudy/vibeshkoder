@@ -44,6 +44,7 @@ async def login_submit(request: Request, password: str = Form(...)):
         value=cookie_value,
         max_age=7 * 24 * 60 * 60,
         httponly=True,
+        secure=True,
         samesite="lax",
     )
     return response

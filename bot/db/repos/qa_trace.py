@@ -53,6 +53,25 @@ class QaTraceRepo:
         )
 
     @staticmethod
+    async def update_retrieval_fields(
+        session: AsyncSession,
+        *,
+        qa_trace_id: int,
+        evidence_ids: list[int],
+        abstained: bool,
+    ) -> None:
+        """Attach the governed retrieval result to a durable pre-call trace."""
+
+        result = await session.execute(
+            update(QaTrace)
+            .where(QaTrace.id == qa_trace_id)
+            .values(evidence_ids=list(evidence_ids), abstained=abstained)
+        )
+        if getattr(result, "rowcount", None) != 1:
+            raise LookupError(f"QaTrace(id={qa_trace_id}) not found")
+        await session.flush()
+
+    @staticmethod
     async def update_llm_fields(
         session: AsyncSession,
         *,
@@ -94,4 +113,24 @@ class QaTraceRepo:
                 f"QaTrace(id={qa_trace_id}) not found — handler step 1 (create) "
                 "must precede step 3 (update_llm_fields)"
             )
+        await session.flush()
+
+    @staticmethod
+    async def clear_undelivered_llm_summary(
+        session: AsyncSession,
+        *,
+        qa_trace_id: int,
+    ) -> None:
+        """Remove content that was prepared but never delivered to Telegram."""
+
+        result = await session.execute(
+            update(QaTrace)
+            .where(QaTrace.id == qa_trace_id)
+            .values(
+                llm_response_summary=None,
+                llm_response_redacted=True,
+            )
+        )
+        if getattr(result, "rowcount", None) != 1:
+            raise LookupError(f"QaTrace(id={qa_trace_id}) not found")
         await session.flush()

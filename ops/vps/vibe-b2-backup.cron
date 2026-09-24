@@ -1,0 +1,12 @@
+# SHK #523 — external encrypted backups to Backblaze B2.
+# Source of truth: ops/vps/vibe-b2-backup.cron in Jekudy/vibeshkoder.
+# Install: sudo install -m 0644 -o root -g root vibe-b2-backup.cron /etc/cron.d/vibe-b2-backup
+#
+# Shkoder's own dump cron (/etc/cron.d/shkoder-pg-backup, 03:17 UTC) is untouched.
+# The upload runs at 03:50 UTC, after the longest observed dump duration (~13 min).
+# Harry runs at 03:40 UTC — before the Shkoder upload, so the two never share the
+# temporary-file peak, and clear of foodzy-backup at 01:47 UTC.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+40 3 * * * root /usr/local/sbin/backup-to-b2.sh harry >> /var/log/vibe-b2-backup.log 2>&1
+50 3 * * * root /usr/local/sbin/backup-to-b2.sh shkoder >> /var/log/vibe-b2-backup.log 2>&1

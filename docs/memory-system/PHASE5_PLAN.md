@@ -416,14 +416,14 @@ Pause work, comment on tracking issue, escalate if any:
 
 ## §9. PR workflow & merge order
 
-Per `superflow-enforcement.md` Rule 8 + REGISTRY §3.5 (`git_workflow_mode = parallel_wave_prs`):
+Per the parallel sprint PR policy in REGISTRY §3.5:
 
 1. **Sprint 0 (this branch `plan/p5-ratify`)** — single PR ratifying this plan + REGISTRY §4 update + IMPLEMENTATION_STATUS.md Phase 5 section header. PAR review: 1 product (Claude) + 1 technical (Codex `gpt-5.5` `-c model_reasoning_effort=high`). Auto-merge on CI green.
 2. **Wave 0** — single PR `feat/p5-w0-hotfix-164` (carries 15 commits per design §6). PAR review obligatory before merge.
 3. **Wave 1** — two PRs in parallel: `feat/p5-w1-gateway` (T5-01) and `feat/p5-w1-schema` (T5-02). Each PAR-reviewed. Merge order does not matter; T5-01 mocks LedgerRepo until T5-03 lands.
-4. **Wave 2** — one bundled PR `feat/p5-w2-repo-handler` (T5-03 + T5-04) per DRAFT §6 / Rule 11 single-call-site discipline.
+4. **Wave 2** — one bundled PR `feat/p5-w2-repo-handler` (T5-03 + T5-04) per DRAFT §6 and the single-call-site discipline.
 5. **Wave 3** — single PR `feat/p5-w3-evals` (T5-05).
-6. **Final Holistic Review (FHR)** — required per Rule 9 (Phase 5 introduces provider calls + cost-bearing behavior + 3 alembic migrations across 4 PRs ≥ 4 sprints AND `parallel_wave_prs` mode). 2 reviewers (Claude `deep-product-reviewer` + Codex `model_reasoning_effort=high`) review all Phase 5 PRs as unified system. CRITICAL/HIGH must close before declaring Phase 5 closed in `IMPLEMENTATION_STATUS.md` and `CLAUDE.md`.
+6. **Final Holistic Review (FHR)** — required because Phase 5 introduces provider calls, cost-bearing behavior, 3 Alembic migrations, and parallel work across at least 4 sprints. Two reviewers (Claude `deep-product-reviewer` + Codex `model_reasoning_effort=high`) review all Phase 5 PRs as a unified system. CRITICAL/HIGH must close before declaring Phase 5 closed in `IMPLEMENTATION_STATUS.md` and `CLAUDE.md`.
 7. **Phase 5 closure update** (final PR `docs(p5): Phase 5 closed`):
    - `IMPLEMENTATION_STATUS.md` — every T5-* ticket marked done.
    - `ROADMAP.md` — Phase 5 = DONE.

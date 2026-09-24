@@ -88,11 +88,20 @@ class DeepSeekProvider:
         try:
             payload: dict[str, Any] = response.json()
             answer_text = payload["choices"][0]["message"]["content"]
-            usage = payload.get("usage") or {}
+            usage = payload["usage"]
             if not isinstance(answer_text, str):
                 raise TypeError("content must be a string")
-            tokens_in = int(usage.get("prompt_tokens", 0))
-            tokens_out = int(usage.get("completion_tokens", 0))
+            if not isinstance(usage, dict):
+                raise TypeError("usage must be an object")
+            tokens_in = usage["prompt_tokens"]
+            tokens_out = usage["completion_tokens"]
+            if (
+                type(tokens_in) is not int
+                or type(tokens_out) is not int
+                or tokens_in < 0
+                or tokens_out < 0
+            ):
+                raise TypeError("usage token counts must be non-negative integers")
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise ProviderStructuralError(
                 "contract_violation",

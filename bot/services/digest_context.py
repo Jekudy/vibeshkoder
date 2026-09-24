@@ -1,19 +1,10 @@
-"""Digest context builder — read-only governance-filtered query layer.
+"""Build the complete governance-eligible context for one digest window.
 
-T7-03 / Phase 7 Wave 1: produces a structured context bundle for the digest
-LLM synthesis step. The output is fed into `llm_gateway.synthesize_digest`
-(T7-02, separate PR).
+Every eligible current message is returned in chronological order. The query
+never applies cards-first selection, top-N selection, or token-budget
+truncation; prompt-size enforcement happens later and fails the whole run.
 
-T8-03 / Phase 8 Wave 3: widens `type` to `Literal['daily','weekly']`. The
-weekly path reuses the SAME two SQL queries as daily (no third inline copy
-of the forget-events predicate — see comment block below). Only the
-parameter values change: window bounds (7d span vs 24h), cards LIMIT
-(100 vs 30), raw-message LIMIT (`weekly_raw_message_top_n` vs
-`raw_message_top_n`), token budget (`weekly_token_budget_input - 1000` vs
-`token_budget_input - 1000`), and the min-cards fallback threshold
-(`weekly_min_cards_threshold` vs `min_cards_threshold`).
-
-Governance filter (all sources):
+Governance filter:
 - chat_messages.memory_policy = 'normal' (excludes nomem, offrecord, forgotten)
 - message_versions.is_redacted = FALSE   (excludes cascade-redacted rows)
 - NO active forget_event ('pending' / 'processing' / 'completed') targeting
@@ -21,20 +12,8 @@ Governance filter (all sources):
   defense-in-depth check that catches forget_events whose cascade hasn't yet
   flipped is_redacted to TRUE.
 
-PHASE 7.5 CARRYOVER: per PHASE7_PLAN.md §5.C, the forget-events predicate
-SHOULD eventually be extracted into a shared helper used by both this module
-and `bot/services/forget_cascade.py` (DRY guard against drift). This PR
-INLINES the predicate (does not extract). The match logic must stay in sync
-with `forget_cascade._resolve_affected_mvids` (forget_cascade.py:812+).
-
-TODO(#291): extract `_forget_excludes_predicate` to a shared helper. Today
-the predicate is inlined verbatim in TWO queries in this file (cards-first
-+ raw fallback) and once in `forget_cascade.py:255+` — i.e. three textual
-copies in production. Phase 8 T8-03 does NOT add a fourth copy: the weekly
-path reuses the same two queries with different parameter values. If #291
-lands before Phase 9, the helper extraction collapses all three to one and
-any future widening (e.g. Phase 9 reflection layer) inherits the predicate
-automatically.
+The shared forget/control predicates keep this query aligned with the other
+derived-memory pipelines without copying their SQL rules.
 """
 
 from __future__ import annotations
@@ -48,6 +27,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.forget_predicate import forget_excludes_sql_fragment
+from bot.services.control_messages import control_message_excludes_sql_fragment
 
 # Forget-event exclusion predicate — sourced from the shared helper.
 # Issue #291 extracted the inline SQL fragment to bot/services/forget_predicate.py
@@ -55,35 +35,7 @@ from bot.services.forget_predicate import forget_excludes_sql_fragment
 # SAME predicate string.  Changing the predicate semantics requires updating
 # forget_predicate.py AND the golden snapshot in test_forget_predicate_parity.py.
 _FORGET_EXCLUDES = forget_excludes_sql_fragment()
-
-
-# Cards SQL LIMIT per digest type. Daily window is 24h; weekly is 7d
-# (7× more coverage) so the cap widens correspondingly.
-_CARDS_LIMIT_BY_TYPE: dict[str, int] = {
-    "daily": 30,
-    "weekly": 100,
-}
-
-
-@dataclass(frozen=True)
-class DigestConfig:
-    """Minimal DigestConfig for T7-03. T7-02 moves this to `bot/services/digests.py`
-    with `load_digest_config()` for env var loading.
-
-    Phase 8 (T8-03) adds `weekly_*` fields. The parent `DigestConfig` in
-    `bot/services/digests.py` is the env-loaded one; its `to_context_config()`
-    helper forwards both daily and weekly fields into this dataclass so the
-    SQL builder reads from a single source.
-    """
-
-    # Phase 7 (daily) fields
-    min_cards_threshold: int = 3
-    raw_message_top_n: int = 15
-    token_budget_input: int = 8000
-    # Phase 8 (weekly) fields — defaults mirror PHASE8_PLAN.md §5.B.
-    weekly_min_cards_threshold: int = 8
-    weekly_raw_message_top_n: int = 60
-    weekly_token_budget_input: int = 24000
+_CONTROL_EXCLUDES = control_message_excludes_sql_fragment()
 
 
 @dataclass(frozen=True)
@@ -99,11 +51,20 @@ class DigestContextCard:
 class DigestContextMessage:
     message_version_id: int
     chat_message_id: int
-    author_display: str  # html-escape applied
+    author_display: str
     text: str
     ts: datetime
-    # NOTE: reaction_count / reply_count fields intentionally absent.
-    # chat_messages has no such columns; chronological ordering only.
+    author_username: str | None = None
+    telegram_message_id: int | None = None
+    caption: str | None = None
+    message_kind: str | None = None
+    reply_to_message_id: int | None = None
+    message_thread_id: int | None = None
+    media_kind: str | None = None
+    media_description: str | None = None
+    forward_origin_type: str | None = None
+    forward_origin_display: str | None = None
+    forward_origin_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,31 +77,6 @@ class DigestContext:
     messages: list[DigestContextMessage]
 
 
-def _weekly_overrides(
-    digest_config: DigestConfig, *, type: Literal["daily", "weekly"]
-) -> tuple[int, int, int, int]:
-    """Type-aware param resolution in one place — keeps the SQL builder
-    reading from a single source.
-
-    Returns:
-        (cards_limit, raw_top_n, token_budget_input, min_cards_threshold)
-    """
-    if type == "weekly":
-        return (
-            _CARDS_LIMIT_BY_TYPE["weekly"],
-            digest_config.weekly_raw_message_top_n,
-            digest_config.weekly_token_budget_input,
-            digest_config.weekly_min_cards_threshold,
-        )
-    # daily
-    return (
-        _CARDS_LIMIT_BY_TYPE["daily"],
-        digest_config.raw_message_top_n,
-        digest_config.token_budget_input,
-        digest_config.min_cards_threshold,
-    )
-
-
 async def build_digest_context(
     session: AsyncSession,
     *,
@@ -148,167 +84,103 @@ async def build_digest_context(
     window_start: datetime,
     window_end: datetime,
     source_chat_id: int,
-    digest_config: DigestConfig,
 ) -> DigestContext:
-    """Build governance-filtered context for digest synthesis.
+    """Build the full governance-filtered context for digest synthesis.
 
-    Returns approved Phase 6 cards in window first; falls back to raw
-    chronological messages if fewer than the type-aware min-cards threshold.
-    Drops raw messages from the tail to fit the type-aware token budget.
-
-    For ``type='daily'`` uses `digest_config.{min_cards_threshold,
-    raw_message_top_n, token_budget_input}` (Phase 7 defaults).
-    For ``type='weekly'`` uses `digest_config.weekly_*` counterparts and
-    widens the cards SQL LIMIT from 30 → 100.
-
-    Governance filter applied to all sources (identical for daily and weekly):
+    Governance filter applied to every returned message:
     - chat_messages.memory_policy = 'normal'  (excludes nomem, offrecord, forgotten)
     - message_versions.is_redacted = FALSE     (excludes cascade-redacted rows)
     - chat_messages.chat_id = :source_chat_id  (single-chat MVP)
     - cm.date in [window_start, window_end)    (UTC range — original Telegram timestamp)
-    - cards: knowledge_cards.card_status = 'approved'
-    - cards: linked message_versions also pass the above filter
     """
     if type not in ("daily", "weekly"):
         raise ValueError(
             f"build_digest_context: unsupported type {type!r}; expected 'daily' or 'weekly'"
         )
 
-    cards_limit, raw_top_n, token_budget, min_threshold = _weekly_overrides(
-        digest_config, type=type
-    )
-
-    # ---- cards-first query ----
-    # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- _FORGET_EXCLUDES is a module-level constant SQL fragment from forget_predicate.py; no user input flows in.
-    cards_sql = text(f"""
+    # ---- complete current-message window ----
+    messages: list[DigestContextMessage] = []
+    # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- module-level governance fragments contain no user input.
+    raw_sql = text(f"""
         SELECT
-            kc.id::text AS card_id,
-            kc.title,
-            kc.body_markdown,
-            COUNT(cs.id) AS source_count,
-            ARRAY_AGG(cs.id::text ORDER BY cs.created_at, cs.id) AS card_source_ids
-        FROM knowledge_cards kc
-        JOIN card_sources cs ON cs.card_id = kc.id
-        JOIN message_versions mv ON mv.id = cs.message_version_id
+            mv.id AS message_version_id,
+            mv.chat_message_id,
+            cm.message_id AS telegram_message_id,
+            concat_ws(' ', u.first_name, u.last_name) AS author_display,
+            u.username AS author_username,
+            COALESCE(mv.normalized_text, mv.text, '') AS text,
+            mv.caption,
+            cm.message_kind,
+            cm.reply_to_message_id,
+            cm.message_thread_id,
+            mm.media_kind,
+            CASE WHEN mm.description_status = 'ready' THEN mm.description END
+                AS media_description,
+            cm.raw_json #>> '{{forward_origin,type}}' AS forward_origin_type,
+            cm.raw_json #>> '{{forward_origin,date}}' AS forward_origin_date,
+            COALESCE(
+                NULLIF(concat_ws(
+                    ' ',
+                    cm.raw_json #>> '{{forward_origin,sender_user,first_name}}',
+                    cm.raw_json #>> '{{forward_origin,sender_user,last_name}}'
+                ), ''),
+                cm.raw_json #>> '{{forward_origin,sender_user_name}}',
+                cm.raw_json #>> '{{forward_origin,chat,title}}',
+                cm.raw_json #>> '{{forward_origin,author_signature}}'
+            ) AS forward_origin_display,
+            cm.date AS ts
+        FROM message_versions mv
         JOIN chat_messages cm ON cm.id = mv.chat_message_id
-        WHERE kc.card_status = 'approved'
-          AND cm.chat_id = :source_chat_id
+        JOIN users u ON u.id = cm.user_id
+        LEFT JOIN message_media mm ON mm.chat_message_id = cm.id
+        WHERE cm.chat_id = :source_chat_id
+          AND cm.current_version_id = mv.id
           AND cm.date >= :ws
           AND cm.date <  :we
           AND cm.memory_policy = 'normal'
+          AND cm.is_redacted = FALSE
           AND mv.is_redacted = FALSE
+          AND {_CONTROL_EXCLUDES}
           AND {_FORGET_EXCLUDES}
-        GROUP BY kc.id, kc.title, kc.body_markdown, kc.approved_at
-        ORDER BY kc.approved_at DESC NULLS LAST
-        LIMIT :cards_limit
+        ORDER BY cm.date ASC, cm.message_id ASC
     """)
-    card_rows = (
+    raw_rows = (
         (
             await session.execute(
-                cards_sql,
-                {
-                    "source_chat_id": source_chat_id,
-                    "ws": window_start,
-                    "we": window_end,
-                    "cards_limit": cards_limit,
-                },
+                raw_sql,
+                {"source_chat_id": source_chat_id, "ws": window_start, "we": window_end},
             )
         )
         .mappings()
         .all()
     )
-
-    cards: list[DigestContextCard] = []
-    for row in card_rows:
-        cards.append(
-            DigestContextCard(
-                card_id=UUID(row["card_id"]),
-                title=row["title"],
-                body_markdown=row["body_markdown"],
-                source_count=row["source_count"],
-                card_source_ids=[UUID(s) for s in row["card_source_ids"]],
-            )
+    messages = [
+        DigestContextMessage(
+            message_version_id=row["message_version_id"],
+            chat_message_id=row["chat_message_id"],
+            telegram_message_id=row["telegram_message_id"],
+            author_display=row["author_display"],
+            author_username=row["author_username"],
+            text=row["text"],
+            caption=row["caption"],
+            message_kind=row["message_kind"],
+            reply_to_message_id=row["reply_to_message_id"],
+            message_thread_id=row["message_thread_id"],
+            media_kind=row["media_kind"],
+            media_description=row["media_description"],
+            forward_origin_type=row["forward_origin_type"],
+            forward_origin_display=row["forward_origin_display"],
+            forward_origin_date=row["forward_origin_date"],
+            ts=row["ts"],
         )
-
-    # ---- raw fallback only when cards too few ----
-    messages: list[DigestContextMessage] = []
-    if len(cards) < min_threshold:
-        # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text -- _FORGET_EXCLUDES is a module-level constant SQL fragment from forget_predicate.py; no user input flows in.
-        raw_sql = text(f"""
-            SELECT
-                mv.id AS message_version_id,
-                mv.chat_message_id,
-                u.first_name AS author_display,
-                concat_ws(
-                    E'\n',
-                    mv.normalized_text,
-                    mv.caption,
-                    CASE
-                        WHEN mm.description_status = 'ready' THEN
-                            '[Описание изображения] ' || mm.description
-                            || E'\n[Источник изображения] ' || mm.source_message_url
-                        ELSE NULL
-                    END
-                ) AS text,
-                cm.date AS ts
-            FROM message_versions mv
-            JOIN chat_messages cm ON cm.id = mv.chat_message_id
-            JOIN users u ON u.id = cm.user_id
-            LEFT JOIN message_media mm ON mm.chat_message_id = cm.id
-            WHERE cm.chat_id = :source_chat_id
-              AND cm.current_version_id = mv.id
-              AND cm.date >= :ws
-              AND cm.date <  :we
-              AND cm.memory_policy = 'normal'
-              AND mv.is_redacted = FALSE
-              AND {_FORGET_EXCLUDES}
-            ORDER BY cm.date ASC
-            LIMIT :top_n
-        """)
-        raw_rows = (
-            (
-                await session.execute(
-                    raw_sql,
-                    {
-                        "source_chat_id": source_chat_id,
-                        "ws": window_start,
-                        "we": window_end,
-                        "top_n": raw_top_n,
-                    },
-                )
-            )
-            .mappings()
-            .all()
-        )
-
-        # Apply token budget — drop from tail.
-        # `-1000` headroom mirrors Phase 7 behaviour: leaves room for the
-        # prompt template overhead so the gateway does not have to do a
-        # second pass on overflow.
-        headroom = token_budget - 1000
-        used = 0
-        # Rough estimate: len(text) // 3.5 ≈ tokens
-        for row in raw_rows:
-            txt = row["text"] or ""
-            est = int(len(txt) / 3.5)
-            if used + est > headroom:
-                break
-            used += est
-            messages.append(
-                DigestContextMessage(
-                    message_version_id=row["message_version_id"],
-                    chat_message_id=row["chat_message_id"],
-                    author_display=row["author_display"],
-                    text=txt,
-                    ts=row["ts"],
-                )
-            )
+        for row in raw_rows
+    ]
 
     return DigestContext(
         type=type,
         window_start=window_start,
         window_end=window_end,
         source_chat_id=source_chat_id,
-        cards=cards,
+        cards=[],
         messages=messages,
     )

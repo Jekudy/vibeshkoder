@@ -27,6 +27,7 @@ COPY --chown=appuser:appuser pyproject.toml .
 COPY --chown=appuser:appuser bot/ bot/
 COPY --chown=appuser:appuser alembic/ alembic/
 COPY --chown=appuser:appuser alembic.ini .
+COPY --chown=appuser:appuser scripts/ scripts/
 RUN pip install --no-cache-dir --no-deps .
 
 USER appuser

@@ -94,9 +94,7 @@ async def _make_msg(
     return msg.id, mv.id
 
 
-async def _make_card(
-    db_session, *, mv_ids: list[int], card_status: str = "approved"
-) -> uuid.UUID:
+async def _make_card(db_session, *, mv_ids: list[int], card_status: str = "approved") -> uuid.UUID:
     from bot.db.models import CardSource, KnowledgeCard
 
     uid = await _make_user(db_session) if card_status == "approved" else None
@@ -123,7 +121,7 @@ async def test_L7a_forgotten_message_version_excluded_from_digest_context(db_ses
     """Phase 7 binding L7a: a message_version whose chat_message has
     memory_policy='forgotten' (cascade-completed) MUST NOT appear in
     build_digest_context output."""
-    from bot.services.digest_context import DigestConfig, build_digest_context
+    from bot.services.digest_context import build_digest_context
 
     chat_id = _next_chat_id()
     now = datetime.now(timezone.utc)
@@ -145,7 +143,6 @@ async def test_L7a_forgotten_message_version_excluded_from_digest_context(db_ses
         window_start=ws,
         window_end=we,
         source_chat_id=chat_id,
-        digest_config=DigestConfig(min_cards_threshold=10),
     )
     assert ctx.cards == []
     assert ctx.messages == []
@@ -164,7 +161,7 @@ async def test_L7b_card_with_redacted_source_excluded(db_session):
     """Phase 7 binding L7b: when a card_source's linked message_version is
     redacted (is_redacted=TRUE — cascade has nulled the content) the card
     MUST NOT appear in build_digest_context output."""
-    from bot.services.digest_context import DigestConfig, build_digest_context
+    from bot.services.digest_context import build_digest_context
 
     chat_id = _next_chat_id()
     now = datetime.now(timezone.utc)
@@ -185,7 +182,6 @@ async def test_L7b_card_with_redacted_source_excluded(db_session):
         window_start=ws,
         window_end=we,
         source_chat_id=chat_id,
-        digest_config=DigestConfig(),
     )
     assert ctx.cards == []
 
@@ -234,13 +230,16 @@ async def test_C6_citation_invariant_bullet_without_citation_fails(db_session):
     )
 
     class _Provider:
-        async def call(self, *, prompt: str, model: str):
-            # Bullet 0 has a citation, bullet 1 has none → must raise.
+        async def call_structured(self, **_kwargs):
+            # The second item has no citations → strict contract must reject it.
             return ProviderResult(
                 answer_text=(
-                    "TL;DR. Two. Three.\n\n"
-                    f"- First [[mv:{mv}]]\n"
-                    "- Second bullet without any citation\n"
+                    '{"publish":true,"layout":"flat","sections":[{"heading":"",'
+                    '"items":[{"text":"Обсудили тему",'
+                    f'"citations":["[[mv:{mv}]]"]}},'
+                    '{"text":"Обсудили другую тему","citations":[]}]}],'
+                    '"closing":{"text":"Итог",'
+                    f'"citations":["[[mv:{mv}]]"]}}}}'
                 ),
                 citation_ids=(),
                 tokens_in=10,
@@ -250,11 +249,11 @@ async def test_C6_citation_invariant_bullet_without_citation_fails(db_session):
             )
 
     cfg = LLMGatewayConfig(
-        provider="anthropic",
-        model="claude-haiku-4-5-20251001",
+        provider="openai",
+        model="gpt-5.6-sol",
         daily_ceiling_usd=_D("10"),
         monthly_ceiling_usd=_D("100"),
-        prompt_template_version="digest-v0.1.0",
+        prompt_template_version="digest-v0.3.0",
     )
     with pytest.raises(DigestCitationValidationError):
         await synthesize_digest(
@@ -275,7 +274,7 @@ async def test_I5a_pending_forget_event_excludes_cited_mvid(db_session):
     when memory_policy is still 'normal' and is_redacted is still FALSE
     (defense-in-depth — cascade hasn't run yet)."""
     from bot.db.models import ForgetEvent
-    from bot.services.digest_context import DigestConfig, build_digest_context
+    from bot.services.digest_context import build_digest_context
 
     chat_id = _next_chat_id()
     now = datetime.now(timezone.utc)
@@ -306,7 +305,6 @@ async def test_I5a_pending_forget_event_excludes_cited_mvid(db_session):
         window_start=now - timedelta(days=1),
         window_end=now,
         source_chat_id=chat_id,
-        digest_config=DigestConfig(min_cards_threshold=10),
     )
     assert ctx.cards == []
     assert ctx.messages == []
@@ -356,10 +354,16 @@ async def test_I5b_cascade_worker_redacts_digest_citing_mvid(db_session):
 
     await run_cascade_worker_once(db_session, batch_size=10)
 
-    row = (await db_session.execute(
-        text("SELECT status, body_markdown FROM digests WHERE id = :id"),
-        {"id": did},
-    )).mappings().one()
+    row = (
+        (
+            await db_session.execute(
+                text("SELECT status, body_markdown FROM digests WHERE id = :id"),
+                {"id": did},
+            )
+        )
+        .mappings()
+        .one()
+    )
     assert row["status"] in ("redacted", "redacted_edit_failed")
     assert "[REDACTED — забыто]" in row["body_markdown"]
 
@@ -378,9 +382,7 @@ async def test_I5c_publish_revalidation_blocks_stale_citation(db_session):
 
     chat_id = _next_chat_id()
     now = datetime.now(timezone.utc)
-    cm_id, mv = await _make_msg(
-        db_session, chat_id=chat_id, ts=now - timedelta(hours=6)
-    )
+    cm_id, mv = await _make_msg(db_session, chat_id=chat_id, ts=now - timedelta(hours=6))
     digest = Digest(
         type="daily",
         window_start=now - timedelta(days=1),
@@ -410,12 +412,13 @@ async def test_I5c_publish_revalidation_blocks_stale_citation(db_session):
     bot_mock = MagicMock()
     bot_mock.send_message = AsyncMock()
 
-    result = await publish_digest(
-        db_session, bot=bot_mock, digest=digest, digest_config=cfg
-    )
+    result = await publish_digest(db_session, bot=bot_mock, digest=digest, digest_config=cfg)
     # Publisher revalidation MUST have fired.
     assert result.status == "failed"
-    assert "stale" in (result.error_text or "").lower() or "citations" in (result.error_text or "").lower()
+    assert (
+        "stale" in (result.error_text or "").lower()
+        or "citations" in (result.error_text or "").lower()
+    )
     # The DIGEST publish to destination MUST NOT have happened. Admin-notify
     # DMs (different chat_id) are allowed. Verify the destination chat was
     # never targeted.
@@ -423,6 +426,5 @@ async def test_I5c_publish_revalidation_blocks_stale_citation(db_session):
         kwargs = call.kwargs if hasattr(call, "kwargs") else call[1]
         called_chat_id = kwargs.get("chat_id") if kwargs else None
         assert called_chat_id != cfg.destination_chat_id, (
-            "publisher must NOT call send_message on destination_chat_id "
-            "after revalidation failure"
+            "publisher must NOT call send_message on destination_chat_id after revalidation failure"
         )

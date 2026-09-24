@@ -9,9 +9,9 @@
   "pr": null,
   "scope": "Phase 12 (Butler) closure: mandatory Final Holistic Review over the complete butler subsystem (T12-01..T12-09 as a unified system) + 1 HIGH fix + 1 MEDIUM fix + PHASE12_ROLLOUT.md operator runbook + closure-doc flips to CLOSED. Phase 12 is the FINAL phase — closes the 12-phase memory-system cycle.",
   "fhr": {
-    "required_by": "superflow Rule 9 (governance_mode=critical + 11 sprints + parallel waves + privacy invariants) — mandatory at cycle end",
+    "required_by": "project critical-governance policy (11 sprints + parallel waves + privacy invariants) — mandatory at cycle end",
     "method": "6-dimension scoped fan-out workflow (undo-vs-forget, cross-user-consent, forget-cascade-completeness, state-machine-txn, db-constraints, tools-flags-budget) + adversarial verification of every CRITICAL/HIGH against real code, then synthesis. Re-run after initial 2 monolithic FHR agents stalled on watchdog (env flakiness).",
-    "reviewers": "Claude deep-product-reviewer + Claude deep-code-reviewer (Rule 7 fallback — Codex companion DOWN all session: ChatGPT-account 'Unknown feature flag: hooks')",
+    "reviewers": "Claude deep-product-reviewer + Claude deep-code-reviewer (documented independent-review fallback — Codex companion DOWN all session: ChatGPT-account 'Unknown feature flag: hooks')",
     "verdict": "APPROVE",
     "real_findings": {
       "HIGH_fixed": "scheduler.py butler_expire_tick — batched TTL reaper shared one txn with no per-row savepoint; a single FOR-UPDATE-NOWAIT lock-contention (55P03) from forget_cascade poisoned the txn and discarded the whole tick's expirations. FIX: per-row `async with session.begin_nested()` savepoint (commit 8dec11c) + red-green test test_butler_expire_tick_lock_contention_does_not_discard_batch. Bounded blast radius (flag default OFF, idempotent retry) but real state-machine/txn defect.",

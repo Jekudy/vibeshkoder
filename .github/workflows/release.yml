@@ -14,6 +14,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_BOT: ghcr.io/jekudy/vibe-gatekeeper-bot
+  IMAGE_DB: ghcr.io/jekudy/vibe-gatekeeper-postgres
   IMAGE_WEB: ghcr.io/jekudy/vibe-gatekeeper-web
 
 jobs:
@@ -52,7 +53,6 @@ jobs:
             org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
           tags: |
             ${{ env.IMAGE_BOT }}:${{ steps.meta.outputs.sha_tag }}
-            ${{ env.IMAGE_BOT }}:main
 
       - name: Build and push web image
         uses: docker/build-push-action@v6
@@ -65,4 +65,55 @@ jobs:
             org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
           tags: |
             ${{ env.IMAGE_WEB }}:${{ steps.meta.outputs.sha_tag }}
-            ${{ env.IMAGE_WEB }}:main
+
+      - name: Build and push PostgreSQL image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.postgres
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/Jekudy/vibe-gatekeeper
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+          tags: |
+            ${{ env.IMAGE_DB }}:${{ steps.meta.outputs.sha_tag }}
+
+      - name: Promote current release tags
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          current_main="$(git ls-remote "https://github.com/${REPOSITORY}.git" refs/heads/main | cut -f1)"
+          if [[ "$current_main" != "$RELEASE_SHA" ]]; then
+            echo "Skipping stale release $RELEASE_SHA; current main is $current_main"
+            exit 0
+          fi
+
+          docker buildx imagetools create --tag "$IMAGE_BOT:main" "$IMAGE_BOT:$SHA_TAG"
+          docker buildx imagetools create --tag "$IMAGE_WEB:main" "$IMAGE_WEB:$SHA_TAG"
+          docker buildx imagetools create --tag "$IMAGE_DB:main" "$IMAGE_DB:$SHA_TAG"
+
+  deploy-bot:
+    needs: build-and-push
+    runs-on: [self-hosted, shkoder-vps]
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: read
+    env:
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Deploy exact application images with Compose (#521)
+        run: python3 ops/compose/deploy.py "$RELEASE_SHA"

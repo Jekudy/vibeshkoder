@@ -292,5 +292,3 @@ WHERE flag_key IN ('memory.graph.projection.enabled','memory.graph.query.enabled
 ```
 
 This is reversible — no data is lost; only the surfaces are gated.
-
-<!-- updated-by-superflow:2026-05-21 -->

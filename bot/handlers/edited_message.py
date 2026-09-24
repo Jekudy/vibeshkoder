@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 
 from aiogram import Router
 from aiogram.types import Message
@@ -67,8 +68,6 @@ router = Router(name="edited_message")
 # to the new edit chv1 hash; ``MessageVersionRepo.insert_version`` is idempotent on
 # (chat_message_id, content_hash). See ``handle_edited_message`` Step 6 for the inline
 # logic.
-
-
 
 async def _find_chat_message(
     session: AsyncSession,
@@ -239,6 +238,8 @@ async def handle_edited_message(
     message_kind = classify_message_kind(message)
     entities = extract_entities_unified(message)
     edit_date = getattr(message, "edit_date", None)
+    if isinstance(edit_date, int):  # aiogram Message.edit_date is a Unix timestamp (#497)
+        edit_date = datetime.fromtimestamp(edit_date, tz=timezone.utc)
 
     # Step 3: detect policy on EDITED content BEFORE any DB mutation.
     # #offrecord ordering rule: detect_policy runs first, content mutations come after.

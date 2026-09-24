@@ -10,6 +10,7 @@ from aiogram.types import (
     ChatMemberLeft,
     ChatMemberMember,
     ChatMemberUpdated,
+    LinkPreviewOptions,
     Message,
     Update,
     User,
@@ -63,6 +64,7 @@ def _bot_message_update(update_id: int, secret: str) -> Update:
             chat=Chat(id=-1001234567890, type="supergroup", title="community"),
             from_user=User(id=4203, is_bot=True, first_name="Shkoder"),
             text=f"bot-output {secret}",
+            link_preview_options=LinkPreviewOptions(is_disabled=False),
         ),
     )
 
@@ -159,6 +161,10 @@ async def test_all_raw_update_shapes_survive_downstream_rollback(
             )
         assert len(rows) == 3
         assert {row.update_type for row in rows} == set(expected_types)
+        link_preview_row = next(row for row in rows if row.update_id == update_ids[2])
+        assert link_preview_row.raw_json["message"]["link_preview_options"] == {
+            "is_disabled": False
+        }
         assert secret not in caplog.text
         assert all(record.exc_info is None for record in caplog.records)
     finally:

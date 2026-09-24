@@ -50,7 +50,7 @@ def _make_message(
     caption: str | None = None,
     entities: list | None = None,
     caption_entities: list | None = None,
-    edit_date: datetime | None = None,
+    edit_date: int | None = None,
     message_thread_id: int | None = None,
     photo: object = None,
     video: object = None,
@@ -64,7 +64,8 @@ def _make_message(
         caption=caption,
         entities=entities,
         caption_entities=caption_entities,
-        edit_date=edit_date or datetime.now(timezone.utc),
+        # aiogram delivers edit_date as a Unix timestamp (int), not datetime (#497)
+        edit_date=edit_date if edit_date is not None else int(datetime.now(timezone.utc).timestamp()),
         message_thread_id=message_thread_id,
         # aiogram-style attribute probes for classify_message_kind:
         forward_origin=None,
@@ -136,7 +137,7 @@ def test_edit_changes_text_creates_v2(app_env, monkeypatch) -> None:
 
     msg_id = _random_message_id()
     chat_id = -1001234567890
-    message = _make_message(message_id=msg_id, chat_id=chat_id, text="edited text")
+    message = _make_message(message_id=msg_id, chat_id=chat_id, text="edited text", edit_date=1788520014)
 
     # Existing row has old text with a known chv1 hash.
     from bot.services.content_hash import compute_content_hash
@@ -183,6 +184,8 @@ def test_edit_changes_text_creates_v2(app_env, monkeypatch) -> None:
     assert call_kwargs.kwargs["content_hash"] == new_hash
     assert call_kwargs.kwargs["text"] == "edited text"
     assert call_kwargs.kwargs["is_redacted"] is False
+    # aiogram int timestamp must reach the repo as an aware datetime (#497)
+    assert call_kwargs.kwargs["edit_date"] == datetime.fromtimestamp(1788520014, tz=timezone.utc)
 
     # session.execute was called for SELECT + UPDATE (at least 2 calls)
     assert session.execute.call_count >= 1

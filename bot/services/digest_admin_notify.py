@@ -51,8 +51,7 @@ async def notify_admins_digest_failure(
         "<b>⚠️ Phase 7 digest alert</b>\n\n"
         f"digest_id: <code>{html_escape(str(digest_id))}</code>\n"
         f"status: <code>{html_escape(status)}</code>\n"
-        f"error_text: <code>{html_escape(error_text[:500])}</code>\n\n"
-        "<i>Check /digest_history for the full audit trail.</i>"
+        f"error_text: <code>{html_escape(error_text[:500])}</code>"
     )
     try:
         await bot.send_message(chat_id=target, text=body, parse_mode="HTML")

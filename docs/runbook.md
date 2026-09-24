@@ -90,7 +90,7 @@ Initially created on 2026-04-19 as "staging" shells, repurposed as prod on 2026-
 | Kind | UUID | Notes |
 |---|---|---|
 | App `vibe-gatekeeper-web` | `cexv50jspo5gl3kq6ojypw43` | image `ghcr.io/jekudy/vibe-gatekeeper-web:main`, port `8080:8080` (public), fqdn sslip `cexv50jspo5gl3kq6ojypw43.187.77.98.73.sslip.io` |
-| App `vibe-gatekeeper-bot-staging` | `maiwn569gziz935wv0w7kcch` | image `ghcr.io/jekudy/vibe-gatekeeper-bot:main`, polling mode |
+| App `vibe-gatekeeper-bot-prod` | `maiwn569gziz935wv0w7kcch` | immutable image `ghcr.io/jekudy/vibe-gatekeeper-bot:sha-<main commit>`; `.github/workflows/release.yml` deploys it after successful CI and image publication |
 | Postgres `vibe-gatekeeper-pg-staging` | `hdazvm5fz836xj9mdyn8c629` | `postgres:15-alpine`, db `vibe_gatekeeper`, user `vibe`, data migrated from legacy on 2026-04-20 |
 | Redis `vibe-gatekeeper-redis-staging` | `gl28f0g5exzzo4k8w0auzygk` | `redis:7-alpine`, password set |
 

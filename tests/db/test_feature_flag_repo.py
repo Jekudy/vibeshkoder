@@ -104,6 +104,33 @@ async def test_per_scope_flags_coexist_with_global(db_session) -> None:
     ) is True
 
 
+async def test_any_enabled_detects_scoped_canary_while_global_is_off(db_session) -> None:
+    from bot.db.repos.feature_flag import FeatureFlagRepo
+
+    key = _unique_flag_key()
+
+    await FeatureFlagRepo.set_enabled(db_session, flag_key=key, enabled=False)
+    await FeatureFlagRepo.set_enabled(
+        db_session,
+        flag_key=key,
+        enabled=True,
+        scope_type="user",
+        scope_id="8040400404",
+    )
+
+    assert await FeatureFlagRepo.get(db_session, key) is False
+    assert await FeatureFlagRepo.any_enabled(db_session, key) is True
+
+    await FeatureFlagRepo.set_enabled(
+        db_session,
+        flag_key=key,
+        enabled=False,
+        scope_type="user",
+        scope_id="8040400404",
+    )
+    assert await FeatureFlagRepo.any_enabled(db_session, key) is False
+
+
 async def test_memory_flags_have_no_enabled_seed_rows(db_session) -> None:
     """T1-01 invariant: the migration MUST NOT seed any ENABLED memory.* flag.
 

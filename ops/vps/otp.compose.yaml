@@ -1,0 +1,39 @@
+# Issue #521: preserve existing data; external volumes must never be deleted.
+name: otp
+services:
+  shared-otp-bot:
+    image: ${SHARED_OTP_BOT_IMAGE:?SHARED_OTP_BOT_IMAGE must be pinned}
+    pull_policy: never
+    container_name: shared-otp-bot
+    env_file:
+    - path: shared-otp-bot.env
+      format: raw
+    restart: unless-stopped
+    command:
+    - python
+    - shared_otp_bot.py
+    user: app
+    working_dir: /app
+    cpu_shares: 1024
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/health', timeout=2).read()
+      interval: 60000000000ns
+      timeout: 10000000000ns
+      start_period: 10000000000ns
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+    networks:
+    - coolify
+    expose:
+    - 8080/tcp
+networks:
+  coolify:
+    external: true

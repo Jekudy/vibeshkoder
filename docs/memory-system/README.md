@@ -44,8 +44,7 @@ derived status snapshots.
 ## Workflow
 
 - Branch: `feat/memory-foundation` in worktree `.worktrees/memory/`.
-- Framework: superflow (per-worktree state file, does not collide with the main `security-audit`
-  cycle running on `main`).
+- Coordination: isolated worktree, one PR per ticket, CI and review before merge.
 - Issue tracker: GitHub Issues. Labels: `phase:0`, `phase:1`, `area:memory`,
   `area:gatekeeper-safety`, `area:db`, `area:governance`, `area:ingestion`.
 - PR target: `main`. Sprint-PR-queue mode (one PR per ticket, sequential rebase, CI green before

@@ -13,7 +13,7 @@ Protocol surface defined here.
 
 from __future__ import annotations
 
-from typing import Literal, NamedTuple, Protocol, runtime_checkable
+from typing import Any, Literal, Mapping, NamedTuple, Protocol, runtime_checkable
 
 
 class ProviderResult(NamedTuple):
@@ -63,8 +63,25 @@ class LLMProvider(Protocol):
         ...
 
 
+@runtime_checkable
+class DigestLLMProvider(Protocol):
+    """Structured Responses API surface used only by digest generation."""
+
+    async def call_structured(
+        self,
+        *,
+        instructions: str,
+        input_text: str,
+        model: str,
+        schema_name: str,
+        json_schema: Mapping[str, Any],
+        reasoning_effort: str,
+    ) -> ProviderResult: ...
+
+
 __all__ = [
     "LLMProvider",
+    "DigestLLMProvider",
     "ProviderError",
     "ProviderResult",
     "ProviderStructuralError",

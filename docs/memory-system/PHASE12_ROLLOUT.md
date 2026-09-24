@@ -344,5 +344,3 @@ Before enabling any Butler flag in production, confirm:
 - [ ] Staging soak (24h per tool) completed before production flip
 - [ ] Monitoring dashboard / queries set up (see §10)
 - [ ] Kill switch procedure verified (master flag OFF test on staging)
-
-<!-- updated-by-superflow:2026-05-30 -->

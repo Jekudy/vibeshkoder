@@ -1317,5 +1317,3 @@ butler: without tombstones, source trace and review this becomes not a memory sy
 confident archiver of private problems. The first sprint must be boring and ironclad — privacy,
 idempotency, raw archive, versions, policy skeleton. That is what gives shkoder the right to
 remember later.
-
-<!-- updated-by-superflow:2026-05-12 -->

@@ -21,6 +21,7 @@ from bot.handlers import (
     digest,
     edited_message,
     forward_lookup,
+    intro_refresh,
     questionnaire,
     qa,
     start,
@@ -180,18 +181,19 @@ async def main() -> None:
     # Include routers (order matters — more specific first)
     dp.include_routers(
         start.router,
+        intro_refresh.router,
         questionnaire.router,
         vouch.router,
         admin.router,
         admin_extract.router,  # T6-03: /admin_extract — Phase 6 backfill (private chat + admin gated)
         admin_cards.router,  # T6-04/T6-05: /candidates /approve /reject /cards /card
         admin_graph.router,  # T10-07: /graph_project_now /graph_stats /graph_query /graph_purge_now
-        digest.router,  # T7-06: /digest_now /digest_preview /digest_history
+        digest.router,  # /digest_now
         wiki.router,  # T9-06: /wiki_publish /wiki_unpublish /wiki_robots (admin-only)
         butler.router,  # T12-05: /butler /butler_status /butler_cancel /butler_undo (DM-only, flag OFF)
         chat_events.router,
         edited_message.router,  # T1-14: edited_message handler (before chat_messages catch-all)
-        qa.router,  # Mention/reply Q&A only; runtime-gated by memory.qa.enabled
+        qa.router,  # Explicit-mention Q&A only; runtime-gated by memory.qa.enabled
         forward_lookup.router,
         chat_messages.router,  # lowest priority — catches all group messages
     )

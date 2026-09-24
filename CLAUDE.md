@@ -9,11 +9,17 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 ## Runtime Standard
 
 - Source of truth is GitHub, not the VPS.
-- Production deploys from pre-built GHCR images.
-- Coolify is the target runtime manager for product apps.
-- Host-level operator services stay outside Coolify if they need direct VPS control.
-- Bot process exposes `/healthz` on `:3000` via aiohttp for Coolify health_check (added 2026-05-14, issue #168). Env var `HEALTHZ_PORT` overrides the port (default 3000). Post-merge operator step: enable Coolify health_check via `PATCH /api/v1/applications/<id>` with `{"health_check_enabled": true, "health_check_path": "/healthz", "health_check_port": 3000}` — safe to flip only AFTER this release is deployed.
-- `/healthz/db` is a DB-only sub-endpoint (faster, separates DB hiccups from app crashes; consumed by `ops/healing/healthcheck.py` after #270).
+- Production uses Docker Compose at `/srv/shkoder/compose.yaml`; versioned manifests
+  live in `ops/vps/`. Coolify is not required for application operation or deployment.
+- GitHub Actions builds SHA-pinned GHCR images and runs `ops/compose/deploy.py` on the
+  VPS runner. Failed application deployments restore previous bot/web image pins,
+  never database data. Stop the old polling bot before starting its replacement.
+- Bot health is private on port 3000: `/healthz` and DB-only `/healthz/db`.
+  `HEALTHZ_PORT` overrides the bot port; keep the deployment checks aligned.
+- Web HTTPS is routed through the independent proxy; `ops/compose/healthcheck.py`
+  checks applications, DB, Telegram and public HTTPS without Coolify.
+- Runtime secrets stay in private service `.env` files outside git; image pins live
+  in `/srv/shkoder/.env`. Host cron/systemd operator services remain outside Compose.
 
 ## Environments
 
@@ -45,9 +51,17 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 
 ## Current Migration Rule
 
-- Coolify is the production runtime for bot and web deploys.
-- Legacy `/home/claw/vibe-gatekeeper` is retained only as rollback fallback until
-  `scripts/cleanup-legacy.sh` passes its A3, soak window, and disk preflights.
+- Issue #521 tracks the migration of Shkoder, Foodzy, Harry and shared OTP to
+  independent Compose projects. Check its latest evidence before assuming a service
+  has completed cutover and for verification evidence.
+- Preserve old stopped containers, their configuration snapshots and existing external
+  volumes until cutover and rollback checks are complete. Container/image rollback
+  does not restore a database; never run old and new consumers or database containers
+  against the same production data at once.
+- Never use `docker compose down -v`, prune user data, remove retained volumes or
+  restore database backups without a verified backup and explicit user approval.
+- Legacy `/home/claw/vibe-gatekeeper` remains retained; cleanup requires its existing
+  `scripts/cleanup-legacy.sh` preflights and the approval above.
 
 ## Memory System Cycle (active 2026-04-26+)
 
@@ -352,12 +366,12 @@ registry). Phase 11 binding **86 → 86** (L12/C10/I9/R8/G3 lands in T12-09).
 Commits `a411e9e`..`3122431`. Alembic head 075 → 076. No flag flipped.
 Operator steps: none. 2-round dual-model review: Claude product ACCEPTED +
 Claude tech APPROVE (Codex companion stalled; fell back to second Claude
-reviewer per Rule 7).
+reviewer under the documented secondary-review fallback).
 
 **Phase 12 (Butler) — CLOSED 2026-05-30.** All 10 sprints merged (T12-01..T12-10).
 Phase 11 binding **102/102** green (+25 Butler ACs: L11.a-e, C10.a-c, I9.a-f, R8.a-g,
 G3.a-d). FHR APPROVE (Claude `deep-product-reviewer` + Claude `standard-code-reviewer`
-per Rule 7; Codex companion stalled through all FHR rounds). 1 HIGH fixed: scheduler
+under the documented secondary-review fallback; Codex companion stalled through all FHR rounds). 1 HIGH fixed: scheduler
 TTL tick now uses a savepoint per action so a single expiry failure does not roll back
 the entire batch (mirrors `digest_daily_job` pattern). 1 MEDIUM fixed: ORM
 `ButlerActionConfirmation.status` CheckConstraint now includes `'revoked'` (migration
@@ -391,7 +405,7 @@ M4 configurable fake session in tests. No migration (uses existing
 Phase 11 binding **86 → 86** (delta 0; L12/C10/I9/R8/G3 family lands in T12-09).
 Commits `e8dc08f`..`92326c3`. No flag flipped. Rollout: `docs/rollout-fragments/phase12/T12-08.md`.
 2-round dual-model review: Claude product ACCEPTED + Claude tech APPROVE (Codex companion
-stalled; fell back to second Claude reviewer per Rule 7). FHR required at T12-10 (cycle-end).
+stalled; fell back to the documented second-Claude fallback). FHR required at T12-10 (cycle-end).
 
 **Phase 12 (Butler) — T12-09 (Phase 11 binding suite 77 → 102 + empty-evidence abstention guard) 2026-05-30.**
 Wave 3 sprint: 25 new binding ACs across `tests/evals/test_butler_{leakage,citations,
@@ -409,7 +423,7 @@ sibling path (T12-08). Handler maps `'empty_evidence'` → `_MSG_EMPTY_EVIDENCE`
 column from T12-04). No flag flipped (`memory.butler.*` all default OFF). Commits
 `3285039`..`2a598f8` (9 commits). Phase 11 binding **77 → 102** (+25 ACs). 2-round
 dual-model review: Claude product ACCEPTED + Claude tech APPROVE (Codex companion
-stalled; Rule 7 Claude fallback; 1 LOW handler routing finding fixed + regression test).
+stalled; documented second-Claude fallback; 1 LOW handler routing finding fixed + regression test).
 Phase 12 remains IN PROGRESS — FHR + T12-10 required for closure. Phase 12.5 carryovers:
 I9.b auto-followup_correction edge case deferred; spec mask-format divergence
 (`[CONTENT_REDACTED: forget_event_id={n}]` spec vs shipped JSONB `{"redacted":true,
@@ -502,5 +516,3 @@ Read these BEFORE touching anything under `bot/db/`, `bot/services/`,
 Historical memory-cycle labels such as `phase:0` and `phase:1` remain valid, but GitHub
 Issues is the canonical tracker for all work in this repository. Local status documents
 are derived snapshots.
-
-<!-- updated-by-superflow:2026-05-27 -->

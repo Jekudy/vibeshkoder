@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -9,8 +9,10 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Computed,
+    Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     JSON,
@@ -25,6 +27,7 @@ from sqlalchemy import (
 )
 import uuid as _uuid_module
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -114,6 +117,9 @@ class User(Base):
     is_imported_only: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false"), default=False
     )
+    # NULL is intentionally fail-closed for semantic indexing: only authors
+    # positively identified by Telegram as human have is_bot=False.
+    is_bot: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     intro: Mapped[Intro | None] = relationship(
         "Intro", back_populates="user", foreign_keys="[Intro.user_id]"
@@ -122,13 +128,53 @@ class User(Base):
 
 class Application(Base):
     __tablename__ = "applications"
-    __table_args__ = (Index("ix_applications_user_status", "user_id", "status"),)
+    __table_args__ = (
+        UniqueConstraint("id", "user_id", name="uq_applications_id_user_id"),
+        ForeignKeyConstraint(
+            ["base_application_id", "user_id"],
+            ["applications.id", "applications.user_id"],
+            name="fk_applications_base_owner",
+        ),
+        CheckConstraint(
+            "((flow_kind IS NOT NULL AND flow_kind IN ('admission','refresh')) "
+            "OR (flow_kind IS NULL AND status IN ('added','rejected'))) "
+            "AND (base_application_id IS NULL "
+            "OR (flow_kind IS NOT NULL AND flow_kind = 'refresh'))",
+            name="ck_applications_flow_kind",
+        ),
+        CheckConstraint(
+            "status IN ('filling','confirmed','delivery_failed','pending','vouched','added','rejected','privacy_block')",
+            name="ck_applications_status",
+        ),
+        CheckConstraint(
+            "catalog_version IN ('legacy-v1','intro-v2')",
+            name="ck_applications_catalog_version",
+        ),
+        CheckConstraint(
+            "status = 'filling' OR confirmed_intro_html IS NOT NULL "
+            "OR (catalog_version = 'legacy-v1' AND flow_kind IS NULL "
+            "AND status IN ('added','rejected'))",
+            name="ck_applications_confirmed_snapshot",
+        ),
+        Index("ix_applications_user_status", "user_id", "status"),
+        Index(
+            "uq_applications_active_refresh",
+            "user_id",
+            unique=True,
+            postgresql_where=text("flow_kind = 'refresh' AND status IN ('filling','confirmed')"),
+            sqlite_where=text("flow_kind = 'refresh' AND status IN ('filling','confirmed')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     status: Mapped[str] = mapped_column(
         String(20)
-    )  # filling, pending, vouched, added, rejected, privacy_block
+    )  # filling, confirmed, pending, vouched, added, rejected, privacy_block
+    flow_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    base_application_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    catalog_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    confirmed_intro_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     invite_user_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -157,24 +203,46 @@ class Application(Base):
 
 class QuestionnaireAnswer(Base):
     __tablename__ = "questionnaire_answers"
-    __table_args__ = (Index("ix_qa_user_current", "user_id", "is_current"),)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["application_id", "user_id"],
+            ["applications.id", "applications.user_id"],
+            name="fk_questionnaire_answers_application_owner",
+        ),
+        UniqueConstraint(
+            "application_id", "field_id", name="uq_questionnaire_answers_application_field"
+        ),
+        CheckConstraint(
+            "field_id IS NOT NULL OR is_current = false",
+            name="ck_questionnaire_answers_field_id_legacy",
+        ),
+        Index("ix_qa_user_current", "user_id", "is_current"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
-    application_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("applications.id"))
+    application_id: Mapped[int] = mapped_column(Integer, nullable=False)
     question_index: Mapped[int] = mapped_column(SmallInteger)
     question_text: Mapped[str] = mapped_column(Text)
     answer_text: Mapped[str] = mapped_column(Text)
+    field_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=func.now(), server_default=func.now()
     )
     is_current: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    application: Mapped[Application | None] = relationship(back_populates="answers")
+    application: Mapped[Application] = relationship(back_populates="answers")
 
 
 class Intro(Base):
     __tablename__ = "intros"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["application_id", "user_id"],
+            ["applications.id", "applications.user_id"],
+            name="fk_intros_application_owner",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), unique=True)
@@ -182,6 +250,7 @@ class Intro(Base):
     vouched_by_name: Mapped[str] = mapped_column(String(255))
     sheets_row_number: Mapped[int | None] = mapped_column(Integer)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    application_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=func.now(), server_default=func.now()
     )
@@ -190,6 +259,121 @@ class Intro(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="intro")
+
+
+class IntroEffectOutbox(Base):
+    __tablename__ = "intro_effect_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "application_id", "effect_kind", name="uq_intro_effect_outbox_application_kind"
+        ),
+        CheckConstraint(
+            "effect_kind IN ('candidate_card','admission_intro','member_intro','refresh_intro','sheet_projection')",
+            name="ck_intro_effect_outbox_effect_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending','processing','sent','unknown','failed','stale')",
+            name="ck_intro_effect_outbox_status",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_intro_effect_outbox_attempt_count"),
+        CheckConstraint(
+            "message_id IS NULL OR chat_id IS NOT NULL",
+            name="ck_intro_effect_outbox_message_requires_chat",
+        ),
+        CheckConstraint(
+            "status <> 'processing' OR (attempt_count > 0 AND attempt_started_at IS NOT NULL)",
+            name="ck_intro_effect_outbox_processing_claim",
+        ),
+        CheckConstraint(
+            "status NOT IN ('processing','unknown') "
+            "OR (attempt_count > 0 AND attempt_started_at IS NOT NULL)",
+            name="ck_intro_effect_outbox_attempt_identity",
+        ),
+        CheckConstraint(
+            "effect_kind <> 'sheet_projection' OR status <> 'unknown'",
+            name="ck_intro_effect_outbox_sheet_projection_unknown",
+        ),
+        Index("ix_intro_effect_outbox_status_id", "status", "id"),
+        Index(
+            "uq_intro_effect_outbox_telegram_identity",
+            "chat_id",
+            "message_id",
+            unique=True,
+            postgresql_where=text("message_id IS NOT NULL"),
+            sqlite_where=text("message_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    application_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("applications.id"), nullable=False
+    )
+    effect_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    attempt_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class IntroEffectReconciliation(Base):
+    __tablename__ = "intro_effect_reconciliations"
+    __table_args__ = (
+        UniqueConstraint(
+            "effect_id", "attempt_count", name="uq_intro_effect_reconciliations_effect_attempt"
+        ),
+        CheckConstraint(
+            "action IN ('record-sent','retry-absent')",
+            name="ck_intro_effect_reconciliations_action",
+        ),
+        CheckConstraint(
+            "attempt_count > 0",
+            name="ck_intro_effect_reconciliations_attempt_count",
+        ),
+        CheckConstraint(
+            "length(btrim(reason)) BETWEEN 1 AND 500",
+            name="ck_intro_effect_reconciliations_reason",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "((action = 'record-sent' AND chat_id IS NOT NULL AND message_id IS NOT NULL "
+            "AND message_id > 0 AND evidence_sha256 IS NULL) "
+            "OR (action = 'retry-absent' AND chat_id IS NULL AND message_id IS NULL "
+            "AND evidence_sha256 ~ '^[0-9a-f]{64}$'))",
+            name="ck_intro_effect_reconciliations_action_shape",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "action <> 'retry-absent' OR evidence_sha256 IS NOT NULL",
+            name="ck_intro_effect_reconciliations_retry_evidence",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    effect_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("intro_effect_outbox.id", ondelete="RESTRICT"), nullable=False
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    evidence_sha256: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    operator_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class ChatMessage(Base):
@@ -752,15 +936,249 @@ class QaTrace(Base):
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 6), nullable=True)
 
 
+class SemanticIndexRun(Base):
+    __tablename__ = "semantic_index_runs"
+    __table_args__ = (
+        CheckConstraint("run_type IN ('backfill','reindex')", name="ck_semantic_index_runs_type"),
+        CheckConstraint(
+            "status IN ('running','completed','failed')",
+            name="ck_semantic_index_runs_status",
+        ),
+        CheckConstraint("embedding_dimensions > 0", name="ck_semantic_index_runs_dimensions"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    embedding_provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding_dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    eligible_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    indexed_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    reason_counts: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+    cursor: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SemanticRetrievalUnit(Base):
+    __tablename__ = "semantic_retrieval_units"
+    __table_args__ = (
+        CheckConstraint("source_type IN ('message','card')", name="ck_semantic_units_source_type"),
+        CheckConstraint("embedding_dimensions = 1536", name="ck_semantic_units_dimensions"),
+        CheckConstraint(
+            "chunk_index >= 0 AND chunk_count > 0 AND chunk_index < chunk_count",
+            name="ck_semantic_units_chunk_bounds",
+        ),
+        CheckConstraint(
+            "embedding_status IN ('reserved','completed','failed')",
+            name="ck_semantic_units_embedding_status",
+        ),
+        CheckConstraint(
+            "(embedding_status = 'reserved' AND embedding IS NULL "
+            "AND chunk_text IS NULL AND indexed_at IS NULL) OR "
+            "(embedding_status = 'completed' AND embedding IS NOT NULL "
+            "AND chunk_text IS NOT NULL AND length(trim(chunk_text)) BETWEEN 1 AND 800 "
+            "AND indexed_at IS NOT NULL) OR "
+            "(embedding_status = 'failed' AND embedding IS NULL "
+            "AND chunk_text IS NULL AND indexed_at IS NULL)",
+            name="ck_semantic_units_embedding_state",
+        ),
+        CheckConstraint(
+            "(invalidated_at IS NULL) = (invalidation_reason IS NULL)",
+            name="ck_semantic_units_invalidation_pair",
+        ),
+        UniqueConstraint(
+            "source_type",
+            "source_id",
+            "source_revision",
+            "chunk_index",
+            "content_hash",
+            "embedding_model",
+            name="uq_semantic_units_identity",
+        ),
+        Index("ix_semantic_units_chat_active", "chat_id", "invalidated_at"),
+        Index("ix_semantic_units_source", "source_type", "source_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_revision: Mapped[str] = mapped_column(String(128), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
+    chunk_count: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding_provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding_model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding_dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    chunk_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
+    llm_usage_ledger_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("llm_usage_ledger.id", ondelete="RESTRICT"), nullable=False
+    )
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidation_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class SemanticRetrievalUnitSource(Base):
+    __tablename__ = "semantic_retrieval_unit_sources"
+    __table_args__ = (
+        CheckConstraint("position >= 0", name="ck_semantic_unit_sources_position"),
+        UniqueConstraint("unit_id", "position", name="uq_semantic_unit_sources_position"),
+        Index("ix_semantic_unit_sources_message_version_id", "message_version_id"),
+    )
+
+    unit_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("semantic_retrieval_units.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    message_version_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("message_versions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    position: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+
+class SemanticQaAttempt(Base):
+    __tablename__ = "semantic_qa_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "slot_number IS NULL OR slot_number IN (1,2)", name="ck_semantic_attempts_slot"
+        ),
+        CheckConstraint(
+            "status IN ('denied','reserved','consumed','released')",
+            name="ck_semantic_attempts_status",
+        ),
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('answered','abstained','technical_failure','quota_denied')",
+            name="ck_semantic_attempts_outcome",
+        ),
+        CheckConstraint(
+            "(status = 'denied' AND slot_number IS NULL AND outcome = 'quota_denied' "
+            "AND delivery_started_at IS NULL) OR "
+            "(status = 'reserved' AND slot_number IS NOT NULL AND finalized_at IS NULL AND "
+            "((outcome IS NULL AND delivery_started_at IS NULL) OR "
+            "(outcome IN ('answered','abstained') AND delivery_started_at IS NOT NULL))) OR "
+            "(status = 'consumed' AND slot_number IS NOT NULL "
+            "AND outcome IN ('answered','abstained') AND delivery_started_at IS NOT NULL "
+            "AND finalized_at IS NOT NULL) OR "
+            "(status = 'released' AND slot_number IS NOT NULL "
+            "AND outcome = 'technical_failure' AND finalized_at IS NOT NULL)",
+            name="ck_semantic_attempts_state",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_semantic_qa_attempts_idempotency_key"),
+        Index(
+            "uq_semantic_qa_attempts_active_slot",
+            "user_tg_id",
+            "local_day",
+            "slot_number",
+            unique=True,
+            postgresql_where=text("status IN ('reserved','consumed')"),
+        ),
+        Index("ix_semantic_qa_attempts_user_day", "user_tg_id", "local_day", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_tg_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_chat_message_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("chat_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    local_day: Mapped[date] = mapped_column(Date, nullable=False)
+    slot_number: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    qa_trace_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("qa_traces.id", ondelete="SET NULL"), nullable=True
+    )
+    embedding_llm_call_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("llm_usage_ledger.id", ondelete="SET NULL"), nullable=True
+    )
+    synthesis_llm_call_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("llm_usage_ledger.id", ondelete="SET NULL"), nullable=True
+    )
+    reserved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    progress_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    delivery_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SemanticRetrievalTrace(Base):
+    __tablename__ = "semantic_retrieval_traces"
+    __table_args__ = (
+        CheckConstraint(
+            "retrieval_mode IN ('hybrid','fts_fallback','shadow')",
+            name="ck_semantic_retrieval_traces_mode",
+        ),
+        CheckConstraint(
+            "fts_latency_ms >= 0 AND vector_latency_ms >= 0 "
+            "AND fusion_latency_ms >= 0 AND total_latency_ms >= 0",
+            name="ck_semantic_retrieval_traces_latency",
+        ),
+        UniqueConstraint("attempt_id", name="uq_semantic_retrieval_traces_attempt_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    attempt_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("semantic_qa_attempts.id", ondelete="CASCADE"), nullable=False
+    )
+    qa_trace_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("qa_traces.id", ondelete="SET NULL"), nullable=True
+    )
+    query_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    retrieval_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    candidate_ranks: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=False
+    )
+    result_source_ids: Mapped[list[str]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=False
+    )
+    fts_latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    vector_latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    fusion_latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class IntroRefreshTracking(Base):
     __tablename__ = "intro_refresh_tracking"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "cycle_started_at", name="uq_intro_refresh_tracking_user_cycle"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     cycle_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     reminders_sent: Mapped[int] = mapped_column(SmallInteger, default=0)
     last_reminder_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    phase: Mapped[str] = mapped_column(String(20))  # daily, every_2_days, done
+    phase: Mapped[str] = mapped_column(String(20))
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -994,8 +1412,10 @@ class LlmUsageLedger(Base):
     """Per-call audit log for every LLM gateway invocation (T5-02 / alembic 024).
 
     Written by ``bot/services/llm_gateway.py`` for every call outcome, including
-    cache hits, abstentions, budget refusals, and errors. Never committed by the
-    gateway itself — the caller (handler) owns the transaction.
+    cache hits, abstentions, budget refusals, and errors. Most calls remain in
+    the caller transaction; paid semantic embedding/synthesis calls durably
+    commit an explicit ``reserved_in_flight`` row before provider dispatch and
+    replace that marker with the terminal audit outcome afterward.
 
     All numeric fields (tokens, cost, latency) use server defaults of 0 so that
     partial rows created for budget-guard placeholders are self-consistent.
@@ -1007,6 +1427,10 @@ class LlmUsageLedger(Base):
 
     __tablename__ = "llm_usage_ledger"
     __table_args__ = (
+        CheckConstraint(
+            "tokens_in >= 0 AND tokens_out >= 0 AND cost_usd >= 0 AND latency_ms >= 0",
+            name="ck_llm_usage_ledger_nonnegative_usage",
+        ),
         Index("ix_llm_usage_ledger_qa_trace_id", "qa_trace_id"),
         Index("ix_llm_usage_ledger_model_created_at", "model", "created_at"),
         Index("ix_llm_usage_ledger_created_at", "created_at"),
@@ -1041,7 +1465,7 @@ class LlmUsageLedger(Base):
     # call_type added in migration 064; migration 080 adds wiki/image rollout calls.
     # 'unknown' (legacy / default), 'qa_synthesis', 'digest_daily', 'digest_weekly',
     # 'graph_projection', 'extract_candidates', 'butler_decision', 'butler_summary',
-    # 'wiki_compilation', 'image_description'.
+    # 'wiki_compilation', 'image_description', 'semantic_embedding'.
     # Caller SHOULD always pass explicitly; 'unknown' is the fallback only for legacy rows.
     call_type: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default=text("'unknown'")
@@ -1715,26 +2139,17 @@ class Digest(Base):
             "type IN ('daily','weekly')",
             name="ck_digests_type",
         ),
-        # T8-01 / Phase 8: status enum widened to 14 values. The 4 new entries
-        # (awaiting_review, approved_for_publish, rejected_by_admin,
-        # rejected_by_reaper) cover the weekly editorial review-gate state
-        # machine. See alembic migration 038.
         CheckConstraint(
             "status IN ("
             "'running','draft','posting','posted','failed','skipped',"
             "'cost_exceeded','skipped_no_destination','redacted',"
-            "'redacted_edit_failed',"
-            "'awaiting_review','approved_for_publish',"
-            "'rejected_by_admin','rejected_by_reaper'"
+            "'redacted_edit_failed'"
             ")",
             name="ck_digests_status",
         ),
-        # T8-01: body required across the audit-trail review statuses too.
         CheckConstraint(
             "status NOT IN ("
-            "'draft','posting','posted','redacted','redacted_edit_failed',"
-            "'awaiting_review','approved_for_publish','rejected_by_admin',"
-            "'rejected_by_reaper'"
+            "'draft','posting','posted','redacted','redacted_edit_failed'"
             ")"
             " OR body_markdown IS NOT NULL",
             name="ck_digests_body_markdown_not_null_for_visible_statuses",
@@ -1745,15 +2160,6 @@ class Digest(Base):
             " AND posted_message_id IS NOT NULL"
             " AND posted_at IS NOT NULL)",
             name="ck_digests_posted_fields_required",
-        ),
-        # Manual weekly approval requires attribution. Automatic weekly
-        # publishing moves draft → posting → posted without an admin.
-        CheckConstraint(
-            "status <> 'approved_for_publish'"
-            " OR type <> 'weekly'"
-            " OR (published_by_admin_id IS NOT NULL"
-            " AND approved_at IS NOT NULL)",
-            name="ck_digests_approved_audit",
         ),
         Index(
             "ix_digests_status_draft",
@@ -1770,12 +2176,6 @@ class Digest(Base):
             "ix_digests_posting_started_at",
             "posting_started_at",
             postgresql_where=text("status = 'posting'"),
-        ),
-        # T8-01: stale-review reaper drives off this partial index.
-        Index(
-            "ix_digests_status_awaiting_review",
-            "awaiting_review_at",
-            postgresql_where=text("status = 'awaiting_review'"),
         ),
     )
 
@@ -1808,13 +2208,6 @@ class Digest(Base):
         DateTime(timezone=True), nullable=True
     )
     error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # T8-01 / Phase 8: weekly review-gate workflow columns.
-    awaiting_review_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    published_by_admin_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1835,16 +2228,10 @@ class DigestRun(Base):
 
     __tablename__ = "digest_runs"
     __table_args__ = (
-        # T8-01 / Phase 8: 5 new audit values cover the review-gate state
-        # transitions (awaiting_review, approved_for_publish, rejected_by_admin,
-        # rejected_by_reaper) plus operator regeneration audit
-        # (regenerated_by_admin). See alembic migration 038.
         CheckConstraint(
             "status IN ("
             "'running','finished','failed','skipped',"
-            "'cost_exceeded','skipped_no_destination',"
-            "'awaiting_review','approved_for_publish',"
-            "'rejected_by_admin','rejected_by_reaper','regenerated_by_admin'"
+            "'cost_exceeded','skipped_no_destination'"
             ")",
             name="ck_digest_runs_status",
         ),
