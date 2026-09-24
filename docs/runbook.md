@@ -151,16 +151,23 @@ sudo docker compose stop bot
 sudo docker compose up -d --no-deps bot web
 
 # 4. Verify (same checks deploy.py waits on):
-sudo python3 /srv/shkoder/healthcheck.py   # or: ops/compose/healthcheck.py from repo
 sudo docker exec shkoder-bot python -c \
   'import urllib.request; print(urllib.request.urlopen("http://localhost:3000/healthz", timeout=5).status)'
 # Ожидаемо: 200
+
+# Full report (bot/db/web + Telegram + public HTTPS) — needs PUBLIC_HEALTH_URL
+# (the HTTPS public web URL, same value as GitHub vars.PUBLIC_HEALTH_URL used
+# by .github/workflows/healthcheck.yml):
+sudo PUBLIC_HEALTH_URL=<https public web url> python3 /srv/shkoder/healthcheck.py
+# или из checkout'а репо: ops/compose/healthcheck.py — скрипт делает
+# `docker compose exec` в shkoder-bot/shkoder-web, поэтому запуск с VPS и sudo.
 ```
 
 Notes:
 
-- Do **not** re-run `deploy.py <prev_sha>` — it refuses any sha that is not the
-  current `main` tip ("stale release" guard). Rollback is a `.env` pin revert +
+- Do **not** re-run `deploy.py <prev_sha>` — for any sha that is not the current
+  `main` tip it prints "Skipping stale release" and exits 0 **without doing
+  anything** (silent no-op, not an error). Rollback is a `.env` pin revert +
   `compose up`, as above.
 - `DB_IMAGE`/`REDIS_IMAGE` pins are never part of an application rollback.
 - Never start the legacy `/home/claw/vibe-gatekeeper` compose stack as a
@@ -278,14 +285,21 @@ After the 7-day soak window (earliest: 2026-04-27) and A3 credentials decouple c
 ./scripts/cleanup-legacy.sh --force
 ```
 
-Script behavior:
+> **STALE since the Compose cutover (#521, 2026-09-16).** `cleanup-legacy.sh`
+> predates it: preflight 1 enumerates containers by the old Coolify app UUIDs
+> and exits 2 when it finds none — i.e. on current prod the script fails before
+> doing anything, and its post-verify also checks Coolify UUID containers. The
+> script must be updated to inspect `shkoder-*` containers before it can run;
+> until then this section is reference only.
 
-- Preflight 1: verifies no running container references `/home/claw` via Mounts or HostConfig.Binds. Abort if any match.
+Script behavior (as written — Coolify-era, see note above):
+
+- Preflight 1: verifies no running Coolify-UUID container references `/home/claw` via Mounts or HostConfig.Binds; exits 2 if no such containers exist.
 - Preflight 2: refuses to run before `SOAK_END=2026-04-27` unless `--force`.
 - Preflight 3: requires ≥200M free on VPS `/`.
 - Mandatory backup: tars the dir to `/root/backups/vibe-gatekeeper-legacy-<ts>.tar.gz` with integrity check.
 - Stops any stray legacy compose containers (best-effort), then `rm -rf`.
-- Post-verify: shkoder compose containers still up + Telegram `getMe` ok.
+- Post-verify: Coolify-UUID containers still up + Telegram `getMe` ok.
 
 Restore from backup if needed:
 
