@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import tempfile
@@ -9,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+
+_ALERT_TITLE_PREFIX = "[ALERT] healing escalation — "
 
 
 @dataclass(frozen=True)
@@ -43,12 +46,69 @@ def _send_telegram(reason: str, bot_token: str, admin_id: int, gh_repo: str) -> 
     response.raise_for_status()
 
 
-def _create_issue(
+def _gh(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["gh", *args],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
+def _find_open_alert_issue(title: str, gh_repo: str) -> tuple[int, str] | None:
+    """Return ``(number, url)`` of the open issue with this exact alert title."""
+    result = _gh(
+        "issue",
+        "list",
+        "--repo",
+        gh_repo,
+        "--state",
+        "open",
+        "--label",
+        "healing",
+        "--search",
+        f'"{_ALERT_TITLE_PREFIX.strip()}" in:title',
+        "--json",
+        "number,title,url",
+        "--limit",
+        "50",
+    )
+    for item in json.loads(result.stdout):
+        if item["title"] == title:
+            return int(item["number"]), str(item["url"])
+    return None
+
+
+def _comment_repeat(number: int, reason: str, gh_repo: str) -> None:
+    _gh(
+        "issue",
+        "comment",
+        str(number),
+        "--repo",
+        gh_repo,
+        "--body",
+        (
+            "repeat escalation (deduped)\n"
+            f"reason: {reason}\n"
+            f"ts: {datetime.now(UTC).isoformat()}"
+        ),
+    )
+
+
+def _file_alert_issue(
     reason: str,
     transcript_path: Path,
     snapshot_path: Path,
     gh_repo: str,
 ) -> str:
+    """Keep one open issue per alert key (reason): comment on repeat, else create."""
+    title = f"{_ALERT_TITLE_PREFIX}{reason}"
+    existing = _find_open_alert_issue(title, gh_repo)
+    if existing is not None:
+        number, url = existing
+        _comment_repeat(number, reason, gh_repo)
+        return url
+
     body = (
         f"# Healing escalation\n\n"
         f"Reason: {reason}\n\n"
@@ -59,27 +119,21 @@ def _create_issue(
         handle.write(body)
         body_file = Path(handle.name)
     try:
-        result = subprocess.run(
-            [
-                "gh",
-                "issue",
-                "create",
-                "--repo",
-                gh_repo,
-                "--title",
-                f"[ALERT] healing escalation — {reason}",
-                "--body-file",
-                str(body_file),
-                "--label",
-                "healing",
-                "--label",
-                "incident",
-                "--label",
-                "priority:high",
-            ],
-            check=True,
-            text=True,
-            capture_output=True,
+        result = _gh(
+            "issue",
+            "create",
+            "--repo",
+            gh_repo,
+            "--title",
+            title,
+            "--body-file",
+            str(body_file),
+            "--label",
+            "healing",
+            "--label",
+            "incident",
+            "--label",
+            "priority:high",
         )
     finally:
         body_file.unlink(missing_ok=True)
@@ -108,10 +162,11 @@ def escalate(
         errors.append(f"telegram: {exc}")
 
     try:
-        issue_url = _create_issue(reason, transcript, snapshot, gh_repo)
+        issue_url = _file_alert_issue(reason, transcript, snapshot, gh_repo)
         issue_ok = True
-    except subprocess.CalledProcessError as exc:
-        errors.append(f"github issue: {exc.stderr or exc}")
+    except (subprocess.CalledProcessError, ValueError) as exc:
+        detail = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else exc
+        errors.append(f"github issue: {detail or exc}")
 
     return EscalationResult(
         telegram_ok=telegram_ok,
