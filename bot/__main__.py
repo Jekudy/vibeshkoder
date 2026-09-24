@@ -6,10 +6,16 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.methods import GetUpdates
 from aiohttp import web
 
 from bot.config import settings
-from bot.services.health import check_db, report
+from bot.services.health import (
+    check_db,
+    note_poll_ok,
+    note_polling_started,
+    report,
+)
 from bot.handlers import (
     admin,
     admin_cards,
@@ -148,6 +154,16 @@ def _register_update_middlewares(dp: Dispatcher) -> None:
     dp.update.middleware(NormalizedMemoryPersistenceMiddleware())
 
 
+async def _poll_liveness_probe(make_request, bot: Bot, method):
+    """aiogram session middleware (issue #541): timestamp every successful
+    getUpdates response so /healthz can prove the polling loop is alive.
+    Empty long-poll responses count — they arrive every polling_timeout."""
+    result = await make_request(bot, method)
+    if isinstance(method, GetUpdates):
+        note_poll_ok()
+    return result
+
+
 async def main() -> None:
     # Storage: Redis in prod, in-memory FSM in dev. The DB driver is postgres in both modes
     # (T0-02; see bot/db/engine.py).
@@ -168,6 +184,10 @@ async def main() -> None:
         token=settings.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    # Issue #541: hook the getUpdates request path before polling starts so
+    # health.check_telegram_poll() observes the polling loop, not get_me().
+    bot.session.middleware.register(_poll_liveness_probe)
+    note_polling_started()
     dp = Dispatcher(storage=storage)
 
     # Register middleware on all update types.
@@ -220,15 +240,18 @@ async def main() -> None:
             logger.info("startup: %s", line)
         h = await report()
         logger.info(
-            "startup health: db.ok=%s settings_sanity.ok=%s",
+            "startup health: db.ok=%s settings_sanity.ok=%s telegram_poll.ok=%s",
             h.db.ok,
             h.settings_sanity.ok,
+            h.telegram_poll.ok,
         )
         if not h.ok:
             logger.warning(
-                "startup health degraded: db.reason=%r settings.reason=%r",
+                "startup health degraded: db.reason=%r settings.reason=%r "
+                "telegram_poll.reason=%r",
                 h.db.reason,
                 h.settings_sanity.reason,
+                h.telegram_poll.reason,
             )
         # Log allowed_updates so we can verify the rollout invariant
         # (no update type without a handler — see HANDOFF.md §8).
