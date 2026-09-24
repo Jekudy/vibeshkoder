@@ -121,6 +121,19 @@ async def _try_acquire_scheduler_lock(session: AsyncSession) -> bool:
 
 MEMORY_EXTRACTION_SCHEDULER_ENABLED_FLAG = "memory.extraction.scheduler.enabled"
 
+# Bounded automatic retry for transient provider failures at the live cursor
+# (issue #531). A failed ``version_cursor`` run without a resolution row used
+# to block every tick until a manual ``reconcile_extraction_run`` call; the
+# scheduler now writes the retry resolution itself while the failure class is
+# transient and the per-window attempt budget is not exhausted. The bound
+# counts total provider dispatches for one cursor window: attempt_no
+# ``EXTRACTION_SCHEDULER_MAX_AUTO_ATTEMPTS`` failing leaves the run
+# unresolved so an operator ``reconcile_extraction_run`` decision stays
+# available (a written resolution row is append-only and would lock it out).
+EXTRACTION_SCHEDULER_MAX_AUTO_ATTEMPTS = 3
+_TRANSIENT_GATEWAY_ERROR_PREFIXES = ("provider_transient:", "provider_exception:")
+_SAFE_RETRY_DISPATCH_STATES = frozenset({"not_dispatched", "rejected_pre_accept"})
+
 
 # ─── Protocol seam — concrete impl lands in T6-03 ────────────────────────────
 
@@ -1371,14 +1384,15 @@ async def _first_blocking_image_in_cursor_window(
     return int(blocking) if blocking is not None else None
 
 
-async def _has_unresolved_cursor_run(
+async def _get_unresolved_cursor_run(
     session: AsyncSession,
     *,
     source_chat_id: int,
     cursor_start_message_version_id: int,
-) -> bool:
-    unresolved = await session.scalar(
-        select(ExtractionRun.id)
+) -> ExtractionRun | None:
+    """Return the latest unresolved non-completed run pinned at the cursor."""
+    return await session.scalar(
+        select(ExtractionRun)
         .outerjoin(
             ExtractionRunResolution,
             ExtractionRunResolution.run_id == ExtractionRun.id,
@@ -1390,9 +1404,173 @@ async def _has_unresolved_cursor_run(
             ExtractionRun.run_status.in_(("running", "failed")),
             ExtractionRunResolution.id.is_(None),
         )
+        .order_by(ExtractionRun.attempt_no.desc())
         .limit(1)
     )
-    return unresolved is not None
+
+
+async def _auto_resolve_failed_cursor_run(
+    *,
+    run: ExtractionRun,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> bool:
+    """Write a bounded retry resolution for a transiently failed cursor run.
+
+    The resolution goes through ``reconcile_extraction_run`` in its own
+    committed transaction — the same code path an operator uses — so the
+    durable retry dispatch sees a committed row and all dispatch-state gates
+    stay enforced. Returns ``True`` when the resolution was recorded, which
+    makes the run visible to ``_get_reconciled_cursor_retry`` later in the
+    same tick. Returns ``False`` — leaving the run operator-actionable — for:
+
+    * ``run_status='running'`` rows (the process may still hold the provider
+      call; a duplicate dispatch must stay an operator decision);
+    * non-transient ``gateway_error`` classes (``provider_structural:*``,
+      ``provider_unknown:*``, or none) — retries cannot fix them;
+    * attempt ``EXTRACTION_SCHEDULER_MAX_AUTO_ATTEMPTS`` — the per-window
+      dispatch budget is exhausted and the gap must not be skipped silently;
+    * a missing/invalid ``MEMORY_AUTOMATION_ACTOR_USER_ID`` or a reconcile
+      rejection (unknown actor, changed run state).
+    """
+    if run.run_status != "failed":
+        return False
+    if run.attempt_no >= EXTRACTION_SCHEDULER_MAX_AUTO_ATTEMPTS:
+        logger.error(
+            "extraction_scheduler_auto_retry_exhausted",
+            extra={
+                "extraction_run_id": str(run.id),
+                "attempt_no": run.attempt_no,
+                "gateway_error": run.gateway_error,
+                "resolution": "operator reconcile_extraction_run required",
+            },
+        )
+        return False
+    gateway_error = run.gateway_error or ""
+    if not gateway_error.startswith(_TRANSIENT_GATEWAY_ERROR_PREFIXES):
+        return False
+
+    # Lazy imports: memory_backfill and memory_reconciliation import this
+    # module at top level.
+    from bot.services.memory_backfill import (
+        MemoryBackfillConfigurationError,
+        resolve_automation_actor_user_id,
+    )
+    from bot.services.memory_reconciliation import (
+        MemoryReconciliationError,
+        reconcile_extraction_run,
+    )
+
+    try:
+        actor_user_id = resolve_automation_actor_user_id(None)
+    except MemoryBackfillConfigurationError:
+        logger.warning(
+            "extraction_scheduler_auto_retry_no_actor",
+            extra={"extraction_run_id": str(run.id)},
+        )
+        return False
+
+    action = (
+        "safe_retry"
+        if run.dispatch_state in _SAFE_RETRY_DISPATCH_STATES
+        else "risk_accepted_retry"
+    )
+    try:
+        await reconcile_extraction_run(
+            session_factory=session_factory,
+            run_id=run.id,
+            action=action,
+            actor_user_id=actor_user_id,
+            reason=(
+                f"auto: transient provider failure ({gateway_error}); "
+                f"retry {run.attempt_no + 1}/"
+                f"{EXTRACTION_SCHEDULER_MAX_AUTO_ATTEMPTS} of the same window"
+            ),
+            accept_possible_duplicate_cost=(action == "risk_accepted_retry"),
+        )
+    except MemoryReconciliationError:
+        logger.warning(
+            "extraction_scheduler_auto_retry_rejected",
+            extra={"extraction_run_id": str(run.id)},
+        )
+        return False
+    logger.info(
+        "extraction_scheduler_auto_retry",
+        extra={
+            "extraction_run_id": str(run.id),
+            "action": action,
+            "attempt_no": run.attempt_no,
+            "gateway_error": gateway_error,
+        },
+    )
+    return True
+
+
+async def _bounded_cursor_end(
+    session: AsyncSession,
+    *,
+    source_chat_id: int,
+    after_message_version_id: int,
+    through_message_version_id: int,
+) -> int:
+    """Shrink ``through_message_version_id`` so the payload fits the input cap.
+
+    Long catch-up windows (e.g. after a cursor stall) would exceed
+    ``MAX_EXTRACTION_INPUT_BYTES`` and fail every tick. Walking versions in
+    order and summing the canonical per-line size keeps each tick to one
+    bounded provider call. Governance filters are deliberately not applied:
+    the estimate is an upper bound because the pass may still exclude rows.
+
+    A single version larger than the cap still becomes a one-version window:
+    ``run_extraction_pass`` then records a loud ``input_size_exceeded``
+    failure instead of the cursor stalling silently.
+    """
+    rows = (
+        await session.execute(
+            text(
+                """
+            SELECT mv.id, mv.text, mv.caption, mv.normalized_text
+            FROM message_versions AS mv
+            JOIN chat_messages AS c
+              ON c.id = mv.chat_message_id
+             AND c.current_version_id = mv.id
+            WHERE c.chat_id = :source_chat_id
+              AND mv.id > :after_message_version_id
+              AND mv.id <= :through_message_version_id
+            ORDER BY mv.id
+            """
+            ),
+            {
+                "source_chat_id": source_chat_id,
+                "after_message_version_id": after_message_version_id,
+                "through_message_version_id": through_message_version_id,
+            },
+        )
+    ).all()
+
+    total_bytes = 0
+    bounded_end: int | None = None
+    for mv_id, row_text, caption, normalized_text in rows:
+        line_bytes = len(
+            serialize_untrusted_source_versions(
+                [
+                    {
+                        "message_version_id": mv_id,
+                        "text": row_text,
+                        "caption": caption,
+                        "normalized_text": normalized_text,
+                    }
+                ]
+            ).encode("utf-8")
+        )
+        # JSONL joins lines with "\n" — one separator byte per extra row.
+        next_total = total_bytes + line_bytes + (1 if bounded_end is not None else 0)
+        if bounded_end is not None and next_total > MAX_EXTRACTION_INPUT_BYTES:
+            break
+        total_bytes = next_total
+        bounded_end = int(mv_id)
+    if bounded_end is None:
+        return int(rows[0][0]) if rows else through_message_version_id
+    return bounded_end
 
 
 async def extraction_scheduler_tick(
@@ -1446,16 +1624,23 @@ async def extraction_scheduler_tick(
         source_chat_id=source_chat_id,
         enabled_at=phase_6_enabled_at,
     )
-    if await _has_unresolved_cursor_run(
+    unresolved_run = await _get_unresolved_cursor_run(
         session,
         source_chat_id=source_chat_id,
         cursor_start_message_version_id=cursor_start,
+    )
+    if unresolved_run is not None and not await _auto_resolve_failed_cursor_run(
+        run=unresolved_run,
+        session_factory=durable_session_factory or _engine_session,
     ):
         logger.error(
             "extraction_scheduler_unresolved_run",
             extra={
                 "source_chat_id": source_chat_id,
                 "cursor_start_message_version_id": cursor_start,
+                "extraction_run_id": str(unresolved_run.id),
+                "run_status": unresolved_run.run_status,
+                "attempt_no": unresolved_run.attempt_no,
             },
         )
         return SchedulerTickResult(skipped=True, reason="unresolved_extraction_run")
@@ -1486,6 +1671,15 @@ async def extraction_scheduler_tick(
             source_chat_id=source_chat_id,
             after_message_version_id=cursor_start,
         )
+        if cursor_end > cursor_start:
+            # A fresh window may cover a long backlog after a stall; bound it
+            # so one tick stays within one provider-input-sized call.
+            cursor_end = await _bounded_cursor_end(
+                session,
+                source_chat_id=source_chat_id,
+                after_message_version_id=cursor_start,
+                through_message_version_id=cursor_end,
+            )
     if cursor_end <= cursor_start:
         if blocking_image_message_version_id is not None:
             return SchedulerTickResult(
