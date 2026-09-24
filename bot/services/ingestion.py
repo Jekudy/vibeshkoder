@@ -78,10 +78,18 @@ def _extract_chat_and_message_ids(update: Update) -> tuple[int | None, int | Non
 
 
 def _extract_text_and_caption(update: Update) -> tuple[str | None, str | None]:
+    """Return the text/caption policy detection must see for this update.
+
+    ``callback_query.message`` is a full message snapshot and is the only content
+    carrier on that update shape. It can also be an ``InaccessibleMessage`` (no
+    ``text``/``caption`` attributes), so fields are read via ``getattr``.
+    """
     msg = update.message or update.edited_message
+    if msg is None and update.callback_query is not None:
+        msg = update.callback_query.message
     if msg is None:
         return None, None
-    return msg.text, msg.caption
+    return getattr(msg, "text", None), getattr(msg, "caption", None)
 
 
 async def is_raw_archive_enabled(session: AsyncSession) -> bool:
