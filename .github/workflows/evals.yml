@@ -2,6 +2,11 @@ name: Evals
 
 on:
   workflow_dispatch:
+  # Nightly deterministic suite only: local pytest + frozen sanitized report,
+  # no provider keys in job env, tests/evals/test_no_llm_imports.py enforces
+  # the no-paid-calls invariant. Restore of the pre-#411 trigger (#535).
+  schedule:
+    - cron: "15 3 * * *"
 
 jobs:
   evals:

@@ -174,14 +174,67 @@ def test_redact_handles_edited_message(app_env) -> None:
 
 
 def test_redact_passes_through_when_no_event_field(app_env) -> None:
-    """Update with no message/edited_message etc — pass through unchanged."""
+    """Update with no event field at all — pass through unchanged."""
+    from bot.services.governance import redact_raw_for_offrecord
+
+    raw = {"update_id": 3}
+    redacted = redact_raw_for_offrecord(raw)
+    assert redacted == raw
+
+
+def test_redact_passes_through_callback_query_without_message(app_env) -> None:
+    """Bare ``callback_query`` (inline button, no message snapshot) has no content
+    fields — scrubbing leaves it unchanged. ``data`` is structured bot-authored
+    input, not user content, and is kept."""
     from bot.services.governance import redact_raw_for_offrecord
 
     raw = {"update_id": 3, "callback_query": {"id": "abc", "data": "btn"}}
     redacted = redact_raw_for_offrecord(raw)
-    # callback_query is not in _EVENT_FIELDS, so not touched. Acceptable for T1-12 —
-    # callback_query.data is structured input, not user content.
     assert redacted == raw
+
+
+def test_redact_scrubs_callback_query_message_snapshot(app_env) -> None:
+    """Issue #86: ``callback_query.message`` is a full message snapshot (text/caption/
+    entities plus nested ``reply_to_message``) that bypassed the redactor."""
+    from bot.services.governance import redact_raw_for_offrecord
+
+    raw = {
+        "update_id": 30,
+        "callback_query": {
+            "id": "cb1",
+            "from_user": {"id": 7},
+            "chat_instance": "ci",
+            "data": "btn:1",
+            "message": {
+                "message_id": 9,
+                "text": "secret #offrecord",
+                "caption": "cap secret",
+                "entities": [{"type": "hashtag"}],
+                "caption_entities": [{"type": "italic"}],
+                "chat": {"id": -100, "type": "supergroup"},
+                "reply_to_message": {
+                    "message_id": 8,
+                    "text": "parent secret",
+                },
+            },
+        },
+    }
+    redacted = redact_raw_for_offrecord(raw)
+    cb = redacted["callback_query"]
+    msg = cb["message"]
+    assert "text" not in msg
+    assert "caption" not in msg
+    assert "entities" not in msg
+    assert "caption_entities" not in msg
+    assert "text" not in msg["reply_to_message"]
+    assert msg["reply_to_message"]["message_id"] == 8
+    # Structural fields survive:
+    assert cb["id"] == "cb1"
+    assert cb["data"] == "btn:1"
+    assert cb["from_user"] == {"id": 7}
+    assert msg["message_id"] == 9
+    assert msg["chat"] == {"id": -100, "type": "supergroup"}
+    assert redacted["update_id"] == 30
 
 
 def test_redact_returns_none_for_none(app_env) -> None:
