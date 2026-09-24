@@ -44,6 +44,7 @@ Privacy-critical design notes
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -3706,6 +3707,14 @@ class LLMBudgetExceededError(DigestGatewayError):
     """Shared gateway budget exceeded."""
 
 
+# Bounded in-stage retry for pre-charge provider rejections (issue #537).
+# Only ``rate_limit`` is safe: it is an explicit 429 before the provider
+# accepts the paid request. timeout/5xx/connection_reset stay fail-closed —
+# their outcome is ambiguous and an automatic second call could double-charge.
+_DIGEST_RATE_LIMIT_RETRIES = 1
+_DIGEST_RATE_LIMIT_RETRY_DELAY_SECONDS = 20.0
+
+
 @dataclass(frozen=True)
 class SynthesizeDigestResult:
     publish: bool
@@ -3788,32 +3797,56 @@ async def _call_digest_stage(
         call_type=call_type,
     )
 
-    started = time.monotonic()
-    try:
-        provider_result = await provider.call_structured(
-            instructions=instructions,
-            input_text=input_text,
-            model=config.model,
-            schema_name=schema_name,
-            json_schema=json_schema,
-            reasoning_effort="medium",
-        )
-    except Exception as exc:
-        latency_ms = int((time.monotonic() - started) * 1000)
-        await ledger_repo.update_placeholder(
-            session,
-            llm_call_id=placeholder_row.id,
-            cost_usd=Decimal("0"),
-            response_hash=None,
-            tokens_in=0,
-            tokens_out=0,
-            request_id=None,
-            latency_ms=latency_ms,
-            error=exc.__class__.__name__,
-        )
-        if isinstance(exc, (ProviderStructuralError, ProviderTransientError)):
-            raise DigestProviderError(f"digest provider failure: {exc.subtype}") from None
-        raise DigestProviderError(f"digest provider failure: {exc.__class__.__name__}") from None
+    # ``rate_limit`` is a rejected pre-charge response (see the image path's
+    # ``ImageDescriptionAmbiguousError`` split), so one bounded retry is safe.
+    # Every other subtype is ambiguous — the provider may have accepted and
+    # charged the request — and stays fail-closed with no automatic retry.
+    rate_limit_retries = 0
+    while True:
+        started = time.monotonic()
+        try:
+            provider_result = await provider.call_structured(
+                instructions=instructions,
+                input_text=input_text,
+                model=config.model,
+                schema_name=schema_name,
+                json_schema=json_schema,
+                reasoning_effort="medium",
+            )
+            break
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - started) * 1000)
+            await ledger_repo.update_placeholder(
+                session,
+                llm_call_id=placeholder_row.id,
+                cost_usd=Decimal("0"),
+                response_hash=None,
+                tokens_in=0,
+                tokens_out=0,
+                request_id=None,
+                latency_ms=latency_ms,
+                error=exc.__class__.__name__,
+            )
+            if (
+                isinstance(exc, ProviderTransientError)
+                and exc.subtype == "rate_limit"
+                and rate_limit_retries < _DIGEST_RATE_LIMIT_RETRIES
+            ):
+                rate_limit_retries += 1
+                logger.warning(
+                    "digest_provider_rate_limit_retry",
+                    extra={
+                        "llm_call_id": placeholder_row.id,
+                        "digest_type": digest_type,
+                        "schema_name": schema_name,
+                        "attempt": rate_limit_retries,
+                    },
+                )
+                await asyncio.sleep(_DIGEST_RATE_LIMIT_RETRY_DELAY_SECONDS)
+                continue
+            if isinstance(exc, (ProviderStructuralError, ProviderTransientError)):
+                raise DigestProviderError(f"digest provider failure: {exc.subtype}") from None
+            raise DigestProviderError(f"digest provider failure: {exc.__class__.__name__}") from None
 
     latency_ms = int((time.monotonic() - started) * 1000)
     answer_text = provider_result.answer_text or ""
