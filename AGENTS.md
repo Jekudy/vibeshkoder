@@ -62,4 +62,8 @@ Vibe Gatekeeper is a Telegram + web gatekeeping system for managing community ap
 - Never use `docker compose down -v`, prune user data, remove retained volumes or
   restore database backups without a verified backup and explicit user approval.
 - Legacy `/home/claw/vibe-gatekeeper` remains retained; cleanup requires its existing
-  `scripts/cleanup-legacy.sh` preflights and the approval above.
+  `scripts/cleanup-legacy.sh` preflights and the approval above. It is **not** a
+  rollback target: application rollback is reverting `BOT_IMAGE`/`WEB_IMAGE` to the
+  previous `sha-` tag in `/srv/shkoder/.env` (see `docs/runbook.md` "Rollback
+  Procedure"); starting the legacy stack would run a second consumer/database
+  against diverged production data.

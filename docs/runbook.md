@@ -56,9 +56,11 @@ Never commit:
 ## Release Model
 
 - CI validates the repo.
-- Release workflow builds and pushes GHCR images.
-- Coolify deploys pre-built images from GHCR.
-- Rollback uses the previous image tag.
+- Release workflow builds and pushes GHCR images tagged `sha-<full commit>`.
+- GitHub Actions runs `ops/compose/deploy.py` on the VPS runner, which pins
+  `BOT_IMAGE`/`WEB_IMAGE` in `/srv/shkoder/.env` and restarts bot/web via
+  Docker Compose at `/srv/shkoder/compose.yaml` (Coolify removed 2026-09-16, #521).
+- Rollback uses the previous `sha-` image tag — see "Rollback Procedure".
 
 ## Current Server State
 
@@ -120,31 +122,72 @@ Executed directly from legacy → Coolify prod (staging skipped, per user direct
 
 ## Rollback Procedure
 
-If Coolify prod becomes unhealthy:
+Production runs Docker Compose at `/srv/shkoder/` with SHA-pinned GHCR images
+(`BOT_IMAGE`/`WEB_IMAGE` in `/srv/shkoder/.env`, tags `sha-<full commit>`).
+Rollback = redeploy the previous sha tag. It touches **application images only —
+never the database**.
+
+`ops/compose/deploy.py` already does this automatically when a deploy fails its
+readiness checks: it restores the previous `.env` pins and brings the old images
+back up. The manual path below is for rolling back a *healthy but bad* release.
 
 ```bash
 ssh claw@187.77.98.73
-TOKEN=<coolify api token>
-API=http://100.101.196.21:8100/api/v1
-# 1. Stop Coolify bot FIRST to release BOT_TOKEN from Telegram session:
-curl -X POST -H "Authorization: Bearer $TOKEN" "$API/applications/maiwn569gziz935wv0w7kcch/stop"
-# 2. Stop Coolify web to free port 8080:
-curl -X POST -H "Authorization: Bearer $TOKEN" "$API/applications/cexv50jspo5gl3kq6ojypw43/stop"
-# 3. Restart legacy stack:
-cd /home/claw/vibe-gatekeeper && docker compose up -d
+cd /srv/shkoder
+
+# 1. Find the previous deployed sha (git log on main, or `git log` of deploys):
+sudo grep -E '^(BOT|WEB)_IMAGE=' .env   # current pins
+# previous sha = the commit deployed before the bad one (GHCR keeps all sha- tags)
+
+# 2. Pin both images back to the previous sha:
+sudo sed -i \
+  -e "s|^BOT_IMAGE=.*|BOT_IMAGE=ghcr.io/jekudy/vibe-gatekeeper-bot:sha-<prev_sha40>|" \
+  -e "s|^WEB_IMAGE=.*|WEB_IMAGE=ghcr.io/jekudy/vibe-gatekeeper-web:sha-<prev_sha40>|" \
+  .env
+
+# 3. Pull, stop the old polling bot FIRST (single consumer rule), then start:
+sudo docker compose pull bot web
+sudo docker compose stop bot
+sudo docker compose up -d --no-deps bot web
+
+# 4. Verify (same checks deploy.py waits on):
+sudo python3 /srv/shkoder/healthcheck.py   # or: ops/compose/healthcheck.py from repo
+sudo docker exec shkoder-bot python -c \
+  'import urllib.request; print(urllib.request.urlopen("http://localhost:3000/healthz", timeout=5).status)'
+# Ожидаемо: 200
 ```
 
-Legacy `docker-compose.yml`, `.env`, and `credentials.json` are preserved in `/home/claw/vibe-gatekeeper` — do not delete until prod has run stably for 7+ days.
+Notes:
 
-## Coolify deploys
+- Do **not** re-run `deploy.py <prev_sha>` — it refuses any sha that is not the
+  current `main` tip ("stale release" guard). Rollback is a `.env` pin revert +
+  `compose up`, as above.
+- `DB_IMAGE`/`REDIS_IMAGE` pins are never part of an application rollback.
+- Never start the legacy `/home/claw/vibe-gatekeeper` compose stack as a
+  fallback: it is pre-migration code and would run a second consumer/database
+  against diverged production data. It is retained only for
+  `scripts/cleanup-legacy.sh` preflight history — see "Legacy Dir Cleanup".
 
-Canonical reference: `~/Vibe/knowledge/nocoders/docs/architecture/coolify-deploy-playbook.md` plus `/coolify-deploy` skill.
+## Compose deploys
+
+- **Deploy:** push to `main` → GHA builds `sha-<commit>` images →
+  `ops/compose/deploy.py` on the VPS runner pins and restarts bot/web.
+- **Start/stop app:** `sudo docker compose -f /srv/shkoder/compose.yaml start|stop bot|web`.
+- **Logs:** `sudo docker logs shkoder-bot --tail 500` (same for `shkoder-web`).
+- **Secrets:** `/srv/shkoder/{bot,web,db,redis}.env` outside git; image pins in
+  `/srv/shkoder/.env`.
+- **Health:** `ops/compose/healthcheck.py` (apps, DB, Telegram, public HTTPS);
+  bot `/healthz` + `/healthz/db` on container port 3000.
+
+## Coolify deploys (historical — Coolify removed 2026-09-16, #521)
+
+Kept for history only; none of this is live. Use "Compose deploys" above.
 
 - **Start app:** Coolify UI → project → app → Start. CLI: `coolify start <app-uuid>` (if `coolify` CLI available on host) or `docker start <container-uuid>` as fallback.
 - **Stop app:** Coolify UI → Stop, or `coolify stop <app-uuid>`.
 - **Pull logs (last 500 lines, follow):** `coolify logs <app-uuid> --tail 500 --follow`; fallback `docker logs <container-uuid> --tail 500`.
 - **Where secrets live:** Coolify env panel per app. On disk: `/data/coolify/...` (ACL 600 root:root). Never commit to git.
-- **Rollback to previous digest:** Coolify UI → app → Deployments → select previous deployment → Redeploy. CLI path: update image reference in app config to the prior `@sha256:` digest, redeploy.
+- **Rollback to previous digest:** was Coolify UI → app → Deployments → Redeploy; now — see "Rollback Procedure" above.
 
 ## Phase 4 Hotfix #164 — Post-Deploy Operator Notes
 
@@ -237,12 +280,12 @@ After the 7-day soak window (earliest: 2026-04-27) and A3 credentials decouple c
 
 Script behavior:
 
-- Preflight 1: verifies no running Coolify vibe-gatekeeper container references `/home/claw` via Mounts or HostConfig.Binds. Abort if any match.
+- Preflight 1: verifies no running container references `/home/claw` via Mounts or HostConfig.Binds. Abort if any match.
 - Preflight 2: refuses to run before `SOAK_END=2026-04-27` unless `--force`.
 - Preflight 3: requires ≥200M free on VPS `/`.
 - Mandatory backup: tars the dir to `/root/backups/vibe-gatekeeper-legacy-<ts>.tar.gz` with integrity check.
 - Stops any stray legacy compose containers (best-effort), then `rm -rf`.
-- Post-verify: Coolify vibe-gatekeeper containers still up + Telegram `getMe` ok.
+- Post-verify: shkoder compose containers still up + Telegram `getMe` ok.
 
 Restore from backup if needed:
 
@@ -250,7 +293,14 @@ Restore from backup if needed:
 ssh foodzy-vps-claw "sudo tar xzf /root/backups/vibe-gatekeeper-legacy-<ts>.tar.gz -C /home/claw"
 ```
 
-## Rollback Drill (Coolify → Legacy)
+## Rollback Drill (Coolify → Legacy) — OBSOLETE
+
+> **Устарело 2026-09-24 (#539).** Coolify снят с прода 2026-09-16 (#521);
+> `/home/claw/vibe-gatekeeper` — pre-migration код, запуск его compose-стека
+> против текущей прод-БД запрещён (no-two-consumers + schema drift).
+> Реальный rollback — возврат `sha-` пина в `/srv/shkoder/.env`, см.
+> "Rollback Procedure" выше; он не трогает БД, поэтому data-loss window
+> и весь этот drill не нужны. Секция сохранена для истории.
 
 Controlled симуляция падения Coolify runtime с переходом на legacy stack. Процедура не тестировалась с момента cutover 2026-04-20 — до первого реального инцидента её нужно прогнать в drill-режиме и зафиксировать результат.
 
