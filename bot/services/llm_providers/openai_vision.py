@@ -19,6 +19,18 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_DESCRIPTION_CHARS = 1_200
 SUPPORTED_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
 
+# gpt-5-nano is a reasoning model: ``max_completion_tokens`` bounds reasoning
+# tokens PLUS visible output (OpenAI chat.completions reference), and the
+# server-side default ``reasoning_effort`` is ``medium``.  The previous cap of
+# 180 was fully consumed by reasoning on every call, so ``message.content``
+# came back empty with ``finish_reason="length"`` and the adapter raised
+# ``contract_violation`` (prod: ~180/180 failed since 2026-07-16).
+# ``minimal`` effort skips the reasoning spend on a 1-3 sentence caption task;
+# 2_048 keeps headroom even if the effort hint is ignored.
+MAX_COMPLETION_TOKENS = 2_048
+REASONING_EFFORT = "minimal"
+_REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
 
 @dataclass(frozen=True)
 class VisionDescriptionResult:
@@ -37,11 +49,13 @@ class OpenAIVisionProvider:
         *,
         api_key: str | None = None,
         client: httpx.AsyncClient | None = None,
-        max_completion_tokens: int = 180,
+        max_completion_tokens: int = MAX_COMPLETION_TOKENS,
+        reasoning_effort: str | None = REASONING_EFFORT,
     ) -> None:
         self._api_key = api_key
         self._client = client
         self._max_completion_tokens = max_completion_tokens
+        self._reasoning_effort = reasoning_effort
 
     async def describe(
         self,
@@ -98,6 +112,12 @@ class OpenAIVisionProvider:
             "max_completion_tokens": self._max_completion_tokens,
             "stream": False,
         }
+        # ``reasoning_effort`` is rejected (400) by non-reasoning models such as
+        # gpt-4o-mini, so it is sent only to reasoning-model ids.
+        if self._reasoning_effort is not None and model.startswith(
+            _REASONING_MODEL_PREFIXES
+        ):
+            payload["reasoning_effort"] = self._reasoning_effort
 
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(
@@ -165,7 +185,9 @@ class OpenAIVisionProvider:
 
 __all__ = [
     "DEFAULT_OPENAI_VISION_MODEL",
+    "MAX_COMPLETION_TOKENS",
     "MAX_IMAGE_BYTES",
     "OpenAIVisionProvider",
+    "REASONING_EFFORT",
     "VisionDescriptionResult",
 ]
