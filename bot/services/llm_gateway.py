@@ -351,7 +351,11 @@ MAX_WIKI_PRIOR_BODY_CHARS = 100_000
 MAX_WIKI_PROMPT_CHARS = 200_000
 MAX_WIKI_RESERVED_OUTPUT_TOKENS = 100_000
 MAX_VISION_RESERVED_INPUT_TOKENS = 5_000
-MAX_VISION_RESERVED_OUTPUT_TOKENS = 180
+# Must equal ``openai_vision.MAX_COMPLETION_TOKENS`` (asserted in
+# tests/services/test_openai_vision_provider.py): the reservation covers the
+# adapter's whole worst-case output budget, which for reasoning models
+# includes reasoning tokens.
+MAX_VISION_RESERVED_OUTPUT_TOKENS = 2_048
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
