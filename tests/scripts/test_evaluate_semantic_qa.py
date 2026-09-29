@@ -240,7 +240,10 @@ def test_validator_binds_exact_release_sha_and_workflow_calls_it(tmp_path: Path)
     assert set(workflow[True]) == {"workflow_dispatch", "schedule"}
     assert workflow[True]["schedule"] == [{"cron": "15 3 * * *"}]
     assert "evals-gate" not in workflow["jobs"]
-    assert "python -m scripts.evaluate_semantic_qa validate-report" in workflow_text
+    validate = next(step for step in workflow["jobs"]["evals"]["steps"]
+                    if step.get("name") == "Validate sanitized private frozen eval report")
+    assert validate["if"] == "github.event_name == 'workflow_dispatch'"
+    assert "python -m scripts.evaluate_semantic_qa validate-report" in validate["run"]
     assert "MIN_MACRO_RECALL_AT_5" not in workflow_text
 
 
