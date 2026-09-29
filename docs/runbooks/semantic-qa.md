@@ -360,7 +360,7 @@ python -m scripts.evaluate_semantic_qa evaluate \
 невалидный или неполный input. Report mode `0600`, `contains_raw_text=false`.
 
 Передать exact sanitized report как repository secret и запустить manual-only
-workflow на том же commit (daily schedule намеренно отсутствует):
+workflow на том же commit (nightly `schedule` гоняет только детерминированные тесты; шаг `validate-report` исполняется только при `workflow_dispatch`):
 
 ```bash
 gh secret set SEMANTIC_EVAL_REPORT_JSON < /tmp/semantic-eval-<UTC>.json

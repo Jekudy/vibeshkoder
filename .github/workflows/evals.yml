@@ -2,7 +2,8 @@ name: Evals
 
 on:
   workflow_dispatch:
-  # Nightly deterministic suite only: local pytest + frozen sanitized report,
+  # Nightly deterministic suite only: local pytest. The release-bound frozen
+  # report is validated only on workflow_dispatch (runbook semantic-qa.md, #545);
   # no provider keys in job env, tests/evals/test_no_llm_imports.py enforces
   # the no-paid-calls invariant. Restore of the pre-#411 trigger (#535).
   schedule:
@@ -101,6 +102,7 @@ jobs:
           exit "$eval_status"
 
       - name: Validate sanitized private frozen eval report
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           SEMANTIC_EVAL_REPORT_JSON: ${{ secrets.SEMANTIC_EVAL_REPORT_JSON }}
