@@ -8,3 +8,11 @@
   `update-branch` trivy FAIL на main-side `anyio` CVE-2026-63374 (fixed в
   4.14.2, чинится в #530). Гейт «CI green on head» не пройден.
   Осталось: после мержа #530 — update-branch #416 и мержить.
+
+## 2026-09-30
+
+- 2026-09-30 14:01 — агент (thr_cfph7gt9p5): Evals перепроверен после #548. Nightly run 36697378870 зелёный (241 passed, validate skipped, artifact загружен); ручной dispatch на main 36704461337 fail-closed (validate exit 2, секрета нет). Проверено: `gh run view`.
+- 2026-09-30 14:01 — агент (thr_cfph7gt9p5): найден пробел — runbook `semantic-qa.md` §6 `gh workflow run --ref "$RELEASE_GIT_SHA"` → HTTP 422 (dispatch принимает только branch/tag), `gh run watch` без id падает неинтерактивно. Issue #549.
+- 2026-09-30 14:01 — агент решил (thr_cfph7gt9p5, дизайн подтверждён Fable claude-fable-5-1): docs-only фикс — временный lightweight tag через `gh api`, id run из вывода `gh workflow run`, удаление тега. Отвергнуто: input `release_sha` (binding становится заявленным), `--ref main` (гонка с main), изменение workflow (не нужно).
+- 2026-09-30 14:01 — агент (thr_cfph7gt9p5): точный блок прогнан в zsh — run 36705450962 `workflow_dispatch`, headSha dfce40a, validate exit 2, watch exit 1, тег удалён. BMAD review 18 findings (11 patch, 7 reject), Fable APPROVE, ponytail-review lean. Spec `_bmad-output/implementation-artifacts/spec-gh-549-evals-release-dispatch-runbook.md`.
+- 2026-09-30 14:01 — агент (thr_cfph7gt9p5): осталось — мерж PR по #549 и проверка CI на main; остаточные риски: Node20-deprecation warning и миграция ubuntu-latest на Ubuntu 26 с 19.10 (repo-wide, сейчас не ломает).

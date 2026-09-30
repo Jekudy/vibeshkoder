@@ -360,12 +360,19 @@ python -m scripts.evaluate_semantic_qa evaluate \
 невалидный или неполный input. Report mode `0600`, `contains_raw_text=false`.
 
 Передать exact sanitized report как repository secret и запустить manual-only
-workflow на том же commit (nightly `schedule` гоняет только детерминированные тесты; шаг `validate-report` исполняется только при `workflow_dispatch`):
+workflow на том же commit (nightly `schedule` гоняет только детерминированные тесты; шаг `validate-report` исполняется только при `workflow_dispatch`).
+`workflow_dispatch` принимает только branch или tag, поэтому на release commit
+через GitHub API создаётся временный lightweight tag, который удаляется после
+run; `gh workflow run` возвращает URL именно этого run. Если run прерван,
+удалить tag последней командой:
 
 ```bash
+TAG="semantic-eval-${RELEASE_GIT_SHA}"
 gh secret set SEMANTIC_EVAL_REPORT_JSON < /tmp/semantic-eval-<UTC>.json
-gh workflow run evals.yml --ref "$RELEASE_GIT_SHA"
-gh run watch --exit-status
+gh api --silent -X POST "repos/{owner}/{repo}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${RELEASE_GIT_SHA}"
+RUN_URL=$(gh workflow run evals.yml --ref "${TAG}")
+gh run watch "${RUN_URL##*/}" --exit-status
+gh api --silent -X DELETE "repos/{owner}/{repo}/git/refs/tags/${TAG}"
 ```
 
 Workflow fail-closed при отсутствующем/невалидном secret, несовпадении
