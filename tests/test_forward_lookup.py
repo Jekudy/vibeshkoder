@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 from tests.conftest import import_module
+
+_HANDLER_LOGGER = "bot.handlers.forward_lookup"
 
 
 def _message(requester_id: int, text: str = "stored community message") -> SimpleNamespace:
@@ -65,7 +68,36 @@ def test_forward_lookup_member_can_lookup(app_env, monkeypatch) -> None:
     assert "private intro text" in answer_text
 
 
-def test_forward_lookup_non_member_denied(app_env, monkeypatch) -> None:
+def test_forward_lookup_missing_requester_denied(app_env, monkeypatch, caplog) -> None:
+    handler = import_module("bot.handlers.forward_lookup")
+    session = AsyncMock()
+    message = _message(requester_id=111)
+
+    user_get = AsyncMock(return_value=None)
+    message_lookup = AsyncMock(return_value=_chat_message())
+    intro_get = AsyncMock(return_value=_intro())
+
+    monkeypatch.setattr(handler.UserRepo, "get", user_get)
+    monkeypatch.setattr(handler.MessageRepo, "find_by_exact_text", message_lookup)
+    monkeypatch.setattr(handler.IntroRepo, "get", intro_get)
+
+    caplog.set_level(logging.INFO)
+    asyncio.run(handler.handle_forwarded_message(message, session))
+
+    user_get.assert_awaited_once_with(session, 111)
+    message_lookup.assert_not_called()
+    intro_get.assert_not_called()
+    message.answer.assert_not_called()
+    records = [r for r in caplog.records if r.name == _HANDLER_LOGGER]
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.INFO
+    assert record.msg == "forward_lookup denied: user_id=%s not found in DB"
+    assert record.args == (111,)
+    assert record.getMessage() == "forward_lookup denied: user_id=111 not found in DB"
+
+
+def test_forward_lookup_non_member_denied(app_env, monkeypatch, caplog) -> None:
     handler = import_module("bot.handlers.forward_lookup")
     session = AsyncMock()
     message = _message(requester_id=111)
@@ -78,6 +110,7 @@ def test_forward_lookup_non_member_denied(app_env, monkeypatch) -> None:
     monkeypatch.setattr(handler.MessageRepo, "find_by_exact_text", message_lookup)
     monkeypatch.setattr(handler.IntroRepo, "get", intro_get)
 
+    caplog.set_level(logging.INFO)
     asyncio.run(handler.handle_forwarded_message(message, session))
 
     user_get.assert_awaited_once_with(session, 111)
@@ -86,6 +119,13 @@ def test_forward_lookup_non_member_denied(app_env, monkeypatch) -> None:
     message.answer.assert_not_called()
     assert all("Alice" not in args.args for args in message.answer.await_args_list)
     assert all("private intro text" not in args.args for args in message.answer.await_args_list)
+    records = [r for r in caplog.records if r.name == _HANDLER_LOGGER]
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.INFO
+    assert record.msg == "forward_lookup denied: user_id=%s is not a member"
+    assert record.args == (111,)
+    assert record.getMessage() == "forward_lookup denied: user_id=111 is not a member"
 
 
 def test_forward_lookup_admin_can_lookup(app_env, monkeypatch) -> None:

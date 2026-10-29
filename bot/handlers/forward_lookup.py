@@ -37,7 +37,7 @@ async def handle_forwarded_message(
     requester = await UserRepo.get(session, message.from_user.id)
     if requester is None:
         logger.info(
-            "forward_lookup denied for non-member user_id=%s",
+            "forward_lookup denied: user_id=%s not found in DB",
             message.from_user.id,
         )
         return
@@ -45,7 +45,7 @@ async def handle_forwarded_message(
     is_admin = requester.id in settings.ADMIN_IDS or requester.is_admin is True
     if requester.is_member is not True and not is_admin:
         logger.info(
-            "forward_lookup denied for non-member user_id=%s",
+            "forward_lookup denied: user_id=%s is not a member",
             message.from_user.id,
         )
         return
