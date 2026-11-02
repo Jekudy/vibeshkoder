@@ -92,6 +92,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Drop the index without restoring duplicates deleted by upgrade.
+
+    See docs/memory-system/HANDOFF.md#migration-008-and-012-downgrade.
+    """
     if not _is_postgresql():
         return
 

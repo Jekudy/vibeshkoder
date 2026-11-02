@@ -1104,6 +1104,41 @@ Next candidates: T2-03 (import apply), any T-* touching `message_versions` reten
 | Extraction            | disable extraction; derived rows hidden / deleted       |
 | Forget                | do not rollback tombstones casually                     |
 
+### Migration 008 and 012 downgrade
+
+These downgrades are partial and do not restore the pre-upgrade data. Production
+migrations are forward-only; application image rollback does not roll back database
+data. Treat a database downgrade as a deliberate recovery operation.
+
+- **008:** downgrade clears `chat_messages.current_version_id` only when it points
+  to a `message_versions` row with `version_seq = 1` and `raw_update_id IS NULL`,
+  then deletes those rows. This is a heuristic, not a record of every backfilled
+  row: upgrade copies the source `raw_update_id`, so backfilled v1 rows with a
+  non-null value remain. Other v1 rows with a null value can also be deleted.
+  Later live versions remain and can be left without their v1 base; a parent
+  pointing to a later version is not reset. Deleted data is not restored.
+- **012:** on PostgreSQL, upgrade keeps the oldest pending invite per application
+  (ordered by `created_at`, then `id`) and deletes the other pending duplicates.
+  Downgrade drops `ix_invite_outbox_pending_unique`; it does not restore deleted
+  duplicates. Non-PostgreSQL upgrade and downgrade skip this operation.
+
+Before any downgrade:
+
+1. Stop writers and consumers, and identify the target database and current Alembic
+   revision. Do not run old and new consumers or database containers against the
+   same production data.
+2. Take a database backup and verify its integrity and restorability in an isolated
+   environment. Record the backup and account for writes since it was taken. Restoring
+   a backup requires explicit approval and may lose subsequent writes.
+3. On an isolated copy, inspect affected v1 and later versions, current-version
+   pointers, and pending invite duplicates; rehearse the downgrade and check schema,
+   row counts, references, and application invariants. Plan manual reconciliation
+   from verified evidence; do not assume downgrade reconstructs deleted rows.
+4. Proceed only with an approved recovery plan. Afterward repeat the checks before
+   resuming a single set of compatible consumers. If data must be restored or
+   reconciled, use the approved plan and verified backup; image rollback alone is
+   insufficient.
+
 ### Monitoring (this cycle)
 
 - `/healthz` uptime
