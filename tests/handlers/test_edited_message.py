@@ -376,6 +376,66 @@ def test_apply_offrecord_flip_redacts_existing_message_versions(app_env) -> None
 # ─── Test 4: offrecord → normal flip is a NO-OP for policy AND content ──────
 
 
+@pytest.mark.asyncio
+async def test_offrecord_edit_keeps_parent_redacted_in_database(db_session) -> None:
+    """A legacy redacted text row stays redacted after an edit to a photo caption."""
+    from sqlalchemy import select
+
+    from bot.db.models import ChatMessage, MessageVersion, User
+
+    handler = import_module("bot.handlers.edited_message")
+    user_id = _random_user_id()
+    chat_id = handler.settings.COMMUNITY_CHAT_ID
+    message_id = _random_message_id()
+    db_session.add(User(id=user_id, first_name="Test"))
+    await db_session.flush()
+    row = ChatMessage(
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=message_id,
+        date=datetime.now(timezone.utc),
+        text=None,
+        caption=None,
+        raw_json=None,
+        message_kind="text",
+        memory_policy="offrecord",
+        is_redacted=True,
+    )
+    db_session.add(row)
+    await db_session.flush()
+    row_id = row.id
+
+    message = _make_message(
+        message_id=message_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        text=None,
+        caption="ordinary edited caption",
+        photo=object(),
+    )
+    await handler.handle_edited_message(message, db_session)
+
+    # Select scalar columns from the database, not the identity-mapped ORM object.
+    stored = (
+        await db_session.execute(
+            select(
+                ChatMessage.text, ChatMessage.caption, ChatMessage.raw_json,
+                ChatMessage.memory_policy, ChatMessage.is_redacted, ChatMessage.current_version_id,
+            ).where(ChatMessage.id == row_id)
+        )
+    ).one()
+    assert stored[:5] == (None, None, None, "offrecord", True)
+    # A kind change reaches the parent update instead of the unchanged-hash early return.
+    assert stored.current_version_id is not None
+    version = (
+        await db_session.execute(
+            select(MessageVersion.text, MessageVersion.caption, MessageVersion.is_redacted)
+            .where(MessageVersion.id == stored.current_version_id)
+        )
+    ).one()
+    assert version == (None, None, True)
+
+
 def test_edited_message_offrecord_to_normal_is_noop_for_policy_and_content(
     app_env, monkeypatch
 ) -> None:
