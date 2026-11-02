@@ -200,7 +200,7 @@ async def test_alembic_upgrade_head_on_clean_db_green(migrated_database_url: str
     # + editorial-review removal (090) + versioned intro flow (091)
     # + shared intro refresh wave uniqueness (092).
     # Assert the current head explicitly; revisit when future migrations land.
-    assert current == "092"
+    assert current == "093"
 
 
 async def test_insert_message_versions_generates_search_tsv_from_normalized_text(

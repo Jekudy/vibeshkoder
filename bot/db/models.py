@@ -410,7 +410,7 @@ class ChatMessage(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     message_id: Mapped[int] = mapped_column(BigInteger)
     chat_id: Mapped[int] = mapped_column(BigInteger)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"))
     text: Mapped[str | None] = mapped_column(Text)
     date: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     raw_json: Mapped[dict | None] = mapped_column(JSON)
