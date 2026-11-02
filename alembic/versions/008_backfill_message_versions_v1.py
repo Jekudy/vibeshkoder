@@ -165,12 +165,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Wipe v1 versions created by the backfill and reset current_version_id.
+    """Partially undo the backfill; data is not restored.
 
-    Targets only ``version_seq=1`` rows whose ``raw_update_id IS NULL`` (heuristic for
-    backfilled rows — live ingestion writes raw_update_id once T1-04+T1-14 land). Any
-    manually-inserted v1 test rows with NULL ``raw_update_id`` would also be wiped, but
-    that's acceptable in the downgrade path since tests use isolated transactions.
+    See docs/memory-system/HANDOFF.md#migration-008-and-012-downgrade.
     """
     bind = op.get_bind()
     bind.execute(
