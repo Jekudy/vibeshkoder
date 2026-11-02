@@ -1070,7 +1070,7 @@ async def test_senderless_message_persists_with_full_history(db_session, content
     assert version.text == content
 
 
-@pytest.mark.parametrize("reader", ["search", "extractor", "revalidation", "locks", "predicate", "semantic", "digest", "llm", "butler", "digest_citations", "wiki_compiler", "cascade", "qa"])
+@pytest.mark.parametrize("reader", ["search", "extractor", "revalidation", "locks", "predicate", "semantic", "digest", "llm", "butler", "digest_citations", "wiki_compiler", "cascade", "qa", "predicate_sql"])
 async def test_senderless_reader_contract(db_session, reader) -> None:
     from datetime import timedelta
 
@@ -1118,6 +1118,12 @@ async def test_senderless_reader_contract(db_session, reader) -> None:
     elif reader == "predicate":
         stmt = select(ChatMessage.id).join(MessageVersion, MessageVersion.chat_message_id == ChatMessage.id).where(ChatMessage.id == row.id, forget_excludes_expression())
         assert (await db_session.execute(stmt)).scalar_one() == row.id
+    elif reader == "predicate_sql":
+        from sqlalchemy import text
+        from bot.services.forget_predicate import forget_excludes_sql_fragment
+
+        stmt = text("SELECT cm.id FROM chat_messages cm JOIN message_versions mv ON mv.chat_message_id = cm.id WHERE cm.id = :id AND " + forget_excludes_sql_fragment())
+        assert (await db_session.execute(stmt, {"id": row.id})).scalar_one() == row.id
     elif reader == "butler":
         from bot.services.butler_evidence import _fetch_governance_fields
 
@@ -1181,3 +1187,40 @@ async def test_rehydrate_senderless_does_not_supersede_none_user_tombstone(db_se
                                         raw_update_id=None, raw_payload={}, captured_at=message.date)
     await db_session.refresh(event)
     assert event.status != "superseded"
+
+
+@pytest.mark.parametrize("reader", ["search", "extractor", "revalidation", "butler", "digest_citations", "wiki_compiler"])
+async def test_senderless_message_tombstone_blocks_readers(db_session, reader) -> None:
+    from datetime import timedelta
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.services.message_persistence import persist_message_with_policy
+
+    message = _make_text_message(message_id=987658, chat_id=-100987658, text="tombstonedsenderword")
+    message.from_user = None
+    row = (await persist_message_with_policy(db_session, message)).chat_message
+    mvid = row.current_version_id
+    await ForgetEventRepo.create(db_session, target_type="message", target_id=str(row.id), actor_user_id=None,
+                                 authorized_by="system", tombstone_key=f"message:{row.chat_id}:{row.message_id}")
+    if reader == "search":
+        from bot.services.search import search_messages
+        hits = await search_messages(db_session, "tombstonedsenderword", chat_id=row.chat_id, include_cards=False)
+        assert not any(hit.message_version_id == mvid for hit in hits)
+    elif reader == "extractor":
+        from bot.services.extractor import _select_eligible_sources
+        rows = await _select_eligible_sources(db_session, window_start=message.date - timedelta(minutes=1),
+            window_end=message.date + timedelta(minutes=1), source_chat_id=row.chat_id, force_include_chat_message_ids=None)
+        assert not any(source.message_version_id == mvid for source in rows)
+    elif reader == "revalidation":
+        from bot.services.governance_revalidation import revalidate_sources
+        status, detail = await revalidate_sources(db_session, [mvid])
+        assert status == "blocked" and detail["failure_reason"] == "forget_tombstone_match"
+    elif reader == "butler":
+        from bot.services.butler_evidence import _fetch_governance_fields
+        assert (await _fetch_governance_fields(db_session, mvids=[mvid]))[mvid] is None
+    elif reader == "digest_citations":
+        from bot.services.digest_publisher import _digest_revalidate_citations
+        assert not await _digest_revalidate_citations(db_session, digest=SimpleNamespace(citations=[{"kind": "message_version", "id": mvid}]))
+    elif reader == "wiki_compiler":
+        from bot.services.wiki_compiler import WikiSourceRejectedError, _load_governed_sources
+        with pytest.raises(WikiSourceRejectedError):
+            await _load_governed_sources(db_session, card_ids=(), direct_mvids=(mvid,), source_chat_id=row.chat_id)
