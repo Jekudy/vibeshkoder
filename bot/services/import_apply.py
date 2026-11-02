@@ -490,7 +490,7 @@ async def _apply_one_message(
         create_ghost_if_missing=True,
     )
     if user_id is None:
-        # No resolved user → cannot persist (chat_messages.user_id is NOT NULL).
+        # Importer requires a resolved user even though live messages may have no sender.
         # ACKing it would let the checkpoint advance past missing history.
         raise ValueError(
             f"cannot resolve user for export_msg_id={msg_id}: human message has no valid from_id"

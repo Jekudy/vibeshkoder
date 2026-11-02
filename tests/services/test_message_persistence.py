@@ -1050,3 +1050,90 @@ async def test_persist_does_not_overwrite_existing_current_version_id(db_session
     assert r2.chat_message.current_version_id == v2.id, (
         "current_version_id was overwritten back to v1 — edit→v1 regression detected"
     )
+
+
+@pytest.mark.parametrize("content", ["anonymous message", "anonymous #offrecord message"])
+async def test_senderless_message_persists_with_full_history(db_session, content) -> None:
+    from sqlalchemy import select
+
+    from bot.db.models import ChatMessage, MessageVersion
+    from bot.services.message_persistence import persist_message_with_policy
+
+    message = _make_text_message(message_id=987654, chat_id=-100987654, user_id=77001, text=content)
+    message.from_user = None
+    result = await persist_message_with_policy(db_session, message)
+    row = (await db_session.execute(select(ChatMessage).where(ChatMessage.id == result.chat_message.id))).scalar_one()
+    version = (await db_session.execute(select(MessageVersion).where(MessageVersion.id == row.current_version_id))).scalar_one()
+    assert row.user_id is None
+    assert row.text == content
+    assert result.policy == "normal"
+    assert version.text == content
+
+
+@pytest.mark.parametrize("reader", ["search", "extractor", "revalidation", "locks", "predicate", "semantic", "digest", "llm", "butler", "digest_citations", "wiki_compiler", "cascade"])
+async def test_senderless_reader_contract(db_session, reader) -> None:
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from bot.db.models import ChatMessage, MessageVersion
+    from bot.services.advisory_locks import governed_message_lock_keys
+    from bot.services.digest_context import build_digest_context
+    from bot.services.extractor import _select_eligible_sources
+    from bot.services.forget_predicate import forget_excludes_expression
+    from bot.services.governance_revalidation import revalidate_sources
+    from bot.services.llm_gateway import _source_filter
+    from bot.services.message_persistence import persist_message_with_policy
+    from bot.services.search import search_messages
+    from bot.services.semantic_index import list_eligible_message_documents
+
+    message = _make_text_message(message_id=987655, chat_id=-100987655, text="uniquesenderlessword")
+    message.from_user = None
+    saved = await persist_message_with_policy(db_session, message)
+    row = saved.chat_message
+    mvid = row.current_version_id
+    start = message.date - timedelta(minutes=1)
+    end = message.date + timedelta(minutes=1)
+    if reader == "search":
+        hits = await search_messages(db_session, "uniquesenderlessword", chat_id=message.chat.id, include_cards=False)
+        assert any(hit.message_version_id == mvid and hit.user_id is None for hit in hits)
+    elif reader == "extractor":
+        rows = await _select_eligible_sources(db_session, window_start=start, window_end=end, source_chat_id=message.chat.id, force_include_chat_message_ids=None)
+        assert any(item.message_version_id == mvid and item.user_id is None for item in rows)
+    elif reader == "revalidation":
+        assert await revalidate_sources(db_session, [mvid]) == ("ok", None)
+    elif reader == "locks":
+        keys = await governed_message_lock_keys(db_session, [mvid])
+        assert not any(key == "user:None" for key in keys)
+        assert len(keys) == 3
+    elif reader == "predicate":
+        stmt = select(ChatMessage.id).join(MessageVersion, MessageVersion.chat_message_id == ChatMessage.id).where(ChatMessage.id == row.id, forget_excludes_expression())
+        assert (await db_session.execute(stmt)).scalar_one() == row.id
+    elif reader == "butler":
+        from bot.services.butler_evidence import _fetch_governance_fields
+
+        assert (await _fetch_governance_fields(db_session, mvids=[mvid]))[mvid]["text"] == message.text
+    elif reader == "digest_citations":
+        from bot.services.digest_publisher import _digest_revalidate_citations
+
+        digest = SimpleNamespace(citations=[{"kind": "message_version", "id": mvid}])
+        assert await _digest_revalidate_citations(db_session, digest=digest)
+    elif reader == "wiki_compiler":
+        from bot.services.wiki_compiler import _load_governed_sources
+
+        _, _, allowed = await _load_governed_sources(db_session, card_ids=(), direct_mvids=(mvid,), source_chat_id=message.chat.id)
+        assert mvid in allowed
+    elif reader == "cascade":
+        from bot.services.forget_cascade import _cascade_message_versions
+
+        assert await _cascade_message_versions(db_session, SimpleNamespace(target_type="user", target_id="778899")) == 0
+        assert await _cascade_message_versions(db_session, SimpleNamespace(target_type="message", target_id=str(row.id))) == 1
+        await db_session.refresh(row)
+    elif reader == "semantic":
+        docs = await list_eligible_message_documents(db_session, chat_id=message.chat.id)
+        assert not any(str(mvid) == doc.source_id for doc in docs)
+    elif reader == "digest":
+        context = await build_digest_context(db_session, type="daily", window_start=start, window_end=end, source_chat_id=message.chat.id)
+        assert not context.messages
+    elif reader == "llm":
+        assert await _source_filter(db_session, [mvid], chat_id=message.chat.id) == []

@@ -113,7 +113,7 @@ async def test_head_clean_upgrade_removes_review_columns(migration_database_url:
     _alembic(migration_database_url, "upgrade", "head")
     conn = await _connect(migration_database_url)
     try:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "092"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "093"
         columns = await conn.fetch(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name='digests' AND column_name = ANY($1::text[])",
@@ -243,11 +243,11 @@ async def test_090_downgrade_restores_079_relaxed_approval_audit(
         await conn.close()
 
 
-async def test_alembic_head_is_092(migration_database_url: str) -> None:
+async def test_alembic_head_is_093(migration_database_url: str) -> None:
     _alembic(migration_database_url, "upgrade", "head")
     conn = await _connect(migration_database_url)
     try:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "092"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "093"
     finally:
         await conn.close()
 
@@ -679,5 +679,30 @@ async def test_079_approval_audit_allows_automatic_weekly_publish(
                 "INSERT INTO digests (type, window_start, window_end, body_markdown, citations, status) "
                 "VALUES ('weekly', now() - interval '28 days', now(), 'body', '[]', 'approved_for_publish')"
             )
+    finally:
+        await conn.close()
+
+
+async def test_093_downgrade_preserves_null_rows(migration_database_url: str) -> None:
+    _alembic(migration_database_url, "upgrade", "093")
+    conn = await _connect(migration_database_url)
+    try:
+        await conn.execute(
+            "INSERT INTO chat_messages (message_id, chat_id, user_id, date) "
+            "VALUES (1, -100, NULL, now())"
+        )
+        result = _alembic(migration_database_url, "downgrade", "092", check=False)
+        assert result.returncode != 0
+        assert "chat_messages contains NULL user_id rows" in result.stderr
+        assert await conn.fetchval("SELECT count(*) FROM chat_messages WHERE user_id IS NULL") == 1
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "093"
+        await conn.execute("DELETE FROM chat_messages WHERE chat_id = -100 AND message_id = 1")
+    finally:
+        await conn.close()
+    _alembic(migration_database_url, "downgrade", "092")
+    _alembic(migration_database_url, "upgrade", "093")
+    conn = await _connect(migration_database_url)
+    try:
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "093"
     finally:
         await conn.close()

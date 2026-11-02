@@ -30,13 +30,17 @@ async def save_chat_message(
         return
 
     if message.from_user is None:
-        return
+        sender_chat = message.sender_chat
+        reason = ("sender_chat" if sender_chat is not None
+                  and sender_chat.id != message.chat.id else "anonymous_admin")
+        logger.info("chat_message without user: chat_id=%s message_id=%s reason=%s",
+                    message.chat.id, message.message_id, reason)
 
     # This bot's own digest/Q&A/wiki posts are output, never source memory. Other bots
     # remain valid source authors. Skipping only the running bot before
     # UserRepo/persistence prevents feedback loops while the upstream middleware still
     # retains every delivered raw update.
-    if message.from_user.is_bot:
+    if message.from_user is not None and message.from_user.is_bot:
         runtime_bot = message.bot
         if runtime_bot is None:
             raise RuntimeError("bot-authored message requires an attached bot instance")
@@ -44,14 +48,15 @@ async def save_chat_message(
             return
 
     # Keep sender profile fresh for message attribution and admin lookups.
-    await UserRepo.upsert(
-        session,
-        telegram_id=message.from_user.id,
-        username=message.from_user.username,
-        first_name=message.from_user.first_name,
-        last_name=message.from_user.last_name,
-        is_bot=getattr(message.from_user, "is_bot", None),
-    )
+    if message.from_user is not None:
+        await UserRepo.upsert(
+            session,
+            telegram_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+            is_bot=getattr(message.from_user, "is_bot", None),
+        )
 
     # Persist with policy detection (advisory lock + governance + mark creation).
     # The helper mirrors the former inline logic from this handler body so DB state

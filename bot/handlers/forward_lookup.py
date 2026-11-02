@@ -62,7 +62,9 @@ async def handle_forwarded_message(
         return
 
     # Get user info
-    user = await UserRepo.get(session, chat_msg.user_id)
+    user = (
+        await UserRepo.get(session, chat_msg.user_id) if chat_msg.user_id is not None else None
+    )
     if user is None:
         await message.answer(FORWARD_NOT_FOUND)
         return

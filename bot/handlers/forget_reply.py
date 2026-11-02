@@ -116,7 +116,7 @@ async def handle_forget(
         return
 
     # Authorization check.
-    is_author = chat_message.user_id == requester_user.id
+    is_author = chat_message.user_id is not None and chat_message.user_id == requester_user.id
     is_admin = requester_user.is_admin
 
     if not is_author and not is_admin:
