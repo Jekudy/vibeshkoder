@@ -144,9 +144,10 @@ async def rehydrate_message_from_import(
     )
     tombstone_keys = {
         f"message:{saved.chat_id}:{saved.message_id}",
-        f"user:{saved.user_id}",
         *(f"message_hash:{value}" for value in hashes),
     }
+    if saved.user_id is not None:
+        tombstone_keys.add(f"user:{saved.user_id}")
     from bot.db.models import ForgetEvent
 
     await session.execute(

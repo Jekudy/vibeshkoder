@@ -41,7 +41,7 @@ class MessageRepo:
         session: AsyncSession,
         message_id: int,
         chat_id: int,
-        user_id: int,
+        user_id: int | None,
         text: str | None,
         date: datetime,
         raw_json: dict | None = None,

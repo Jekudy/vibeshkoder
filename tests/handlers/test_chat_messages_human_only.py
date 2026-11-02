@@ -190,3 +190,34 @@ async def test_qa_router_persists_human_question_before_consuming_it(monkeypatch
 
     upsert.assert_awaited_once()
     persist.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("sender_id", "reason"),
+    [(COMMUNITY_CHAT_ID, "anonymous_admin"), (-100987, "sender_chat"), (None, "anonymous_admin")],
+)
+async def test_senderless_message_persists_and_logs(monkeypatch, caplog, sender_id, reason):
+    import logging
+
+    handler = import_module("bot.handlers.chat_messages")
+    message = _message(is_bot=False, with_photo=True)
+    message.from_user = None
+    message.sender_chat = SimpleNamespace(id=sender_id) if sender_id is not None else None
+    upsert = AsyncMock()
+    persist = AsyncMock(return_value=SimpleNamespace(
+        policy="normal", is_offrecord_mark_created=False, chat_message=SimpleNamespace(id=802)
+    ))
+    enqueue = AsyncMock()
+    monkeypatch.setattr(handler.UserRepo, "upsert", upsert)
+    monkeypatch.setattr(handler, "persist_message_with_policy", persist)
+    monkeypatch.setattr(handler, "enqueue_photo_memory", enqueue)
+    with caplog.at_level(logging.INFO, logger=handler.__name__):
+        await handler.save_chat_message(message, AsyncMock())
+    upsert.assert_not_awaited()
+    persist.assert_awaited_once()
+    enqueue.assert_awaited_once()
+    records = [record for record in caplog.records if record.levelno == logging.INFO]
+    assert len(records) == 1
+    assert str(COMMUNITY_CHAT_ID) in records[0].message
+    assert "701" in records[0].message
+    assert f"reason={reason}" in records[0].message
