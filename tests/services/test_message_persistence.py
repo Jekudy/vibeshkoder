@@ -1070,7 +1070,7 @@ async def test_senderless_message_persists_with_full_history(db_session, content
     assert version.text == content
 
 
-@pytest.mark.parametrize("reader", ["search", "extractor", "revalidation", "locks", "predicate", "semantic", "digest", "llm", "butler", "digest_citations", "wiki_compiler", "cascade", "qa", "predicate_sql"])
+@pytest.mark.parametrize("reader", ["search", "extractor", "revalidation", "locks", "predicate", "semantic", "digest", "llm", "butler", "digest_citations", "wiki_compiler", "cascade", "qa", "tombstone_gate"])
 async def test_senderless_reader_contract(db_session, reader) -> None:
     from datetime import timedelta
 
@@ -1118,12 +1118,10 @@ async def test_senderless_reader_contract(db_session, reader) -> None:
     elif reader == "predicate":
         stmt = select(ChatMessage.id).join(MessageVersion, MessageVersion.chat_message_id == ChatMessage.id).where(ChatMessage.id == row.id, forget_excludes_expression())
         assert (await db_session.execute(stmt)).scalar_one() == row.id
-    elif reader == "predicate_sql":
-        from sqlalchemy import text
-        from bot.services.forget_predicate import forget_excludes_sql_fragment
+    elif reader == "tombstone_gate":
+        from bot.services.llm_gateway import _forget_tombstone_check
 
-        stmt = text("SELECT cm.id FROM chat_messages cm JOIN message_versions mv ON mv.chat_message_id = cm.id WHERE cm.id = :id AND " + forget_excludes_sql_fragment())
-        assert (await db_session.execute(stmt, {"id": row.id})).scalar_one() == row.id
+        assert await _forget_tombstone_check(db_session, [mvid]) == []
     elif reader == "butler":
         from bot.services.butler_evidence import _fetch_governance_fields
 
