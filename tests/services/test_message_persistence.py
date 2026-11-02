@@ -1070,7 +1070,7 @@ async def test_senderless_message_persists_with_full_history(db_session, content
     assert version.text == content
 
 
-@pytest.mark.parametrize("reader", ["search", "extractor", "revalidation", "locks", "predicate", "semantic", "digest", "llm", "butler", "digest_citations", "wiki_compiler", "cascade"])
+@pytest.mark.parametrize("reader", ["search", "extractor", "revalidation", "locks", "predicate", "semantic", "digest", "llm", "butler", "digest_citations", "wiki_compiler", "cascade", "qa"])
 async def test_senderless_reader_contract(db_session, reader) -> None:
     from datetime import timedelta
 
@@ -1097,6 +1097,15 @@ async def test_senderless_reader_contract(db_session, reader) -> None:
     if reader == "search":
         hits = await search_messages(db_session, "uniquesenderlessword", chat_id=message.chat.id, include_cards=False)
         assert any(hit.message_version_id == mvid and hit.user_id is None for hit in hits)
+    elif reader == "qa":
+        from bot.handlers.qa import _bundle_users, _format_message_item
+        from bot.services.evidence import _build_evidence_item
+
+        hits = await search_messages(db_session, "uniquesenderlessword", chat_id=message.chat.id, include_cards=False)
+        item = _build_evidence_item(next(hit for hit in hits if hit.message_version_id == mvid))
+        users, sensitive = await _bundle_users(db_session, SimpleNamespace(items=[item]))
+        assert users == {} and not sensitive
+        assert "—" in _format_message_item(item, "987655", users)
     elif reader == "extractor":
         rows = await _select_eligible_sources(db_session, window_start=start, window_end=end, source_chat_id=message.chat.id, force_include_chat_message_ids=None)
         assert any(item.message_version_id == mvid and item.user_id is None for item in rows)
@@ -1137,3 +1146,38 @@ async def test_senderless_reader_contract(db_session, reader) -> None:
         assert not context.messages
     elif reader == "llm":
         assert await _source_filter(db_session, [mvid], chat_id=message.chat.id) == []
+
+
+async def test_senderless_edit_keeps_nullable_author(db_session) -> None:
+    from bot.config import settings
+    from bot.handlers.edited_message import handle_edited_message
+    from bot.services.message_persistence import persist_message_with_policy
+
+    message = _make_text_message(message_id=987656, chat_id=settings.COMMUNITY_CHAT_ID, text="before")
+    message.from_user = None
+    result = await persist_message_with_policy(db_session, message)
+    original_version = result.chat_message.current_version_id
+    message.text = "after"
+    message.edit_date = datetime.now(timezone.utc)
+    await handle_edited_message(message, db_session)
+    await db_session.refresh(result.chat_message)
+    assert result.chat_message.user_id is None
+    assert result.chat_message.current_version_id != original_version
+
+
+async def test_rehydrate_senderless_does_not_supersede_none_user_tombstone(db_session) -> None:
+    from bot.db.repos.forget_event import ForgetEventRepo
+    from bot.db.repos.user import UserRepo
+    from bot.services.message_persistence import persist_message_with_policy, rehydrate_message_from_import
+
+    message = _make_text_message(message_id=987657, chat_id=-100987657, user_id=987657, text="restored")
+    message.from_user = None
+    saved = await persist_message_with_policy(db_session, message)
+    event = await ForgetEventRepo.create(db_session, target_type="user", target_id="987657",
+                                         actor_user_id=None, authorized_by="system", tombstone_key="user:None")
+    await UserRepo.upsert(db_session, telegram_id=987657, username=None, first_name="Restored", last_name=None)
+    message.from_user = SimpleNamespace(id=987657)
+    await rehydrate_message_from_import(db_session, message, chat_message_id=saved.chat_message.id,
+                                        raw_update_id=None, raw_payload={}, captured_at=message.date)
+    await db_session.refresh(event)
+    assert event.status != "superseded"

@@ -156,3 +156,15 @@ def test_forward_lookup_admin_can_lookup(app_env, monkeypatch) -> None:
     assert "Alice" in answer_text
     assert "alice" in answer_text
     assert "private intro text" in answer_text
+
+
+def test_forward_lookup_senderless_has_no_user_lookup(app_env, monkeypatch) -> None:
+    handler = import_module("bot.handlers.forward_lookup")
+    session = AsyncMock()
+    message = _message(111)
+    get_user = AsyncMock(return_value=_user(111, is_member=True))
+    monkeypatch.setattr(handler.UserRepo, "get", get_user)
+    monkeypatch.setattr(handler.MessageRepo, "find_by_exact_text", AsyncMock(return_value=_chat_message(None)))
+    asyncio.run(handler.handle_forwarded_message(message, session))
+    get_user.assert_awaited_once_with(session, 111)
+    message.answer.assert_awaited_once_with(handler.FORWARD_NOT_FOUND)

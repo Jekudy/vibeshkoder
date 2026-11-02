@@ -700,3 +700,15 @@ async def test_validation_rejects_non_current_version(db_session) -> None:
 
     assert result.valid is False
     assert result.reasons[f"mvid:{old_mvid}"] == "non_current"
+
+
+async def test_senderless_source_is_valid_and_message_tombstone_blocks(db_session) -> None:
+    from bot.services.wiki_governance import validate_sources
+
+    row = await _make_chat_message(db_session, user_id=None)
+    mvid = await _make_message_version(db_session, chat_message_id=row.id)
+    page = await _make_wiki_page(db_session)
+    await _link_mv(db_session, page_id=page, message_version_id=mvid)
+    assert (await validate_sources(db_session, page_id=page, source_chat_id=row.chat_id)).valid
+    await _make_forget_event(db_session, tombstone_key=f"message:{row.chat_id}:{row.message_id}")
+    assert not (await validate_sources(db_session, page_id=page, source_chat_id=row.chat_id)).valid

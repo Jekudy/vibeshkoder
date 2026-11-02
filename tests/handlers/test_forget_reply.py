@@ -565,3 +565,27 @@ async def test_forget_db_idempotent_no_duplicate_row(db_session) -> None:
         select(ForgetEvent).where(ForgetEvent.tombstone_key == tombstone_key)
     )
     assert ev is not None
+
+
+@pytest.mark.parametrize("is_admin", [False, True])
+async def test_forget_senderless_requires_admin(db_session, is_admin) -> None:
+    from sqlalchemy import select
+    from bot.config import settings
+    from bot.db.models import ChatMessage, ForgetEvent
+    from datetime import datetime, timezone
+
+    handler = import_module("bot.handlers.forget_reply")
+    user_id = await _make_db_user_fr(db_session, is_admin=is_admin)
+    row = ChatMessage(message_id=_random_message_id(), chat_id=settings.COMMUNITY_CHAT_ID,
+                      user_id=None, text="anonymous", date=datetime.now(timezone.utc))
+    db_session.add(row)
+    await db_session.flush()
+    message = _make_command_message(chat_id=row.chat_id, user_id=user_id,
+                                    reply_to_message_id=row.message_id)
+    await handler.handle_forget(message, db_session)
+    event = await db_session.scalar(select(ForgetEvent).where(ForgetEvent.target_id == str(row.id),
+                                                              ForgetEvent.target_type == "message"))
+    if is_admin:
+        assert event is not None and event.authorized_by == "admin"
+    else:
+        assert event is None

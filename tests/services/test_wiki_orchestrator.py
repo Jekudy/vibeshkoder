@@ -772,3 +772,21 @@ async def test_automatic_entry_points_reject_zero_chat_scope(db_session) -> None
         )
     with pytest.raises(ValueError, match="source_chat_id"):
         await load_static_wiki_pages(db_session, source_chat_id=0)
+
+
+async def test_topic_inventory_accepts_senderless_source(db_session) -> None:
+    from sqlalchemy import select
+    from bot.db.models import CardSource, ChatMessage, MessageVersion
+    from bot.services.wiki_orchestrator import _load_topics
+
+    actor = await _make_user(db_session)
+    card_id = await _make_card(db_session, actor_id=actor, topic_slug="senderless-test", title="Test")
+    message_id = await db_session.scalar(
+        select(MessageVersion.chat_message_id).join(CardSource, CardSource.message_version_id == MessageVersion.id)
+        .where(CardSource.card_id == card_id)
+    )
+    message = await db_session.get(ChatMessage, message_id)
+    message.user_id = None
+    await db_session.flush()
+    inventory = await _load_topics(db_session, source_chat_id=SOURCE_CHAT_ID)
+    assert any(topic.slug == "senderless-test" for topic in inventory.eligible)
