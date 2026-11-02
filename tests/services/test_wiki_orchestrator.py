@@ -790,3 +790,23 @@ async def test_topic_inventory_accepts_senderless_source(db_session) -> None:
     await db_session.flush()
     inventory = await _load_topics(db_session, source_chat_id=SOURCE_CHAT_ID)
     assert any(topic.slug == "senderless-test" for topic in inventory.eligible)
+
+
+async def test_senderless_card_governance_consumers(db_session) -> None:
+    from types import SimpleNamespace
+    from sqlalchemy import select
+    from bot.db.models import CardSource, ChatMessage, MessageVersion
+    from bot.services.digest_publisher import _digest_revalidate_citations
+    from bot.services.wiki_compiler import _load_governed_sources
+
+    actor = await _make_user(db_session)
+    card_id = await _make_card(db_session, actor_id=actor, topic_slug="null-author-card", title="Test")
+    source = await db_session.scalar(select(CardSource).where(CardSource.card_id == card_id))
+    version = await db_session.get(MessageVersion, source.message_version_id)
+    message = await db_session.get(ChatMessage, version.chat_message_id)
+    message.user_id = None
+    await db_session.flush()
+    cards, _, allowed = await _load_governed_sources(db_session, card_ids=(card_id,), direct_mvids=(), source_chat_id=SOURCE_CHAT_ID)
+    assert len(cards) == 1 and version.id in allowed
+    digest = SimpleNamespace(citations=[{"kind": "card_source", "id": str(source.id)}])
+    assert await _digest_revalidate_citations(db_session, digest=digest)
