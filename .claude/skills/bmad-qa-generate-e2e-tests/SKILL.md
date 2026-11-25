@@ -68,11 +68,11 @@ Activation is complete. If `activation_steps_prepend` or `activation_steps_appen
 
 ### Step 0: Detect Test Framework
 
-Check project for existing test framework:
+For API and non-browser tests, check the project for an existing test framework. If the project needs only browser tests, skip framework discovery.
 
-- Look for `package.json` dependencies (playwright, jest, vitest, cypress, etc.)
+- Look for `package.json` dependencies (for example, Jest or Vitest)
 - Check for existing test files to understand patterns
-- Use whatever test framework the project already has
+- Use the existing test framework for API and non-browser tests. Use `bb-ego-browser` for browser tests.
 - If no framework exists:
   - Analyze source code to determine project type (React, Vue, Node API, etc.)
   - Search online for current recommended test framework for that stack
@@ -97,7 +97,9 @@ For API endpoints/services, generate tests that:
 
 ### Step 3: Generate E2E Tests (if UI exists)
 
-For UI features, generate tests that:
+For UI features, run `ego-browser skill` and follow the installed guide. If Ego is unavailable, report the blocker.
+
+Generate browser tests that:
 
 - Test user workflows end-to-end
 - Use semantic locators (roles, labels, text)
@@ -108,7 +110,7 @@ For UI features, generate tests that:
 
 ### Step 4: Run Tests
 
-Execute tests to verify they pass (use project's test command).
+Run API and non-browser tests with the project's test command. If that command also starts a legacy browser suite, run only the API and non-browser suite. Run browser tests with `ego-browser`.
 
 If failures occur, fix them immediately.
 

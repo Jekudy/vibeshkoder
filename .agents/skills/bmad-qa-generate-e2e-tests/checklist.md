@@ -4,7 +4,7 @@
 
 - [ ] API tests generated (if applicable)
 - [ ] E2E tests generated (if UI exists)
-- [ ] Tests use standard test framework APIs
+- [ ] Browser tests use `ego-browser`. Other tests use standard test framework APIs.
 - [ ] Tests cover happy path
 - [ ] Tests cover 1-2 critical error cases
 
@@ -24,7 +24,7 @@
 
 ## Validation
 
-Run the tests using your project's test command.
+Run API and non-browser tests with the project's test command. If that command also starts a legacy browser suite, run only the API and non-browser suite. Run browser tests with `ego-browser`.
 
 **Expected**: All tests pass ✅
 
